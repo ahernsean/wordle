@@ -7,11 +7,19 @@ group that guess produces.  Any disagreement between the stored value and that
 fold is therefore a genuine inconsistency, not a difference of opinion between
 two searches.
 
-`branch_best_by_policy` keys a branch by (branch_key, policy, answer_list_id)
-with `solve_budget` outside the key, so a branch's tainted and untainted values
-compete for one row and the last write wins.  Nothing records which of a
-child's values a parent folded, so a parent left holding the other one cannot
-be found by query — only by redoing the fold.  That is what this audit does.
+A branch holds up to two kinds of exact result — the unrestricted optimum in
+`branch_best_by_policy`, and one per budget in
+`branch_best_by_policy_and_budget` — and the fold has to read the one its
+parent actually used.  An unrestricted parent's subtrees were solved
+unrestricted; a parent solved under budget b spent one guess reaching each
+child, so it read them at b-1: the unrestricted child when its own worst case
+fits there, and otherwise the child solved at exactly b-1.
+
+Both facts once shared one row, and the last write won.  Nothing records which
+of a child's values a parent folded, so a parent left holding the other one
+cannot be found by query — only by redoing the fold.  That is what this audit
+does, and it stays worth doing after the split: it is what says whether a cache
+carries damage from before it.
 
 Two directions of disagreement, with very different consequences:
 
@@ -114,8 +122,11 @@ def fold_branch(branch_words, best_guess, response_cache, child_lookup):
     costs one guess more than its own subtree.
 
     child_lookup(branch_key) returns (max_depth, erd) for a stored group, or
-    None when no row holds it.  Groups of one word are answered here rather
-    than looked up, matching _solve_subset's own n == 1 base case.
+    None when no row holds it.  It carries the scope: a fold is only sound
+    against the results its own search would have read, so the caller supplies
+    a lookup already bound to the parent's budget.  Groups of one word are
+    answered here rather than looked up, matching _solve_subset's own n == 1
+    base case.
     """
     n = len(branch_words)
     groups = response_cache.group_words(best_guess, branch_words)
@@ -151,7 +162,8 @@ class DepthAudit:
     """Bottom-up fold of every stored branch row, with optional repair.
 
     Rows must arrive in ascending branch size so each row's response groups —
-    always strictly smaller than the row itself — are already folded.
+    always strictly smaller than the row itself — are already folded, in both
+    scopes.
     """
 
     def __init__(self, score_cache, policy, response_cache, repair=False):
@@ -159,8 +171,9 @@ class DepthAudit:
         self._policy = policy
         self._responses = response_cache
         self._repair = repair
-        # branch_key -> (max_depth, best_score) as the audit now believes them:
-        # the folded depth where the fold completed, the stored depth otherwise.
+        # (branch_key, solve_budget) -> (max_depth, best_score) as the audit
+        # now believes them: the folded depth where the fold completed, the
+        # stored depth otherwise.  solve_budget None is the unrestricted result.
         self._known = {}
         self.checked = 0
         self.legacy = 0
@@ -178,8 +191,27 @@ class DepthAudit:
         self.mismatch_sizes = Counter()
         self.findings = []
 
-    def _child(self, branch_key):
-        return self._known.get(branch_key)
+    def _child_lookup(self, parent_budget):
+        """Group lookup as a parent at `parent_budget` would have read it.
+
+        An unrestricted parent read unrestricted children.  A parent capped at
+        b reached each child having spent one guess, so it read them at b-1 —
+        preferring the unrestricted child whose own worst case fits there, and
+        falling back to the one solved at exactly b-1.  Mirrors
+        ScoreCache.read_for_budget one level down.
+        """
+        if parent_budget is None:
+            return lambda branch_key: self._known.get((branch_key, None))
+        child_budget = parent_budget - 1
+
+        def lookup(branch_key):
+            canonical = self._known.get((branch_key, None))
+            if (canonical is not None and canonical[0] is not None
+                    and canonical[0] <= child_budget):
+                return canonical
+            return self._known.get((branch_key, child_budget))
+
+        return lookup
 
     def run(self, rows, list_limit=0, progress=None):
         for row in rows:
@@ -198,7 +230,8 @@ class DepthAudit:
         best_guess = row['best_guess']
         solve_budget = row['solve_budget']
         self.checked += 1
-        self._known[branch_key] = (stored_depth, stored_score)
+        scope = solve_budget
+        self._known[(branch_key, scope)] = (stored_depth, stored_score)
 
         if stored_depth is None:
             # A legacy row records no depth at all; the budget-aware reader
@@ -207,7 +240,8 @@ class DepthAudit:
             return
 
         branch_words = decode_subset(branch_key)
-        fold = fold_branch(branch_words, best_guess, self._responses, self._child)
+        fold = fold_branch(branch_words, best_guess, self._responses,
+                           self._child_lookup(scope))
         if fold.degenerate:
             self.degenerate += 1
             return
@@ -216,7 +250,7 @@ class DepthAudit:
             self.unresolved_groups += len(fold.missing)
             return
 
-        self._known[branch_key] = (fold.depth, stored_score)
+        self._known[(branch_key, scope)] = (fold.depth, stored_score)
         score_agrees = abs(fold.erd - stored_score) <= SCORE_TOLERANCE
         if not score_agrees:
             self.score_stale += 1
@@ -250,7 +284,8 @@ class DepthAudit:
         if not safe_to_repair:
             self.repair_withheld += 1
             return
-        if self._cache.repair_max_depth(branch_key, self._policy, fold.depth):
+        if self._cache.repair_max_depth(branch_key, self._policy, fold.depth,
+                                        solve_budget=scope):
             self.repaired += 1
 
     def summary(self):
@@ -293,26 +328,39 @@ class _ReadOnlyDecompositions:
 
 
 def iter_rows(score_cache, policy):
-    """Every stored branch row for one policy, smallest branch first.
+    """Every stored branch result for one policy, smallest branch first.
 
-    Yielded one branch size at a time, each wave read to completion before it
-    is handed out: --repair updates the same table the rows come from, and a
-    cursor still open over it would be reading a moving target.
+    Spans both branch tables, so a branch with an unrestricted result and two
+    budget-specific ones yields three rows — each is a separate fact with its
+    own fold.  Yielded one branch size at a time, each wave read to completion
+    before it is handed out: --repair updates the same tables the rows come
+    from, and a cursor still open over one would be reading a moving target.
     """
     conn = score_cache._conn
     answer_list_id = score_cache.answer_list_id
     sizes = [row[0] for row in conn.execute("""
-        SELECT DISTINCT length(branch_key) / 5
+        SELECT DISTINCT length(branch_key) / 5 AS branch_size
         FROM branch_best_by_policy
         WHERE policy = ? AND answer_list_id = ?
-        ORDER BY length(branch_key)
-    """, (policy, answer_list_id)).fetchall()]
+        UNION
+        SELECT DISTINCT length(branch_key) / 5 AS branch_size
+        FROM branch_best_by_policy_and_budget
+        WHERE policy = ? AND answer_list_id = ?
+        ORDER BY branch_size
+    """, (policy, answer_list_id, policy, answer_list_id)).fetchall()]
     for size in sizes:
+        # Both scopes of one branch size together: a parent is strictly larger
+        # than every group it folds, so anything a fold needs is already done.
         yield from conn.execute("""
             SELECT branch_key, best_guess, best_score, max_depth, solve_budget
             FROM branch_best_by_policy
             WHERE policy = ? AND answer_list_id = ? AND length(branch_key) / 5 = ?
-        """, (policy, answer_list_id, size)).fetchall()
+            UNION ALL
+            SELECT branch_key, best_guess, best_score, max_depth, solve_budget
+            FROM branch_best_by_policy_and_budget
+            WHERE policy = ? AND answer_list_id = ? AND length(branch_key) / 5 = ?
+        """, (policy, answer_list_id, size,
+              policy, answer_list_id, size)).fetchall()
 
 
 def _size_span(sizes):

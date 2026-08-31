@@ -597,7 +597,7 @@ class TestScoreCacheSQLite(unittest.TestCase):
         sc = ScoreCache(self.db, ANSWERS)
         branch_key = ScoreCache.encode_subset(["crane", "slate", "trace"])
         sc.write(branch_key, "full", "heart", 2.5)
-        self.assertEqual(sc._mem_cache[(branch_key, "full")],
+        self.assertEqual(sc._mem_cache[(branch_key, "full", None)],
                          ("heart", 2.5, None, None))
 
         # Closing the connection proves this read is served from memory,
@@ -614,7 +614,7 @@ class TestScoreCacheSQLite(unittest.TestCase):
         sc2 = ScoreCache(self.db, ANSWERS)
         first = sc2.read(branch_key, "hard")
         self.assertEqual(first, ("earth", 1.8))
-        self.assertEqual(sc2._mem_cache[(branch_key, "hard")],
+        self.assertEqual(sc2._mem_cache[(branch_key, "hard", None)],
                          ("earth", 1.8, None, None))
 
         # A second read must not touch SQLite at all.
@@ -743,7 +743,7 @@ class TestScoreCacheSQLite(unittest.TestCase):
 
         self.assertIsNone(sc.read_detail(branch_key, "full"),
                           "failed write must not be persisted")
-        self.assertEqual(sc._mem_cache[(branch_key, "full")],
+        self.assertEqual(sc._mem_cache[(branch_key, "full", None)],
                           ("heart", 2.5, None, None),
                           "result must still be memoized for this run")
         sc.close()

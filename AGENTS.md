@@ -119,6 +119,30 @@ worker that simply finished its bundle leaves no unfinished claims at all, which
 is how a partly-solved branch resumes: sequential hand-off over a branch's life
 is normal, and only *concurrent* occupancy is capped.
 
+### A branch's exact results are keyed by scope
+
+A branch has two kinds of exact result and they are separate facts: the
+**unrestricted optimum** in `branch_best_by_policy`, and one **budget-specific**
+result per budget in `branch_best_by_policy_and_budget` (keyed by
+`(branch_key, policy, answer_list_id, solve_budget)`).  Both can be right and
+differ, so neither table's write may displace the other's.
+
+Read through `ScoreCache.read_for_budget`, never `read_with_depth`, when a
+budget is in play: the unrestricted result wins when its `max_depth` fits the
+budget, and only otherwise does the result solved at *exactly* that budget
+apply.  `wordle_engine._cache_reuse` stays the single statement of the rule;
+`read_for_budget` only selects which result to put to it.  The memory mirror is
+keyed by scope for the same reason the tables are.
+
+**A second exact result at a scope already stored does not replace it** —
+equal-cost strategies can differ in `max_depth`, and an ancestor folded the
+stored one.  A second result that disagrees on cost raises
+`CacheWriteConflict`.
+
+Only `branch_best_by_policy` is the "one row per branch" table.  Any count,
+report, or query that means branches must not union the two: a branch with
+results at three budgets is one branch.
+
 ### Completed work has two records, and they can disagree
 
 "Already solved" is answered by the **permanent cache**
@@ -673,9 +697,10 @@ erroring on a column the migration "already ran". Stopping costs nothing here:
 precache work has no deadline, `stop` drains cleanly, and in-progress claims
 survive a restart.
 
-**Only five tables cross between Linux and the phone.** `export_cache.py`'s
+**Only six tables cross between Linux and the phone.** `export_cache.py`'s
 `EXPORT_TABLES` and `import_cache.py`'s `TABLES` both move `answer_list`,
-`response_decomposition`, `branch_best_by_policy`, `candidate_scores` and
+`response_decomposition`, `branch_best_by_policy`,
+`branch_best_by_policy_and_budget`, `candidate_scores` and
 `candidate_erd_by_policy`. A cache table outside that list — the per-opener
 summaries, for instance — is written locally on each machine and never travels,
 so changing its shape cannot produce a file the other side fails to read.

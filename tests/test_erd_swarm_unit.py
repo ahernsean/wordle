@@ -241,6 +241,7 @@ class TestPromotedSpine(unittest.TestCase):
                 for entry_budget, guess, pattern in descent_entries:
                     w._note_depth(entry_budget, 5, guess, pattern)
                 w.score_cache.read_with_depth.return_value = None
+                w.score_cache.read_for_budget.return_value = None
                 w.score_cache.read_loss.return_value = None
                 w.queue.read_cut_result.return_value = []
                 w.queue.has_pending_row.return_value = False
@@ -262,6 +263,7 @@ class TestPromotedSpine(unittest.TestCase):
         root_key = b"root-branch"
         w._work_context = _context(branch_key=root_key)
         w.score_cache.read_with_depth.return_value = None
+        w.score_cache.read_for_budget.return_value = None
         w.score_cache.read_loss.return_value = None
         w.queue.read_cut_result.return_value = []
         w.queue.has_pending_row.return_value = False
@@ -950,7 +952,10 @@ class TestTransferredTaintFinalization(unittest.TestCase):
             with mock.patch.object(erd_swarm, "cache_all_scores"):
                 self.assertTrue(worker.maybe_finalize(
                     branch_key, branch_words, worker.n_candidates))
-            return worker.score_cache.read_with_depth(branch_key, ERD_ALL)
+            # A transferred taint records the result under the branch's
+            # budget rather than as the unrestricted optimum, so read it
+            # back the way a search at that budget would.
+            return worker.score_cache.read_for_budget(branch_key, ERD_ALL, 4)
         finally:
             worker.close()
 
@@ -3407,6 +3412,7 @@ class TestCooperativeSolveCeiling(unittest.TestCase):
         w = _bare_worker()
         w.score_cache = mock.MagicMock()
         w.score_cache.read_with_depth.return_value = None
+        w.score_cache.read_for_budget.return_value = None
         w.score_cache.read_loss.return_value = None
         w.queue.read_cut_result.return_value = []
         w.queue.has_pending_row.return_value = False

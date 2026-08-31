@@ -141,39 +141,109 @@ class _CacheFixture(unittest.TestCase):
             score_cache.close()
         return audit
 
-    def row_for(self, branch_key):
+    def row_for(self, branch_key, solve_budget=None):
+        """The stored result for one branch at one scope.
+
+        None is the unrestricted result; an int is the one solved under that
+        cap.  They live in different tables and are different facts.
+        """
         score_cache = self.open_cache()
+        if solve_budget is None:
+            return score_cache._conn.execute(
+                "SELECT best_guess, best_score, max_depth, solve_budget, updated_at "
+                "FROM branch_best_by_policy "
+                "WHERE branch_key = ? AND policy = ? AND answer_list_id = ?",
+                (branch_key, ERD_ALL, score_cache.answer_list_id)).fetchone()
         return score_cache._conn.execute(
-            "SELECT best_guess, best_score, max_depth, solve_budget "
-            "FROM branch_best_by_policy "
-            "WHERE branch_key = ? AND policy = ? AND answer_list_id = ?",
-            (branch_key, ERD_ALL, score_cache.answer_list_id)).fetchone()
+            "SELECT best_guess, best_score, max_depth, solve_budget, updated_at "
+            "FROM branch_best_by_policy_and_budget "
+            "WHERE branch_key = ? AND policy = ? AND answer_list_id = ? "
+            "  AND solve_budget = ?",
+            (branch_key, ERD_ALL, score_cache.answer_list_id,
+             solve_budget)).fetchone()
 
     def deepest_chain(self):
-        """Branch keys from the root down the groups that set its max_depth.
+        """Facts from the root down the groups that set its max_depth.
 
-        Following the group that achieves `1 + child_depth == parent_depth` is
-        what makes a change to the last link propagate all the way back up.
+        Each element is (branch_key, solve_budget): a branch can hold an
+        unrestricted result and one per budget, and only the fact a parent
+        actually folded is on its chain.  Descending picks the group achieving
+        `1 + child_depth == parent_depth` in the scope that parent read — one
+        budget down, unrestricted first — so a change to the last link
+        propagates all the way back up.
         """
         score_cache = self.open_cache()
         responses = ResponseCache(self.answer_words, score_cache=score_cache)
-        depths = {bytes(row['branch_key']): row['max_depth']
+        depths = {(bytes(row['branch_key']), row['solve_budget']): row['max_depth']
                   for row in iter_rows(score_cache, ERD_ALL)}
-        chain = [ScoreCache.encode_subset(self.answer_words)]
+        root = ScoreCache.encode_subset(self.answer_words)
+        root_scope = None if (root, None) in depths else FIXTURE_BUDGET
+        chain = [(root, root_scope)]
         while True:
-            branch_key = chain[-1]
-            row = self.row_for(branch_key)
-            branch_words = decode_subset(branch_key)
-            groups = responses.group_words(row['best_guess'], branch_words)
+            branch_key, scope = chain[-1]
+            row = self.row_for(branch_key, scope)
+            child_budget = None if scope is None else scope - 1
+            groups = responses.group_words(row['best_guess'],
+                                           decode_subset(branch_key))
             for group in groups.values():
                 if len(group) < 2:
                     continue
                 group_key = ScoreCache.encode_subset(group)
-                if depths.get(group_key) == row['max_depth'] - 1:
-                    chain.append(group_key)
+                fact = self._child_fact(depths, group_key, child_budget)
+                if fact is not None and depths[fact] == row['max_depth'] - 1:
+                    chain.append(fact)
                     break
             else:
                 return chain
+
+    @staticmethod
+    def _child_fact(depths, group_key, child_budget):
+        """Which of a group's facts a parent at `child_budget` would read."""
+        canonical_depth = depths.get((group_key, None))
+        if child_budget is None:
+            return (group_key, None) if canonical_depth is not None else None
+        if canonical_depth is not None and canonical_depth <= child_budget:
+            return (group_key, None)
+        if (group_key, child_budget) in depths:
+            return (group_key, child_budget)
+        return None
+
+    def restate(self, fact, max_depth=None, best_score=None):
+        """Replace one stored fact's recorded values, keeping its strategy.
+
+        Written with SQL rather than ScoreCache.write, which now refuses a
+        same-scope rewrite: this is reproducing the state a cache was left in
+        *before* that refusal existed, which is exactly what the audit is for.
+        """
+        branch_key, scope = fact
+        row = self.row_for(branch_key, scope)
+        table = ('branch_best_by_policy' if scope is None
+                 else 'branch_best_by_policy_and_budget')
+        score_cache = self.open_cache()
+        score_cache._conn.execute(
+            f"UPDATE {table} SET max_depth = ?, best_score = ? "
+            "WHERE branch_key = ? AND policy = ? AND answer_list_id = ?",
+            (row['max_depth'] if max_depth is None else max_depth,
+             row['best_score'] if best_score is None else best_score,
+             branch_key, ERD_ALL, score_cache.answer_list_id))
+        return row
+
+    def understate(self, fact):
+        """Record one fact a guess shallower than its own strategy needs."""
+        return self.restate(fact, max_depth=self.row_for(*fact)['max_depth'] - 1)
+
+    def overstate(self, fact):
+        return self.restate(fact, max_depth=self.row_for(*fact)['max_depth'] + 1)
+
+
+def _flagged(audit):
+    """The (branch_reference, solve_budget) facts an audit reported."""
+    return {(finding['branch_reference'], finding['solve_budget'])
+            for finding in audit.findings}
+
+
+def _fact_reference(fact):
+    return (branch_reference(fact[0]), fact[1])
 
 
 class CleanRebuildTest(_CacheFixture):
@@ -189,24 +259,38 @@ class CleanRebuildTest(_CacheFixture):
         self.assertEqual(audit.score_stale, 0)
 
     def test_the_fixture_reaches_the_states_the_audit_is_about(self):
-        # A fold over rows that were all shallow, or none of them tainted,
-        # would assert nothing about either.
+        # A fold over rows that were all shallow, or all of one scope, would
+        # assert nothing about either.
         score_cache = self.open_cache()
-        rows = score_cache._conn.execute(
-            "SELECT MAX(max_depth), SUM(solve_budget IS NOT NULL) "
-            "FROM branch_best_by_policy WHERE policy = ? AND answer_list_id = ?",
-            (ERD_ALL, score_cache.answer_list_id)).fetchone()
-        self.assertGreaterEqual(rows[0], 4)
-        self.assertGreater(rows[1], 0)
-        self.assertGreaterEqual(len(self.deepest_chain()), 3)
+        canonical = score_cache._conn.execute(
+            "SELECT COUNT(*) FROM branch_best_by_policy "
+            "WHERE policy = ? AND answer_list_id = ?",
+            (ERD_ALL, score_cache.answer_list_id)).fetchone()[0]
+        budgeted = score_cache._conn.execute(
+            "SELECT COUNT(*) FROM branch_best_by_policy_and_budget "
+            "WHERE policy = ? AND answer_list_id = ?",
+            (ERD_ALL, score_cache.answer_list_id)).fetchone()[0]
+        self.assertGreater(canonical, 0)
+        self.assertGreater(budgeted, 0)
+        chain = self.deepest_chain()
+        self.assertGreaterEqual(len(chain), 3)
+        self.assertGreaterEqual(self.row_for(*chain[0])['max_depth'], 4)
+
+    def test_no_budget_specific_result_reaches_the_canonical_table(self):
+        score_cache = self.open_cache()
+        self.assertEqual(score_cache._conn.execute(
+            "SELECT COUNT(*) FROM branch_best_by_policy "
+            "WHERE solve_budget IS NOT NULL").fetchone()[0], 0)
 
     def test_a_legacy_row_is_counted_rather_than_contradicted(self):
-        chain = self.deepest_chain()
+        branch_key, scope = self.deepest_chain()[-1]
+        table = ('branch_best_by_policy' if scope is None
+                 else 'branch_best_by_policy_and_budget')
         score_cache = self.open_cache()
         score_cache._conn.execute(
-            "UPDATE branch_best_by_policy SET max_depth = NULL "
+            f"UPDATE {table} SET max_depth = NULL "
             "WHERE branch_key = ? AND policy = ? AND answer_list_id = ?",
-            (chain[-1], ERD_ALL, score_cache.answer_list_id))
+            (branch_key, ERD_ALL, score_cache.answer_list_id))
         audit = self.audit()
         self.assertEqual(audit.legacy, 1)
         # Its parent folds it as an unresolved group rather than as depth 0.
@@ -221,87 +305,94 @@ class CleanRebuildTest(_CacheFixture):
         # hide a genuinely stale score that happens to be near enough.
         score_cache = self.open_cache()
         responses = ResponseCache(self.answer_words, score_cache=score_cache)
-        stored = {}
+        known = {}
+        checked = 0
         for row in iter_rows(score_cache, ERD_ALL):
             branch_key = bytes(row['branch_key'])
-            fold = fold_branch(decode_subset(branch_key), row['best_guess'],
-                               responses, stored.get)
+            scope = row['solve_budget']
+            fold = fold_branch(
+                decode_subset(branch_key), row['best_guess'], responses,
+                _known_lookup(known, scope))
             self.assertTrue(fold.complete)
             self.assertEqual(fold.erd, row['best_score'])
-            stored[branch_key] = (row['max_depth'], row['best_score'])
-        self.assertGreater(len(stored), 20)
+            known[(branch_key, scope)] = (row['max_depth'], row['best_score'])
+            checked += 1
+        self.assertGreater(checked, 20)
+
+
+def _known_lookup(known, parent_scope):
+    """A fold lookup over a plain dict, scoped as DepthAudit scopes its own."""
+    if parent_scope is None:
+        return lambda key: known.get((key, None))
+    child_budget = parent_scope - 1
+
+    def lookup(key):
+        canonical = known.get((key, None))
+        if (canonical is not None and canonical[0] is not None
+                and canonical[0] <= child_budget):
+            return canonical
+        return known.get((key, child_budget))
+
+    return lookup
 
 
 class AliasedOverwriteTest(_CacheFixture):
     """The overwrite of issue #302, and what the audit makes of it."""
 
-    def restate(self, branch_key, max_depth):
-        """Rewrite one branch's recorded depth, keeping its strategy.
-
-        A branch whose row was replaced by the other of its two competing
-        values leaves exactly this behind at every ancestor that folded the
-        one it replaced: the same best_guess and best_score it always had,
-        against a depth that no longer describes the subtree beneath it.
-        """
-        row = self.row_for(branch_key)
-        score_cache = self.open_cache()
-        score_cache.write(branch_key, ERD_ALL, row['best_guess'], row['best_score'],
-                          max_depth=max_depth, solve_budget=FIXTURE_BUDGET)
-        return row['max_depth']
-
     def understate_chain(self):
-        """Understate every branch on the deepest chain by one guess.
+        """Understate every fact on the deepest chain by one guess.
 
-        The deepest branch's own strategy still needs the depth it always
-        needed, so correcting it re-opens the gap at its parent, and so on to
-        the root — the ancestry the issue's global fold cannot count because
-        it reads back the same understated children.
+        The deepest one's own strategy still needs the depth it always needed,
+        so correcting it re-opens the gap at its parent, and so on to the root
+        — the ancestry the issue's global fold cannot count because it reads
+        back the same understated children.
         """
         chain = self.deepest_chain()
-        true_depths = [self.restate(key, self.row_for(key)['max_depth'] - 1)
-                       for key in chain]
-        return chain, true_depths
+        for fact in chain:
+            self.understate(fact)
+        return chain
 
     def naive_flagged(self):
         """What a fold that reads each child's stored depth would flag."""
         score_cache = self.open_cache()
         responses = ResponseCache(self.answer_words, score_cache=score_cache)
-        rows = [(bytes(row['branch_key']), row['best_guess'], row['max_depth'])
+        rows = [(bytes(row['branch_key']), row['solve_budget'],
+                 row['best_guess'], row['max_depth'])
                 for row in iter_rows(score_cache, ERD_ALL)]
-        stored = {key: (max_depth, 0.0) for key, _guess, max_depth in rows}
+        stored = {(key, scope): (max_depth, 0.0)
+                  for key, scope, _guess, max_depth in rows}
         flagged = set()
-        for branch_key, best_guess, max_depth in rows:
+        for branch_key, scope, best_guess, max_depth in rows:
             fold = fold_branch(decode_subset(branch_key), best_guess, responses,
-                               stored.get)
+                               _known_lookup(stored, scope))
             if fold.complete and fold.depth != max_depth:
-                flagged.add(branch_reference(branch_key))
+                flagged.add((branch_reference(branch_key), scope))
         return flagged
 
-    def test_an_understated_branch_is_reported_against_its_own_subtree(self):
-        chain = self.deepest_chain()
-        parent = chain[-2]
-        true_depth = self.restate(parent, self.row_for(parent)['max_depth'] - 1)
+    def test_an_understated_fact_is_reported_against_its_own_subtree(self):
+        parent = self.deepest_chain()[-2]
+        true_depth = self.row_for(*parent)['max_depth']
+        self.understate(parent)
 
-        audit = self.audit(list_limit=len(chain))
-        flagged = {finding['branch_reference']: finding for finding in audit.findings}
-        self.assertIn(branch_reference(parent), flagged)
-        self.assertEqual(flagged[branch_reference(parent)]['stored_max_depth'],
-                         true_depth - 1)
-        self.assertEqual(flagged[branch_reference(parent)]['folded_max_depth'],
-                         true_depth)
+        audit = self.audit(list_limit=10)
+        flagged = {(f['branch_reference'], f['solve_budget']): f
+                   for f in audit.findings}
+        self.assertIn(_fact_reference(parent), flagged)
+        finding = flagged[_fact_reference(parent)]
+        self.assertEqual(finding['stored_max_depth'], true_depth - 1)
+        self.assertEqual(finding['folded_max_depth'], true_depth)
         self.assertEqual(audit.depth_deltas[(true_depth - 1, true_depth)], 1)
-        self.assertEqual(audit.tainted_split['tainted'], 1)
-        self.assertEqual(audit.mismatch_sizes[len(decode_subset(parent))], 1)
+        self.assertEqual(audit.mismatch_sizes[len(decode_subset(parent[0]))], 1)
 
-    def test_every_ancestor_of_an_understated_branch_is_flagged(self):
-        chain, true_depths = self.understate_chain()
+    def test_every_ancestor_of_an_understated_fact_is_flagged(self):
+        chain = self.understate_chain()
         self.assertGreaterEqual(len(chain), 3)
 
-        audit = self.audit(list_limit=len(chain))
-        flagged = {finding['branch_reference'] for finding in audit.findings}
-        for branch_key in chain:
-            self.assertIn(branch_reference(branch_key), flagged,
-                          f'{branch_reference(branch_key)} not flagged')
+        audit = self.audit(list_limit=len(chain) + 5)
+        flagged = _flagged(audit)
+        for fact in chain:
+            self.assertIn(_fact_reference(fact), flagged,
+                          f'{_fact_reference(fact)} not flagged')
         self.assertEqual(audit.depth_too_low, len(chain))
         self.assertEqual(audit.depth_too_high, 0)
 
@@ -310,47 +401,35 @@ class AliasedOverwriteTest(_CacheFixture):
         # re-reads each child's stored depth agrees with a parent that folded
         # the same understated value and moves on, so its count is a floor on
         # the real one rather than a measurement of it.
-        chain, _true_depths = self.understate_chain()
-        audit = self.audit(list_limit=len(chain))
-        flagged = {finding['branch_reference'] for finding in audit.findings}
+        chain = self.understate_chain()
+        audit = self.audit(list_limit=len(chain) + 5)
+        flagged = _flagged(audit)
         naive = self.naive_flagged()
-        self.assertIn(branch_reference(chain[-2]), flagged)
-        self.assertNotIn(branch_reference(chain[-2]), naive)
+        self.assertIn(_fact_reference(chain[-2]), flagged)
+        self.assertNotIn(_fact_reference(chain[-2]), naive)
         self.assertLess(naive, flagged)
 
-    def test_an_overstated_branch_reads_as_conservative(self):
-        chain = self.deepest_chain()
-        parent = chain[-2]
-        true_depth = self.restate(parent, self.row_for(parent)['max_depth'] + 1)
+    def test_an_overstated_fact_reads_as_conservative(self):
+        parent = self.deepest_chain()[-2]
+        true_depth = self.row_for(*parent)['max_depth']
+        self.overstate(parent)
         audit = self.audit()
         self.assertEqual(audit.depth_too_high, 1)
         self.assertEqual(audit.depth_too_low, 0)
         self.assertEqual(audit.depth_deltas[(true_depth + 1, true_depth)], 1)
 
     def test_a_replaced_score_is_reported_but_never_rewritten(self):
-        chain = self.deepest_chain()
-        child = chain[-1]
-        row = self.row_for(child)
-        score_cache = self.open_cache()
-        score_cache.write(child, ERD_ALL, row['best_guess'], row['best_score'] + 0.5,
-                          max_depth=row['max_depth'], solve_budget=row['solve_budget'])
+        child = self.deepest_chain()[-1]
+        row = self.restate(child, best_score=self.row_for(*child)['best_score'] + 0.5)
         audit = self.audit(repair=True)
         self.assertGreaterEqual(audit.score_stale, 1)
         self.assertEqual(audit.depth_too_low, 0)
         self.assertEqual(audit.depth_too_high, 0)
-        self.assertAlmostEqual(self.row_for(child)['best_score'],
+        self.assertAlmostEqual(self.row_for(*child)['best_score'],
                                row['best_score'] + 0.5)
 
 
 class RepairTest(_CacheFixture):
-
-    def understate(self, branch_key):
-        """Record one branch a guess shallower than its own strategy needs."""
-        row = self.row_for(branch_key)
-        score_cache = self.open_cache()
-        score_cache.write(branch_key, ERD_ALL, row['best_guess'], row['best_score'],
-                          max_depth=row['max_depth'] - 1, solve_budget=FIXTURE_BUDGET)
-        return row
 
     def test_repair_rewrites_the_depth_and_leaves_the_strategy_alone(self):
         parent = self.deepest_chain()[-2]
@@ -358,17 +437,26 @@ class RepairTest(_CacheFixture):
 
         audit = self.audit(repair=True)
         self.assertEqual(audit.repaired, audit.depth_too_low + audit.depth_too_high)
-        after = self.row_for(parent)
+        after = self.row_for(*parent)
         self.assertEqual(after['max_depth'], before['max_depth'])
         self.assertEqual(after['best_guess'], before['best_guess'])
         self.assertEqual(after['best_score'], before['best_score'])
-        # The overwrite's own taint marker stands: repair touches only depth.
-        self.assertEqual(after['solve_budget'], FIXTURE_BUDGET)
+        self.assertEqual(after['solve_budget'], before['solve_budget'])
+
+    def test_a_repair_reaches_a_budget_specific_result(self):
+        # The two scopes live in different tables, so a repair that only knew
+        # the canonical one would silently no-op on half the cache.
+        budgeted = [fact for fact in self.deepest_chain() if fact[1] is not None]
+        self.assertTrue(budgeted, 'fixture has no budget-specific facts')
+        fact = budgeted[-1]
+        before = self.understate(fact)
+        self.assertGreater(self.audit(repair=True).repaired, 0)
+        self.assertEqual(self.row_for(*fact)['max_depth'], before['max_depth'])
 
     def test_a_repaired_cache_audits_clean_on_the_next_run(self):
         chain = self.deepest_chain()
-        for branch_key in chain:
-            self.understate(branch_key)
+        for fact in chain:
+            self.understate(fact)
         self.assertEqual(self.audit(repair=True).repaired, len(chain))
 
         second = self.audit()
@@ -382,7 +470,8 @@ class RepairTest(_CacheFixture):
         audit = self.audit()
         self.assertGreaterEqual(audit.depth_too_low, 1)
         self.assertEqual(audit.repaired, 0)
-        self.assertEqual(self.row_for(parent)['max_depth'], before['max_depth'] - 1)
+        self.assertEqual(self.row_for(*parent)['max_depth'],
+                         before['max_depth'] - 1)
 
     def test_repair_max_depth_reports_a_row_it_did_not_find(self):
         score_cache = self.open_cache()
@@ -390,56 +479,48 @@ class RepairTest(_CacheFixture):
             ScoreCache.encode_subset(['aaaaa', 'bbbbb']), ERD_ALL, 3))
 
     def test_repair_max_depth_drops_the_row_from_the_session_mirror(self):
-        branch_key = self.deepest_chain()[-1]
+        branch_key, scope = self.deepest_chain()[-1]
         score_cache = self.open_cache()
-        original = score_cache.read_with_depth(branch_key, ERD_ALL)
+        original = score_cache.read_for_budget(branch_key, ERD_ALL, scope)
         self.assertTrue(score_cache.repair_max_depth(
-            branch_key, ERD_ALL, original[2] + 1))
-        self.assertEqual(score_cache.read_with_depth(branch_key, ERD_ALL)[2],
-                         original[2] + 1)
+            branch_key, ERD_ALL, original[2] + 1, solve_budget=scope))
+        self.assertEqual(
+            score_cache.read_for_budget(branch_key, ERD_ALL, scope)[2],
+            original[2] + 1)
 
 
 class RepairSafetyTest(_CacheFixture):
     """Which direction of disagreement --repair is willing to act on."""
 
-    def restate(self, branch_key, max_depth=None, best_score=None):
-        row = self.row_for(branch_key)
-        score_cache = self.open_cache()
-        score_cache.write(
-            branch_key, ERD_ALL, row['best_guess'],
-            row['best_score'] if best_score is None else best_score,
-            max_depth=row['max_depth'] if max_depth is None else max_depth,
-            solve_budget=row['solve_budget'])
-        return row
-
     def test_an_overstated_depth_is_lowered_when_the_score_holds_up(self):
         parent = self.deepest_chain()[-2]
-        before = self.restate(parent, max_depth=self.row_for(parent)['max_depth'] + 1)
+        before = self.overstate(parent)
         audit = self.audit(repair=True)
         self.assertEqual(audit.repair_withheld, 0)
         self.assertEqual(audit.repaired, 1)
-        self.assertEqual(self.row_for(parent)['max_depth'], before['max_depth'])
+        self.assertEqual(self.row_for(*parent)['max_depth'], before['max_depth'])
 
     def test_an_overstated_depth_is_left_alone_when_the_score_is_stale(self):
         # Lowering it would offer the row at budgets that previously rejected
         # it, on the strength of an ERD this same pass just contradicted.
         parent = self.deepest_chain()[-2]
-        before = self.row_for(parent)
+        before = self.row_for(*parent)
         self.restate(parent, max_depth=before['max_depth'] + 1,
                      best_score=before['best_score'] + 0.5)
         audit = self.audit(repair=True)
-        # The replaced score also disagrees at whoever folded it, so the
-        # stale count is the parent plus its own ancestry.
+        # The replaced score also disagrees at whoever folded it, so the stale
+        # count is the parent plus its own ancestry.
         self.assertGreaterEqual(audit.score_stale, 1)
         self.assertEqual(audit.depth_too_high, 1)
         self.assertEqual(audit.repaired, 0)
         self.assertEqual(audit.repair_withheld, 1)
-        self.assertEqual(self.row_for(parent)['max_depth'], before['max_depth'] + 1)
+        self.assertEqual(self.row_for(*parent)['max_depth'],
+                         before['max_depth'] + 1)
 
     def test_an_understated_depth_is_raised_even_when_the_score_is_stale(self):
         # Raising only withdraws reuse, so a stale score is no reason to wait.
         parent = self.deepest_chain()[-2]
-        before = self.row_for(parent)
+        before = self.row_for(*parent)
         self.restate(parent, max_depth=before['max_depth'] - 1,
                      best_score=before['best_score'] + 0.5)
         audit = self.audit(repair=True)
@@ -447,36 +528,27 @@ class RepairSafetyTest(_CacheFixture):
         self.assertEqual(audit.depth_too_low, 1)
         self.assertEqual(audit.repaired, 1)
         self.assertEqual(audit.repair_withheld, 0)
-        self.assertEqual(self.row_for(parent)['max_depth'], before['max_depth'])
+        self.assertEqual(self.row_for(*parent)['max_depth'], before['max_depth'])
 
 
 class RepairSideEffectsTest(_CacheFixture):
     """What a repair has to do beyond the column it corrects."""
 
-    def understate(self, branch_key):
-        row = self.row_for(branch_key)
-        score_cache = self.open_cache()
-        score_cache.write(branch_key, ERD_ALL, row['best_guess'], row['best_score'],
-                          max_depth=row['max_depth'] - 1, solve_budget=FIXTURE_BUDGET)
-        return row
-
-    def updated_at_of(self, branch_key):
-        score_cache = self.open_cache()
-        return score_cache._conn.execute(
-            "SELECT updated_at FROM branch_best_by_policy "
-            "WHERE branch_key = ? AND policy = ? AND answer_list_id = ?",
-            (branch_key, ERD_ALL, score_cache.answer_list_id)).fetchone()[0]
+    def updated_at_of(self, fact):
+        return self.row_for(*fact)['updated_at']
 
     def test_a_repair_moves_updated_at_so_an_incremental_export_carries_it(self):
         # export_cache --since selects updated_at > ?, so a repair that left
         # the timestamp alone would be dropped from every incremental export.
         parent = self.deepest_chain()[-2]
         self.understate(parent)
+        table = ('branch_best_by_policy' if parent[1] is None
+                 else 'branch_best_by_policy_and_budget')
         score_cache = self.open_cache()
         score_cache._conn.execute(
-            "UPDATE branch_best_by_policy SET updated_at = 0 "
+            f"UPDATE {table} SET updated_at = 0 "
             "WHERE branch_key = ? AND policy = ? AND answer_list_id = ?",
-            (parent, ERD_ALL, score_cache.answer_list_id))
+            (parent[0], ERD_ALL, score_cache.answer_list_id))
         self.assertEqual(self.updated_at_of(parent), 0)
 
         self.assertEqual(self.audit(repair=True).repaired, 1)
@@ -489,10 +561,10 @@ class RepairSideEffectsTest(_CacheFixture):
             "WHERE policy = ? AND answer_list_id = ?",
             (ERD_ALL, score_cache.answer_list_id)).fetchone()[0]
 
-    def seed_candidate_erd(self, branch_key):
-        row = self.row_for(branch_key)
+    def seed_candidate_erd(self, fact):
+        row = self.row_for(*fact)
         score_cache = self.open_cache()
-        score_cache.write_candidate_erd(branch_key, row['best_guess'], ERD_ALL,
+        score_cache.write_candidate_erd(fact[0], row['best_guess'], ERD_ALL,
                                         row['best_score'], row['max_depth'], 2)
 
     def test_a_repair_drops_the_candidate_erd_folds_it_invalidates(self):
@@ -561,7 +633,7 @@ class ReadOnlyAuditTest(_CacheFixture):
         self.addCleanup(score_cache.close)
         self.assertFalse(score_cache.checkpoint_on_close)
         with self.assertRaises(sqlite3.OperationalError):
-            score_cache.repair_max_depth(self.deepest_chain()[-1], ERD_ALL, 9)
+            score_cache.repair_max_depth(self.deepest_chain()[-1][0], ERD_ALL, 9)
 
     def test_a_read_only_cache_reports_the_same_answer_list_id(self):
         writable = self.open_cache()
@@ -585,18 +657,12 @@ class CommandLineTest(_CacheFixture):
         self.assertEqual(status, 0)
         self.assertIn('stored max_depth TOO LOW  (unsound reuse): 0', output)
 
-    def understate(self, branch_key):
-        row = self.row_for(branch_key)
-        score_cache = self.open_cache()
-        score_cache.write(branch_key, ERD_ALL, row['best_guess'], row['best_score'],
-                          max_depth=row['max_depth'] - 1, solve_budget=FIXTURE_BUDGET)
-
     def test_an_understated_row_exits_nonzero_and_is_listed(self):
         parent = self.deepest_chain()[-2]
         self.understate(parent)
         status, output = self.run_main('--list', '10')
         self.assertEqual(status, 1)
-        self.assertIn(branch_reference(parent), output)
+        self.assertIn(branch_reference(parent[0]), output)
         self.assertIn('deltas:', output)
 
     def test_repair_exits_zero_and_reports_what_it_rewrote(self):

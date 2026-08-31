@@ -2117,7 +2117,8 @@ class _BranchWorker:
             n_words = len(words)
             # Already solved by someone? reuse without re-promoting.
             reuse = _cache_reuse(
-                self.score_cache.read_with_depth(branch_key, ERD_ALL), budget)
+                self.score_cache.read_for_budget(branch_key, ERD_ALL, budget),
+                budget)
             if reuse is not None:
                 return (SOLVED, *reuse)
             # Already proven a loss within this budget? don't register a swarm
@@ -2203,7 +2204,8 @@ class _BranchWorker:
                 # Finished?  Check before claiming so we never touch a branch that
                 # another worker just finalized and deleted.
                 reuse = _cache_reuse(
-                    self.score_cache.read_with_depth(branch_key, ERD_ALL), budget)
+                    self.score_cache.read_for_budget(branch_key, ERD_ALL, budget),
+                    budget)
                 if reuse is not None:
                     return (SOLVED, *reuse)
                 loss_budget = self.score_cache.read_loss(
@@ -2416,7 +2418,8 @@ class _BranchWorker:
                                           claimed['source_pattern'])
             budget = self._spine_budget(opener_spine)
             reuse = _cache_reuse(
-                self.score_cache.read_with_depth(claimed['branch_key'], ERD_ALL),
+                self.score_cache.read_for_budget(
+                    claimed['branch_key'], ERD_ALL, budget),
                 budget)
             if reuse is None:
                 break

@@ -4,10 +4,9 @@ The import_cache module is a CLI tool (main() is # pragma: no cover), but its
 utility functions — _fmt_eta, _all_cols, _pk_cols, _insert_sql, and
 _copy_table_with_progress — contain real logic worth pinning.
 
-test_erd_fixes.TestMergeUntaintedWins already covers the tainted-vs-untainted
-UPSERT semantics by calling _all_cols and _insert_sql directly; those tests
-continue to provide that coverage.  The tests here focus on the helper
-functions and the end-to-end copy path.
+test_erd_fixes.TestMergeKeepsBothScopes covers the merge semantics for a
+branch's two kinds of result by calling _all_cols and _insert_sql directly.
+The tests here focus on the helper functions and the end-to-end copy path.
 """
 import hashlib
 import io
@@ -98,22 +97,21 @@ class TestTargetHasTable(_TmpDB):
 
 class TestInsertSql(unittest.TestCase):
     def _all_erd_cols(self):
-        return list(import_cache._ERD_UPSERT_COLS) + ["extra_col"]
+        return list(import_cache._ERD_ROUTING_COLS) + ["extra_col"]
 
-    def test_branch_best_with_all_required_cols_returns_upsert(self):
-        sql = import_cache._insert_sql("branch_best_by_policy", self._all_erd_cols())
-        self.assertIn("DO UPDATE", sql)
-        self.assertIn("solve_budget IS NOT NULL", sql)
+    def test_every_table_keeps_what_the_target_holds(self):
+        # Both branch tables key a row by the scope it belongs to, so a
+        # collision is two caches holding the same fact rather than two
+        # different facts competing for one row.
+        for table in (import_cache.CANONICAL_TABLE, import_cache.BUDGET_TABLE,
+                      "response_decomposition"):
+            with self.subTest(table=table):
+                sql = import_cache._insert_sql(table, self._all_erd_cols())
+                self.assertIn("INSERT OR IGNORE", sql)
+                self.assertNotIn("DO UPDATE", sql)
 
     def test_other_table_returns_insert_or_ignore(self):
         sql = import_cache._insert_sql("response_decomposition", ["guess", "patterns"])
-        self.assertIn("INSERT OR IGNORE", sql)
-        self.assertNotIn("DO UPDATE", sql)
-
-    def test_branch_best_missing_required_col_falls_back_to_insert_or_ignore(self):
-        # Without solve_budget the tainted-vs-untainted rule cannot be applied.
-        cols = [c for c in import_cache._ERD_UPSERT_COLS if c != "solve_budget"]
-        sql = import_cache._insert_sql("branch_best_by_policy", cols)
         self.assertIn("INSERT OR IGNORE", sql)
         self.assertNotIn("DO UPDATE", sql)
 

@@ -1700,7 +1700,7 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
     branch_key = ScoreCache.encode_subset(branch_words)
     if score_cache:
         reuse = _cache_reuse(
-            score_cache.read_with_depth(branch_key, policy), budget)
+            score_cache.read_for_budget(branch_key, policy, budget), budget)
         if reuse is not None:
             return (SOLVED, *reuse)   # cached values are exact optima
         # A loss proven within b guesses is a loss within any budget <= b.

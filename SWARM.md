@@ -630,6 +630,59 @@ swarm was down.
 
 Cache coverage inspection uses `erd_search.py view --cache` with an optional semantic branch target.
 
+### A branch's two kinds of exact result
+
+`branch_best_by_policy` holds one row per branch: the **unrestricted optimum**,
+the best strategy over all strategies, reusable at any remaining budget its own
+`max_depth` can meet.  `branch_best_by_policy_and_budget` holds the
+**budget-specific** results, keyed by `(branch_key, policy, answer_list_id,
+solve_budget)` — the optimum among strategies feasible at exactly that budget.
+
+Both can be right and differ, which is why they are not one row.  Sharing a key
+made either write destroy the other, after ancestors may already have folded
+the value it displaced, and nothing records which one they folded (issue #302).
+
+A search at budget `b` reads the unrestricted result first and takes it when
+`max_depth <= b`: globally optimal is also optimal within any budget it can
+meet.  Only when it does not fit is the budget-specific result consulted, and
+only the one solved at exactly `b` — a row from another budget is optimal
+against a different set of feasible strategies.  An unlimited search reads the
+unrestricted table alone.  `ScoreCache.read_for_budget` makes that selection;
+`wordle_engine._cache_reuse` remains the one place the rule is stated.
+
+**A second exact result for a branch at a scope it already holds does not
+replace it.**  Two exact searches of one scope agree on the cost, and
+equal-cost strategies can still differ in `max_depth`, so overwriting would
+leave every ancestor that folded the stored depth describing a subtree the
+cache no longer holds.  A second result that *disagrees* on the cost cannot be
+reconciled that way and raises `CacheWriteConflict` — the two searches cannot
+both be right, and recording either invalidates whichever ancestors folded the
+other.  Expect that never to fire; if it does, the log line names the branch,
+policy, budget and both values.
+
+Counts say which they mean.  `exact_branch_count` counts branches with an
+unrestricted result; `budgeted_result_count` counts budget-specific results and
+`budgeted_branch_count` the branches holding them.  Never union the two tables
+for a branch count — a branch with results at three budgets is one branch.
+
+**Migration.**  Opening a pre-split cache moves its `solve_budget IS NOT NULL`
+rows into the budget table and clears `candidate_erd_by_policy`, whose every
+row memoised a fold under the old branch-row identity.  The canonical table is
+not rebuilt, so the migration is a row move on the minority rather than a
+rewrite of a multi-GB file.
+
+**Deploy before syncing.**  The canonical table's shape is unchanged, so an
+older reader handed a newer export still consumes the unrestricted rows it
+understands and ignores the budget table it does not.  A newer importer routes
+an older writer's budget-specific rows — which arrive in the canonical table —
+into the budget table, never into the canonical one.  Deploy the new code
+before merging any export into a migrated cache.
+
+**The quarantined cache is hints-only.**  Moving its rows under the new schema
+does not certify them: nothing in the migration re-derives a value or repairs
+an ancestor that folded a displaced one.  Treat that file as candidate-ordering
+hints and write clean exact results under the new schema.
+
 ### Audit the max_depth column
 
 ```bash

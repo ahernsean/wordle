@@ -26,14 +26,17 @@ place, schema_migrations is populated, and all of this happens before the
 target holds any of the merged rows, not after. Merging into an
 already-current target is a fast no-op bootstrap.
 
-branch_best_by_policy is the exception: its primary key
-(branch_key, policy, answer_list_id) does NOT include solve_budget, so two caches
-can legitimately hold DIFFERENT entries for the same key — e.g. one solved
-unconstrained (solve_budget NULL, reusable at any budget) and one solved under
-a depth cap (solve_budget set, reusable only at that budget).  The unconstrained
-entry strictly dominates (see wordle_engine._cache_reuse), so for that table we
-let an incoming untainted row replace an existing tainted one, rather than
-silently keeping whichever the target happened to have first.
+A branch's two kinds of exact result are keyed apart — the unrestricted
+optimum in branch_best_by_policy, one per budget in
+branch_best_by_policy_and_budget — so a collision in either table is two caches
+holding the same fact, and INSERT OR IGNORE is exact there too.
+
+A source written before that split carries its budget-specific results in
+branch_best_by_policy, marked by a non-NULL solve_budget.  Merging those into
+the target's canonical table would put two different facts back on one key, so
+they are routed into the budget table under their own budget and skipped by the
+canonical copy.  An older reader handed a newer export sees a table it does not
+know and ignores it, keeping the unrestricted rows it does understand.
 
 Run with --dry-run first to see how many rows would be added/upgraded.  Prefer
 to run while workers are stopped (or at least briefly paused) to avoid competing
@@ -60,40 +63,35 @@ TABLES = [
     'answer_list',
     'response_decomposition',
     'branch_best_by_policy',
+    'branch_best_by_policy_and_budget',
     'candidate_scores',
     'candidate_erd_by_policy',
 ]
 
+# A branch's budget-specific results live in their own table.  A source written
+# before that split carries them in branch_best_by_policy instead, marked by a
+# non-NULL solve_budget; they are routed to the budget table and never merged
+# into the canonical one, whose rows are unrestricted optima.
+CANONICAL_TABLE = 'branch_best_by_policy'
+BUDGET_TABLE = 'branch_best_by_policy_and_budget'
+
 DEFAULT_TARGET = DEFAULT_CACHE_PATH
 
-# Columns the untainted-preference UPSERT for branch_best_by_policy needs.
-_ERD_UPSERT_COLS = {'branch_key', 'policy', 'answer_list_id', 'solve_budget',
-                    'best_guess', 'best_score', 'updated_at', 'max_depth'}
+# Columns the legacy budget-specific routing needs.
+_ERD_ROUTING_COLS = {'branch_key', 'policy', 'answer_list_id', 'solve_budget',
+                     'best_guess', 'best_score', 'updated_at', 'max_depth'}
 
 
 def _insert_sql(table: str, cols: list[str]) -> str:
-    """INSERT statement for a merge batch.
+    """INSERT statement for a merge batch: keep whatever the target holds.
 
-    For branch_best_by_policy, a key collision can pit a tainted entry against
-    an untainted one (the PK omits solve_budget); the untainted entry is
-    strictly more reusable, so an incoming untainted row replaces an existing
-    tainted one.  Every other table — and any conflict that isn't
-    tainted->untainted — is a plain INSERT OR IGNORE (keep what's there).
+    Every table is a plain INSERT OR IGNORE.  Both branch tables now key a row
+    by the scope it belongs to, so a collision is two caches holding the same
+    fact rather than two different facts competing, and there is nothing to
+    prefer between them.
     """
     col_list = ', '.join(cols)
     placeholders = ', '.join('?' * len(cols))
-    if table == 'branch_best_by_policy' and _ERD_UPSERT_COLS <= set(cols):
-        return f"""
-            INSERT INTO main.{table} ({col_list}) VALUES ({placeholders})
-            ON CONFLICT(branch_key, policy, answer_list_id) DO UPDATE SET
-                best_guess   = excluded.best_guess,
-                best_score   = excluded.best_score,
-                updated_at   = excluded.updated_at,
-                max_depth    = excluded.max_depth,
-                solve_budget = excluded.solve_budget
-            WHERE main.{table}.solve_budget IS NOT NULL
-              AND excluded.solve_budget IS NULL
-        """
     return (f'INSERT OR IGNORE INTO main.{table} ({col_list}) '
             f'VALUES ({placeholders})')
 
@@ -171,6 +169,51 @@ def _fmt_eta(seconds: float) -> str:
     return f'{seconds // 3600}h{(seconds % 3600) // 60:02d}m'
 
 
+def _legacy_budget_rows_predicate(conn) -> str:
+    """SQL restricting src.branch_best_by_policy to its budget-specific rows.
+
+    A source written after the split has none — its canonical table holds only
+    unrestricted optima — and one written before it marks them with a non-NULL
+    solve_budget.  A source old enough to lack the column has none either.
+    """
+    if 'solve_budget' not in _all_cols_src(conn, CANONICAL_TABLE):
+        return '0'
+    return 'solve_budget IS NOT NULL'
+
+
+def _all_cols_src(conn, table: str) -> list[str]:
+    return [r[1] for r in conn.execute(f'PRAGMA src.table_info({table})')]
+
+
+def _route_legacy_budget_rows(conn) -> int:
+    """Move a legacy source's budget-specific rows into the budget table.
+
+    They arrive in the canonical table because they predate the split.  Merging
+    them there would put two different facts back on one key, which is the
+    thing the split exists to stop, so they are routed by their own budget
+    instead.  Rows the target already holds are left alone.
+    """
+    predicate = _legacy_budget_rows_predicate(conn)
+    if predicate == '0':
+        return 0
+    # The predicate above already established the source has solve_budget.
+    available = set(_all_cols_src(conn, CANONICAL_TABLE))
+    cols = [column for column in
+            ('branch_key', 'branch_reference', 'policy', 'answer_list_id',
+             'solve_budget', 'best_guess', 'best_score', 'updated_at',
+             'max_depth')
+            if column in available]
+    col_list = ', '.join(cols)
+    before = conn.total_changes
+    conn.execute('BEGIN')
+    conn.execute(f"""
+        INSERT OR IGNORE INTO main.{BUDGET_TABLE} ({col_list})
+        SELECT {col_list} FROM src.{CANONICAL_TABLE} WHERE {predicate}
+    """)
+    conn.execute('COMMIT')
+    return conn.total_changes - before
+
+
 def _copy_table_with_progress(conn, table) -> int:
     """Copy src.table -> main.table in rowid-paged batches with live progress.
 
@@ -182,7 +225,15 @@ def _copy_table_with_progress(conn, table) -> int:
     cols = _all_cols(conn, table)
     col_list = ', '.join(cols)
     insert_sql = _insert_sql(table, cols)
-    total = conn.execute(f'SELECT COUNT(*) FROM src.{table}').fetchone()[0]
+    # A legacy source's budget-specific rows are routed to the budget table by
+    # _route_legacy_budget_rows; they must not also land in the canonical one.
+    row_filter = ''
+    if table == CANONICAL_TABLE:
+        predicate = _legacy_budget_rows_predicate(conn)
+        if predicate != '0':
+            row_filter = f' AND NOT ({predicate})'
+    total = conn.execute(
+        f'SELECT COUNT(*) FROM src.{table} WHERE 1{row_filter}').fetchone()[0]
     if total == 0:
         print(f'  {table}: source empty, skipping')
         return 0
@@ -194,7 +245,7 @@ def _copy_table_with_progress(conn, table) -> int:
     while True:
         rows = conn.execute(
             f'SELECT rowid, {col_list} FROM src.{table} '
-            f'WHERE rowid > ? ORDER BY rowid LIMIT ?',
+            f'WHERE rowid > ?{row_filter} ORDER BY rowid LIMIT ?',
             (last_rowid, BATCH)).fetchall()
         if not rows:
             break
@@ -297,24 +348,24 @@ def main():  # pragma: no cover
                     n = conn.execute(
                         f'SELECT COUNT(*) FROM src.{table}').fetchone()[0]
                 msg = f'  {table}: {n:,} rows would be inserted'
-                # Account for the tainted->untainted upgrades INSERT OR IGNORE
-                # would silently miss (and the real merge now performs).
-                if (table == 'branch_best_by_policy'
-                        and 'solve_budget' in _all_cols(conn, table)):
-                    up = conn.execute(f"""
-                        SELECT COUNT(*) FROM src.{table} s
-                        JOIN main.{table} m
-                          ON m.branch_key     = s.branch_key
-                         AND m.policy         = s.policy
-                         AND m.answer_list_id = s.answer_list_id
-                        WHERE m.solve_budget IS NOT NULL
-                          AND s.solve_budget IS NULL
-                    """).fetchone()[0]
-                    if up:
-                        msg += f' (+{up:,} tainted->untainted upgrades)'
+                # A legacy source's budget-specific rows are counted where they
+                # will land, not where they currently sit.
+                if table == CANONICAL_TABLE:
+                    predicate = _legacy_budget_rows_predicate(conn)
+                    if predicate != '0':
+                        routed = conn.execute(
+                            f'SELECT COUNT(*) FROM src.{table} '
+                            f'WHERE {predicate}').fetchone()[0]
+                        if routed:
+                            n -= routed
+                            msg = (f'  {table}: {n:,} rows would be inserted '
+                                   f'({routed:,} budget-specific rows routed '
+                                   f'to {BUDGET_TABLE})')
                 print(msg)
             else:
                 n = _merge_table(conn, table)
+                if table == CANONICAL_TABLE:
+                    n += _route_legacy_budget_rows(conn)
 
             total_new += n
 
