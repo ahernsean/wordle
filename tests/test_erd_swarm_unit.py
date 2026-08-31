@@ -2620,6 +2620,7 @@ class TestInfeasibleCandidateCounters(unittest.TestCase):
 
         worker.queue.add_nodes_spent.assert_called_once_with(
             b"branch", 7, infeasible=True)
+        worker.queue.mark_branch_tainted.assert_called_once_with(b"branch")
 
 
 class TestTwoLevelERDPruneBundles(unittest.TestCase):
@@ -3292,7 +3293,11 @@ class TestFinalizeTelemetryFailureIsolation(unittest.TestCase):
         w.queue.try_finalize_branch.return_value = True
         w.queue.read_branch_meta.return_value = ("crane", 1.8, 2, False, 4, None, False)
         w.queue.get_branch.return_value = {
-            "nodes_spent": 0, "created_at": 100, "finalized_at": 200,
+            "nodes_spent": 0,
+            "infeasible_candidates": 0,
+            "infeasible_nodes": 0,
+            "created_at": 100,
+            "finalized_at": 200,
             "spine": "SALET -g-g-",
         }
         w.queue.finalize_bundle_stats.return_value = (None, None, None, None)
@@ -3579,7 +3584,11 @@ class TestMaybeFinalizeTriage(unittest.TestCase):
         w.queue.try_finalize_branch.return_value = True
         w.queue.read_branch_meta.return_value = meta
         w.queue.get_branch.return_value = {
-            "nodes_spent": nodes_spent, "created_at": 100, "finalized_at": 200,
+            "nodes_spent": nodes_spent,
+            "infeasible_candidates": 0,
+            "infeasible_nodes": 0,
+            "created_at": 100,
+            "finalized_at": 200,
             "spine": "SALET -g-g-",
         }
         w.queue.get_pending_branch.return_value = None

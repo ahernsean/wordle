@@ -1341,6 +1341,11 @@ class _BranchWorker:
 
         nodes_delta = self._nodes - nodes_before
         if self._adaptive and (nodes_delta > 0 or status == OVER_DEPTH_BUDGET):
+            # These counters cover candidates proven infeasible at this level,
+            # not candidates whose taint arrived from a deeper branch.  They
+            # are therefore a lower bound on local infeasibility.  Every such
+            # proof also carries budget_tainted, so infeasible_candidates > 0
+            # implies that the branch is marked tainted below.
             self.queue.add_nodes_spent(
                 branch_key, nodes_delta,
                 infeasible=status == OVER_DEPTH_BUDGET)
@@ -1669,11 +1674,9 @@ class _BranchWorker:
          ceiling, cut_occurred) = meta
         branch_row = self.queue.get_branch(branch_key)
         nodes_spent = branch_row['nodes_spent'] if branch_row else 0
-        try:
-            infeasible_candidates = branch_row['infeasible_candidates']
-            infeasible_nodes = branch_row['infeasible_nodes']
-        except (KeyError, TypeError):
-            infeasible_candidates = infeasible_nodes = 0
+        infeasible_candidates = (branch_row['infeasible_candidates']
+                                 if branch_row else 0)
+        infeasible_nodes = branch_row['infeasible_nodes'] if branch_row else 0
         created_at = branch_row['created_at'] if branch_row else None
         finalized_at = branch_row['finalized_at'] if branch_row else None
         spine = branch_row['spine'] if branch_row else None
