@@ -202,7 +202,7 @@ class ScoreCache:
                 timeout=timeout, isolation_level=None
             )
             self._conn.row_factory = sqlite3.Row
-            self._supply_missing_budget_table()
+            self._present_pre_split_cache_by_scope()
             self.answer_list_id = answer_list_id(self.answer_words)
         else:
             self._conn = sqlite3.connect(
@@ -246,33 +246,58 @@ class ScoreCache:
                 # closing here is impossible.
                 pass
 
-    def _supply_missing_budget_table(self):
-        """Stand in for branch_best_by_policy_and_budget on a pre-split cache.
+    _BRANCH_RESULT_COLUMNS = (
+        'branch_key', 'branch_reference', 'policy', 'answer_list_id',
+        'solve_budget', 'best_guess', 'best_score', 'updated_at', 'max_depth')
 
-        A cache written before the split has no such table — the migration
-        that creates it runs in _ensure_schema, which a read-only open
-        deliberately skips.  Every reader that spans both scopes would then
-        fail on a database it is meant to be able to inspect, and inspecting
-        an un-migrated cache is the whole point of opening one read-only.
+    def _present_pre_split_cache_by_scope(self):
+        """Show a pre-split cache through the split's own two tables.
 
-        A TEMP view supplies it.  Temp objects live outside the file, so this
-        writes nothing, and SQLite resolves an unqualified name against temp
-        before main, so the readers need no special case.  Empty is the honest
-        answer: a pre-split cache keeps its budget-specific results in the
-        canonical table with solve_budget set, and each row still names the
-        scope it belongs to.
+        A cache written before the split has no branch_best_by_policy_and_budget
+        — the migration that creates it runs in _ensure_schema, which a
+        read-only open deliberately skips.  Every reader spanning both scopes
+        would then fail on a database it is meant to inspect, and inspecting an
+        un-migrated cache is the whole point of opening one read-only.
+
+        Both tables are supplied as TEMP views over the legacy one, split on
+        solve_budget.  Supplying only the budget half would be worse than the
+        failure it replaces: the legacy canonical table holds both scopes, so
+        every reader would take a budget-specific result for the unrestricted
+        optimum and hand it out at any budget — the cross-scope reuse this
+        schema exists to stop.
+
+        Temp objects live outside the file, so this writes nothing, and SQLite
+        resolves an unqualified name against temp before main, so the readers
+        need no special case.  The view bodies name main. explicitly; unqualified
+        they would resolve to the temp views themselves.
         """
-        exists = self._conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
-            ('branch_best_by_policy_and_budget',)).fetchone()
-        if exists:
+        if self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                ('branch_best_by_policy_and_budget',)).fetchone():
             return
-        self._conn.execute("""
-            CREATE TEMP VIEW branch_best_by_policy_and_budget AS
-            SELECT branch_key, branch_reference, policy, answer_list_id,
-                   solve_budget, best_guess, best_score, updated_at, max_depth
-            FROM branch_best_by_policy WHERE 0
-        """)
+        legacy_columns = {row["name"] for row in
+                          self._conn.execute("PRAGMA table_info(branch_best_by_policy)")}
+        selection = self._legacy_select(legacy_columns)
+        if 'solve_budget' in legacy_columns:
+            unrestricted, budgeted = 'solve_budget IS NULL', 'solve_budget IS NOT NULL'
+        else:
+            # Older still: with no solve_budget column every row is an
+            # unrestricted result and there are no budget-specific ones.
+            unrestricted, budgeted = '1', '0'
+        for view, condition in (('branch_best_by_policy', unrestricted),
+                                ('branch_best_by_policy_and_budget', budgeted)):
+            self._conn.execute(f"""
+                CREATE TEMP VIEW {view} AS
+                SELECT {selection} FROM main.branch_best_by_policy
+                WHERE {condition}
+            """)
+
+    @classmethod
+    def _legacy_select(cls, legacy_columns):
+        """Select list giving a legacy table the post-split column shape."""
+        return ', '.join(
+            column if column in legacy_columns else f'NULL AS {column}'
+            for column in cls._BRANCH_RESULT_COLUMNS)
 
     def _is_migration_done(self, name):
         """Return True if migration `name` has been recorded as complete."""

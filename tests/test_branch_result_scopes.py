@@ -16,6 +16,7 @@ import unittest
 from contextlib import redirect_stderr
 from unittest import mock
 
+import import_cache
 from cache_sqlite import (CacheWriteConflict, ScoreCache,
                           branch_reference, exact_results_agree)
 from wordle_engine import ERD_ALL, _cache_reuse
@@ -964,32 +965,71 @@ class PreSplitReadOnlyTest(_CacheTest):
         score_cache.close()
         return path
 
-    def test_a_read_only_open_can_read_a_cache_that_predates_the_split(self):
-        path = self.pre_split_cache()
+    def read_only(self, path):
         score_cache = ScoreCache(path, WORDS, checkpoint_on_close=False,
                                  read_only=True)
         self.addCleanup(score_cache.close)
+        return score_cache
+
+    def test_the_unrestricted_result_reads_as_unrestricted(self):
+        score_cache = self.read_only(self.pre_split_cache())
         self.assertEqual(score_cache.read_with_depth(self.key, ERD_ALL),
                          ("crane", 2.0, 3, None))
-        # No budget table, so no budget-specific result is separately stored.
-        self.assertIsNone(
-            score_cache._read_full_at_budget(self.key, ERD_ALL, 3))
         self.assertEqual(
-            score_cache.read_for_budget(self.key, ERD_ALL, 3)[0], "crane")
+            score_cache.read_for_budget(self.key, ERD_ALL, 4)[0], "crane")
 
-    def test_the_reports_span_both_scopes_on_a_pre_split_cache(self):
-        path = self.pre_split_cache("presplit-reports.sqlite3")
-        score_cache = ScoreCache(path, WORDS, checkpoint_on_close=False,
-                                 read_only=True)
-        self.addCleanup(score_cache.close)
+    def test_a_budget_specific_result_is_only_readable_at_its_own_budget(self):
+        # The legacy table holds both scopes.  Presented as one canonical
+        # table it would hand a budget-3 result out as the unrestricted
+        # optimum, and at any budget -- the cross-scope reuse the split exists
+        # to stop, reintroduced by the compatibility shape itself.
+        score_cache = self.read_only(self.pre_split_cache("presplit-scope.sqlite3"))
+        tainted = ScoreCache.encode_subset(WORDS[:2])
+        self.assertEqual(
+            score_cache.read_for_budget(tainted, ERD_ALL, 3),
+            ("slate", 2.5, 2, 3))
+        self.assertIsNone(score_cache.read_for_budget(tainted, ERD_ALL, 4))
+        self.assertIsNone(score_cache.read_for_budget(tainted, ERD_ALL, None))
+        self.assertIsNone(score_cache.read_with_depth(tainted, ERD_ALL))
+
+    def test_the_aggregate_split_counts_each_scope_where_it_belongs(self):
+        score_cache = self.read_only(self.pre_split_cache("presplit-reports.sqlite3"))
         summary = score_cache.erd_report_summary(ERD_ALL, 0)
-        self.assertEqual(summary["budgeted_result_count"], 0)
+        self.assertEqual(summary["exact_branch_count"], 1)
+        self.assertEqual(summary["budgeted_result_count"], 1)
+        self.assertEqual(summary["budgeted_branch_count"], 1)
         self.assertIsNotNone(score_cache.last_write_ts())
         self.assertEqual(
             score_cache.report_branch_state(self.key, ERD_ALL, budget=3)
             ["best_guess"], "crane")
         exact_by_key, _loss = score_cache.report_branch_row_maps(ERD_ALL)
         self.assertIn(self.key, exact_by_key)
+
+    def test_a_cache_older_than_solve_budget_still_opens(self):
+        # Older still: no solve_budget column at all, so every row is an
+        # unrestricted result and only the budget half is missing.
+        path = os.path.join(self._dir, "ancient.sqlite3")
+        score_cache = ScoreCache(path, WORDS, checkpoint_on_close=False)
+        answer_list_id = score_cache.answer_list_id
+        score_cache._conn.execute(f"DROP TABLE {BUDGETED}")
+        score_cache._conn.execute(f"DROP TABLE {CANONICAL}")
+        score_cache._conn.execute(f"""
+            CREATE TABLE {CANONICAL} (
+                branch_key BLOB NOT NULL, policy TEXT NOT NULL,
+                answer_list_id TEXT NOT NULL, best_guess TEXT NOT NULL,
+                best_score REAL NOT NULL, updated_at INTEGER NOT NULL,
+                PRIMARY KEY (branch_key, policy, answer_list_id))
+        """)
+        score_cache._conn.execute(
+            f"INSERT INTO {CANONICAL} VALUES (?, ?, ?, 'crane', 2.0, 5)",
+            (self.key, ERD_ALL, answer_list_id))
+        score_cache.close()
+
+        read_only = self.read_only(path)
+        self.assertEqual(read_only.read_with_depth(self.key, ERD_ALL),
+                         ("crane", 2.0, None, None))
+        self.assertEqual(
+            read_only.erd_report_summary(ERD_ALL, 0)["budgeted_result_count"], 0)
 
     def test_the_audit_runs_over_a_pre_split_cache(self):
         from verify_branch_depths import iter_rows
@@ -1074,8 +1114,30 @@ class _FailingConnection:
         return getattr(self._real, name)
 
 
-class ImportRaceTest(_CacheTest):
-    """A live writer racing the merge, after the preflight came back clean."""
+class _InterleavingConnection:
+    """Lets a live writer in once, the first time the merge commits a batch.
+
+    A worker cannot write while the merge holds BEGIN IMMEDIATE, so the race
+    it wins is the gap between two batches.
+    """
+
+    def __init__(self, real, on_commit):
+        self._real = real
+        self._on_commit = on_commit
+
+    def execute(self, sql, *args, **kwargs):
+        result = self._real.execute(sql, *args, **kwargs)
+        if self._on_commit is not None and sql.strip().upper() == 'COMMIT':
+            callback, self._on_commit = self._on_commit, None
+            callback()
+        return result
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class _ImportFixture(_CacheTest):
+    """A source cache attached to a target, as import_cache runs them."""
 
     def _attach(self, target_path, source_path):
         conn = sqlite3.connect(target_path, isolation_level=None)
@@ -1096,6 +1158,10 @@ class ImportRaceTest(_CacheTest):
         path = os.path.join(self._dir, name)
         ScoreCache(path, WORDS, checkpoint_on_close=False).close()
         return path
+
+
+class ImportRaceTest(_ImportFixture):
+    """A live writer racing the merge, after the preflight came back clean."""
 
     def test_a_writer_that_beats_the_copy_cannot_hide_a_disagreement(self):
         # The preflight only describes the target as the import found it.
@@ -1205,3 +1271,122 @@ class ImportRaceTest(_CacheTest):
             import_cache._route_legacy_budget_rows(failing)
         self.assertEqual(
             conn.execute(f"SELECT COUNT(*) FROM main.{BUDGETED}").fetchone()[0], 0)
+
+
+class MergeTableIndexTest(_ImportFixture):
+    """A merge that is stopped must cost rows, not the target's schema.
+
+    _merge_table drops a from-scratch target's secondary indexes so the bulk
+    copy does not pay B-tree maintenance per insert.  The copy can raise --
+    that is exactly what the live-writer race above provokes -- so the
+    recreate has to happen on the way out as well as on the way through.
+    """
+
+    def _index_names(self, conn, table):
+        return sorted(name for name, _ in
+                      import_cache._droppable_indexes(conn, table))
+
+    def _two_row_source(self, name, *, solve_budget=None):
+        """A source whose second row is the one the live writer will contest."""
+        path = os.path.join(self._dir, name)
+        source = ScoreCache(path, WORDS, checkpoint_on_close=False)
+        source.write(ScoreCache.encode_subset(WORDS[:3]), ERD_ALL, "stale", 1.5,
+                     max_depth=2, solve_budget=solve_budget)
+        source.write(self.key, ERD_ALL, "slate", 2.5,
+                     max_depth=3, solve_budget=solve_budget)
+        source.close()
+        return path
+
+    def _stopped_by_a_live_writer(self, table, *, solve_budget=None):
+        """Run _merge_table against an empty target a worker writes into.
+
+        The target has to still be empty when _merge_table decides whether to
+        defer the indexes, so the contested row cannot be written up front --
+        it has to arrive in the gap between two batches, which is the only
+        moment a live worker can take the write lock during a merge.
+        """
+        source = self._two_row_source("stopped_src.sqlite3",
+                                      solve_budget=solve_budget)
+        target = self._empty_target("stopped_tgt.sqlite3")
+        live = ScoreCache(target, WORDS, checkpoint_on_close=False)
+        self.addCleanup(live.close)
+        conn = self._attach(target, source)
+        expected = self._index_names(conn, table)
+        self.assertTrue(expected)
+
+        racing = _InterleavingConnection(
+            conn, lambda: live.write(self.key, ERD_ALL, "crane", 2.0,
+                                     max_depth=3, solve_budget=solve_budget))
+        with mock.patch.object(import_cache, 'BATCH', 1), \
+                redirect_stderr(io.StringIO()):
+            with self.assertRaises(import_cache.ImportConflict):
+                import_cache._merge_table(racing, table)
+        return conn, expected
+
+    def test_a_stopped_merge_leaves_the_targets_indexes_in_place(self):
+        conn, expected = self._stopped_by_a_live_writer(CANONICAL)
+        self.assertEqual(self._index_names(conn, CANONICAL), expected)
+        # The row the writer won is untouched by the rolled-back batch.
+        self.assertEqual(
+            conn.execute(f"SELECT best_guess, best_score FROM main.{CANONICAL} "
+                         "WHERE branch_key = ?", (self.key,)).fetchall(),
+            [("crane", 2.0)])
+
+    def test_the_same_stop_on_the_budget_table(self):
+        conn, expected = self._stopped_by_a_live_writer(BUDGETED, solve_budget=3)
+        self.assertEqual(self._index_names(conn, BUDGETED), expected)
+
+    def test_an_unrelated_failure_also_restores_them(self):
+        source = self._source("mergeboom_src.sqlite3", "crane", 2.0)
+        target = self._empty_target("mergeboom_tgt.sqlite3")
+        conn = self._attach(target, source)
+        expected = self._index_names(conn, CANONICAL)
+
+        failing = _FailingConnection(conn, fail_executemany=True)
+        with self.assertRaises(sqlite3.OperationalError):
+            import_cache._merge_table(failing, CANONICAL)
+
+        self.assertEqual(self._index_names(conn, CANONICAL), expected)
+
+    def test_the_indexes_are_gone_while_an_empty_target_is_filled(self):
+        # Without this the recreate could be passing vacuously: a merge that
+        # never dropped anything restores the indexes by doing nothing.
+        source = self._source("defer_src.sqlite3", "crane", 2.0)
+        target = self._empty_target("defer_tgt.sqlite3")
+        conn = self._attach(target, source)
+        expected = self._index_names(conn, CANONICAL)
+        seen = []
+
+        real = import_cache._copy_table_with_progress
+
+        def spy(copy_conn, table):
+            seen.append(self._index_names(copy_conn, table))
+            return real(copy_conn, table)
+
+        with mock.patch.object(import_cache, '_copy_table_with_progress', spy):
+            import_cache._merge_table(conn, CANONICAL)
+
+        self.assertEqual(seen, [[]])
+        self.assertEqual(self._index_names(conn, CANONICAL), expected)
+
+    def test_a_populated_target_keeps_its_indexes_throughout(self):
+        source = self._source("keep_src.sqlite3", "crane", 2.0)
+        target = self._empty_target("keep_tgt.sqlite3")
+        occupant = ScoreCache(target, WORDS, checkpoint_on_close=False)
+        occupant.write(ScoreCache.encode_subset(WORDS[:3]), ERD_ALL,
+                       "stale", 1.5, max_depth=2)
+        occupant.close()
+        conn = self._attach(target, source)
+        expected = self._index_names(conn, CANONICAL)
+        seen = []
+
+        real = import_cache._copy_table_with_progress
+
+        def spy(copy_conn, table):
+            seen.append(self._index_names(copy_conn, table))
+            return real(copy_conn, table)
+
+        with mock.patch.object(import_cache, '_copy_table_with_progress', spy):
+            import_cache._merge_table(conn, CANONICAL)
+
+        self.assertEqual(seen, [expected])

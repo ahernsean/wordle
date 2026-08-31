@@ -150,6 +150,12 @@ def _merge_table(conn, table: str) -> int:
     copy (dropped before, recreated after) so a multi-million-row disaster
     recovery doesn't pay incremental B-tree maintenance on every insert;
     an incremental merge into an already-populated table is untouched.
+
+    They are recreated whatever happens.  The copy can now raise -- a live
+    writer introducing a conflicting exact result stops the merge mid-way --
+    and leaving the target without its secondary indexes would degrade every
+    reader until some later schema open happened to rebuild them.  A failed
+    merge must cost rows, not the schema.
     """
     row_count = conn.execute(f'SELECT COUNT(*) FROM main.{table}').fetchone()[0]
     deferred_indexes = []
@@ -157,10 +163,11 @@ def _merge_table(conn, table: str) -> int:
         deferred_indexes = _droppable_indexes(conn, table)
         for name, _ in deferred_indexes:
             conn.execute(f'DROP INDEX IF EXISTS {name}')
-    n = _copy_table_with_progress(conn, table)
-    for _, create_sql in deferred_indexes:
-        conn.execute(create_sql)
-    return n
+    try:
+        return _copy_table_with_progress(conn, table)
+    finally:
+        for _, create_sql in deferred_indexes:
+            conn.execute(create_sql)
 
 
 def _pk_cols(conn, table: str) -> list[str]:
