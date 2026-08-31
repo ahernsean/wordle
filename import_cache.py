@@ -40,7 +40,11 @@ know and ignores it, keeping the unrestricted rows it does understand.
 
 A key collision in either exact-result table is normally one fact reached
 twice, but that is checked rather than assumed: before any row moves, colliding
-rows whose costs disagree are reported and the merge refuses.  Two exact
+rows that are not the same certificate are reported and the merge refuses.
+That preflight describes the target as it was when the import started, so each
+batch re-checks inside its own write transaction — a live worker can store a
+disagreeing result after a clean scan, and INSERT OR IGNORE would drop the
+source's row without a word.  Two exact
 results for one scope cannot both be right, and keeping either displaces
 whichever the other cache's ancestors folded.  --dry-run reports them and
 continues.
@@ -177,6 +181,16 @@ def _fmt_eta(seconds: float) -> str:
     return f'{seconds // 3600}h{(seconds % 3600) // 60:02d}m'
 
 
+class ImportConflict(Exception):
+    """A colliding exact result was found while the merge was under way.
+
+    The preflight catches what is already there when the import starts; this
+    is the one a live writer introduced after that scan.  Batches that already
+    committed stand — INSERT OR IGNORE makes them idempotent, so re-running
+    after the disagreement is resolved resumes rather than duplicates.
+    """
+
+
 def _legacy_budget_rows_predicate(conn) -> str:
     """SQL restricting src.branch_best_by_policy to its budget-specific rows.
 
@@ -186,7 +200,7 @@ def _legacy_budget_rows_predicate(conn) -> str:
     """
     if 'solve_budget' not in _all_cols_src(conn, CANONICAL_TABLE):
         return '0'
-    return 'solve_budget IS NOT NULL'
+    return 's.solve_budget IS NOT NULL'
 
 
 def _all_cols_src(conn, table: str) -> list[str]:
@@ -213,11 +227,45 @@ def _route_legacy_budget_rows(conn) -> int:
             if column in available]
     col_list = ', '.join(cols)
     before = conn.total_changes
-    conn.execute('BEGIN')
-    conn.execute(f"""
-        INSERT OR IGNORE INTO main.{BUDGET_TABLE} ({col_list})
-        SELECT {col_list} FROM src.{CANONICAL_TABLE} WHERE {predicate}
-    """)
+    conn.execute('BEGIN IMMEDIATE')
+    try:
+        conn.execute(f"""
+            INSERT OR IGNORE INTO main.{BUDGET_TABLE} ({col_list})
+            SELECT {col_list} FROM src.{CANONICAL_TABLE} s WHERE {predicate}
+        """)
+        # Same reason the batch copy checks inside its transaction: a live
+        # worker can store a disagreeing budget-specific result after the
+        # preflight came back clean, and INSERT OR IGNORE would drop the
+        # source's row silently.
+        conflict = conn.execute(f"""
+            SELECT s.branch_key, s.policy, s.solve_budget,
+                   m.best_guess, m.best_score, m.max_depth,
+                   s.best_guess, s.best_score, s.max_depth
+            FROM src.{CANONICAL_TABLE} s
+            JOIN main.{BUDGET_TABLE} m
+              ON m.branch_key     = s.branch_key
+             AND m.policy         = s.policy
+             AND m.answer_list_id = s.answer_list_id
+             AND m.solve_budget   = s.solve_budget
+            WHERE {predicate}
+              AND (abs(m.best_score - s.best_score) > ?
+                   OR m.max_depth IS NOT s.max_depth)
+            LIMIT 1
+        """, (EXACT_SCORE_TOLERANCE,)).fetchone()
+        if conflict is not None:
+            conn.execute('ROLLBACK')
+            found = ('budget-specific (routed)', branch_reference(conflict[0]),
+                     conflict[1], conflict[2],
+                     (conflict[3], conflict[4], conflict[5]),
+                     (conflict[6], conflict[7], conflict[8]))
+            print()
+            _report_conflicts([found])
+            raise ImportConflict(found[1])
+    except ImportConflict:
+        raise
+    except Exception:
+        conn.execute('ROLLBACK')
+        raise
     conn.execute('COMMIT')
     return conn.total_changes - before
 
@@ -256,7 +304,8 @@ def _conflicting_exact_results(conn, src_tables, limit=20):
         # that is where they can collide.
         comparisons.append(
             ('budget-specific (routed)', BUDGET_TABLE, CANONICAL_TABLE,
-             's.solve_budget IS NOT NULL', ' AND m.solve_budget = s.solve_budget'))
+             _legacy_budget_rows_predicate(conn),
+             ' AND m.solve_budget = s.solve_budget'))
     if BUDGET_TABLE in src_tables and _target_has_table(conn, BUDGET_TABLE):
         comparisons.append(
             ('budget-specific', BUDGET_TABLE, BUDGET_TABLE, '1',
@@ -304,6 +353,39 @@ def _report_conflicts(conflicts) -> None:
           file=sys.stderr)
 
 
+def _batch_conflict(conn, table, row_filter, low_rowid, high_rowid):
+    """A non-equivalent collision among src rows in (low_rowid, high_rowid].
+
+    Called inside the batch's own write transaction, so no other connection
+    can commit between this check and the insert it validates.  Returns one
+    conflict row, or None.
+    """
+    if table not in (CANONICAL_TABLE, BUDGET_TABLE):
+        return None
+    budget_join = ('' if table == CANONICAL_TABLE
+                   else ' AND m.solve_budget = s.solve_budget')
+    rows = conn.execute(f"""
+        SELECT s.branch_key, s.policy, s.solve_budget,
+               m.best_guess, m.best_score, m.max_depth,
+               s.best_guess, s.best_score, s.max_depth
+        FROM src.{table} s
+        JOIN main.{table} m
+          ON m.branch_key     = s.branch_key
+         AND m.policy         = s.policy
+         AND m.answer_list_id = s.answer_list_id{budget_join}
+        WHERE s.rowid > ? AND s.rowid <= ?{row_filter}
+          AND (abs(m.best_score - s.best_score) > ?
+               OR m.max_depth IS NOT s.max_depth)
+        LIMIT 1
+    """, (low_rowid, high_rowid, EXACT_SCORE_TOLERANCE)).fetchall()
+    if not rows:
+        return None
+    row = rows[0]
+    scope = 'unrestricted' if table == CANONICAL_TABLE else 'budget-specific'
+    return (scope, branch_reference(row[0]), row[1], row[2],
+            (row[3], row[4], row[5]), (row[6], row[7], row[8]))
+
+
 def _copy_table_with_progress(conn, table) -> int:
     """Copy src.table -> main.table in rowid-paged batches with live progress.
 
@@ -311,6 +393,19 @@ def _copy_table_with_progress(conn, table) -> int:
     its own, so an interrupted merge can simply be re-run to resume.  Paging
     by rowid (rather than one opaque INSERT...SELECT of millions of rows) is
     what lets us show a percentage and ETA instead of an apparent hang.
+
+    For the two exact-result tables each batch validates inside its own write
+    transaction: the preflight only describes the target as it was when the
+    import started, and a live worker can store a disagreeing result after
+    that scan came back clean — INSERT OR IGNORE would then drop the source's
+    row without a word.  Holding the write lock across the insert and the
+    check is what makes the two one step.  A conflict rolls the batch back and
+    raises ImportConflict.
+
+    BEGIN IMMEDIATE takes that lock up front rather than at the first write,
+    so the guarantee does not rest on the insert happening to be the first
+    statement in the block.  With the statements in their current order a
+    deferred BEGIN would hold too, which is why no test separates them.
     """
     cols = _all_cols(conn, table)
     col_list = ', '.join(cols)
@@ -323,7 +418,7 @@ def _copy_table_with_progress(conn, table) -> int:
         if predicate != '0':
             row_filter = f' AND NOT ({predicate})'
     total = conn.execute(
-        f'SELECT COUNT(*) FROM src.{table} WHERE 1{row_filter}').fetchone()[0]
+        f'SELECT COUNT(*) FROM src.{table} s WHERE 1{row_filter}').fetchone()[0]
     if total == 0:
         print(f'  {table}: source empty, skipping')
         return 0
@@ -334,16 +429,29 @@ def _copy_table_with_progress(conn, table) -> int:
     last_print = 0.0
     while True:
         rows = conn.execute(
-            f'SELECT rowid, {col_list} FROM src.{table} '
-            f'WHERE rowid > ?{row_filter} ORDER BY rowid LIMIT ?',
+            f'SELECT s.rowid, {col_list} FROM src.{table} s '
+            f'WHERE s.rowid > ?{row_filter} ORDER BY s.rowid LIMIT ?',
             (last_rowid, BATCH)).fetchall()
         if not rows:
             break
-        last_rowid = rows[-1][0]
+        batch_low, last_rowid = last_rowid, rows[-1][0]
         before = conn.total_changes
-        conn.execute('BEGIN')
-        conn.executemany(insert_sql, [tuple(r[1:]) for r in rows])
-        conn.execute('COMMIT')
+        conn.execute('BEGIN IMMEDIATE')
+        try:
+            conn.executemany(insert_sql, [tuple(r[1:]) for r in rows])
+            conflict = _batch_conflict(conn, table, row_filter,
+                                       batch_low, last_rowid)
+            if conflict is not None:
+                conn.execute('ROLLBACK')
+                print()
+                _report_conflicts([conflict])
+                raise ImportConflict(conflict[1])
+            conn.execute('COMMIT')
+        except ImportConflict:
+            raise
+        except Exception:
+            conn.execute('ROLLBACK')
+            raise
         inserted += conn.total_changes - before
         scanned += len(rows)
 
@@ -455,7 +563,7 @@ def main():  # pragma: no cover
                     predicate = _legacy_budget_rows_predicate(conn)
                     if predicate != '0':
                         routed = conn.execute(
-                            f'SELECT COUNT(*) FROM src.{table} '
+                            f'SELECT COUNT(*) FROM src.{table} s '
                             f'WHERE {predicate}').fetchone()[0]
                         if routed:
                             n -= routed
@@ -464,9 +572,15 @@ def main():  # pragma: no cover
                                    f'to {BUDGET_TABLE})')
                 print(msg)
             else:
-                n = _merge_table(conn, table)
-                if table == CANONICAL_TABLE:
-                    n += _route_legacy_budget_rows(conn)
+                try:
+                    n = _merge_table(conn, table)
+                    if table == CANONICAL_TABLE:
+                        n += _route_legacy_budget_rows(conn)
+                except ImportConflict:
+                    print('\nMerge stopped. Batches already committed stand '
+                          'and are idempotent: resolve the disagreement and '
+                          're-run to resume.', file=sys.stderr)
+                    sys.exit(1)
 
             total_new += n
 

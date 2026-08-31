@@ -337,9 +337,11 @@ class TestMergeTable(_TmpDB):
     def test_does_not_defer_indexes_for_an_already_populated_target(self):
         self._make_src_with_entry()
         target_sc = self._cache("target.sqlite3")
-        key = ScoreCache.encode_subset(WORDS)
-        target_sc.write(key, ERD_ALL, "slate", 2.0, max_depth=3,
-                        solve_budget=None)
+        # A different branch: this test is about index deferral on a populated
+        # target, and a colliding row that disagreed would be refused by the
+        # merge's own exact-result check before it got there.
+        target_sc.write(ScoreCache.encode_subset(WORDS[:3]), ERD_ALL,
+                        "slate", 2.0, max_depth=3, solve_budget=None)
         target_sc.close()
 
         conn = sqlite3.connect(self.path("target.sqlite3"),

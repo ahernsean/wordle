@@ -6,12 +6,14 @@ remaining-depth budget.  They live in separate tables so neither write can
 destroy the other, because an ancestor may already have folded the one being
 replaced and nothing records which it folded (issue #302).
 """
+import io
 import os
 import shutil
 import sqlite3
 import tempfile
 import threading
 import unittest
+from contextlib import redirect_stderr
 from unittest import mock
 
 from cache_sqlite import (CacheWriteConflict, ScoreCache,
@@ -953,3 +955,163 @@ class EquivalenceRuleTest(unittest.TestCase):
                     (stored[0], stored[1], incoming[0], incoming[1],
                      import_cache.EXACT_SCORE_TOLERANCE)).fetchone()[0]
                 self.assertEqual(not flagged, agree)
+
+
+class _FailingConnection:
+    """A connection proxy that fails one statement.
+
+    sqlite3.Connection is an immutable type, so its methods cannot be patched;
+    wrapping is how the rest of the suite drives a mid-statement failure.
+    """
+
+    def __init__(self, real, *, fail_executemany=False, fail_insert_prefix=None):
+        self._real = real
+        self._fail_executemany = fail_executemany
+        self._fail_insert_prefix = fail_insert_prefix
+
+    def executemany(self, sql, *args, **kwargs):
+        if self._fail_executemany:
+            raise sqlite3.OperationalError("boom")
+        return self._real.executemany(sql, *args, **kwargs)
+
+    def execute(self, sql, *args, **kwargs):
+        prefix = self._fail_insert_prefix
+        if prefix is not None and sql.lstrip().startswith(prefix):
+            raise sqlite3.OperationalError("boom")
+        return self._real.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class ImportRaceTest(_CacheTest):
+    """A live writer racing the merge, after the preflight came back clean."""
+
+    def _attach(self, target_path, source_path):
+        conn = sqlite3.connect(target_path, isolation_level=None)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(f"ATTACH DATABASE '{source_path}' AS src")
+        self.addCleanup(conn.close)
+        return conn
+
+    def _source(self, name, guess, score, *, max_depth=3, solve_budget=None):
+        path = os.path.join(self._dir, name)
+        source = ScoreCache(path, WORDS, checkpoint_on_close=False)
+        source.write(self.key, ERD_ALL, guess, score, max_depth=max_depth,
+                     solve_budget=solve_budget)
+        source.close()
+        return path
+
+    def _empty_target(self, name):
+        path = os.path.join(self._dir, name)
+        ScoreCache(path, WORDS, checkpoint_on_close=False).close()
+        return path
+
+    def test_a_writer_that_beats_the_copy_cannot_hide_a_disagreement(self):
+        # The preflight only describes the target as the import found it.
+        import import_cache
+        source = self._source("race_src.sqlite3", "slate", 2.5)
+        target = self._empty_target("race_tgt.sqlite3")
+        conn = self._attach(target, source)
+        src_tables = {row[0] for row in conn.execute(
+            "SELECT name FROM src.sqlite_master WHERE type='table'")}
+        self.assertEqual(
+            import_cache._conflicting_exact_results(conn, src_tables), [])
+
+        # ...and a worker stores a disagreeing result after that scan.
+        live = ScoreCache(target, WORDS, checkpoint_on_close=False)
+        live.write(self.key, ERD_ALL, "crane", 2.0, max_depth=3)
+        live.close()
+
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(import_cache.ImportConflict):
+                import_cache._copy_table_with_progress(conn, CANONICAL)
+        # Rolled back: the source's row was neither merged nor dropped.
+        self.assertEqual(
+            conn.execute(f"SELECT best_guess, best_score FROM main.{CANONICAL}"
+                         ).fetchall(), [("crane", 2.0)])
+
+    def test_the_same_race_on_a_budget_specific_result(self):
+        import import_cache
+        source = self._source("brace_src.sqlite3", "slate", 2.5, solve_budget=3)
+        target = self._empty_target("brace_tgt.sqlite3")
+        conn = self._attach(target, source)
+        live = ScoreCache(target, WORDS, checkpoint_on_close=False)
+        live.write(self.key, ERD_ALL, "crane", 2.0, max_depth=3, solve_budget=3)
+        live.close()
+
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(import_cache.ImportConflict):
+                import_cache._copy_table_with_progress(conn, BUDGETED)
+
+    def test_an_equal_certificate_arriving_late_is_not_a_conflict(self):
+        # The winner of the race stored the same certificate, so there is
+        # nothing to reconcile and the merge carries on.
+        import import_cache
+        source = self._source("ok_src.sqlite3", "crane", 2.0)
+        target = self._empty_target("ok_tgt.sqlite3")
+        conn = self._attach(target, source)
+        live = ScoreCache(target, WORDS, checkpoint_on_close=False)
+        live.write(self.key, ERD_ALL, "crane", 2.0, max_depth=3)
+        live.close()
+
+        self.assertEqual(
+            import_cache._copy_table_with_progress(conn, CANONICAL), 0)
+
+    def test_the_legacy_routing_checks_inside_its_own_transaction(self):
+        import import_cache
+        path = os.path.join(self._dir, "legacy_src.sqlite3")
+        source = ScoreCache(path, WORDS, checkpoint_on_close=False)
+        source._conn.execute(
+            f"INSERT OR REPLACE INTO {CANONICAL} "
+            "(branch_key, policy, answer_list_id, best_guess, best_score, "
+            " updated_at, max_depth, solve_budget) VALUES (?,?,?,'slate',2.5,7,3,3)",
+            (self.key, ERD_ALL, source.answer_list_id))
+        source._conn.execute(f"DROP TABLE {BUDGETED}")
+        source.close()
+
+        target = self._empty_target("legacy_tgt.sqlite3")
+        conn = self._attach(target, path)
+        live = ScoreCache(target, WORDS, checkpoint_on_close=False)
+        live.write(self.key, ERD_ALL, "crane", 2.0, max_depth=3, solve_budget=3)
+        live.close()
+
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(import_cache.ImportConflict):
+                import_cache._route_legacy_budget_rows(conn)
+        self.assertEqual(
+            conn.execute(f"SELECT COUNT(*) FROM main.{BUDGETED}").fetchone()[0], 1)
+
+    def test_a_failure_mid_batch_rolls_the_batch_back(self):
+        # The batch must not half-land: whatever went wrong, the target is
+        # left as it was so a re-run resumes from a coherent state.
+        import import_cache
+        source = self._source("boom_src.sqlite3", "crane", 2.0)
+        target = self._empty_target("boom_tgt.sqlite3")
+        conn = self._attach(target, source)
+
+        failing = _FailingConnection(conn, fail_executemany=True)
+        with self.assertRaises(sqlite3.OperationalError):
+            import_cache._copy_table_with_progress(failing, CANONICAL)
+        self.assertEqual(
+            conn.execute(f"SELECT COUNT(*) FROM main.{CANONICAL}").fetchone()[0], 0)
+
+    def test_a_failure_mid_routing_rolls_the_routing_back(self):
+        import import_cache
+        path = os.path.join(self._dir, "boomlegacy_src.sqlite3")
+        source = ScoreCache(path, WORDS, checkpoint_on_close=False)
+        source._conn.execute(
+            f"INSERT OR REPLACE INTO {CANONICAL} "
+            "(branch_key, policy, answer_list_id, best_guess, best_score, "
+            " updated_at, max_depth, solve_budget) VALUES (?,?,?,'slate',2.5,7,3,3)",
+            (self.key, ERD_ALL, source.answer_list_id))
+        source._conn.execute(f"DROP TABLE {BUDGETED}")
+        source.close()
+        target = self._empty_target("boomlegacy_tgt.sqlite3")
+        conn = self._attach(target, path)
+
+        failing = _FailingConnection(conn, fail_insert_prefix='INSERT OR IGNORE')
+        with self.assertRaises(sqlite3.OperationalError):
+            import_cache._route_legacy_budget_rows(failing)
+        self.assertEqual(
+            conn.execute(f"SELECT COUNT(*) FROM main.{BUDGETED}").fetchone()[0], 0)
