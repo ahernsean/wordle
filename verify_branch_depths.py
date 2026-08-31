@@ -26,13 +26,25 @@ run is what its parents are folded against.  A naive fold that reads only
 stored values undercounts: an understated child understates its ancestors, and
 reading that same child back agrees with them.
 
-`--repair` writes each folded value back.  It rewrites `max_depth` only —
-`best_guess` is the strategy the row already claims, and this is its true
-worst-case line length.  A stale `best_score` is reported but never rewritten:
-a wrong ERD may mean `best_guess` is no longer the argmin, which only a
-re-search (verify_erd_cache.py) can settle.
+`--repair` writes each folded value back, and rewrites `max_depth` only.  A
+stale `best_score` is reported but never rewritten: a wrong ERD may mean
+`best_guess` is no longer the argmin, which only a re-search
+(verify_erd_cache.py) can settle.
 
-Stop the swarm before running with --repair.
+The two directions are not equally safe to repair, so they are not repaired
+alike.  Raising a depth only ever withdraws reuse, and is always applied.
+Lowering one widens the budget range the row is offered at, which is a claim
+about a strategy — so it is applied only when the row's `best_score` agrees
+with its own fold, and withheld otherwise rather than extending the reach of a
+score this pass has just contradicted.
+
+A repair also drops the policy's `candidate_erd_by_policy` folds.  Those
+memoise folds over the rows being repaired and are trusted on a matching
+response-group count alone, which a depth repair does not change; a report
+would otherwise keep serving the pre-repair depth.
+
+An audit-only run opens the cache read-only, so it can be run against a live
+one.  Stop the swarm before running with --repair.
 
 Usage:
     python3.13 verify_branch_depths.py
@@ -159,6 +171,8 @@ class DepthAudit:
         self.depth_too_high = 0
         self.score_stale = 0
         self.repaired = 0
+        self.repair_withheld = 0
+        self.candidate_erds_dropped = 0
         self.depth_deltas = Counter()
         self.tainted_split = Counter()
         self.mismatch_sizes = Counter()
@@ -172,6 +186,9 @@ class DepthAudit:
             self._audit_row(row, list_limit)
             if progress is not None:
                 progress(self.checked)
+        if self.repaired:
+            self.candidate_erds_dropped = (
+                self._cache.delete_candidate_erds_for_policy(self._policy))
         return self
 
     def _audit_row(self, row, list_limit):
@@ -200,15 +217,22 @@ class DepthAudit:
             return
 
         self._known[branch_key] = (fold.depth, stored_score)
-        if abs(fold.erd - stored_score) > SCORE_TOLERANCE:
+        score_agrees = abs(fold.erd - stored_score) <= SCORE_TOLERANCE
+        if not score_agrees:
             self.score_stale += 1
         if fold.depth == stored_depth:
             return
 
         if fold.depth > stored_depth:
+            # Raising a depth only withdraws reuse; safe whatever the score is.
             self.depth_too_low += 1
+            safe_to_repair = True
         else:
+            # Lowering one offers the row at budgets that previously rejected
+            # it.  That is a claim about the strategy, so it needs a score this
+            # pass has confirmed rather than one it has just contradicted.
             self.depth_too_high += 1
+            safe_to_repair = score_agrees
         self.depth_deltas[(stored_depth, fold.depth)] += 1
         self.tainted_split['tainted' if solve_budget is not None else 'untainted'] += 1
         self.mismatch_sizes[len(branch_words)] += 1
@@ -221,8 +245,12 @@ class DepthAudit:
                 'folded_max_depth': fold.depth,
                 'solve_budget': solve_budget,
             })
-        if self._repair and self._cache.repair_max_depth(
-                branch_key, self._policy, fold.depth):
+        if not self._repair:
+            return
+        if not safe_to_repair:
+            self.repair_withheld += 1
+            return
+        if self._cache.repair_max_depth(branch_key, self._policy, fold.depth):
             self.repaired += 1
 
     def summary(self):
@@ -236,12 +264,32 @@ class DepthAudit:
             'depth_too_high': self.depth_too_high,
             'score_stale': self.score_stale,
             'repaired': self.repaired,
+            'repair_withheld': self.repair_withheld,
+            'candidate_erds_dropped': self.candidate_erds_dropped,
             'depth_deltas': {f'{was} -> {now}': count
                              for (was, now), count in sorted(self.depth_deltas.items())},
             'tainted_split': dict(sorted(self.tainted_split.items())),
             'mismatch_sizes': dict(sorted(self.mismatch_sizes.items())),
             'findings': self.findings,
         }
+
+
+class _ReadOnlyDecompositions:
+    """A ResponseCache backing store that reads the cache but never adds to it.
+
+    ResponseCache persists a guess's pattern blob on first use, which would
+    make an audit a writer.  Reads still go to the cache, so a run over a
+    warm one pays nothing to recompute.
+    """
+
+    def __init__(self, score_cache):
+        self._cache = score_cache
+
+    def read_decomposition(self, guess):
+        return self._cache.read_decomposition(guess)
+
+    def write_decomposition(self, guess, blob):
+        pass
 
 
 def iter_rows(score_cache, policy):
@@ -298,6 +346,11 @@ def render_report(summary, elapsed, repair):
         f"  stored best_score disagrees with its own fold: {summary['score_stale']:,}")
     if repair:
         lines.append(f"  max_depth rows repaired: {summary['repaired']:,}")
+        lines.append(
+            f"  repairs withheld (would widen reuse for a stale score): "
+            f"{summary['repair_withheld']:,}")
+        lines.append(
+            f"  candidate ERD folds dropped: {summary['candidate_erds_dropped']:,}")
     for finding in summary['findings']:
         lines.append(
             f"    {finding['branch_reference']}  n={finding['branch_size']:,}  "
@@ -328,15 +381,22 @@ def main(argv=None):
     args = parser.parse_args(argv)
     ensure_runtime_dir()
 
+    if not os.path.exists(args.cache):
+        parser.error(f'no cache at {os.path.abspath(args.cache)}')
+
     answer_words = load_word_list(args.answers)
-    score_cache = ScoreCache(args.cache, answer_words, checkpoint_on_close=False)
-    # Sharing the cache lets the fold read response_decomposition rows the
-    # solver already wrote instead of recomputing every guess's patterns.
-    responses = ResponseCache(score_cache.answer_words, score_cache=score_cache)
+    score_cache = ScoreCache(args.cache, answer_words, checkpoint_on_close=False,
+                             read_only=not args.repair)
+    # The fold reads response_decomposition rows the solver already wrote
+    # rather than recomputing every guess's patterns.  It never writes one
+    # back: a guess the cache has not decomposed stays decomposed in memory
+    # for this run, so an audit adds nothing to the file it is auditing.
+    responses = ResponseCache(score_cache.answer_words,
+                              score_cache=_ReadOnlyDecompositions(score_cache))
     if not args.json:
         print(f'Cache  : {os.path.abspath(args.cache)}')
         print(f'Policy : {args.policy}')
-        print(f'Mode   : {"repair" if args.repair else "audit only"}')
+        print(f'Mode   : {"repair" if args.repair else "audit only (read-only)"}')
         print(flush=True)
 
     started = time.time()

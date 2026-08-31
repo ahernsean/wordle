@@ -17,6 +17,11 @@ def branch_reference(branch_key: bytes) -> str:
     return hashlib.sha1(bytes(branch_key)).hexdigest()[:12]
 
 
+def answer_list_id(answer_words) -> str:
+    """Return the namespace key for one answer word list."""
+    return hashlib.sha256("\n".join(answer_words).encode()).hexdigest()
+
+
 class _LRUDict:
     """Fixed-capacity LRU cache backed by an OrderedDict.
 
@@ -117,18 +122,36 @@ class ScoreCache:
     """
 
     def __init__(self, db_path, answer_words, timeout=30.0,
-                 checkpoint_on_close=True, max_mem_entries=None):
+                 checkpoint_on_close=True, max_mem_entries=None,
+                 read_only=False):
         self.db_path = Path(db_path)
         self.answer_words = list(answer_words)
-        self.checkpoint_on_close = checkpoint_on_close
-        self._conn = sqlite3.connect(
-            self.db_path, timeout=timeout, isolation_level=None
-        )
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
-        self._ensure_schema()
-        self.answer_list_id = self._ensure_answer_list()
+        self.read_only = read_only
+        # A read-only cache never checkpoints: TRUNCATE is itself a write.
+        self.checkpoint_on_close = checkpoint_on_close and not read_only
+        if read_only:
+            # An inspection pass over a live cache must leave no trace, not
+            # even the schema migration and answer-list row an ordinary open
+            # writes.  SQLite enforces that for us: mode=ro rejects every
+            # write, so a caller that reaches for one gets an error instead of
+            # a silently swallowed no-op.  It also refuses to create the file,
+            # which is what keeps a mistyped path from reading as an empty
+            # database.
+            self._conn = sqlite3.connect(
+                f"file:{self.db_path}?mode=ro", uri=True,
+                timeout=timeout, isolation_level=None
+            )
+            self._conn.row_factory = sqlite3.Row
+            self.answer_list_id = answer_list_id(self.answer_words)
+        else:
+            self._conn = sqlite3.connect(
+                self.db_path, timeout=timeout, isolation_level=None
+            )
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+            self._ensure_schema()
+            self.answer_list_id = self._ensure_answer_list()
         self.read_hits = 0
         self.read_misses = 0
         self.write_count = 0
@@ -540,15 +563,14 @@ class ScoreCache:
             self._mark_migration_done(migration_name)
 
     def _ensure_answer_list(self):
-        canonical = "\n".join(self.answer_words)
-        answer_list_id = hashlib.sha256(canonical.encode()).hexdigest()
+        list_id = answer_list_id(self.answer_words)
         now = int(time.time())
         self._conn.execute("""
             INSERT OR IGNORE INTO answer_list
                 (answer_list_id, answer_hash, answer_count, created_at)
             VALUES (?, ?, ?, ?)
-        """, (answer_list_id, answer_list_id, len(self.answer_words), now))
-        return answer_list_id
+        """, (list_id, list_id, len(self.answer_words), now))
+        return list_id
 
     def close(self):
         if self.checkpoint_on_close:
@@ -785,17 +807,43 @@ class ScoreCache:
         guess's response groups, so a row whose stored value disagrees with
         that fold can be set to the folded value without re-searching: the
         strategy is unchanged, only the worst-case line length it was
-        recorded with.  best_guess, best_score, solve_budget and updated_at
-        are left as they are — the row is not a new result.
+        recorded with.  best_guess, best_score and solve_budget are left as
+        they are.
+
+        updated_at moves to now, because the row did change: export_cache's
+        --since selects on it, so a repair that left the timestamp alone would
+        be dropped from every incremental export.  A full export does not
+        carry it either — import_cache keeps the target's row for a collision
+        that isn't tainted->untainted — so each cache is repaired on its own
+        machine rather than receiving another's repairs.
 
         Returns True when a row was updated.
         """
         cursor = self._conn.execute("""
-            UPDATE branch_best_by_policy SET max_depth = ?
+            UPDATE branch_best_by_policy SET max_depth = ?, updated_at = ?
             WHERE branch_key = ? AND policy = ? AND answer_list_id = ?
-        """, (max_depth, branch_key, policy, self.answer_list_id))
+        """, (max_depth, int(time.time()), branch_key, policy,
+              self.answer_list_id))
         self._mem_cache.pop((branch_key, policy), None)
         return cursor.rowcount > 0
+
+    def delete_candidate_erds_for_policy(self, policy):
+        """Drop every folded candidate ERD for one policy, returning the count.
+
+        Each of those rows memoises a fold over branch_best_by_policy rows and
+        is trusted on a matching response-group count alone, so a change to any
+        branch row it folded leaves it stating a stale ERD and max_remaining_depth
+        that no read re-checks.  A repair pass changes branch rows without
+        changing any group count, and the memo is keyed by a hash of the
+        parent's word set, so there is no way to ask which folds touched a
+        given branch.  Dropping the policy's folds is therefore the narrowest
+        invalidation the schema supports; each is re-earned by one fold.
+        """
+        cursor = self._conn.execute("""
+            DELETE FROM candidate_erd_by_policy
+            WHERE policy = ? AND answer_list_id = ?
+        """, (policy, self.answer_list_id))
+        return cursor.rowcount
 
     def delete(self, branch_key, policy):
         """Remove a cached branch result so it gets recomputed.

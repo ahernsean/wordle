@@ -655,13 +655,36 @@ is what its parents are folded against; a fold that re-read stored children
 would agree with every parent that folded the same understated child, and its
 count is a floor rather than a measurement.
 
-`--repair` writes each folded depth back, and only that column: `best_guess` is
-the strategy the row already claims and the folded value is its true worst
-case.  A `best_score` that disagrees with its own fold is counted but never
-rewritten — a wrong ERD may mean `best_guess` is no longer the argmin, which
-only a re-search (`verify_erd_cache.py`) settles.  Stop the swarm before
-repairing; an audit-only run is safe while workers are active.  An audit-only
-run exits 1 when it finds a row stored below its fold.
+`--repair` writes each folded depth back, and only that column.  A `best_score`
+that disagrees with its own fold is counted but never rewritten — a wrong ERD
+may mean `best_guess` is no longer the argmin, which only a re-search
+(`verify_erd_cache.py`) settles.
+
+The two directions are not repaired alike.  Raising a depth only withdraws
+reuse, so it is always applied.  Lowering one widens the budget range the row
+is offered at, which is a claim about a strategy — so it is applied only when
+the row's `best_score` agrees with its own fold, and withheld otherwise rather
+than extending the reach of a score the same pass just contradicted.  The
+report counts what it withheld.
+
+A repair also drops the policy's `candidate_erd_by_policy` folds.  Each memoises
+a fold over the rows being repaired and is trusted on a matching
+response-group count alone — which a depth repair does not change — so a report
+would otherwise keep serving the pre-repair depth.  There is no reverse index
+from a branch to the folds that read it, so the whole policy goes; each is
+re-earned by one fold.
+
+**A repair does not travel between caches.**  It moves `updated_at`, so an
+incremental `export_cache.py --since` carries the row, but `import_cache.py`
+keeps the target's row for any collision that is not tainted→untainted — so
+the repaired value does not land.  Repair each cache on its own machine; the
+fold is deterministic, so both arrive at the same answer.
+
+An audit-only run opens the cache **read-only** (SQLite `mode=ro`): it writes
+no schema migration, no answer-list row, and no response decomposition, so it
+is safe against a live cache while workers are active.  A cache path that does
+not exist is an error, not an empty clean audit.  An audit-only run exits 1
+when it finds a row stored below its fold.  Stop the swarm before `--repair`.
 
 ### Export for the iPhone
 

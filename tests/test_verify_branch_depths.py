@@ -9,12 +9,13 @@ ancestor that folded the value it replaced.
 """
 import io
 import json
+import sqlite3
 import os
 import random
 import shutil
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 
 import verify_branch_depths
 from cache_sqlite import ScoreCache, branch_reference
@@ -129,9 +130,11 @@ class _CacheFixture(unittest.TestCase):
 
     def audit(self, repair=False, list_limit=0):
         score_cache = ScoreCache(self.cache_path, self.answer_words,
-                                 checkpoint_on_close=False)
+                                 checkpoint_on_close=False, read_only=not repair)
         try:
-            responses = ResponseCache(self.answer_words, score_cache=score_cache)
+            responses = ResponseCache(
+                self.answer_words,
+                score_cache=verify_branch_depths._ReadOnlyDecompositions(score_cache))
             audit = DepthAudit(score_cache, ERD_ALL, responses, repair=repair)
             audit.run(iter_rows(score_cache, ERD_ALL), list_limit=list_limit)
         finally:
@@ -396,6 +399,178 @@ class RepairTest(_CacheFixture):
                          original[2] + 1)
 
 
+class RepairSafetyTest(_CacheFixture):
+    """Which direction of disagreement --repair is willing to act on."""
+
+    def restate(self, branch_key, max_depth=None, best_score=None):
+        row = self.row_for(branch_key)
+        score_cache = self.open_cache()
+        score_cache.write(
+            branch_key, ERD_ALL, row['best_guess'],
+            row['best_score'] if best_score is None else best_score,
+            max_depth=row['max_depth'] if max_depth is None else max_depth,
+            solve_budget=row['solve_budget'])
+        return row
+
+    def test_an_overstated_depth_is_lowered_when_the_score_holds_up(self):
+        parent = self.deepest_chain()[-2]
+        before = self.restate(parent, max_depth=self.row_for(parent)['max_depth'] + 1)
+        audit = self.audit(repair=True)
+        self.assertEqual(audit.repair_withheld, 0)
+        self.assertEqual(audit.repaired, 1)
+        self.assertEqual(self.row_for(parent)['max_depth'], before['max_depth'])
+
+    def test_an_overstated_depth_is_left_alone_when_the_score_is_stale(self):
+        # Lowering it would offer the row at budgets that previously rejected
+        # it, on the strength of an ERD this same pass just contradicted.
+        parent = self.deepest_chain()[-2]
+        before = self.row_for(parent)
+        self.restate(parent, max_depth=before['max_depth'] + 1,
+                     best_score=before['best_score'] + 0.5)
+        audit = self.audit(repair=True)
+        # The replaced score also disagrees at whoever folded it, so the
+        # stale count is the parent plus its own ancestry.
+        self.assertGreaterEqual(audit.score_stale, 1)
+        self.assertEqual(audit.depth_too_high, 1)
+        self.assertEqual(audit.repaired, 0)
+        self.assertEqual(audit.repair_withheld, 1)
+        self.assertEqual(self.row_for(parent)['max_depth'], before['max_depth'] + 1)
+
+    def test_an_understated_depth_is_raised_even_when_the_score_is_stale(self):
+        # Raising only withdraws reuse, so a stale score is no reason to wait.
+        parent = self.deepest_chain()[-2]
+        before = self.row_for(parent)
+        self.restate(parent, max_depth=before['max_depth'] - 1,
+                     best_score=before['best_score'] + 0.5)
+        audit = self.audit(repair=True)
+        self.assertGreaterEqual(audit.score_stale, 1)
+        self.assertEqual(audit.depth_too_low, 1)
+        self.assertEqual(audit.repaired, 1)
+        self.assertEqual(audit.repair_withheld, 0)
+        self.assertEqual(self.row_for(parent)['max_depth'], before['max_depth'])
+
+
+class RepairSideEffectsTest(_CacheFixture):
+    """What a repair has to do beyond the column it corrects."""
+
+    def understate(self, branch_key):
+        row = self.row_for(branch_key)
+        score_cache = self.open_cache()
+        score_cache.write(branch_key, ERD_ALL, row['best_guess'], row['best_score'],
+                          max_depth=row['max_depth'] - 1, solve_budget=FIXTURE_BUDGET)
+        return row
+
+    def updated_at_of(self, branch_key):
+        score_cache = self.open_cache()
+        return score_cache._conn.execute(
+            "SELECT updated_at FROM branch_best_by_policy "
+            "WHERE branch_key = ? AND policy = ? AND answer_list_id = ?",
+            (branch_key, ERD_ALL, score_cache.answer_list_id)).fetchone()[0]
+
+    def test_a_repair_moves_updated_at_so_an_incremental_export_carries_it(self):
+        # export_cache --since selects updated_at > ?, so a repair that left
+        # the timestamp alone would be dropped from every incremental export.
+        parent = self.deepest_chain()[-2]
+        self.understate(parent)
+        score_cache = self.open_cache()
+        score_cache._conn.execute(
+            "UPDATE branch_best_by_policy SET updated_at = 0 "
+            "WHERE branch_key = ? AND policy = ? AND answer_list_id = ?",
+            (parent, ERD_ALL, score_cache.answer_list_id))
+        self.assertEqual(self.updated_at_of(parent), 0)
+
+        self.assertEqual(self.audit(repair=True).repaired, 1)
+        self.assertGreater(self.updated_at_of(parent), 0)
+
+    def candidate_erd_count(self):
+        score_cache = self.open_cache()
+        return score_cache._conn.execute(
+            "SELECT COUNT(*) FROM candidate_erd_by_policy "
+            "WHERE policy = ? AND answer_list_id = ?",
+            (ERD_ALL, score_cache.answer_list_id)).fetchone()[0]
+
+    def seed_candidate_erd(self, branch_key):
+        row = self.row_for(branch_key)
+        score_cache = self.open_cache()
+        score_cache.write_candidate_erd(branch_key, row['best_guess'], ERD_ALL,
+                                        row['best_score'], row['max_depth'], 2)
+
+    def test_a_repair_drops_the_candidate_erd_folds_it_invalidates(self):
+        # Those folds are trusted on a matching response-group count alone,
+        # and a depth repair does not change one — so a report would keep
+        # serving the pre-repair depth if they survived.
+        parent = self.deepest_chain()[-2]
+        self.seed_candidate_erd(parent)
+        self.assertEqual(self.candidate_erd_count(), 1)
+        self.understate(parent)
+
+        audit = self.audit(repair=True)
+        self.assertEqual(audit.candidate_erds_dropped, 1)
+        self.assertEqual(self.candidate_erd_count(), 0)
+
+    def test_an_audit_that_repairs_nothing_leaves_the_folds_in_place(self):
+        self.seed_candidate_erd(self.deepest_chain()[-2])
+        audit = self.audit(repair=True)
+        self.assertEqual(audit.repaired, 0)
+        self.assertEqual(audit.candidate_erds_dropped, 0)
+        self.assertEqual(self.candidate_erd_count(), 1)
+
+
+class ReadOnlyAuditTest(_CacheFixture):
+    """An audit-only run must leave the cache it inspects untouched."""
+
+    def cache_bytes(self):
+        with open(self.cache_path, 'rb') as handle:
+            return handle.read()
+
+    def decomposition_count(self):
+        score_cache = self.open_cache()
+        return score_cache._conn.execute(
+            "SELECT COUNT(*) FROM response_decomposition").fetchone()[0]
+
+    def test_a_missing_cache_is_an_error_not_a_clean_audit(self):
+        # A mistyped path used to be created empty and certified as clean.
+        missing = os.path.join(self._dir, 'nope.sqlite3')
+        with self.assertRaises(SystemExit) as raised:
+            with redirect_stderr(io.StringIO()):
+                verify_branch_depths.main(
+                    ['--cache', missing, '--answers', self.answers_path])
+        self.assertNotEqual(raised.exception.code, 0)
+        self.assertFalse(os.path.exists(missing))
+
+    def test_an_audit_only_run_adds_no_response_decompositions(self):
+        score_cache = self.open_cache()
+        score_cache._conn.execute("DELETE FROM response_decomposition")
+        self.assertEqual(self.decomposition_count(), 0)
+
+        with redirect_stdout(io.StringIO()):
+            verify_branch_depths.main(
+                ['--cache', self.cache_path, '--answers', self.answers_path])
+        self.assertEqual(self.decomposition_count(), 0)
+
+    def test_an_audit_only_run_leaves_the_file_byte_identical(self):
+        before = self.cache_bytes()
+        with redirect_stdout(io.StringIO()):
+            verify_branch_depths.main(
+                ['--cache', self.cache_path, '--answers', self.answers_path])
+        self.assertEqual(self.cache_bytes(), before)
+
+    def test_a_read_only_cache_refuses_a_write(self):
+        score_cache = ScoreCache(self.cache_path, self.answer_words,
+                                 checkpoint_on_close=False, read_only=True)
+        self.addCleanup(score_cache.close)
+        self.assertFalse(score_cache.checkpoint_on_close)
+        with self.assertRaises(sqlite3.OperationalError):
+            score_cache.repair_max_depth(self.deepest_chain()[-1], ERD_ALL, 9)
+
+    def test_a_read_only_cache_reports_the_same_answer_list_id(self):
+        writable = self.open_cache()
+        read_only = ScoreCache(self.cache_path, self.answer_words,
+                               checkpoint_on_close=False, read_only=True)
+        self.addCleanup(read_only.close)
+        self.assertEqual(read_only.answer_list_id, writable.answer_list_id)
+
+
 class CommandLineTest(_CacheFixture):
 
     def run_main(self, *args):
@@ -444,7 +619,8 @@ class CommandLineTest(_CacheFixture):
             {'checked': 739662, 'legacy': 0, 'incomplete': 0, 'degenerate': 4,
              'unresolved_groups': 0,
              'depth_too_low': 1070, 'depth_too_high': 36, 'score_stale': 2500,
-             'repaired': 1106,
+             'repaired': 1106, 'repair_withheld': 30,
+             'candidate_erds_dropped': 189,
              'depth_deltas': {'3 -> 4': 1065, '4 -> 5': 5},
              'tainted_split': {'tainted': 1070},
              'mismatch_sizes': {16: 500, 25: 570},
