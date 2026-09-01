@@ -2,10 +2,11 @@
 
 ## Project structure
 
-A Wordle solver with five layers:
+A Wordle solver with six layers:
 - **Engine** (`wordle_engine.py`): core ERD search, scoring, response simulation
 - **Kernel** (`pattern_matrix.py`): NumPy response-pattern matrix and vectorized candidate statistics; the engine's sole NumPy import point. NumPy is a hard requirement on every target; the pure-Python engine paths remain permanently as the reference implementation (they never call NumPy), selected by passing `pattern_matrix=None`
 - **Cache** (`cache_sqlite.py`): SQLite-backed persistence of branch results and candidate scores
+- **Hints** (`hint_cache.py`): a second, read-only cache consulted for candidate order only
 - **Swarm** (`erd_swarm.py`, `erd_queue.py`, `erd_search.py`): parallel ERD precache workers
 - **CLI** (`wordle.py`): interactive game interface and all user-facing commands
 
@@ -160,6 +161,35 @@ scopes some earlier query happened to list.
 Only `branch_best_by_policy` is the "one row per branch" table.  Any count,
 report, or query that means branches must not union the two: a branch with
 results at three budgets is one branch.
+
+### A hint cache names a word and nothing else
+
+`--hint-cache` opens a quarantined historical cache alongside the live one.
+Its rows were produced by earlier solver versions, so they are descriptive
+history, not certificates: a historical row may put its word first in a
+branch's candidate order, and may do nothing else.  It is never an exact hit,
+never a fold input, never a ceiling, never a loss, never a queue-admission
+answer, and never an export source.
+
+`HintCache` is the whole interface, and the guarantee is structural rather
+than procedural: its queries select `best_guess` alone, so no stored ERD,
+`max_remaining_depth`, or `solve_budget` has a path out of the module.  Do not
+widen them, and do not hand the historical file to anything that takes a
+`ScoreCache` — that type has `read_for_budget`, and any caller holding one can
+take an exact hit from it.
+
+The artifact is opened `mode=ro&immutable=1`, which is stricter than
+`read_only=True` on a `ScoreCache`: plain `mode=ro` still touches the `-shm`
+sidecar.  `immutable=1` in exchange ignores an uncheckpointed WAL, so the open
+refuses a nonempty `-wal` instead of silently reading a stale snapshot.
+
+The hint is applied at two levels and they use different scopes.
+`wordle_engine._hint_first` runs inside the recursion, where the budget is in
+hand, and prefers the exact-budget historical row over the unrestricted one.
+`_BranchWorker._hint_first_in_order` runs on the swarm's branch packing order,
+which `claim_next_bundle` indexes with a shared cursor, so it must be a
+function of the branch alone and uses the unrestricted scope only.  Both are
+ordering; neither can change an optimum.
 
 ### Completed work has two records, and they can disagree
 

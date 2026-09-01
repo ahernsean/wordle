@@ -311,8 +311,19 @@ CREATE TABLE IF NOT EXISTS worker_heartbeat (
     cur_help_depth     INTEGER NOT NULL DEFAULT 0,  -- _help_other_branch nesting depth
     source_work_id     INTEGER,     -- source_work(source_work_id) selected at the
                                     -- last claim boundary; NULL if none was selected
-    scheduling_role    TEXT         -- one of SCHEDULING_ROLES; NULL if source_work_id
+    scheduling_role    TEXT,        -- one of SCHEDULING_ROLES; NULL if source_work_id
                                     -- is NULL
+    -- Hint-artifact accounting for the run (hint_cache.py).  All NULL when the
+    -- swarm was started without --hint-cache, which is not the same fact as a
+    -- measured zero.  hint_lookups counts branches asked about, hint_hits the
+    -- ones the artifact named a word for; accepted/rejected split the hits by
+    -- whether that word was in the candidate pool, and hint_winners counts the
+    -- accepted hints that went on to win their branch on recomputed evidence.
+    hint_lookups       INTEGER,
+    hint_hits          INTEGER,
+    hint_accepted      INTEGER,
+    hint_rejected      INTEGER,
+    hint_winners       INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS run_meta (
@@ -388,7 +399,13 @@ CREATE TABLE IF NOT EXISTS active_branches (
     -- [pack_cursor, n_candidates) are virgin and packed by the
     -- O(1)-amortized forward path.  Lives here (not worker-local memory) so
     -- concurrent claim_next_bundle calls never pack overlapping bundles.
-    pack_cursor    INTEGER NOT NULL DEFAULT 0
+    pack_cursor    INTEGER NOT NULL DEFAULT 0,
+    -- When this branch first acquired an incumbent (best_erd went from NULL to
+    -- a value), and the branch's node count at that moment.  Together with
+    -- created_at they are the "how much did it cost to get a first bound"
+    -- measurement a hint run is judged on.  NULL until the first incumbent.
+    first_best_at        INTEGER,
+    nodes_at_first_best  INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_active_branches_status_pri
@@ -715,6 +732,17 @@ CREATE TABLE IF NOT EXISTS telemetry.branch_finalize_log (
     max_best_first_position_before_winner INTEGER,
     republished_candidates  INTEGER,
     max_candidate_republish_count INTEGER,
+    -- Hint-artifact payoff (hint_cache.py).  hint_word is the candidate the
+    -- read-only historical artifact named for this branch and hint_was_winner
+    -- whether the branch's own recomputed winner turned out to be that word;
+    -- both NULL on a run with no hint artifact.  first_best_at and
+    -- nodes_at_first_best are when the branch acquired any incumbent at all
+    -- and what it had spent by then, which against created_at is the cost a
+    -- good hint is supposed to remove.
+    hint_word               TEXT,
+    hint_was_winner         INTEGER,
+    first_best_at           INTEGER,
+    nodes_at_first_best     INTEGER,
     recorded_at             INTEGER NOT NULL
 );
 
@@ -1595,6 +1623,29 @@ class ERDQueue:
             "cur_help_depth": "INTEGER NOT NULL DEFAULT 0",
         })
 
+        # Hint-artifact accounting (issue #304): additive/nullable everywhere.
+        # NULL means "this row predates hints, or the run had no hint
+        # artifact" — never a measured zero.  Last in _migrate because the
+        # table rebuilds above copy a fixed column list: a column added before
+        # one of them would be dropped by it.
+        self._add_columns("worker_heartbeat", {
+            "hint_lookups": "INTEGER",
+            "hint_hits": "INTEGER",
+            "hint_accepted": "INTEGER",
+            "hint_rejected": "INTEGER",
+            "hint_winners": "INTEGER",
+        })
+        self._add_columns("active_branches", {
+            "first_best_at": "INTEGER",
+            "nodes_at_first_best": "INTEGER",
+        })
+        self._add_columns("branch_finalize_log", {
+            "hint_word": "TEXT",
+            "hint_was_winner": "INTEGER",
+            "first_best_at": "INTEGER",
+            "nodes_at_first_best": "INTEGER",
+        }, schema="telemetry")
+
         # Baseline epoch 0 and the run_meta pointer, both idempotent.  git_sha is
         # stamped later (set_epoch) when a deploy knows it.
         now = int(time.time())
@@ -2287,7 +2338,9 @@ class ERDQueue:
                   cur_candidate=None, cand_n_seen=None, claim_total=None,
                   cur_max_depth=None, cur_nodes=None, node_rate=None,
                   cur_path=None, cur_help_depth=0, source_work_id=None,
-                  scheduling_role=None):
+                  scheduling_role=None,
+                  hint_lookups=None, hint_hits=None, hint_accepted=None,
+                  hint_rejected=None, hint_winners=None):
         if scheduling_role is not None and scheduling_role not in SCHEDULING_ROLES:
             raise ValueError(f"unknown scheduling_role {scheduling_role!r}: "
                              f"expected one of {SCHEDULING_ROLES}")
@@ -2301,14 +2354,19 @@ class ERDQueue:
                  cand_rate, cache_hits, cache_misses, n_cutoff, n_pruned, n_ok,
                  best_guess, best_erd, bound_erd, cur_candidate, cand_n_seen, claim_total,
                  cur_max_depth, cur_nodes, node_rate, cur_path, cur_help_depth,
-                 source_work_id, scheduling_role)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 source_work_id, scheduling_role,
+                 hint_lookups, hint_hits, hint_accepted, hint_rejected,
+                 hint_winners)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?)
         """, (worker_id, pid, current_branch_id, n_words, started_at,
               now, claims_done, claim_idx, claim_started_at,
               cand_rate, cache_hits, cache_misses, n_cutoff, n_pruned, n_ok,
               best_guess, best_erd, bound_erd, cur_candidate, cand_n_seen, claim_total,
               cur_max_depth, cur_nodes, node_rate, cur_path, cur_help_depth,
-              source_work_id, scheduling_role))
+              source_work_id, scheduling_role,
+              hint_lookups, hint_hits, hint_accepted, hint_rejected,
+              hint_winners))
         # Attributed so a heartbeat write storm is visible in the WAL report: an
         # unthrottled per-candidate heartbeat is a full-page WAL frame each and
         # otherwise hides here, uncategorised.
@@ -3246,15 +3304,26 @@ class ERDQueue:
         max_depth is the winning candidate's worst-case line length; it is
         stored atomically with the best it belongs to, so best_max_depth always
         describes the current best_guess.
+
+        The same statement stamps first_best_at/nodes_at_first_best on the
+        update that creates the branch's first incumbent, and leaves them alone
+        on every later improvement — COALESCE keeps the first value, so "how
+        long, and how many nodes, before this branch had any bound at all"
+        survives the rest of the solve.  nodes_spent is read from the row being
+        updated, which is why this cannot be done by the caller: only the
+        statement that wins the transition knows it was the first.
         """
         branch_id = self._intern_branch(branch_key, create=True)
+        now = int(time.time())
         self._conn.execute("""
             UPDATE active_branches
             SET best_erd = ?, best_guess = ?, best_max_depth = ?,
-                best_updated_at = ?
+                best_updated_at = ?,
+                first_best_at = COALESCE(first_best_at, ?),
+                nodes_at_first_best = COALESCE(nodes_at_first_best, nodes_spent)
             WHERE branch_id = ?
               AND (best_erd IS NULL OR ? < best_erd)
-        """, (best_erd, best_guess, max_depth, int(time.time()), branch_id,
+        """, (best_erd, best_guess, max_depth, now, now, branch_id,
               best_erd))
 
     def read_branch_best(self, branch_key):
@@ -6078,7 +6147,9 @@ class ERDQueue:
                                 two_level_erd_pruned_candidates=None,
                                 infeasible_candidates=None,
                                 infeasible_nodes=None,
-                                schedule_diagnostics=None):
+                                schedule_diagnostics=None,
+                                hint_word=None, hint_was_winner=None,
+                                first_best_at=None, nodes_at_first_best=None):
         """Persist a branch's timing/cost the moment before delete_branch drops it.
 
         The bundle-diagnostic columns (n_bundles, max_bundle_nodes,
@@ -6102,6 +6173,13 @@ class ERDQueue:
         carries the branch's best-first scheduling evidence past the claim
         rows that are about to be deleted; None leaves every one of its
         columns NULL.
+
+        hint_word is the word the run's hint artifact named for this branch and
+        hint_was_winner whether the branch's own recomputed winner turned out
+        to be that word — the payoff measurement for a hinted rebuild.  Both
+        are NULL on a run with no hint artifact.  first_best_at/
+        nodes_at_first_best are the branch's first-incumbent stamps, which
+        against created_at give the cost of reaching any bound at all.
         """
         schedule_diagnostics = schedule_diagnostics or {}
         if (one_level_erd_pruned_candidates is None
@@ -6123,9 +6201,11 @@ class ERDQueue:
                  candidates_completed_before_winner,
                  max_best_first_position_before_winner,
                  republished_candidates, max_candidate_republish_count,
+                 hint_word, hint_was_winner, first_best_at,
+                 nodes_at_first_best,
                  recorded_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (branch_key, spine, n_words, budget, self.epoch, created_at,
               finalized_at, nodes_spent, n_claims, n_bundles, max_bundle_nodes,
               total_bundle_wall_millis, censored_units, ceiling, outcome,
@@ -6140,6 +6220,9 @@ class ERDQueue:
                   "max_best_first_position_before_winner"),
               schedule_diagnostics.get("republished_candidates"),
               schedule_diagnostics.get("max_candidate_republish_count"),
+              hint_word,
+              None if hint_was_winner is None else int(hint_was_winner),
+              first_best_at, nodes_at_first_best,
               now))
 
     def add_cut_reuse_miss(self, branch_key, n_words, budget, wanted_ceiling,

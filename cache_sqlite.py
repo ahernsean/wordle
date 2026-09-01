@@ -61,6 +61,62 @@ def _branch_facts_by_key(rows):
     return facts
 
 
+BRANCH_RESULT_COLUMNS = (
+    'branch_key', 'branch_reference', 'policy', 'answer_list_id',
+    'solve_budget', 'best_guess', 'best_score', 'updated_at', 'max_depth')
+
+
+def legacy_branch_result_select(legacy_columns):
+    """Select list giving a legacy branch table the post-split column shape."""
+    return ', '.join(
+        column if column in legacy_columns else f'NULL AS {column}'
+        for column in BRANCH_RESULT_COLUMNS)
+
+
+def present_pre_split_cache_by_scope(conn):
+    """Show a pre-split cache through the split's own two tables.
+
+    A cache written before the split has no branch_best_by_policy_and_budget
+    — the migration that creates it runs in ScoreCache._ensure_schema, which a
+    read-only open deliberately skips.  Every reader spanning both scopes
+    would then fail on a database it is meant to inspect, and inspecting an
+    un-migrated cache is the whole point of opening one read-only.
+
+    Both tables are supplied as TEMP views over the legacy one, split on
+    solve_budget.  Supplying only the budget half would be worse than the
+    failure it replaces: the legacy canonical table holds both scopes, so
+    every reader would take a budget-specific result for the unrestricted
+    optimum and hand it out at any budget — the cross-scope reuse this
+    schema exists to stop.
+
+    Temp objects live outside the file, so this writes nothing — it is safe
+    even on a connection opened immutable — and SQLite resolves an unqualified
+    name against temp before main, so the readers need no special case.  The
+    view bodies name main. explicitly; unqualified they would resolve to the
+    temp views themselves.
+    """
+    if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            ('branch_best_by_policy_and_budget',)).fetchone():
+        return
+    legacy_columns = {row["name"] for row in
+                      conn.execute("PRAGMA table_info(branch_best_by_policy)")}
+    selection = legacy_branch_result_select(legacy_columns)
+    if 'solve_budget' in legacy_columns:
+        unrestricted, budgeted = 'solve_budget IS NULL', 'solve_budget IS NOT NULL'
+    else:
+        # Older still: with no solve_budget column every row is an
+        # unrestricted result and there are no budget-specific ones.
+        unrestricted, budgeted = '1', '0'
+    for view, condition in (('branch_best_by_policy', unrestricted),
+                            ('branch_best_by_policy_and_budget', budgeted)):
+        conn.execute(f"""
+            CREATE TEMP VIEW {view} AS
+            SELECT {selection} FROM main.branch_best_by_policy
+            WHERE {condition}
+        """)
+
+
 class CacheWriteConflict(Exception):
     """Two exact results disagree for one branch at one budget scope.
 
@@ -77,7 +133,7 @@ def answer_list_id(answer_words) -> str:
     return hashlib.sha256("\n".join(answer_words).encode()).hexdigest()
 
 
-class _LRUDict:
+class LRUDict:
     """Fixed-capacity LRU cache backed by an OrderedDict.
 
     Evicts the least-recently-used entry when the capacity is reached.
@@ -202,7 +258,7 @@ class ScoreCache:
                 timeout=timeout, isolation_level=None
             )
             self._conn.row_factory = sqlite3.Row
-            self._present_pre_split_cache_by_scope()
+            present_pre_split_cache_by_scope(self._conn)
             self.answer_list_id = answer_list_id(self.answer_words)
         else:
             self._conn = sqlite3.connect(
@@ -227,13 +283,13 @@ class ScoreCache:
         # same small branches millions of times across sibling branches.
         # max_mem_entries caps the cache size with LRU eviction so long-lived
         # worker processes do not consume unbounded memory.  None = unbounded.
-        self._mem_cache = _LRUDict(max_size=max_mem_entries)
+        self._mem_cache = LRUDict(max_size=max_mem_entries)
         # Session mirror of proven losses (positive hits only): (branch_key,
         # policy) -> largest budget at which the branch is proven a loss.  A
         # worker re-encounters the same inseparable residue under thousands of
         # candidates within one branch sweep; this turns each repeat into an
         # O(1) hit instead of a fresh exhaustive disproof.
-        self._loss_mem_cache = _LRUDict(max_size=max_mem_entries)
+        self._loss_mem_cache = LRUDict(max_size=max_mem_entries)
 
     def __del__(self):
         conn = getattr(self, '_conn', None)
@@ -245,59 +301,6 @@ class ScoreCache:
                 # finalizing it; SQLite connections are thread-affine, so
                 # closing here is impossible.
                 pass
-
-    _BRANCH_RESULT_COLUMNS = (
-        'branch_key', 'branch_reference', 'policy', 'answer_list_id',
-        'solve_budget', 'best_guess', 'best_score', 'updated_at', 'max_depth')
-
-    def _present_pre_split_cache_by_scope(self):
-        """Show a pre-split cache through the split's own two tables.
-
-        A cache written before the split has no branch_best_by_policy_and_budget
-        — the migration that creates it runs in _ensure_schema, which a
-        read-only open deliberately skips.  Every reader spanning both scopes
-        would then fail on a database it is meant to inspect, and inspecting an
-        un-migrated cache is the whole point of opening one read-only.
-
-        Both tables are supplied as TEMP views over the legacy one, split on
-        solve_budget.  Supplying only the budget half would be worse than the
-        failure it replaces: the legacy canonical table holds both scopes, so
-        every reader would take a budget-specific result for the unrestricted
-        optimum and hand it out at any budget — the cross-scope reuse this
-        schema exists to stop.
-
-        Temp objects live outside the file, so this writes nothing, and SQLite
-        resolves an unqualified name against temp before main, so the readers
-        need no special case.  The view bodies name main. explicitly; unqualified
-        they would resolve to the temp views themselves.
-        """
-        if self._conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
-                ('branch_best_by_policy_and_budget',)).fetchone():
-            return
-        legacy_columns = {row["name"] for row in
-                          self._conn.execute("PRAGMA table_info(branch_best_by_policy)")}
-        selection = self._legacy_select(legacy_columns)
-        if 'solve_budget' in legacy_columns:
-            unrestricted, budgeted = 'solve_budget IS NULL', 'solve_budget IS NOT NULL'
-        else:
-            # Older still: with no solve_budget column every row is an
-            # unrestricted result and there are no budget-specific ones.
-            unrestricted, budgeted = '1', '0'
-        for view, condition in (('branch_best_by_policy', unrestricted),
-                                ('branch_best_by_policy_and_budget', budgeted)):
-            self._conn.execute(f"""
-                CREATE TEMP VIEW {view} AS
-                SELECT {selection} FROM main.branch_best_by_policy
-                WHERE {condition}
-            """)
-
-    @classmethod
-    def _legacy_select(cls, legacy_columns):
-        """Select list giving a legacy table the post-split column shape."""
-        return ', '.join(
-            column if column in legacy_columns else f'NULL AS {column}'
-            for column in cls._BRANCH_RESULT_COLUMNS)
 
     def _is_migration_done(self, name):
         """Return True if migration `name` has been recorded as complete."""

@@ -31,6 +31,7 @@ from dataclasses import dataclass
 
 import pattern_matrix as pattern_matrix_module
 from cache_sqlite import ScoreCache, mem_cache_limit
+from hint_cache import open_hint_cache
 from erd_lattice import erd_ge
 from wordle_engine import (
     ERD_ALL,
@@ -300,9 +301,12 @@ class _MidLoopPublisher:
     frame-local token via enter() — so a single instance serves every claim.
 
     When check() fires at frame F:
-    - The prefix candidates (evaluated inline in Σk² order) are marked done
-      in the candidate_claims table by their all_words index so cooperative
-      workers do not redo them.
+    - The prefix candidates are marked done in the candidate_claims table by
+      their all_words index so cooperative workers do not redo them.  The
+      prefix is whatever the frame actually evaluated — Σk² order, or that
+      order with the hint artifact's candidate moved to the front — and the
+      soundness argument below is about what each marked candidate was proven
+      to be worth, not about the order they were reached in.
     - The remainder is driven by cooperative_solve, which claims unclaimed
       slots in natural all_words order.
     - The finished result is returned directly; the engine short-circuits the
@@ -568,7 +572,7 @@ class _BranchWorker:
 
     def __init__(self, worker_id, cache_path, queue_path, stop_event,
                  root_budget=ROOT_BUDGET, n_workers=1,
-                 enable_adaptive_decomposition=True,
+                 enable_adaptive_decomposition=True, hint_cache_path=None,
                  small_count=BUNDLE_SMALL_COUNT, count_cap=BUNDLE_COUNT_CAP,
                  bundle_node_cap=BUNDLE_NODE_CAP,
                  bundle_wall_cap_seconds=BUNDLE_WALL_CAP_SECONDS,
@@ -611,6 +615,16 @@ class _BranchWorker:
         self.score_cache = ScoreCache(cache_path, self.all_answers,
                                       max_mem_entries=max_entries)
         self.rcache = ResponseCache(self.all_answers, self.score_cache)
+        # Quarantined history, opened read-only and immutable, consulted only
+        # for candidate order.  None when the run was started without
+        # --hint-cache; a path that cannot serve as a hint artifact raises out
+        # of here rather than starting the worker with hints silently off.
+        self.hint_cache = open_hint_cache(
+            hint_cache_path, self.all_answers, cache_path)
+        if self.hint_cache is not None:
+            logger.info('%s hint cache %s: %d branch row(s) in this answer '
+                        'list', self.name, self.hint_cache.db_path,
+                        self.hint_cache.namespace_branch_count)
         self.pattern_matrix = pattern_matrix_module.PatternMatrix.load_or_build(
             cache_path, self.all_words, self.all_answers, self.score_cache)
         # One table for the worker's whole lifetime: every claim draws its
@@ -716,6 +730,10 @@ class _BranchWorker:
         # logs (the ceiling stops the swarm via SIGTERM -> request_stop -> this).
         self._log_wal_traffic(time.time(), force=True)
         self.queue.clear_heartbeat(self.name)
+        if self.hint_cache is not None:
+            logger.info('%s hint totals: %s', self.name,
+                        self.hint_cache.stats())
+            self.hint_cache.close()
         self.score_cache.checkpoint()
         self.score_cache.close()
         self.queue.checkpoint("PASSIVE")
@@ -1076,6 +1094,10 @@ class _BranchWorker:
         node_rate = (self._nodes - self._nodes_at_last_hb) / dt if dt > 0 else 0.0
         self._last_hb = now
         self._nodes_at_last_hb = self._nodes
+        # Empty when the run has no hint artifact, which leaves every hint
+        # column NULL rather than reporting a zero the worker never measured.
+        hint_stats = (self.hint_cache.stats() if self.hint_cache is not None
+                      else {})
         self.queue.heartbeat(
             self.name, os.getpid(), branch_key, n_words, self.started,
             self.claims_done, claim_idx=claim_idx,
@@ -1083,6 +1105,7 @@ class _BranchWorker:
             cache_hits=self.score_cache.read_hits,
             cache_misses=self.score_cache.read_misses,
             n_cutoff=self.n_cutoff, n_pruned=self.n_pruned, n_ok=self.n_ok,
+            **hint_stats,
             best_guess=best_guess, best_erd=best_erd, bound_erd=bound_erd,
             cur_candidate=self._cur_candidate,
             cur_max_depth=self._cand_max_depth,
@@ -1161,10 +1184,18 @@ class _BranchWorker:
         vocabulary, in the same order.
 
         This is a pure function of branch_indices (the pattern matrix, which
-        is immutable shared data, plus the branch's words), so every worker
+        is immutable shared data, plus the branch's words) and, when the run
+        was started with one, the immutable hint artifact — so every worker
         process computes a bit-identical array independently: the queue DB
         only has to hold the shared cursor and best_erd (claim_next_bundle),
-        never this vector (adaptive_claim_packing.md §12).
+        never this vector (adaptive_claim_packing.md §12).  Both inputs are
+        fixed for the life of a swarm, which is what keeps the order stable
+        across the many claims a branch takes: claim_next_bundle's pack_cursor
+        and candidate_holes are positions IN this order, so a branch whose
+        order changed under them would lose best-first priority (never
+        coverage, which the full-pass backstop guarantees).  Starting a swarm
+        with a different --hint-cache than the one that opened its live
+        branches is therefore a scheduling regression, not a correctness one.
         """
         cached = self._packing_stats_cache.get(branch_key)
         if cached is not None:
@@ -1173,9 +1204,41 @@ class _BranchWorker:
         stats = self.pattern_matrix.candidate_stats(branch_indices)
         order = sorted(range(self.n_candidates),
                        key=lambda idx: stats.sum_squared_group_sizes[idx])
+        order = self._hint_first_in_order(branch_key, order)
         result = (order, stats.cost_lower_bound)
         self._packing_stats_cache[branch_key] = result
         return result
+
+    def _hint_first_in_order(self, branch_key, order):
+        """Move the branch's historical candidate to the front of `order`.
+
+        The result is still a permutation of range(n_candidates): the hint
+        changes which candidate a bundle hands out first, never which
+        candidates the branch owes.  Nothing the historical cache holds about
+        the branch's cost reaches the search — the moved candidate is claimed
+        and evaluated exactly as it would be from any other position, and only
+        that recomputed result can lower the branch's best_erd.
+
+        The unrestricted historical scope is used rather than the branch's own
+        budget because packing order must be a function of the branch alone;
+        the budget-specific preference applies inside the engine's recursion,
+        where the budget is in hand (wordle_engine._hint_first).
+        """
+        if self.hint_cache is None:
+            return order
+        hinted = self.hint_cache.hint_candidate(branch_key, ERD_ALL, None)
+        if hinted is None:
+            return order
+        try:
+            idx = self.all_words.index(hinted)
+        except ValueError:
+            self.hint_cache.note_rejected()
+            return order
+        self.hint_cache.note_accepted()
+        position = order.index(idx)
+        if position == 0:
+            return order
+        return [idx] + order[:position] + order[position + 1:]
 
     def _claim_bundle(self, branch_key, n_candidates, words,
                       expected_source_work_id=None,
@@ -1329,6 +1392,7 @@ class _BranchWorker:
             metric_observer=_metric_observer if self._adaptive else None,
             pattern_matrix=self.pattern_matrix,
             branch_floor_table=self.branch_floor_table,
+            hint_cache=self.hint_cache,
             heartbeat=lambda: self._heartbeat(
                 branch_key, n_words, idx, claim_started,
                 local_candidate, local_best, bound_erd=_eff_bound()))
@@ -1680,6 +1744,9 @@ class _BranchWorker:
         created_at = branch_row['created_at'] if branch_row else None
         finalized_at = branch_row['finalized_at'] if branch_row else None
         spine = branch_row['spine'] if branch_row else None
+        first_best_at = branch_row['first_best_at'] if branch_row else None
+        nodes_at_first_best = (branch_row['nodes_at_first_best']
+                               if branch_row else None)
         # Wall span of the branch (upper bound — solves interleave).  The only
         # per-solve wall figure, recorded on the cost sample and the finalize log.
         wall_millis = (None if created_at is None or finalized_at is None
@@ -1799,6 +1866,9 @@ class _BranchWorker:
                 best_guess=best_guess, best_erd=best_erd,
                 cache_write_millis=cache_write_millis,
                 schedule_diagnostics=schedule_diagnostics,
+                first_best_at=first_best_at,
+                nodes_at_first_best=nodes_at_first_best,
+                **self._hint_outcome(branch_key, best_guess),
                 outcome='loss' if ceiling_proves_loss else ('cut' if cut else
                         ('exact' if best_guess is not None else 'loss')))
             spine_tokens = (spine or "").split()
@@ -1841,6 +1911,28 @@ class _BranchWorker:
         # different, unrelated branch.
         self._last_claim_complete = time.time()
         return True
+
+    def _hint_outcome(self, branch_key, best_guess):
+        """The branch's hint and whether the recomputed winner matched it.
+
+        Empty on a run with no hint artifact, so the finalize row keeps NULL
+        in both columns rather than claiming a measured miss.  The comparison
+        is after the fact only: the winner was established by a full
+        evaluation against the live cache, and this reads it to say whether
+        the hint was worth consulting.
+
+        hint_was_winner stays NULL when there is no winner to compare against
+        — a cut or a proven loss — because "the hint did not win" would read as
+        a hint that lost a contest the branch never held.
+        """
+        if self.hint_cache is None:
+            return {}
+        hint_word = self.hint_cache.hint_candidate(
+            branch_key, ERD_ALL, None, count_lookup=False)
+        if hint_word is None or best_guess is None:
+            return {"hint_word": hint_word, "hint_was_winner": None}
+        return {"hint_word": hint_word,
+                "hint_was_winner": hint_word == best_guess}
 
     def _await_rival_finalize(self, branch_key, words, n_words, n_candidates):
         """Every candidate is done but a rival holds the finalize.
@@ -2657,7 +2749,8 @@ class _BranchWorker:
 
 
 def swarm_worker(worker_id, cache_path, queue_path, stop_event,  # pragma: no cover
-                 n_workers=1, enable_adaptive_decomposition=True):
+                 n_workers=1, enable_adaptive_decomposition=True,
+                 hint_cache_path=None):
     """Process entry point for a swarm worker (target= for mp.Process)."""
     # Drop the supervisor's inherited handler during startup; a signal here would
     # otherwise run the parent's handler against the shared stop_event.
@@ -2667,7 +2760,8 @@ def swarm_worker(worker_id, cache_path, queue_path, stop_event,  # pragma: no co
     logger.info('worker-%d starting (pid=%d)', worker_id, os.getpid())
     w = _BranchWorker(worker_id, cache_path, queue_path, stop_event,
                       n_workers=n_workers,
-                      enable_adaptive_decomposition=enable_adaptive_decomposition)
+                      enable_adaptive_decomposition=enable_adaptive_decomposition,
+                      hint_cache_path=hint_cache_path)
 
     # Now that the worker exists, handle termination cooperatively: request a stop
     # so run() returns and the finally below runs close(), which clears this

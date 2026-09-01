@@ -227,11 +227,11 @@ class TestLastWriteTs(_TmpDB, unittest.TestCase):
 
 
 class TestLRUDict(unittest.TestCase):
-    """_LRUDict: eviction order, capacity boundary, interface contract."""
+    """LRUDict: eviction order, capacity boundary, interface contract."""
 
     def _make(self, size):
-        from cache_sqlite import _LRUDict
-        return _LRUDict(max_size=size)
+        from cache_sqlite import LRUDict
+        return LRUDict(max_size=size)
 
     def test_get_on_miss_returns_default(self):
         d = self._make(4)
@@ -305,8 +305,8 @@ class TestLRUDict(unittest.TestCase):
         self.assertEqual(len(d), 2)
 
     def test_unbounded_when_max_size_none(self):
-        from cache_sqlite import _LRUDict
-        d = _LRUDict(max_size=None)
+        from cache_sqlite import LRUDict
+        d = LRUDict(max_size=None)
         for i in range(1000):
             d[i] = i
         self.assertEqual(len(d), 1000)

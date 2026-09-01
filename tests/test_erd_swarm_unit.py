@@ -115,6 +115,8 @@ def _bare_worker():
     w.republish_limit = erd_swarm.BUNDLE_REPUBLISH_LIMIT
     w._packing_stats_cache = {}
     w.rcache = mock.MagicMock()
+    # No hint artifact: the default a run without --hint-cache produces.
+    w.hint_cache = None
     w.pattern_matrix = None
     w.branch_floor_table = None
     w.score_cache = mock.MagicMock()
@@ -3303,6 +3305,8 @@ class TestFinalizeTelemetryFailureIsolation(unittest.TestCase):
             "infeasible_nodes": 0,
             "created_at": 100,
             "finalized_at": 200,
+            "first_best_at": 150,
+            "nodes_at_first_best": 40,
             "spine": "SALET -g-g-",
         }
         w.queue.finalize_bundle_stats.return_value = (None, None, None, None)
@@ -3595,6 +3599,8 @@ class TestMaybeFinalizeTriage(unittest.TestCase):
             "infeasible_nodes": 0,
             "created_at": 100,
             "finalized_at": 200,
+            "first_best_at": 150,
+            "nodes_at_first_best": 40,
             "spine": "SALET -g-g-",
         }
         w.queue.get_pending_branch.return_value = None

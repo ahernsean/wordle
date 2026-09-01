@@ -666,6 +666,14 @@ def _normalize_worker(row, generated_at, answer_set):
         ),
         "cache_hit_count": _row_value(row, "cache_hits", 0),
         "cache_miss_count": _row_value(row, "cache_misses", 0),
+        # Hint-artifact accounting, kept apart from the cache counts above: a
+        # hint is an ordering suggestion, never a cache hit.  None throughout
+        # on a run with no hint artifact.
+        "hint_lookup_count": _row_value(row, "hint_lookups"),
+        "hint_hit_count": _row_value(row, "hint_hits"),
+        "hint_accepted_count": _row_value(row, "hint_accepted"),
+        "hint_rejected_count": _row_value(row, "hint_rejected"),
+        "hint_winner_count": _row_value(row, "hint_winners"),
         "solved_evaluation_count": _row_value(row, "n_ok", 0),
         "erd_cutoff_evaluation_count": _row_value(row, "n_cutoff", 0),
         "remaining_depth_pruned_evaluation_count": _row_value(row, "n_pruned", 0),
@@ -799,6 +807,15 @@ def _empty_data():
             "solved_evaluation_count": 0,
             "erd_cutoff_evaluation_count": 0,
             "remaining_depth_pruned_evaluation_count": 0,
+            # Hint-artifact totals.  Deliberately alongside, not folded into,
+            # the cache counts: a hint reorders candidates and is never a
+            # cache hit.  All zero on a run with no hint artifact, which is
+            # how a display knows not to show a hint section at all.
+            "hint_lookup_count": 0,
+            "hint_hit_count": 0,
+            "hint_accepted_count": 0,
+            "hint_rejected_count": 0,
+            "hint_winner_count": 0,
         },
         "branches": [],
         "recently_completed_branches": [],
@@ -891,7 +908,10 @@ def _queue_overview(sources, generated_at, answer_set, report):
             )
         worker_total_keys = tuple(report["data"]["worker_totals"])
         worker_totals = {
-            key: sum(worker[key] for worker in workers if worker["is_live"])
+            # A worker with no hint artifact reports None rather than 0, so the
+            # per-worker fact stays "not measured"; the fleet total is a count
+            # and treats those as contributing nothing.
+            key: sum(worker[key] or 0 for worker in workers if worker["is_live"])
             for key in worker_total_keys
         }
         epoch_metadata = queue.epoch_metadata()

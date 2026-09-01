@@ -676,6 +676,18 @@ def _render_sections(report, previous_report, color, width, display_order):
         "remaining-depth pruned "
         f"{_percentage(totals['remaining_depth_pruned_evaluation_count'], evaluation_count)}",
     ], width)
+    # Its own section, never folded into "Cache:" above: those counts are the
+    # live cache's exact results, while these describe an ordering suggestion
+    # from a read-only historical artifact.  Absent entirely when the run has
+    # no hint artifact.
+    if totals["hint_lookup_count"]:
+        summary += _inline_section("Hints (ordering only):", [
+            f"lookups {totals['hint_lookup_count']:,}",
+            f"named {_percentage(totals['hint_hit_count'], totals['hint_lookup_count'])}",
+            f"accepted {totals['hint_accepted_count']:,}",
+            f"rejected {totals['hint_rejected_count']:,}",
+            f"won {_percentage(totals['hint_winner_count'], totals['hint_accepted_count'])}",
+        ], width)
 
     selected_statuses = report.get("filters", {}).get("branch_statuses") or []
     status_label = ",".join(selected_statuses) if selected_statuses else "all"

@@ -88,6 +88,7 @@ import time
 from datetime import datetime
 
 from cache_sqlite import ScoreCache
+from hint_cache import HintCacheError, open_hint_cache
 from report_model import (
     BRANCH_PHASES,
     BRANCH_STATUSES,
@@ -1053,6 +1054,11 @@ def cmd_run(args):
     # would race on ALTER TABLE ADD COLUMN ("duplicate column name").
     ScoreCache(args.cache, load_word_list(ANSWER_FILE),
                checkpoint_on_close=False).close()
+    # Prove the hint artifact here, in the supervisor, before any worker forks:
+    # every worker would otherwise raise the same refusal independently and the
+    # supervisor would respawn them forever.
+    if not _hint_cache_is_usable(args):
+        return
     queue = ERDQueue(args.queue)
     latch = queue.disk_stop()
     if latch is not None:
@@ -1222,10 +1228,33 @@ def _reap_worker(queue, worker_id: int):
                     worker_id, freed)
 
 
+def _hint_cache_is_usable(args) -> bool:
+    """Open and close the configured hint artifact, reporting any refusal.
+
+    True when the run may proceed — including the ordinary case of no
+    --hint-cache at all.  A refusal is printed and the run stops: a hint path
+    the operator named but the swarm cannot honour must not turn into a silent
+    hintless run.
+    """
+    try:
+        hint = open_hint_cache(args.hint_cache, load_word_list(ANSWER_FILE),
+                               args.cache)
+    except HintCacheError as error:
+        print(f'Refusing to start: {error}', file=sys.stderr)
+        return False
+    if hint is not None:
+        print(f'Hint cache: {hint.db_path} '
+              f'({hint.namespace_branch_count:,} branch rows for this answer '
+              f'list, read-only, candidate order only)')
+        hint.close()
+    return True
+
+
 def _spawn_worker(worker_id: int, args, stop_event):
     p = multiprocessing.Process(
         target=erd_swarm.swarm_worker,
         args=(worker_id, args.cache, args.queue, stop_event, args.workers),
+        kwargs={'hint_cache_path': args.hint_cache},
         daemon=False,
         name=f'erd-worker-{worker_id}',
     )
@@ -1354,6 +1383,11 @@ def main():
     p_run.add_argument('--workers', type=int, default=6, metavar='N',
                        help='Number of swarm worker processes (default: 6)')
     p_run.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
+    p_run.add_argument(
+        '--hint-cache', default=None, metavar='PATH',
+        help='quarantined historical cache, opened read-only and immutable '
+             'and used only to order candidates.  Never a source of exact '
+             'results, bounds, or losses, and never written to.')
     p_run.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
     p_run.add_argument('--recycle-hours', type=float, default=3.0,
                        metavar='H',
