@@ -186,6 +186,31 @@ class TestBudgetScopedERDResultVisibleAtOneGuess(CliTestCase):
         self.assertNotIn("ERD tree not ready", out)
         self.assertIn("3.036", out)
 
+    def test_erd_menu_ranks_candidates_from_budget_specific_child_results(self):
+        """Selecting ERD must rank candidates using _erd_solve_scores' own
+        budget-aware child-branch reads, not just show the root's cached
+        value in the menu label.
+
+        "crane" splits this branch's six words into five response groups,
+        only one of which (['slate', 'stale']) has 2+ words, so caching
+        that single subgroup — at budget - 1, with no unrestricted row —
+        is enough for "crane" to score. If cmd_solve's ERD branch dropped
+        the budget it passes into _erd_solve_scores, this subgroup would be
+        invisible and the menu would report the cache incomplete instead of
+        ranking "crane".
+        """
+        s = self._one_guess_branch()
+        _, budget = self._write_budget_specific_root(
+            s, "tarse", 3.036, max_depth=5)
+        self.gs.score_cache.write(
+            ScoreCache.encode_subset(["slate", "stale"]), ERD_ALL,
+            "slate", 1.5, max_depth=2, solve_budget=budget - 1)
+        n_methods = len(list(ScoringMethod))
+        out = self.run_cmd(cmd_solve, inputs=[str(n_methods + 1)])
+        self.assertNotIn("ERD cache incomplete", out)
+        self.assertIn("Best guesses:", out)
+        self.assertIn("crane : 2.1667", out)
+
 
 class TestCmdDisplayScores(CliTestCase):
     def test_display_with_scores(self):
