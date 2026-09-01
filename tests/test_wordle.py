@@ -2325,6 +2325,81 @@ class TestERDSolveScores(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# _erd_solve_scores reads child branches at their own next remaining budget
+# (issue #311) — a candidate's response subgroups are one guess deeper than
+# the position being scored, so a budget-specific child result (imported or
+# freshly computed under a cap) must be visible even when no unrestricted
+# result is cached for that subgroup.
+# ---------------------------------------------------------------------------
+
+class TestERDSolveScoresBudgetAware(unittest.TestCase):
+
+    # "train" splits these four words into two size-2 response groups
+    # against ["eszyc", "pumzg"] and ["idpyo", "oixzh"] — verified offline;
+    # neither subgroup is a singleton, so both actually require a cache read
+    # rather than being handled by the k==1 inline base case.
+    WORDS = ["eszyc", "pumzg", "idpyo", "oixzh"]
+    CANDIDATE = "train"
+
+    def _soln_with_words(self, words, sc):
+        import types
+        cache = ResponseCache(words)
+        return types.SimpleNamespace(
+            current_words=list(words),
+            score_cache=sc,
+            cache=cache,
+        )
+
+    def test_child_branch_read_at_next_remaining_budget(self):
+        """A budget-specific child result (no unrestricted row) is used when
+        scoring at the parent's budget, read at budget - 1."""
+        with tempfile.TemporaryDirectory() as d:
+            sc = ScoreCache(os.path.join(d, 'test.sqlite3'), self.WORDS)
+            soln = self._soln_with_words(self.WORDS, sc)
+            for pair in (self.WORDS[:2], self.WORDS[2:]):
+                sc.write(ScoreCache.encode_subset(pair), ERD_ALL,
+                         pair[0], 2.0, max_depth=3, solve_budget=4)
+
+            scores = _erd_solve_scores(soln, sc, ERD_ALL,
+                                        guesses=[self.CANDIDATE], budget=5)
+            self.assertIsNotNone(scores,
+                "a budget-specific child result must be readable at the "
+                "candidate's next remaining budget")
+            word, cost = scores[0]
+            self.assertEqual(word, self.CANDIDATE)
+            self.assertAlmostEqual(cost, 3.0, places=10)
+
+    def test_wrong_budget_child_result_is_not_reused(self):
+        """A child result written for a different budget than budget - 1
+        implies is not an exact hit and must not be reused."""
+        with tempfile.TemporaryDirectory() as d:
+            sc = ScoreCache(os.path.join(d, 'test.sqlite3'), self.WORDS)
+            soln = self._soln_with_words(self.WORDS, sc)
+            for pair in (self.WORDS[:2], self.WORDS[2:]):
+                sc.write(ScoreCache.encode_subset(pair), ERD_ALL,
+                         pair[0], 2.0, max_depth=3, solve_budget=3)
+
+            scores = _erd_solve_scores(soln, sc, ERD_ALL,
+                                        guesses=[self.CANDIDATE], budget=5)
+            self.assertIsNone(scores)
+
+    def test_unbudgeted_read_misses_a_budget_specific_only_result(self):
+        """Without a budget (the pre-fix call shape), a branch cached only
+        at a specific budget is invisible — demonstrating the bug this
+        budget-aware read fixes."""
+        with tempfile.TemporaryDirectory() as d:
+            sc = ScoreCache(os.path.join(d, 'test.sqlite3'), self.WORDS)
+            soln = self._soln_with_words(self.WORDS, sc)
+            for pair in (self.WORDS[:2], self.WORDS[2:]):
+                sc.write(ScoreCache.encode_subset(pair), ERD_ALL,
+                         pair[0], 2.0, max_depth=3, solve_budget=4)
+
+            scores = _erd_solve_scores(soln, sc, ERD_ALL,
+                                        guesses=[self.CANDIDATE])
+            self.assertIsNone(scores)
+
+
+# ---------------------------------------------------------------------------
 # _multistep_stats participates in the transparent cache
 # ---------------------------------------------------------------------------
 
@@ -4065,7 +4140,7 @@ class TestPrintStatusSingleBoard(unittest.TestCase):
             soln.guesses = [["salet", ["gray"] * 5]]
             soln.current_words = ANSWERS[:3]
             sc.write(ScoreCache.encode_subset(soln.current_words), ERD_ALL,
-                     "arise", 3.142)
+                     "arise", 3.142, max_depth=4)
 
             gs = self._gs(soln)
             out = io.StringIO()

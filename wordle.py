@@ -1213,12 +1213,22 @@ def _erd_cache_and_policy(gs, soln):
     return cfg.cache(gs, soln), cfg.policy
 
 
+def _current_erd_budget(soln):
+    """Allowed remaining depth for soln's current branch: budget +
+    guess_depth = GAME_GUESSES, and guess_depth is the number of guesses
+    already played."""
+    return GAME_GUESSES - len(soln.guesses)
+
+
 def _best_erd_guess(gs, soln):
     """The cached (word, ERD) for a solution's current branch, or None when
     no ERD is known for it yet.
 
     This is the value print_status tags the status line with, and the guess
-    a bare Enter at the guess prompt plays.
+    a bare Enter at the guess prompt plays. Reads through read_for_budget at
+    the branch's current budget, so a budget-specific exact result (imported
+    or freshly computed under a remaining-depth cap) is visible even when no
+    unrestricted result is cached.
     """
     words = soln.current_words
     if len(words) < 2:
@@ -1226,7 +1236,9 @@ def _best_erd_guess(gs, soln):
     score_cache, policy = _erd_cache_and_policy(gs, soln)
     if score_cache is None:
         return None
-    return score_cache.read(ScoreCache.encode_subset(words), policy)
+    budget = _current_erd_budget(soln)
+    return score_cache.read_for_budget(
+        ScoreCache.encode_subset(words), policy, budget)
 
 
 def _format_cache_timestamp(mtime):
@@ -1284,7 +1296,8 @@ def _format_branch_header(words_count):
     return f'{words_count:,} words | ERD: computing...'
 
 
-def _erd_solve_scores(soln, score_cache=None, policy=ERD_ALL, guesses=None):
+def _erd_solve_scores(soln, score_cache=None, policy=ERD_ALL, guesses=None,
+                       budget=None):
     """
     Rank candidates by ERD using only cached branch values.
     Returns sorted (word, erd_cost) list, lowest first, for every candidate
@@ -1300,12 +1313,17 @@ def _erd_solve_scores(soln, score_cache=None, policy=ERD_ALL, guesses=None):
     guesses:     candidate words to rank.  Defaults to soln.current_words
                  (answer words only).  Pass the full word list to include
                  non-answer candidates in any-word mode.
+    budget:      soln's current branch budget, or None for an unrestricted
+                 read. Each candidate's response subgroups are one guess
+                 deeper than soln, so they are read at budget - 1 — their
+                 own next remaining budget.
     """
     from wordle_engine import _encode_response
     n = len(soln.current_words)
     sc = score_cache if score_cache is not None else soln.score_cache
     cache = soln.cache
     candidates = guesses if guesses is not None else soln.current_words
+    child_budget = budget - 1 if budget is not None else None
     results = []
     for word in candidates:
         if cache and word in cache.answer_words:
@@ -1326,7 +1344,8 @@ def _erd_solve_scores(soln, score_cache=None, policy=ERD_ALL, guesses=None):
             if k == 1:
                 cost += 1.0 / n  # base case: one word left = 1 more guess
                 continue
-            hit = sc.read(ScoreCache.encode_subset(sg), policy)
+            hit = sc.read_for_budget(ScoreCache.encode_subset(sg), policy,
+                                      child_budget)
             if hit is None:
                 ok = False
                 break
@@ -1358,12 +1377,15 @@ def cmd_solve(gs):
         return
 
     # ERD option: available when the full tree for this position is cached
-    # for the current input mode.
+    # for the current input mode, at the position's own budget — a
+    # budget-specific exact result counts here too, not only an
+    # unrestricted one.
     erd_root = None
+    erd_budget = _current_erd_budget(soln)
     erd_sc, erd_policy = _erd_cache_and_policy(gs, soln)
     if not soln._is_full_game() and erd_sc is not None:
         root_key = ScoreCache.encode_subset(soln.current_words)
-        erd_root = erd_sc.read(root_key, erd_policy)
+        erd_root = erd_sc.read_for_budget(root_key, erd_policy, erd_budget)
 
     methods = list(ScoringMethod)
     erd_idx = len(methods) + 1
@@ -1396,7 +1418,8 @@ def cmd_solve(gs):
             print_error("ERD tree not ready yet. Wait for the [ERD ready] notification.")
             return
         erd_guesses = _erd_mode_config(gs).guesses_fn(gs, soln)
-        scores = _erd_solve_scores(soln, erd_sc, erd_policy, guesses=erd_guesses)
+        scores = _erd_solve_scores(soln, erd_sc, erd_policy, guesses=erd_guesses,
+                                    budget=erd_budget)
         if scores is None:  # pragma: no cover - defensive: a cached root implies cached branches
             print_error("ERD cache incomplete — some branches missing.")
             return

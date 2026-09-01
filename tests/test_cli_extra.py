@@ -141,6 +141,52 @@ class TestCmdSolveERDReady(CliTestCase):
         self.assertIn("ERD cache check", out)
 
 
+class TestBudgetScopedERDResultVisibleAtOneGuess(CliTestCase):
+    """Issue #311: a budget-specific exact ERD result (imported, or written
+    by an earlier search under a remaining-depth cap) must be visible from
+    the status line and the ERD menu even when no *unrestricted* result is
+    cached for the branch — both must read through read_for_budget at the
+    branch's own budget, not the unbudgeted read().
+    """
+
+    def _one_guess_branch(self):
+        s = self.soln()
+        s.apply_guess("piano", wordle.parse_response("00g00"))
+        return s
+
+    def _write_budget_specific_root(self, soln, guess, cost, max_depth):
+        branch_key = ScoreCache.encode_subset(soln.current_words)
+        budget = wordle.GAME_GUESSES - len(soln.guesses)
+        self.gs.score_cache.write(branch_key, ERD_ALL, guess, cost,
+                                   max_depth=max_depth, solve_budget=budget)
+        return branch_key, budget
+
+    def test_no_unrestricted_result_is_cached(self):
+        """Sanity check on the fixture: the plain unrestricted read must
+        miss, so the assertions below are exercising the budget-aware path
+        and not an unrestricted hit that would pass either way."""
+        s = self._one_guess_branch()
+        branch_key, _ = self._write_budget_specific_root(
+            s, "tarse", 3.036, max_depth=5)
+        self.assertIsNone(self.gs.score_cache.read(branch_key, ERD_ALL))
+
+    def test_status_line_shows_budget_specific_result(self):
+        s = self._one_guess_branch()
+        self._write_budget_specific_root(s, "tarse", 3.036, max_depth=5)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            print_status(self.gs)
+        self.assertIn("3.036 TARSE", out.getvalue())
+
+    def test_erd_menu_available_with_budget_specific_result(self):
+        s = self._one_guess_branch()
+        self._write_budget_specific_root(s, "tarse", 3.036, max_depth=5)
+        n_methods = len(list(ScoringMethod))
+        out = self.run_cmd(cmd_solve, inputs=[str(n_methods + 1)])
+        self.assertNotIn("ERD tree not ready", out)
+        self.assertIn("3.036", out)
+
+
 class TestCmdDisplayScores(CliTestCase):
     def test_display_with_scores(self):
         s = self.soln()
