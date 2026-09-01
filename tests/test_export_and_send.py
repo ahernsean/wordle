@@ -37,6 +37,10 @@ class TestExportAndSend(unittest.TestCase):
                 exec)
                     if [[ "$*" == *"tailscale status --json"* ]]; then
                         echo '{"BackendState":"Running"}'
+                    elif [[ "$*" == *"tailscale file cp"* ]] && \\
+                            [[ "${PODMAN_TRANSFER_FAIL:-}" == 1 ]]; then
+                        echo '502 Bad Gateway:' >&2
+                        exit 42
                     fi
                     ;;
                 cp|rm) exit 0 ;;
@@ -79,3 +83,14 @@ class TestExportAndSend(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         commands = self.log_path.read_text()
         self.assertNotIn("TS_AUTHKEY=", commands)
+
+    def test_keeps_export_and_explains_how_to_retry_after_transfer_failure(self):
+        result = self._run(PODMAN_TRANSFER_FAIL="1")
+
+        self.assertEqual(result.returncode, 42)
+        self.assertTrue((self.workdir / "wordle_erd_export.sqlite3").exists())
+        self.assertFalse((self.workdir / "wordle_export_watermark").exists())
+        self.assertIn("Taildrop could not reach ios-app.", result.stderr)
+        self.assertIn("retrying will resend it.", result.stderr)
+        self.assertIn("wait for it to report synchronized", result.stderr)
+        self.assertIn("Details: 502 Bad Gateway:", result.stderr)

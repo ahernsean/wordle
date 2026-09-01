@@ -104,6 +104,29 @@ start_taildrop_relay() {
     return 1
 }
 
+send_export_through_taildrop() {
+    local transfer_output transfer_status
+    transfer_output="$(mktemp)"
+    if podman exec "$taildrop_container" \
+            tailscale file cp "/exports/$export_file" "${tailnet_device}:" \
+            >"$transfer_output" 2>&1; then
+        rm -f "$transfer_output"
+        return
+    else
+        transfer_status=$?
+    fi
+
+    echo "Taildrop could not reach $tailnet_device." >&2
+    echo "The export was kept at $export_file; retrying will resend it." >&2
+    echo "On the receiving device, open Tailscale and wait for it to report synchronized, then retry:" >&2
+    echo "  ./export_and_send.sh" >&2
+    if [ -s "$transfer_output" ]; then
+        printf 'Details: %s\n' "$(<"$transfer_output")" >&2
+    fi
+    rm -f "$transfer_output"
+    return "$transfer_status"
+}
+
 since_args=()
 if [ -f "$watermark_file" ]; then
     watermark="$(cat "$watermark_file")"
@@ -114,8 +137,7 @@ next_watermark=$(( $(date +%s) - overlap_seconds ))
 start_taildrop_relay
 python3.13 export_cache.py "${since_args[@]}"
 podman cp "$export_file" "$taildrop_container:/exports/$export_file"
-podman exec "$taildrop_container" \
-    tailscale file cp "/exports/$export_file" "${tailnet_device}:"
+send_export_through_taildrop
 echo "$next_watermark" > "$watermark_file"
 rm -f "$export_file" "$export_file-wal" "$export_file-shm"
 echo "Sent $export_file to $tailnet_device through the Taildrop relay and deleted the local copy."
