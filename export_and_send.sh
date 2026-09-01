@@ -57,19 +57,31 @@ overlap_seconds=3600
 taildrop_state_volume="${WORDLE_TAILDROP_STATE_VOLUME:-wordle-taildrop-state}"
 taildrop_hostname="${WORDLE_TAILDROP_HOSTNAME:-wordle-taildrop}"
 taildrop_image="${WORDLE_TAILDROP_IMAGE:-docker.io/tailscale/tailscale:stable}"
-taildrop_container="wordle-taildrop-${RANDOM}-${RANDOM}"
+taildrop_container="wordle-taildrop"
+taildrop_lock_file="${WORDLE_TAILDROP_LOCK_FILE:-${TMPDIR:-/tmp}/wordle-taildrop-export.lock}"
 taildrop_started=false
+taildrop_temporary_output=""
+
+exec {taildrop_lock_fd}>"$taildrop_lock_file"
+if ! flock -n "$taildrop_lock_fd"; then
+    echo "Another Taildrop export is already running." >&2
+    exit 1
+fi
 
 cleanup_taildrop_container() {
+    if [ -n "$taildrop_temporary_output" ]; then
+        rm -f "$taildrop_temporary_output"
+    fi
     if "$taildrop_started"; then
         podman rm --force "$taildrop_container" >/dev/null 2>&1 || true
     fi
 }
-trap cleanup_taildrop_container EXIT INT TERM
+trap cleanup_taildrop_container EXIT
+trap 'exit 130' INT TERM
 
 start_taildrop_relay() {
     local -a podman_args=(
-        run --detach --rm
+        run --detach
         --name "$taildrop_container"
         --hostname "$taildrop_hostname"
         --security-opt no-new-privileges
@@ -80,20 +92,30 @@ start_taildrop_relay() {
         --env TS_USERSPACE=true
     )
     if [ -n "${TAILSCALE_AUTHKEY:-}" ]; then
-        podman_args+=(--env "TS_AUTHKEY=$TAILSCALE_AUTHKEY")
+        podman_args+=(--env TS_AUTHKEY)
     fi
-    if ! podman volume inspect "$taildrop_state_volume" >/dev/null 2>&1; then
-        podman volume create "$taildrop_state_volume" >/dev/null
+    if podman container exists "$taildrop_container"; then
+        echo "A previous Taildrop relay container still exists: $taildrop_container." >&2
+        echo "Inspect it with: podman logs $taildrop_container" >&2
+        return 1
     fi
     podman_args+=("$taildrop_image")
     podman "${podman_args[@]}" >/dev/null
     taildrop_started=true
 
-    local attempt
+    local attempt status_json relay_running
     for attempt in {1..30}; do
-        if podman exec "$taildrop_container" tailscale status --json 2>/dev/null \
-                | grep -Eq '"BackendState"[[:space:]]*:[[:space:]]*"Running"'; then
+        status_json="$(podman exec "$taildrop_container" \
+            tailscale status --json --peers=false 2>&1 || true)"
+        if [[ "$status_json" =~ \"BackendState\"[[:space:]]*:[[:space:]]*\"Running\" ]]; then
             return
+        fi
+        relay_running="$(podman container inspect --format '{{.State.Running}}' \
+            "$taildrop_container" 2>/dev/null || true)"
+        if [ "$relay_running" != true ]; then
+            echo "The Taildrop relay stopped before it connected." >&2
+            podman logs "$taildrop_container" >&2 || true
+            return 1
         fi
         sleep 1
     done
@@ -107,12 +129,13 @@ start_taildrop_relay() {
 }
 
 send_export_through_taildrop() {
-    local transfer_output transfer_status
-    transfer_output="$(mktemp)"
+    local transfer_status
+    taildrop_temporary_output="$(mktemp)"
     if podman exec "$taildrop_container" \
             tailscale file cp "/exports/$export_file" "${tailnet_device}:" \
-            >"$transfer_output" 2>&1; then
-        rm -f "$transfer_output"
+            >"$taildrop_temporary_output" 2>&1; then
+        rm -f "$taildrop_temporary_output"
+        taildrop_temporary_output=""
         return
     else
         transfer_status=$?
@@ -122,11 +145,34 @@ send_export_through_taildrop() {
     echo "The export was kept at $export_file; retrying will resend it." >&2
     echo "On the receiving device, open Tailscale and wait for it to report synchronized, then retry:" >&2
     echo "  ./export_and_send.sh" >&2
-    if [ -s "$transfer_output" ]; then
-        printf 'Details: %s\n' "$(<"$transfer_output")" >&2
+    if [ -s "$taildrop_temporary_output" ]; then
+        printf 'Details: %s\n' "$(<"$taildrop_temporary_output")" >&2
     fi
-    rm -f "$transfer_output"
+    rm -f "$taildrop_temporary_output"
+    taildrop_temporary_output=""
     return "$transfer_status"
+}
+
+copy_export_into_taildrop_relay() {
+    local copy_status
+    taildrop_temporary_output="$(mktemp)"
+    if podman cp "$export_file" "$taildrop_container:/exports/$export_file" \
+            >"$taildrop_temporary_output" 2>&1; then
+        rm -f "$taildrop_temporary_output"
+        taildrop_temporary_output=""
+        return
+    else
+        copy_status=$?
+    fi
+
+    echo "The Taildrop relay could not prepare the export." >&2
+    echo "The export was kept at $export_file; retrying will resend it." >&2
+    if [ -s "$taildrop_temporary_output" ]; then
+        printf 'Details: %s\n' "$(<"$taildrop_temporary_output")" >&2
+    fi
+    rm -f "$taildrop_temporary_output"
+    taildrop_temporary_output=""
+    return "$copy_status"
 }
 
 since_args=()
@@ -138,7 +184,7 @@ next_watermark=$(( $(date +%s) - overlap_seconds ))
 
 start_taildrop_relay
 python3.13 export_cache.py "${since_args[@]}"
-podman cp "$export_file" "$taildrop_container:/exports/$export_file"
+copy_export_into_taildrop_relay
 send_export_through_taildrop
 echo "$next_watermark" > "$watermark_file"
 rm -f "$export_file" "$export_file-wal" "$export_file-shm"
