@@ -35,8 +35,12 @@ class TestExportAndSend(unittest.TestCase):
             printf '%s\\n' "$*" >> "$PODMAN_LOG"
             case "$1:$2" in
                 run:*) echo relay-container ;;
+                container:exists)
+                    [[ "${PODMAN_CONTAINER_EXISTS:-}" == 1 ]]
+                    ;;
                 container:inspect)
-                    if [[ "${PODMAN_RELAY_STOPS:-}" == 1 ]]; then
+                    if [[ "${PODMAN_RELAY_STOPS:-}" == 1 ]] || \\
+                            [[ "${PODMAN_CONTAINER_EXISTS:-}" == 1 ]]; then
                         echo false
                     else
                         echo true
@@ -49,6 +53,10 @@ class TestExportAndSend(unittest.TestCase):
                             exit 125
                         elif [[ "${PODMAN_RELAY_NEVER_READY:-}" == 1 ]]; then
                             echo '{"BackendState":"NeedsLogin"}'
+                        elif [[ "${PODMAN_LARGE_STATUS:-}" == 1 ]]; then
+                            printf '{"BackendState":"Running","Peer":"'
+                            head -c 70000 /dev/zero | tr '\\0' x
+                            echo '"}'
                         else
                             echo '{"BackendState":"Running"}'
                         fi
@@ -95,6 +103,7 @@ class TestExportAndSend(unittest.TestCase):
         self.assertFalse((self.workdir / "wordle_erd_export.sqlite3").exists())
         commands = self.log_path.read_text()
         self.assertIn("--env TS_AUTH_ONCE=true", commands)
+        self.assertNotIn("--rm", commands)
         self.assertIn("--env TS_USERSPACE=true", commands)
         self.assertIn("--env TS_AUTHKEY", commands)
         self.assertNotIn("TS_AUTHKEY=tskey-auth-bootstrap", commands)
@@ -128,11 +137,12 @@ class TestExportAndSend(unittest.TestCase):
         self.assertIn("authentication failed", result.stderr)
         self.assertIn("rm --force wordle-taildrop", self.log_path.read_text())
 
-    def test_relay_timeout_preserves_the_export_and_prints_setup_hint(self):
+    def test_relay_timeout_aborts_before_exporting_and_prints_setup_hint(self):
         result = self._run(PODMAN_RELAY_NEVER_READY="1")
 
         self.assertEqual(result.returncode, 1)
         self.assertFalse((self.workdir / "wordle_erd_export.sqlite3").exists())
+        self.assertFalse((self.workdir / "wordle_export_watermark").exists())
         self.assertIn("did not connect within 30 seconds", result.stderr)
         self.assertIn("For first-time setup", result.stderr)
 
@@ -155,6 +165,22 @@ class TestExportAndSend(unittest.TestCase):
         self.assertIn("retrying will resend it.", result.stderr)
         self.assertIn("wait for it to report synchronized", result.stderr)
         self.assertIn("Details: 502 Bad Gateway:", result.stderr)
+
+    def test_large_status_payload_still_reports_a_running_relay(self):
+        result = self._run(PODMAN_LARGE_STATUS="1")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        commands = self.log_path.read_text()
+        self.assertIn("tailscale status --json --peers=false", commands)
+
+    def test_removes_an_exited_leftover_relay_before_starting(self):
+        result = self._run(PODMAN_CONTAINER_EXISTS="1")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Removing a leftover Taildrop relay", result.stderr)
+        commands = self.log_path.read_text()
+        self.assertIn("logs wordle-taildrop", commands)
+        self.assertIn("rm --force wordle-taildrop", commands)
 
     def test_rejects_a_second_export_while_the_first_holds_the_lock(self):
         lock_path = self.workdir / "export.lock"

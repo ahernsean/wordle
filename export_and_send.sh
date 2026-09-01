@@ -62,6 +62,10 @@ taildrop_lock_file="${WORDLE_TAILDROP_LOCK_FILE:-${TMPDIR:-/tmp}/wordle-taildrop
 taildrop_started=false
 taildrop_temporary_output=""
 
+if ! command -v flock >/dev/null; then
+    echo "flock is required to serialize Taildrop exports." >&2
+    exit 1
+fi
 exec {taildrop_lock_fd}>"$taildrop_lock_file"
 if ! flock -n "$taildrop_lock_fd"; then
     echo "Another Taildrop export is already running." >&2
@@ -95,9 +99,14 @@ start_taildrop_relay() {
         podman_args+=(--env TS_AUTHKEY)
     fi
     if podman container exists "$taildrop_container"; then
-        echo "A previous Taildrop relay container still exists: $taildrop_container." >&2
-        echo "Inspect it with: podman logs $taildrop_container" >&2
-        return 1
+        if [ "$(podman container inspect --format '{{.State.Running}}' \
+                "$taildrop_container" 2>/dev/null)" = true ]; then
+            echo "A Taildrop relay is already running: $taildrop_container." >&2
+            return 1
+        fi
+        echo "Removing a leftover Taildrop relay from an interrupted run:" >&2
+        podman logs "$taildrop_container" >&2 || true
+        podman rm --force "$taildrop_container" >/dev/null
     fi
     podman_args+=("$taildrop_image")
     podman "${podman_args[@]}" >/dev/null
@@ -128,51 +137,31 @@ start_taildrop_relay() {
     return 1
 }
 
-send_export_through_taildrop() {
-    local transfer_status
+run_taildrop_command() {
+    local headline="$1" retry_instructions="$2" command_status
+    shift 2
     taildrop_temporary_output="$(mktemp)"
-    if podman exec "$taildrop_container" \
-            tailscale file cp "/exports/$export_file" "${tailnet_device}:" \
+    if "$@" \
             >"$taildrop_temporary_output" 2>&1; then
         rm -f "$taildrop_temporary_output"
         taildrop_temporary_output=""
         return
     else
-        transfer_status=$?
+        command_status=$?
     fi
 
-    echo "Taildrop could not reach $tailnet_device." >&2
+    echo "$headline" >&2
     echo "The export was kept at $export_file; retrying will resend it." >&2
-    echo "On the receiving device, open Tailscale and wait for it to report synchronized, then retry:" >&2
-    echo "  ./export_and_send.sh" >&2
+    if "$retry_instructions"; then
+        echo "On the receiving device, open Tailscale and wait for it to report synchronized, then retry:" >&2
+        echo "  ./export_and_send.sh" >&2
+    fi
     if [ -s "$taildrop_temporary_output" ]; then
         printf 'Details: %s\n' "$(<"$taildrop_temporary_output")" >&2
     fi
     rm -f "$taildrop_temporary_output"
     taildrop_temporary_output=""
-    return "$transfer_status"
-}
-
-copy_export_into_taildrop_relay() {
-    local copy_status
-    taildrop_temporary_output="$(mktemp)"
-    if podman cp "$export_file" "$taildrop_container:/exports/$export_file" \
-            >"$taildrop_temporary_output" 2>&1; then
-        rm -f "$taildrop_temporary_output"
-        taildrop_temporary_output=""
-        return
-    else
-        copy_status=$?
-    fi
-
-    echo "The Taildrop relay could not prepare the export." >&2
-    echo "The export was kept at $export_file; retrying will resend it." >&2
-    if [ -s "$taildrop_temporary_output" ]; then
-        printf 'Details: %s\n' "$(<"$taildrop_temporary_output")" >&2
-    fi
-    rm -f "$taildrop_temporary_output"
-    taildrop_temporary_output=""
-    return "$copy_status"
+    return "$command_status"
 }
 
 since_args=()
@@ -184,8 +173,11 @@ next_watermark=$(( $(date +%s) - overlap_seconds ))
 
 start_taildrop_relay
 python3.13 export_cache.py "${since_args[@]}"
-copy_export_into_taildrop_relay
-send_export_through_taildrop
+run_taildrop_command "The Taildrop relay could not prepare the export." false \
+    podman cp "$export_file" "$taildrop_container:/exports/$export_file"
+run_taildrop_command "Taildrop could not reach $tailnet_device." true \
+    podman exec "$taildrop_container" \
+    tailscale file cp "/exports/$export_file" "${tailnet_device}:"
 echo "$next_watermark" > "$watermark_file"
 rm -f "$export_file" "$export_file-wal" "$export_file-shm"
 echo "Sent $export_file to $tailnet_device through the Taildrop relay and deleted the local copy."
