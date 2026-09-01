@@ -680,13 +680,21 @@ def _render_sections(report, previous_report, color, width, display_order):
     # live cache's exact results, while these describe an ordering suggestion
     # from a read-only historical artifact.  Absent entirely when the run has
     # no hint artifact.
+    #
+    # "named" and "legal" are lookup rates over the same population (every
+    # lookup, from both hint sites).  The win rate is taken only over inline
+    # placements, whose wins this same counter sees; a cooperative branch's win
+    # is recorded per branch in branch_finalize_log.hint_was_winner, and mixing
+    # it into this ratio would divide by a denominator several workers each
+    # contributed to.
     if totals["hint_lookup_count"]:
         summary += _inline_section("Hints (ordering only):", [
             f"lookups {totals['hint_lookup_count']:,}",
             f"named {_percentage(totals['hint_hit_count'], totals['hint_lookup_count'])}",
-            f"accepted {totals['hint_accepted_count']:,}",
-            f"rejected {totals['hint_rejected_count']:,}",
-            f"won {_percentage(totals['hint_winner_count'], totals['hint_accepted_count'])}",
+            f"legal {_percentage(totals['hint_accepted_count'], totals['hint_hit_count'])}",
+            f"inline placements {totals['hint_inline_placement_count']:,}",
+            "inline won "
+            f"{_percentage(totals['hint_inline_win_count'], totals['hint_inline_placement_count'])}",
         ], width)
 
     selected_statuses = report.get("filters", {}).get("branch_statuses") or []

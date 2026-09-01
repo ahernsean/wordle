@@ -746,12 +746,27 @@ service — it does not pass flags through.  Add `--hint-cache PATH` to
 sweep is a deliberate rebuild mode, so the unit stays hintless by default.
 
 **Measuring whether hints pay.**  `view` shows a `Hints (ordering only):`
-line — lookups, how many the artifact named a word for, accepted versus
-rejected, and how often an accepted hint went on to win.  Per branch,
-`telemetry.branch_finalize_log` carries `hint_word`, `hint_was_winner`,
-`first_best_at`, and `nodes_at_first_best`; the last two against `created_at`
-are the cost of reaching any bound at all, which is what a good hint is
-supposed to remove.
+line: `lookups`, `named` (the artifact had a row), and `legal` (that word was
+in the candidate pool) are rates over every lookup, from both hint sites.
+`inline placements` and `inline won` are a separate, narrower population —
+hints placed at the front of an inline solver frame, and the ones that won it.
+They are reported apart because a cooperative branch is looked up once per
+worker that computes its packing order, while its winner is decided once, at
+finalize, by whichever worker wins it; dividing one by the other would compare
+different populations.
+
+The cooperative half of that question is answered per branch instead:
+`telemetry.branch_finalize_log` carries `hint_word` and `hint_was_winner`, one
+row per finalized branch, so
+
+```sql
+SELECT COUNT(*) FILTER (WHERE hint_was_winner = 1) * 1.0 / COUNT(*)
+FROM branch_finalize_log WHERE hint_word IS NOT NULL;
+```
+
+is the branch-level hit rate.  The same table's `first_best_at` and
+`nodes_at_first_best`, against `created_at`, are the cost of reaching any bound
+at all — which is what a good hint is supposed to remove.
 
 ### Clean rebuild cutover
 

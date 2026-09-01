@@ -315,15 +315,19 @@ CREATE TABLE IF NOT EXISTS worker_heartbeat (
                                     -- is NULL
     -- Hint-artifact accounting for the run (hint_cache.py).  All NULL when the
     -- swarm was started without --hint-cache, which is not the same fact as a
-    -- measured zero.  hint_lookups counts branches asked about, hint_hits the
-    -- ones the artifact named a word for; accepted/rejected split the hits by
-    -- whether that word was in the candidate pool, and hint_winners counts the
-    -- accepted hints that went on to win their branch on recomputed evidence.
-    hint_lookups       INTEGER,
-    hint_hits          INTEGER,
-    hint_accepted      INTEGER,
-    hint_rejected      INTEGER,
-    hint_winners       INTEGER
+    -- measured zero.  The first four count LOOKUPS, from both hint sites: a
+    -- cooperative branch is looked up once per worker that computes its
+    -- packing order, so they measure coverage (hits/lookups) and legality
+    -- (accepted/hits), never branches.  The inline pair is the separate,
+    -- same-population count of hints placed at the front of an inline solver
+    -- frame and the ones that won it — a cooperative branch's win is recorded
+    -- once, per branch, in branch_finalize_log.hint_was_winner instead.
+    hint_lookups           INTEGER,
+    hint_hits              INTEGER,
+    hint_accepted          INTEGER,
+    hint_rejected          INTEGER,
+    hint_inline_placements INTEGER,
+    hint_inline_wins       INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS run_meta (
@@ -1633,7 +1637,8 @@ class ERDQueue:
             "hint_hits": "INTEGER",
             "hint_accepted": "INTEGER",
             "hint_rejected": "INTEGER",
-            "hint_winners": "INTEGER",
+            "hint_inline_placements": "INTEGER",
+            "hint_inline_wins": "INTEGER",
         })
         self._add_columns("active_branches", {
             "first_best_at": "INTEGER",
@@ -2340,7 +2345,8 @@ class ERDQueue:
                   cur_path=None, cur_help_depth=0, source_work_id=None,
                   scheduling_role=None,
                   hint_lookups=None, hint_hits=None, hint_accepted=None,
-                  hint_rejected=None, hint_winners=None):
+                  hint_rejected=None, hint_inline_placements=None,
+                  hint_inline_wins=None):
         if scheduling_role is not None and scheduling_role not in SCHEDULING_ROLES:
             raise ValueError(f"unknown scheduling_role {scheduling_role!r}: "
                              f"expected one of {SCHEDULING_ROLES}")
@@ -2356,9 +2362,9 @@ class ERDQueue:
                  cur_max_depth, cur_nodes, node_rate, cur_path, cur_help_depth,
                  source_work_id, scheduling_role,
                  hint_lookups, hint_hits, hint_accepted, hint_rejected,
-                 hint_winners)
+                 hint_inline_placements, hint_inline_wins)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?)
+                    ?, ?, ?, ?, ?, ?)
         """, (worker_id, pid, current_branch_id, n_words, started_at,
               now, claims_done, claim_idx, claim_started_at,
               cand_rate, cache_hits, cache_misses, n_cutoff, n_pruned, n_ok,
@@ -2366,7 +2372,7 @@ class ERDQueue:
               cur_max_depth, cur_nodes, node_rate, cur_path, cur_help_depth,
               source_work_id, scheduling_role,
               hint_lookups, hint_hits, hint_accepted, hint_rejected,
-              hint_winners))
+              hint_inline_placements, hint_inline_wins))
         # Attributed so a heartbeat write storm is visible in the WAL report: an
         # unthrottled per-candidate heartbeat is a full-page WAL frame each and
         # otherwise hides here, uncategorised.

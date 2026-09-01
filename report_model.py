@@ -668,12 +668,16 @@ def _normalize_worker(row, generated_at, answer_set):
         "cache_miss_count": _row_value(row, "cache_misses", 0),
         # Hint-artifact accounting, kept apart from the cache counts above: a
         # hint is an ordering suggestion, never a cache hit.  None throughout
-        # on a run with no hint artifact.
+        # on a run with no hint artifact.  The first four count lookups from
+        # both hint sites; the inline pair is the separate same-population
+        # count a win rate may be taken from (see erd_queue's
+        # worker_heartbeat schema).
         "hint_lookup_count": _row_value(row, "hint_lookups"),
         "hint_hit_count": _row_value(row, "hint_hits"),
         "hint_accepted_count": _row_value(row, "hint_accepted"),
         "hint_rejected_count": _row_value(row, "hint_rejected"),
-        "hint_winner_count": _row_value(row, "hint_winners"),
+        "hint_inline_placement_count": _row_value(row, "hint_inline_placements"),
+        "hint_inline_win_count": _row_value(row, "hint_inline_wins"),
         "solved_evaluation_count": _row_value(row, "n_ok", 0),
         "erd_cutoff_evaluation_count": _row_value(row, "n_cutoff", 0),
         "remaining_depth_pruned_evaluation_count": _row_value(row, "n_pruned", 0),
@@ -815,7 +819,8 @@ def _empty_data():
             "hint_hit_count": 0,
             "hint_accepted_count": 0,
             "hint_rejected_count": 0,
-            "hint_winner_count": 0,
+            "hint_inline_placement_count": 0,
+            "hint_inline_win_count": 0,
         },
         "branches": [],
         "recently_completed_branches": [],

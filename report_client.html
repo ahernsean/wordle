@@ -1436,7 +1436,7 @@
       // cache hit.  Absent entirely on a run with no hint artifact, where
       // every hint counter is null rather than a measured zero.
       if(worker.hint_lookup_count!==null&&worker.hint_lookup_count!==undefined){
-        const hints=[["lookups",worker.hint_lookup_count],["named a word",worker.hint_hit_count],["accepted",worker.hint_accepted_count],["rejected",worker.hint_rejected_count],["won their branch",worker.hint_winner_count]];
+        const hints=[["lookups",worker.hint_lookup_count],["named a word",worker.hint_hit_count],["legal in the pool",worker.hint_accepted_count],["rejected",worker.hint_rejected_count],["inline placements",worker.hint_inline_placement_count],["inline wins",worker.hint_inline_win_count]];
         fragment.append(section("Hint cache (candidate order only)",labeledFacts(hints)));
       }
       return fragment;

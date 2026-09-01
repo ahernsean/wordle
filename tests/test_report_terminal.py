@@ -73,7 +73,8 @@ def overview_report():
                 "hint_hit_count": 0,
                 "hint_accepted_count": 0,
                 "hint_rejected_count": 0,
-                "hint_winner_count": 0,
+                "hint_inline_placement_count": 0,
+                "hint_inline_win_count": 0,
             },
             "branches": [{
                 "branch_reference": "0123456789ab",

@@ -183,13 +183,35 @@ The artifact is opened `mode=ro&immutable=1`, which is stricter than
 sidecar.  `immutable=1` in exchange ignores an uncheckpointed WAL, so the open
 refuses a nonempty `-wal` instead of silently reading a stale snapshot.
 
-The hint is applied at two levels and they use different scopes.
-`wordle_engine._hint_first` runs inside the recursion, where the budget is in
-hand, and prefers the exact-budget historical row over the unrestricted one.
-`_BranchWorker._hint_first_in_order` runs on the swarm's branch packing order,
-which `claim_next_bundle` indexes with a shared cursor, so it must be a
-function of the branch alone and uses the unrestricted scope only.  Both are
-ordering; neither can change an optimum.
+The hint is applied at two levels, and both ask at the branch's own budget so
+the artifact's budget-specific rows are not passed over.
+`wordle_engine._hint_first` runs inside the recursion, on the budget the frame
+is solving at.  `_BranchWorker._hint_first_in_order` runs on the swarm's branch
+packing order, on `active_branches.budget` — written once by `create_branch`,
+never updated, and refused to a joiner at a different budget, which is what
+keeps `claim_next_bundle`'s shared `pack_cursor` indexing one stable order.
+`_packing_stats_cache` is keyed by `(branch_key, budget)` for the same reason:
+a finalized branch can be re-created at another budget, and the order left
+behind describes the old one.  Both sites are ordering; neither can change an
+optimum.
+
+**The hint must reach every frame, not just the entry one.**
+`_solve_subset` passes `hint_cache` to `evaluate_candidate` in its candidate
+loop as well as forwarding it into the sub-branch recursion.  Dropping either
+leaves deeper frames unhinted while every result assertion still passes, so
+`test_descendant_frames_get_their_own_ordering_hints` asserts on the branch
+sizes actually looked up.
+
+**Hint counters come in two populations and must not be mixed.**
+`hint_lookups`/`hint_hits`/`hint_accepted`/`hint_rejected` count *lookups* from
+both sites — a cooperative branch is looked up once per worker that computes
+its packing order — so they give coverage and legality rates, never branch
+counts.  `hint_inline_placements`/`hint_inline_wins` are the separate
+same-population pair: one worker owns an inline `_solve_subset` frame from
+placement to winner, so their ratio is meaningful.  A cooperative branch's
+winner is decided once, at finalize, and is recorded per branch in
+`branch_finalize_log.hint_was_winner` — never added to a process counter that
+several workers each contributed placements to.
 
 ### Completed work has two records, and they can disagree
 

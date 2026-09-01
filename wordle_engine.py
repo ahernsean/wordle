@@ -1675,7 +1675,7 @@ def _hint_first(hint_cache, branch_key, policy, budget,
     except ValueError:
         hint_cache.note_rejected()
         return candidate_list, candidate_cost_lower_bounds, None
-    hint_cache.note_accepted()
+    hint_cache.note_accepted_in_frame()
     if position == 0:
         return candidate_list, candidate_cost_lower_bounds, hinted
     reordered = [candidate_list[position]]
@@ -1885,6 +1885,7 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
                 pattern_matrix=pattern_matrix,
                 branch_indices=branch_indices,
                 branch_floor_table=branch_floor_table,
+                hint_cache=hint_cache,
             )
         if status in _ABORT_STATUSES:
             return status
@@ -1926,7 +1927,7 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
         return (OVER_DEPTH_BUDGET, float('inf'), None, True)
 
     if hinted_candidate is not None and best_guess == hinted_candidate:
-        hint_cache.note_winner()
+        hint_cache.note_inline_win()
 
     if score_cache:
         # Untainted (floor never fired) => unconstrained optimum, reusable at

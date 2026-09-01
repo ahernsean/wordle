@@ -94,16 +94,29 @@ class HintCache:
         self._refuse_unless_immutable_snapshot()
         self._conn = self._open_immutable()
         self._memo = LRUDict(max_size=memo_entries)
-        # Hint accounting, all per-process and all ordinary metrics.  lookups
-        # counts questions asked, hits the ones the artifact could answer;
-        # accepted/rejected split the hits by whether the named word was legal
-        # in the caller's candidate pool, and winners counts the accepted hints
-        # that went on to win their branch on recomputed evidence.
+        # Hint accounting, all per-process and all ordinary metrics.
+        #
+        # lookups/hits/accepted/rejected count LOOKUPS, from both hint sites.
+        # A cooperative branch is looked up once by each worker that computes
+        # its packing order, so these are not branch counts; what they measure
+        # is coverage (hits/lookups: did the artifact name a word) and legality
+        # (accepted/hits: was that word in the pool), and both ratios are
+        # internally consistent because accepted + rejected == hits.
+        #
+        # The inline pair is a different, smaller population and is kept apart
+        # for that reason: one worker owns a whole inline _solve_subset frame
+        # from placement to winner, so inline_wins / inline_placements is a
+        # like-for-like rate.  There is deliberately no swarm-branch winner
+        # counter — a cooperative branch's winner is decided once, at finalize,
+        # by whichever worker wins it, and is recorded per branch in
+        # branch_finalize_log.hint_was_winner rather than added to a
+        # per-process counter several workers would each contribute to.
         self.lookups = 0
         self.hits = 0
         self.accepted = 0
         self.rejected = 0
-        self.winners = 0
+        self.inline_placements = 0
+        self.inline_wins = 0
         self.namespace_branch_count = self._inspect_answer_list_namespace()
 
     def _refuse_live_cache(self, live_path):
@@ -251,17 +264,32 @@ class HintCache:
             return row["best_guess"]
         return None
 
-    def note_accepted(self):
-        """A hinted word was legal in the candidate pool and moved to front."""
+    def note_accepted_for_branch_order(self):
+        """A hinted word led a swarm branch's packing order.
+
+        Counted as an acceptance only.  Whether it went on to win the branch
+        is settled at finalize, once, by one worker, and belongs on that
+        branch's finalize row — not in a per-process counter every worker on
+        the branch would contribute to independently.
+        """
         self.accepted += 1
+
+    def note_accepted_in_frame(self):
+        """A hinted word led an inline solver frame's candidate list.
+
+        Counted twice on purpose: once as an acceptance alongside the swarm's,
+        and once in the inline population whose wins this process also sees.
+        """
+        self.accepted += 1
+        self.inline_placements += 1
 
     def note_rejected(self):
         """A hinted word was absent from the candidate pool and ignored."""
         self.rejected += 1
 
-    def note_winner(self):
-        """An accepted hint won its branch on recomputed evidence."""
-        self.winners += 1
+    def note_inline_win(self):
+        """An inline placement won its frame on recomputed evidence."""
+        self.inline_wins += 1
 
     def stats(self):
         """Hint accounting for this process, for logs and heartbeats."""
@@ -270,7 +298,8 @@ class HintCache:
             "hint_hits": self.hits,
             "hint_accepted": self.accepted,
             "hint_rejected": self.rejected,
-            "hint_winners": self.winners,
+            "hint_inline_placements": self.inline_placements,
+            "hint_inline_wins": self.inline_wins,
         }
 
     def close(self):
@@ -284,4 +313,3 @@ class HintCache:
             self.close()
         except sqlite3.Error:  # pragma: no cover — interpreter teardown
             pass
-

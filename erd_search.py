@@ -1048,17 +1048,21 @@ def _enforce_wal_hard_ceiling(queue, procs) -> bool:
 
 
 def cmd_run(args):
+    # First, before anything opens --cache: the two paths might be the same
+    # file, and every operation below writes to --cache.  Checkpointing it and
+    # running its migrations would rewrite the quarantined artifact — new
+    # tables, moved rows, a changed mtime — and only then reach a refusal that
+    # can no longer undo any of it.  Proving the artifact here also keeps a
+    # refusal from being raised independently by every worker, which the
+    # supervisor would respawn forever.
+    if not _hint_cache_is_usable(args):
+        return
     _checkpoint_cache_on_start(args.cache)
     # Apply any pending ScoreCache schema migrations single-threaded now, before
     # the worker processes open the cache concurrently — concurrent first-open
     # would race on ALTER TABLE ADD COLUMN ("duplicate column name").
     ScoreCache(args.cache, load_word_list(ANSWER_FILE),
                checkpoint_on_close=False).close()
-    # Prove the hint artifact here, in the supervisor, before any worker forks:
-    # every worker would otherwise raise the same refusal independently and the
-    # supervisor would respawn them forever.
-    if not _hint_cache_is_usable(args):
-        return
     queue = ERDQueue(args.queue)
     latch = queue.disk_stop()
     if latch is not None:

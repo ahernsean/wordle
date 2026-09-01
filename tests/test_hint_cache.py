@@ -314,13 +314,13 @@ class CandidateOrderTest(_HintCacheTest):
         hint = self.hints(self.write_history([(ANSWERS, "flesh", 9.0, 6, None)]))
         self.assertAlmostEqual(self.solve(self.live(), hint_cache=hint),
                                TRUE_ROOT_ERD)
-        self.assertEqual(hint.winners, 1)
+        self.assertEqual(hint.inline_wins, 1)
 
     def test_a_losing_hint_is_not_recorded_as_a_winner(self):
         hint = self.hints(self.write_history([(ANSWERS, "bumpy", 3.0, 4, None)]))
         self.solve(self.live(), hint_cache=hint)
         self.assertEqual(hint.accepted, 1)
-        self.assertEqual(hint.winners, 0)
+        self.assertEqual(hint.inline_wins, 0)
 
 
 class ScopePreferenceTest(_HintCacheTest):
@@ -342,13 +342,18 @@ class ScopePreferenceTest(_HintCacheTest):
         hint = self.hints(self.write_history([(ANSWERS, "clomp", 3.0, 4, None)]))
         key = ScoreCache.encode_subset(ANSWERS)
         hint.hint_candidate(key, ERD_ALL, None)
-        hint.note_accepted()
-        hint.note_winner()
+        # One acceptance from each site: the swarm's counts only as an
+        # acceptance, the engine's also enters the inline population whose
+        # wins this process sees.
+        hint.note_accepted_for_branch_order()
+        hint.note_accepted_in_frame()
+        hint.note_inline_win()
         hint.note_rejected()
 
         self.assertEqual(hint.stats(), {
-            "hint_lookups": 1, "hint_hits": 1, "hint_accepted": 1,
-            "hint_rejected": 1, "hint_winners": 1})
+            "hint_lookups": 1, "hint_hits": 1, "hint_accepted": 2,
+            "hint_rejected": 1, "hint_inline_placements": 1,
+            "hint_inline_wins": 1})
 
     def test_a_non_counting_read_leaves_the_lookup_rate_alone(self):
         hint = self.hints(self.write_history([(ANSWERS, "clomp", 3.0, 4, None)]))
@@ -757,7 +762,7 @@ class SwarmCandidateOrderTest(_HintCacheTest):
         natural = list(range(len(GUESSES)))
 
         reordered = worker._hint_first_in_order(
-            ScoreCache.encode_subset(ANSWERS), list(natural))
+            ScoreCache.encode_subset(ANSWERS), list(natural), ROOT_BUDGET)
 
         self.assertEqual(reordered[0], GUESSES.index("bumpy"))
         self.assertNotEqual(natural[0], GUESSES.index("bumpy"))
@@ -773,7 +778,7 @@ class SwarmCandidateOrderTest(_HintCacheTest):
 
         self.assertEqual(
             worker._hint_first_in_order(ScoreCache.encode_subset(ANSWERS),
-                                        list(order)),
+                                        list(order), ROOT_BUDGET),
             order)
 
     def test_a_word_outside_the_guess_vocabulary_leaves_the_order_alone(self):
@@ -783,7 +788,7 @@ class SwarmCandidateOrderTest(_HintCacheTest):
 
         self.assertEqual(
             worker._hint_first_in_order(ScoreCache.encode_subset(ANSWERS),
-                                        list(natural)),
+                                        list(natural), ROOT_BUDGET),
             natural)
         self.assertEqual(hint.rejected, 1)
 
@@ -792,7 +797,7 @@ class SwarmCandidateOrderTest(_HintCacheTest):
         natural = list(range(len(GUESSES)))
         self.assertEqual(
             worker._hint_first_in_order(ScoreCache.encode_subset(ANSWERS),
-                                        list(natural)),
+                                        list(natural), ROOT_BUDGET),
             natural)
 
     def test_the_finalize_outcome_names_the_hint_and_whether_it_won(self):
@@ -890,11 +895,13 @@ class TelemetryColumnTest(_HintCacheTest):
         queue = self.queue()
         queue.heartbeat("worker-0", 1234, None, None, 0, 0,
                         hint_lookups=9, hint_hits=7, hint_accepted=6,
-                        hint_rejected=1, hint_winners=2)
+                        hint_rejected=1, hint_inline_placements=4,
+                        hint_inline_wins=2)
         row = queue._conn.execute(
             "SELECT hint_lookups, hint_hits, hint_accepted, hint_rejected, "
-            "hint_winners FROM worker_heartbeat").fetchone()
-        self.assertEqual(tuple(row), (9, 7, 6, 1, 2))
+            "hint_inline_placements, hint_inline_wins "
+            "FROM worker_heartbeat").fetchone()
+        self.assertEqual(tuple(row), (9, 7, 6, 1, 4, 2))
 
     def test_a_heartbeat_without_hints_leaves_the_counters_null(self):
         queue = self.queue()
@@ -921,11 +928,16 @@ class HintReportingTest(unittest.TestCase):
         output = render_report(self._report(
             hint_lookup_count=1000, hint_hit_count=800,
             hint_accepted_count=750, hint_rejected_count=50,
-            hint_winner_count=600), width=100)
+            hint_inline_placement_count=400,
+            hint_inline_win_count=300), width=100)
 
         self.assertIn("Hints (ordering only):", output)
         self.assertIn("lookups 1,000", output)
-        self.assertIn("won 80.0%", output)
+        # "named" and "legal" are rates over lookups; the win rate is taken
+        # only over inline placements, whose wins the same counter sees.
+        self.assertIn("named 80.0%", output)
+        self.assertIn("legal 93.8%", output)
+        self.assertIn("inline won 75.0%", output)
         # The live cache's own counts keep their own line and their own
         # meaning: a hint is not a cache hit.
         cache_line = next(line for line in output.splitlines()
@@ -937,15 +949,17 @@ class HintReportingTest(unittest.TestCase):
             {"worker_id": "worker-0", "pid": 7, "updated_at": 100,
              "cache_hits": 5, "cache_misses": 2,
              "hint_lookups": 9, "hint_hits": 7, "hint_accepted": 6,
-             "hint_rejected": 1, "hint_winners": 2},
+             "hint_rejected": 1, "hint_inline_placements": 4,
+             "hint_inline_wins": 2},
             generated_at=100, answer_set=set(ANSWERS))
 
         self.assertEqual(worker["cache_hit_count"], 5)
         self.assertEqual(
             (worker["hint_lookup_count"], worker["hint_hit_count"],
              worker["hint_accepted_count"], worker["hint_rejected_count"],
-             worker["hint_winner_count"]),
-            (9, 7, 6, 1, 2))
+             worker["hint_inline_placement_count"],
+             worker["hint_inline_win_count"]),
+            (9, 7, 6, 1, 4, 2))
 
     def test_a_worker_with_no_artifact_reports_no_hint_measurement(self):
         """None, not zero: the worker did not measure zero hints, it had no
@@ -955,6 +969,251 @@ class HintReportingTest(unittest.TestCase):
             generated_at=100, answer_set=set(ANSWERS))
         self.assertIsNone(worker["hint_lookup_count"])
         self.assertEqual(worker["cache_hit_count"], 0)
+
+
+class RecursiveHintDepthTest(_HintCacheTest):
+    """The hint reaches every frame the search recurses into, not just the root."""
+
+    def _branch_sizes_looked_up(self, hint):
+        """Answer-set sizes the search asked the artifact about."""
+        sizes = []
+        real = hint.hint_candidate
+
+        def recording(branch_key, policy, budget, count_lookup=True):
+            if count_lookup:
+                sizes.append(len(branch_key) // 5)
+            return real(branch_key, policy, budget, count_lookup=count_lookup)
+
+        hint.hint_candidate = recording
+        with mock.patch("wordle_engine.ORDER_MIN_N", 2):
+            self.solve(self.live(), hint_cache=hint)
+        return sizes
+
+    def test_descendant_frames_get_their_own_ordering_hints(self):
+        """#304 requires recursively reached branches to be hinted too.
+
+        The failure this guards against is silent: forwarding the hint into
+        evaluate_candidate's own recursion but not into the candidate loop
+        that calls it leaves the root the only branch ever asked about, and
+        every result assertion still passes.
+        """
+        sizes = self._branch_sizes_looked_up(
+            self.hints(self.write_history([])))
+
+        self.assertIn(len(ANSWERS), sizes)
+        deeper = sorted({size for size in sizes if size < len(ANSWERS)})
+        self.assertTrue(
+            deeper, f"only the root was looked up; sizes seen: {sorted(set(sizes))}")
+        # More than one level below the root, so a hint that reached children
+        # but not grandchildren is caught as well.
+        self.assertGreater(len(deeper), 1, f"only one depth below the root: {deeper}")
+
+
+class BudgetScopedPackingHintTest(_HintCacheTest):
+    """A branch the artifact covers only at a budget still gets its hint.
+
+    The quarantined file holds tens of thousands of budget-specific rows, so a
+    packing order that asked only the unrestricted table would pass over every
+    branch represented by one.
+    """
+
+    def _worker(self, hint_cache):
+        worker = erd_swarm._BranchWorker.__new__(erd_swarm._BranchWorker)
+        worker.hint_cache = hint_cache
+        worker.all_words = tuple(GUESSES)
+        return worker
+
+    def test_a_budget_only_row_leads_the_packing_order(self):
+        hint = self.hints(self.write_history(
+            [(ANSWERS, "bumpy", 3.0, 4, ROOT_BUDGET)]))
+        worker = self._worker(hint)
+        key = ScoreCache.encode_subset(ANSWERS)
+        natural = list(range(len(GUESSES)))
+
+        at_budget = worker._hint_first_in_order(key, list(natural), ROOT_BUDGET)
+        self.assertEqual(at_budget[0], GUESSES.index("bumpy"))
+        self.assertEqual(sorted(at_budget), natural)
+
+        # Non-vacuous: the unrestricted scope — what the packing order used to
+        # ask for — has nothing to say about this branch, so a build that
+        # dropped the budget leaves the order untouched.
+        self.assertEqual(
+            worker._hint_first_in_order(key, list(natural), None), natural)
+
+    def test_the_branch_budget_selects_between_two_historical_scopes(self):
+        hint = self.hints(self.write_history([
+            (ANSWERS, "clomp", 3.0, 4, None),
+            (ANSWERS, "bumpy", 3.0, 4, ROOT_BUDGET),
+        ]))
+        worker = self._worker(hint)
+        key = ScoreCache.encode_subset(ANSWERS)
+        natural = list(range(len(GUESSES)))
+
+        self.assertEqual(
+            worker._hint_first_in_order(key, list(natural), ROOT_BUDGET)[0],
+            GUESSES.index("bumpy"))
+        self.assertEqual(
+            worker._hint_first_in_order(key, list(natural), ROOT_BUDGET - 1)[0],
+            GUESSES.index("clomp"))
+
+    def test_a_packing_order_is_cached_per_branch_and_budget(self):
+        """A branch re-created at another budget must not inherit the order
+        computed for the one it was finalized at."""
+        hint = self.hints(self.write_history([
+            (ANSWERS, "clomp", 3.0, 4, None),
+            (ANSWERS, "bumpy", 3.0, 4, ROOT_BUDGET),
+        ]))
+        worker = self._worker(hint)
+        worker._packing_stats_cache = {}
+        worker.n_candidates = len(GUESSES)
+        worker.pattern_matrix = _FlatCandidateStats(len(GUESSES))
+        key = ScoreCache.encode_subset(ANSWERS)
+
+        at_budget, _ = worker._packing_stats(key, ANSWERS, ROOT_BUDGET)
+        unrestricted, _ = worker._packing_stats(key, ANSWERS, ROOT_BUDGET - 1)
+
+        self.assertEqual(at_budget[0], GUESSES.index("bumpy"))
+        self.assertEqual(unrestricted[0], GUESSES.index("clomp"))
+        self.assertEqual(len(worker._packing_stats_cache), 2)
+
+
+class _FlatCandidateStats:
+    """PatternMatrix stand-in giving every candidate the same ordering key.
+
+    With no Σk² signal the natural index order survives sorting, so a test can
+    attribute any change in the packing order to the hint alone.
+    """
+
+    def __init__(self, n_candidates):
+        self._n = n_candidates
+
+    def answer_indices(self, words):
+        return list(range(len(words)))
+
+    def candidate_stats(self, branch_indices):
+        return types.SimpleNamespace(
+            sum_squared_group_sizes=[0] * self._n,
+            cost_lower_bound=[0.0] * self._n)
+
+
+class HintPopulationTest(_HintCacheTest):
+    """The displayed win rate compares like with like."""
+
+    def _worker(self, hint_cache):
+        worker = erd_swarm._BranchWorker.__new__(erd_swarm._BranchWorker)
+        worker.hint_cache = hint_cache
+        worker.all_words = tuple(GUESSES)
+        return worker
+
+    def test_a_branch_order_acceptance_stays_out_of_the_inline_population(self):
+        """Several workers each place the same cooperative branch's hint, and
+        only one of them finalizes it.  Counting those placements in the
+        inline denominator would report a win rate diluted by branches whose
+        winner this process never sees."""
+        hint = self.hints(self.write_history([(ANSWERS, "bumpy", 3.0, 4, None)]))
+        key = ScoreCache.encode_subset(ANSWERS)
+        natural = list(range(len(GUESSES)))
+        for _ in range(3):
+            self._worker(hint)._hint_first_in_order(key, list(natural), None)
+
+        self.assertEqual(hint.accepted, 3)
+        self.assertEqual(hint.inline_placements, 0)
+        self.assertEqual(hint.inline_wins, 0)
+
+    def test_an_inline_placement_counts_in_both(self):
+        hint = self.hints(self.write_history([(ANSWERS, "flesh", 9.0, 6, None)]))
+        self.solve(self.live(), hint_cache=hint)
+
+        self.assertEqual(hint.accepted, 1)
+        self.assertEqual(hint.inline_placements, 1)
+        self.assertEqual(hint.inline_wins, 1)
+
+
+class SupervisorLeavesTheArtifactAloneTest(_HintCacheTest):
+    """cmd_run must refuse a same-file configuration before writing anything.
+
+    Every step of startup writes to --cache: a WAL checkpoint, then a
+    ScoreCache open that runs the schema migrations.  If the operator names one
+    file for both flags, doing any of that first rewrites the quarantined
+    artifact — new tables, its budget rows moved, a changed mtime — and the
+    refusal that follows can no longer undo it.  So these assert on the file,
+    not on the message.
+    """
+
+    def _args(self, cache_path, hint_path):
+        return types.SimpleNamespace(
+            cache=cache_path, hint_cache=hint_path,
+            queue=os.path.join(self._dir, "q.sqlite3"), workers=1)
+
+    def _fingerprint(self, path):
+        """Everything a startup write would disturb: bytes, timestamp, and
+        the schema the migration would have added to."""
+        stat = os.stat(path)
+        conn = sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True)
+        try:
+            tables = sorted(
+                row[0] for row in
+                conn.execute("SELECT name FROM sqlite_master WHERE type='table'"))
+            rows = conn.execute(
+                "SELECT COUNT(*) FROM branch_best_by_policy "
+                "WHERE solve_budget IS NOT NULL").fetchone()[0]
+        finally:
+            conn.close()
+        return (stat.st_size, stat.st_mtime_ns, tables, rows,
+                sorted(os.listdir(os.path.dirname(path))))
+
+    def _assert_refused_without_touching(self, artifact, args):
+        before = self._fingerprint(artifact)
+        with mock.patch.object(erd_search, "_spawn_worker") as spawn, \
+                mock.patch.object(erd_search, "_checkpoint_cache_on_start") as ckpt, \
+                redirect_stderr(StringIO()) as err:
+            erd_search.cmd_run(args)
+        spawn.assert_not_called()
+        # The checkpoint is the first thing that would have written; proving it
+        # was never reached is what makes this a guard on ordering rather than
+        # on the artifact happening to survive.
+        ckpt.assert_not_called()
+        self.assertIn("Refusing to start", err.getvalue())
+        self.assertEqual(self._fingerprint(artifact), before)
+
+    def test_the_same_path_for_both_flags_is_refused_before_any_write(self):
+        artifact = _build_pre_split_cache(
+            os.path.join(self.hint_dir, "presplit.sqlite3"), ANSWERS)
+        self._assert_refused_without_touching(
+            artifact, self._args(artifact, artifact))
+
+    def test_a_symlinked_live_cache_is_refused_before_any_write(self):
+        artifact = _build_pre_split_cache(
+            os.path.join(self.hint_dir, "presplit.sqlite3"), ANSWERS)
+        alias = os.path.join(self._dir, "live_alias.sqlite3")
+        os.symlink(artifact, alias)
+        self._assert_refused_without_touching(
+            artifact, self._args(alias, artifact))
+
+    def test_a_hard_linked_live_cache_is_refused_before_any_write(self):
+        artifact = _build_pre_split_cache(
+            os.path.join(self.hint_dir, "presplit.sqlite3"), ANSWERS)
+        alias = os.path.join(self._dir, "live_hardlink.sqlite3")
+        os.link(artifact, alias)
+        self._assert_refused_without_touching(
+            artifact, self._args(alias, artifact))
+
+    def test_opening_a_pre_split_cache_writably_is_what_this_prevents(self):
+        """The pairing that makes the tests above non-vacuous.
+
+        A writable open of the same fixture migrates it, so "unchanged" is a
+        fact about ordering, not about a file that was never at risk.
+        """
+        artifact = _build_pre_split_cache(
+            os.path.join(self.hint_dir, "presplit.sqlite3"), ANSWERS)
+        before = self._fingerprint(artifact)
+
+        ScoreCache(artifact, ANSWERS).close()
+
+        after = self._fingerprint(artifact)
+        self.assertNotEqual(after, before)
+        self.assertIn("branch_best_by_policy_and_budget", after[2])
+        self.assertNotIn("branch_best_by_policy_and_budget", before[2])
 
 
 if __name__ == "__main__":
