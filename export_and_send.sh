@@ -82,7 +82,9 @@ start_taildrop_relay() {
     if [ -n "${TAILSCALE_AUTHKEY:-}" ]; then
         podman_args+=(--env "TS_AUTHKEY=$TAILSCALE_AUTHKEY")
     fi
-    podman volume create "$taildrop_state_volume" >/dev/null
+    if ! podman volume inspect "$taildrop_state_volume" >/dev/null 2>&1; then
+        podman volume create "$taildrop_state_volume" >/dev/null
+    fi
     podman_args+=("$taildrop_image")
     podman "${podman_args[@]}" >/dev/null
     taildrop_started=true

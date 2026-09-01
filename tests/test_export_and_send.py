@@ -31,10 +31,13 @@ class TestExportAndSend(unittest.TestCase):
         self._write_fake("podman", """\
             #!/usr/bin/env bash
             printf '%s\\n' "$*" >> "$PODMAN_LOG"
-            case "$1" in
-                volume) exit 0 ;;
-                run) echo relay-container ;;
-                exec)
+            case "$1:$2" in
+                volume:inspect)
+                    [[ "${PODMAN_STATE_VOLUME_EXISTS:-}" == 1 ]]
+                    ;;
+                volume:create) exit 0 ;;
+                run:*) echo relay-container ;;
+                exec:*)
                     if [[ "$*" == *"tailscale status --json"* ]]; then
                         echo '{"BackendState":"Running"}'
                     elif [[ "$*" == *"tailscale file cp"* ]] && \\
@@ -43,7 +46,7 @@ class TestExportAndSend(unittest.TestCase):
                         exit 42
                     fi
                     ;;
-                cp|rm) exit 0 ;;
+                cp:*|rm:*) exit 0 ;;
                 *) exit 1 ;;
             esac
         """)
@@ -83,6 +86,14 @@ class TestExportAndSend(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         commands = self.log_path.read_text()
         self.assertNotIn("TS_AUTHKEY=", commands)
+
+    def test_reuses_an_existing_relay_state_volume(self):
+        result = self._run(PODMAN_STATE_VOLUME_EXISTS="1")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        commands = self.log_path.read_text()
+        self.assertIn("volume inspect wordle-taildrop-state", commands)
+        self.assertNotIn("volume create wordle-taildrop-state", commands)
 
     def test_keeps_export_and_explains_how_to_retry_after_transfer_failure(self):
         result = self._run(PODMAN_TRANSFER_FAIL="1")
