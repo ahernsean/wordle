@@ -1464,7 +1464,7 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
                    subbranch_solver=None, bound_provider=None,
                    mid_loop_publisher=None, metric_observer=None,
                    pattern_matrix=None, branch_indices=None,
-                   branch_floor_table=None):
+                   branch_floor_table=None, hint_cache=None):
     """Evaluate one `candidate`'s exact ERD for solving `branch_words`.
 
     This is the body of the top-level candidate loop, extracted so a parallel
@@ -1624,7 +1624,7 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
             subbranch_solver, ceiling=sub_ceiling,
             entry_guess=candidate, entry_pattern=pattern_code,
             mid_loop_publisher=mid_loop_publisher, pattern_matrix=pattern_matrix,
-            branch_floor_table=branch_floor_table)
+            branch_floor_table=branch_floor_table, hint_cache=hint_cache)
         if sub in _ABORT_STATUSES:
             return (sub, None, None, False)
         sub_status, sub_cost, sub_max_remaining_depth, sub_budget_tainted = sub
@@ -1648,12 +1648,54 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
     return (SOLVED, cost, cand_max_remaining_depth, floor)
 
 
+def _hint_first(hint_cache, branch_key, policy, budget,
+                candidate_list, candidate_cost_lower_bounds):
+    """Move the historical cache's word for this branch to the front.
+
+    Returns (candidate_list, candidate_cost_lower_bounds, hinted_candidate),
+    with hinted_candidate None whenever the order was left alone — no
+    historical row, or a word the caller's candidate pool does not contain.
+
+    Ordering only.  Nothing the hint cache holds about the branch's cost or
+    worst case is read here or anywhere else, so a wrong hint costs one
+    out-of-order evaluation and cannot change the optimum: the moved candidate
+    is evaluated by the same code, against the same live cache, as it would be
+    from any other position.
+
+    The lower-bound array is permuted alongside the list because the candidate
+    loop indexes the two together — a bound left behind would prune the wrong
+    candidate.  Both are rebuilt rather than mutated: candidate_list is often
+    the caller's shared guess vocabulary, which every branch reuses.
+    """
+    hinted = hint_cache.hint_candidate(branch_key, policy, budget)
+    if hinted is None:
+        return candidate_list, candidate_cost_lower_bounds, None
+    try:
+        position = candidate_list.index(hinted)
+    except ValueError:
+        hint_cache.note_rejected()
+        return candidate_list, candidate_cost_lower_bounds, None
+    hint_cache.note_accepted_in_frame()
+    if position == 0:
+        return candidate_list, candidate_cost_lower_bounds, hinted
+    reordered = [candidate_list[position]]
+    reordered.extend(candidate_list[:position])
+    reordered.extend(candidate_list[position + 1:])
+    bounds = candidate_cost_lower_bounds
+    if bounds is not None:
+        bounds = [bounds[position]]
+        bounds.extend(candidate_cost_lower_bounds[:position])
+        bounds.extend(candidate_cost_lower_bounds[position + 1:])
+    return reordered, bounds, hinted
+
+
 def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
                   policy, cancel_check, heartbeat, note_depth,
                   progress_callback, subbranch_solver=None,
                   branch_floor_table=None,
                   ceiling=float('inf'), entry_guess=None, entry_pattern=None,
-                  mid_loop_publisher=None, pattern_matrix=None):
+                  mid_loop_publisher=None, pattern_matrix=None,
+                  hint_cache=None):
     """Budget-aware core of min_expected_guesses.
 
     Returns (cost, max_depth, floor_hit, cutoff), or None on deadline/cancel
@@ -1675,6 +1717,12 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
 
     budget None = unlimited (legacy: floor never fires, max_depth None,
     results cached as unconstrained).
+
+    hint_cache, when supplied, names one word per branch from a quarantined
+    historical cache.  It reorders candidate_list and nothing else: the hinted
+    word is evaluated first, in full, against score_cache alone, and only that
+    recomputed result can seed best_erd.  score_cache remains the only source
+    of exact results, bounds, and losses.
     """
     n = len(branch_words)
     if heartbeat is not None:
@@ -1779,6 +1827,17 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
                     k * k for k in cache.group_counts(c, branch_words).values()),
             )
 
+    # Gated by ORDER_MIN_N for the same measured reason best-first ordering is:
+    # placing the hint costs one scan of the candidate vocabulary per node, and
+    # below this size the subtree it could reorder is too small to repay it.
+    hinted_candidate = None
+    if (hint_cache is not None and n >= ORDER_MIN_N
+            and len(candidate_list) > 1):
+        (candidate_list, candidate_cost_lower_bounds,
+         hinted_candidate) = _hint_first(
+            hint_cache, branch_key, policy, budget,
+            candidate_list, candidate_cost_lower_bounds)
+
     # Seed the bound with the alpha-beta ceiling: any candidate that can't beat
     # it is a cutoff, and if none can we report a cutoff (lower bound) rather
     # than a spurious optimum.
@@ -1826,6 +1885,7 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
                 pattern_matrix=pattern_matrix,
                 branch_indices=branch_indices,
                 branch_floor_table=branch_floor_table,
+                hint_cache=hint_cache,
             )
         if status in _ABORT_STATUSES:
             return status
@@ -1866,6 +1926,9 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
             score_cache.write_loss(branch_key, policy, budget)
         return (OVER_DEPTH_BUDGET, float('inf'), None, True)
 
+    if hinted_candidate is not None and best_guess == hinted_candidate:
+        hint_cache.note_inline_win()
+
     if score_cache:
         # Untainted (floor never fired) => unconstrained optimum, reusable at
         # any budget >= max_depth: solve_budget NULL.  Tainted => valid only at
@@ -1896,7 +1959,8 @@ def min_expected_guesses(branch_words, cache, score_cache,
                           cancel_check=None, heartbeat=None,
                           note_depth=None, budget=None,
                           subbranch_solver=None, mid_loop_publisher=None,
-                          pattern_matrix=None, branch_floor_table=None):
+                          pattern_matrix=None, branch_floor_table=None,
+                          hint_cache=None):
     """
     Exact expected guesses to solve branch_words, playing optimally.
 
@@ -1916,6 +1980,9 @@ def min_expected_guesses(branch_words, cache, score_cache,
              the whole solve; when supplied, best-first ordering and
              ERD-lower-bound pruning run vectorized instead of per-candidate
              Python scans. None (the default) keeps the pure-Python path.
+    hint_cache: optional HintCache (hint_cache.py) naming one historical
+             candidate per branch.  Ordering only — score_cache stays the sole
+             source of exact results and bounds.
 
     Returns the expected-guesses cost, or None if the deadline/cancel fired or
     (when budgeted) `branch_words` is unsolvable within budget.  Partial results
@@ -1945,7 +2012,8 @@ def min_expected_guesses(branch_words, cache, score_cache,
                         note_depth, progress_callback, subbranch_solver,
                         branch_floor_table=branch_floor_table,
                         mid_loop_publisher=mid_loop_publisher,
-                        pattern_matrix=pattern_matrix)
+                        pattern_matrix=pattern_matrix,
+                        hint_cache=hint_cache)
     if res in _ABORT_STATUSES:
         return None
     status, cost, _md, _budget_tainted = res

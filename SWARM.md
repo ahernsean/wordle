@@ -76,6 +76,7 @@ SIGTERM.  Useful flags:
 | `--workers N` | 6 | Number of worker processes |
 | `--recycle-hours H` | 3.0 | Restart each worker after H hours to bound per-worker memory growth |
 | `--worker-timeout-seconds S` | 30 | Declare a worker dead after S seconds without a heartbeat |
+| `--hint-cache PATH` | none | Read-only historical cache consulted for candidate order only — see [Hint cache](#hint-cache-ordering-from-a-quarantined-history) |
 
 ---
 
@@ -696,7 +697,94 @@ before merging any export into a migrated cache.
 **The quarantined cache is hints-only.**  Moving its rows under the new schema
 does not certify them: nothing in the migration re-derives a value or repairs
 an ancestor that folded a displaced one.  Treat that file as candidate-ordering
-hints and write clean exact results under the new schema.
+hints and write clean exact results under the new schema.  `--hint-cache` is
+the supported way to do that; see below.
+
+### Hint cache: ordering from a quarantined history
+
+A clean rebuild runs two databases at different trust levels.  `--cache` is the
+live cache: writable, authoritative, and holding only results this solver
+recomputed.  `--hint-cache` is the quarantined history: read-only, immutable,
+and able to influence one thing — which candidate a branch evaluates first.
+
+```bash
+python3.13 erd_search.py run --workers 6 \
+    --cache runtime/wordle_cache.sqlite3 \
+    --hint-cache runtime/wordle_cache_hints.sqlite3
+```
+
+What a historical row can do: name a word.  If that word is in the branch's
+candidate pool it is moved to the front of the evaluation order, evaluated in
+full against the live cache like any other candidate, and becomes the
+incumbent only on its own recomputed result.  If it is absent, or the artifact
+has no row for the branch, the ordinary best-first order stands.
+
+What a historical row cannot do: be returned as an exact hit, contribute a
+stored ERD or `max_remaining_depth` to a fold, seed an alpha-beta ceiling,
+prove a loss, satisfy queue admission, or reach an export.  `HintCache`'s
+queries select `best_guess` and nothing else, so no other value has a path out
+of the module.
+
+**The artifact must be a checkpointed snapshot.**  It is opened
+`mode=ro&immutable=1`, which is what keeps the run from touching even the
+`-shm` sidecar — a plain `mode=ro` open rejects writes but still updates WAL
+shared memory, so it is read-only without being observationally immutable.
+`immutable=1` also makes SQLite ignore an uncheckpointed WAL, so startup
+refuses a nonempty `-wal` or a hot `-journal` rather than serving a stale
+snapshot.  Checkpoint the file and archive its sidecars before pointing a run
+at it.
+
+Startup also refuses a path that does not exist, one that resolves onto the
+live cache (symlink and hard link included), a file with no branch results, and
+one whose answer-list namespace cannot be counted.  A named artifact the swarm
+cannot honour stops the run; it never degrades to a silent hintless one.
+
+**Under systemd the flag goes in the unit.**  `wordle-erd.service` hardcodes
+its `ExecStart` line, and `erd_search.py start` only asks systemd to start the
+service — it does not pass flags through.  Add `--hint-cache PATH` to
+`ExecStart` and `systemctl --user daemon-reload` before starting.  A hinted
+sweep is a deliberate rebuild mode, so the unit stays hintless by default.
+
+**Measuring whether hints pay.**  `view` shows a `Hints (ordering only):`
+line: `lookups`, `named` (the artifact had a row), and `legal` (that word was
+in the candidate pool) are rates over every lookup, from both hint sites.
+`inline placements` and `inline won` are a separate, narrower population —
+hints placed at the front of an inline solver frame, and the ones that won it.
+They are reported apart because a cooperative branch is looked up once per
+worker that computes its packing order, while its winner is decided once, at
+finalize, by whichever worker wins it; dividing one by the other would compare
+different populations.
+
+The cooperative half of that question is answered per branch instead:
+`telemetry.branch_finalize_log` carries `hint_word` and `hint_was_winner`, one
+row per finalized branch, so
+
+```sql
+SELECT AVG(hint_was_winner) FROM branch_finalize_log
+WHERE hint_was_winner IS NOT NULL;
+```
+
+is the branch-level hit rate.  The filter is load-bearing: a branch finalized
+as a cut or a proven loss has a `hint_word` but a NULL `hint_was_winner`,
+because no candidate won for the hint to have matched.  Counting those in the
+denominator would score every no-contest branch as a miss.  `hint_word IS NOT
+NULL AND hint_was_winner IS NULL` is its own useful population — hinted
+branches that reached no winner at all.  The same table's `first_best_at` and
+`nodes_at_first_best`, against `created_at`, are the cost of reaching any bound
+at all — which is what a good hint is supposed to remove.
+
+### Clean rebuild cutover
+
+1. Deploy the hint-aware code on Rocky and the phone before starting or
+   syncing any work.
+2. Checkpoint the quarantined cache, archive its `-wal`/`-shm` sidecars, and
+   leave it at an explicitly named hint path.  Nothing writes to it again.
+3. Start from empty live cache, queue, and telemetry databases under a new
+   epoch (`erd_search.py epoch set`, with the swarm stopped).
+4. Run a small pilot — one opener — and check that branches are recomputed
+   rather than returned, that the hint telemetry is populated, and that the
+   hint file's directory listing and mtime are unchanged.
+5. Resume the full sweep only after the pilot passes.
 
 ### Audit the max_depth column
 

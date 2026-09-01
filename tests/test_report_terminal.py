@@ -69,6 +69,12 @@ def overview_report():
                 "solved_evaluation_count": 40,
                 "erd_cutoff_evaluation_count": 50,
                 "remaining_depth_pruned_evaluation_count": 10,
+                "hint_lookup_count": 0,
+                "hint_hit_count": 0,
+                "hint_accepted_count": 0,
+                "hint_rejected_count": 0,
+                "hint_inline_placement_count": 0,
+                "hint_inline_win_count": 0,
             },
             "branches": [{
                 "branch_reference": "0123456789ab",

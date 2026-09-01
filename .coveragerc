@@ -1,8 +1,9 @@
 # Coverage configuration for the Wordle solver.
 #
-# Scope: application core (wordle.py, wordle_engine.py, cache_sqlite.py),
-# parallel ERD precache coordination (erd_swarm.py, erd_queue.py), and the
-# cache sync utilities (export_cache.py, import_cache.py).
+# Scope: application core (wordle.py, wordle_engine.py, cache_sqlite.py,
+# hint_cache.py), parallel ERD precache coordination (erd_swarm.py,
+# erd_queue.py), and the cache sync utilities (export_cache.py,
+# import_cache.py).
 # Out of scope: erd_search.py (supervisor/process-spawn/terminal CLI layer),
 # the verify_*.py re-verification and audit passes, and the one-off diagnostic
 # and dataset scripts.
@@ -17,6 +18,7 @@ source =
     wordle
     wordle_engine
     cache_sqlite
+    hint_cache
     erd_swarm
     erd_queue
     export_cache

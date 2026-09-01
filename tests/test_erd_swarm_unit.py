@@ -115,6 +115,8 @@ def _bare_worker():
     w.republish_limit = erd_swarm.BUNDLE_REPUBLISH_LIMIT
     w._packing_stats_cache = {}
     w.rcache = mock.MagicMock()
+    # No hint artifact: the default a run without --hint-cache produces.
+    w.hint_cache = None
     w.pattern_matrix = None
     w.branch_floor_table = None
     w.score_cache = mock.MagicMock()
@@ -2580,7 +2582,7 @@ class TestClaimBundleRetry(unittest.TestCase):
             side_effect=[erd_queue.CLAIM_RETRY, erd_queue.CLAIM_RETRY,
                         real_bundle])
 
-        result = w._claim_bundle(b"branch", 3, ["a", "b", "c"])
+        result = w._claim_bundle(b"branch", 3, ["a", "b", "c"], ROOT_BUDGET)
 
         self.assertEqual(result, real_bundle)
         self.assertEqual(w.queue.claim_next_bundle.call_count, 3)
@@ -2592,7 +2594,7 @@ class TestClaimBundleRetry(unittest.TestCase):
         w.queue.claim_next_bundle = mock.MagicMock(
             return_value=erd_queue.CLAIM_RETRY)
 
-        result = w._claim_bundle(b"branch", 3, ["a", "b", "c"])
+        result = w._claim_bundle(b"branch", 3, ["a", "b", "c"], ROOT_BUDGET)
 
         self.assertIsNone(result)
         self.assertEqual(w.queue.claim_next_bundle.call_count,
@@ -2604,7 +2606,7 @@ class TestClaimBundleRetry(unittest.TestCase):
             return_value=([0, 1, 2], [0.0, 0.0, 0.0]))
         w.queue.claim_next_bundle = mock.MagicMock(return_value=None)
 
-        result = w._claim_bundle(b"branch", 3, ["a", "b", "c"])
+        result = w._claim_bundle(b"branch", 3, ["a", "b", "c"], ROOT_BUDGET)
 
         self.assertIsNone(result)
         self.assertEqual(w.queue.claim_next_bundle.call_count, 1)
@@ -3303,6 +3305,8 @@ class TestFinalizeTelemetryFailureIsolation(unittest.TestCase):
             "infeasible_nodes": 0,
             "created_at": 100,
             "finalized_at": 200,
+            "first_best_at": 150,
+            "nodes_at_first_best": 40,
             "spine": "SALET -g-g-",
         }
         w.queue.finalize_bundle_stats.return_value = (None, None, None, None)
@@ -3313,13 +3317,20 @@ class TestFinalizeTelemetryFailureIsolation(unittest.TestCase):
         w.queue.add_branch_finalize_log.side_effect = RuntimeError(
             "no column named total_bundle_wall_millis")
         key = b"branch-key"
-        w._packing_stats_cache[key] = object()
+        # Real key shape: the packing order depends on the branch's budget, so
+        # a branch finalized at one budget must not leave an order behind for
+        # any budget it was cached under.  Another branch's entry is seeded too,
+        # so the sweep is shown to be selective rather than a clear().
+        other_key = b"other-branch-key"
+        w._packing_stats_cache[(key, 4)] = object()
+        w._packing_stats_cache[(key, 5)] = object()
+        w._packing_stats_cache[(other_key, 4)] = object()
         with mock.patch.object(erd_swarm, "cache_all_scores"):
             w.maybe_finalize(key, BRANCH, len(BRANCH))
         w.score_cache.write.assert_called_once()
         w.queue.mark_done.assert_called_once_with(key)
         w.queue.delete_branch.assert_called_once_with(key)
-        self.assertNotIn(key, w._packing_stats_cache)
+        self.assertEqual(list(w._packing_stats_cache), [(other_key, 4)])
 
     def test_bundle_stats_aggregation_failure_still_runs_cleanup(self):
         w = self._finalizing_worker()
@@ -3595,6 +3606,8 @@ class TestMaybeFinalizeTriage(unittest.TestCase):
             "infeasible_nodes": 0,
             "created_at": 100,
             "finalized_at": 200,
+            "first_best_at": 150,
+            "nodes_at_first_best": 40,
             "spine": "SALET -g-g-",
         }
         w.queue.get_pending_branch.return_value = None
@@ -4078,6 +4091,7 @@ class TestOneWorkerPerBranch(unittest.TestCase):
         owner = self.queue.owner_row_for_branch(branch_key)
         claim = w._claim_bundle(
             branch_key, owner["n_candidates"], decode_subset(branch_key),
+            w._branch_budget(owner),
             expected_source_work_id=owner["source_work_id"],
             expected_source_priority=owner["owner_priority"])
         self.assertIsNotNone(claim, "fixture worker took no claim to hold")
@@ -4093,6 +4107,7 @@ class TestOneWorkerPerBranch(unittest.TestCase):
         owner = self.queue.owner_row_for_branch(branch_key)
         while w._claim_bundle(
                 branch_key, owner["n_candidates"], decode_subset(branch_key),
+                w._branch_budget(owner),
                 expected_source_work_id=owner["source_work_id"],
                 expected_source_priority=owner["owner_priority"]) is not None:
             pass

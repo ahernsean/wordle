@@ -88,6 +88,7 @@ import time
 from datetime import datetime
 
 from cache_sqlite import ScoreCache
+from hint_cache import HintCacheError, open_hint_cache
 from report_model import (
     BRANCH_PHASES,
     BRANCH_STATUSES,
@@ -1047,6 +1048,15 @@ def _enforce_wal_hard_ceiling(queue, procs) -> bool:
 
 
 def cmd_run(args):
+    # First, before anything opens --cache: the two paths might be the same
+    # file, and every operation below writes to --cache.  Checkpointing it and
+    # running its migrations would rewrite the quarantined artifact — new
+    # tables, moved rows, a changed mtime — and only then reach a refusal that
+    # can no longer undo any of it.  Proving the artifact here also keeps a
+    # refusal from being raised independently by every worker, which the
+    # supervisor would respawn forever.
+    if not _hint_cache_is_usable(args):
+        return
     _checkpoint_cache_on_start(args.cache)
     # Apply any pending ScoreCache schema migrations single-threaded now, before
     # the worker processes open the cache concurrently — concurrent first-open
@@ -1222,10 +1232,33 @@ def _reap_worker(queue, worker_id: int):
                     worker_id, freed)
 
 
+def _hint_cache_is_usable(args) -> bool:
+    """Open and close the configured hint artifact, reporting any refusal.
+
+    True when the run may proceed — including the ordinary case of no
+    --hint-cache at all.  A refusal is printed and the run stops: a hint path
+    the operator named but the swarm cannot honour must not turn into a silent
+    hintless run.
+    """
+    try:
+        hint = open_hint_cache(args.hint_cache, load_word_list(ANSWER_FILE),
+                               args.cache)
+    except HintCacheError as error:
+        print(f'Refusing to start: {error}', file=sys.stderr)
+        return False
+    if hint is not None:
+        print(f'Hint cache: {hint.db_path} '
+              f'({hint.namespace_branch_count:,} branch rows for this answer '
+              f'list, read-only, candidate order only)')
+        hint.close()
+    return True
+
+
 def _spawn_worker(worker_id: int, args, stop_event):
     p = multiprocessing.Process(
         target=erd_swarm.swarm_worker,
         args=(worker_id, args.cache, args.queue, stop_event, args.workers),
+        kwargs={'hint_cache_path': args.hint_cache},
         daemon=False,
         name=f'erd-worker-{worker_id}',
     )
@@ -1354,6 +1387,11 @@ def main():
     p_run.add_argument('--workers', type=int, default=6, metavar='N',
                        help='Number of swarm worker processes (default: 6)')
     p_run.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
+    p_run.add_argument(
+        '--hint-cache', default=None, metavar='PATH',
+        help='quarantined historical cache, opened read-only and immutable '
+             'and used only to order candidates.  Never a source of exact '
+             'results, bounds, or losses, and never written to.')
     p_run.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
     p_run.add_argument('--recycle-hours', type=float, default=3.0,
                        metavar='H',

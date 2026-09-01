@@ -2,10 +2,11 @@
 
 ## Project structure
 
-A Wordle solver with five layers:
+A Wordle solver with six layers:
 - **Engine** (`wordle_engine.py`): core ERD search, scoring, response simulation
 - **Kernel** (`pattern_matrix.py`): NumPy response-pattern matrix and vectorized candidate statistics; the engine's sole NumPy import point. NumPy is a hard requirement on every target; the pure-Python engine paths remain permanently as the reference implementation (they never call NumPy), selected by passing `pattern_matrix=None`
 - **Cache** (`cache_sqlite.py`): SQLite-backed persistence of branch results and candidate scores
+- **Hints** (`hint_cache.py`): a second, read-only cache consulted for candidate order only
 - **Swarm** (`erd_swarm.py`, `erd_queue.py`, `erd_search.py`): parallel ERD precache workers
 - **CLI** (`wordle.py`): interactive game interface and all user-facing commands
 
@@ -160,6 +161,57 @@ scopes some earlier query happened to list.
 Only `branch_best_by_policy` is the "one row per branch" table.  Any count,
 report, or query that means branches must not union the two: a branch with
 results at three budgets is one branch.
+
+### A hint cache names a word and nothing else
+
+`--hint-cache` opens a quarantined historical cache alongside the live one.
+Its rows were produced by earlier solver versions, so they are descriptive
+history, not certificates: a historical row may put its word first in a
+branch's candidate order, and may do nothing else.  It is never an exact hit,
+never a fold input, never a ceiling, never a loss, never a queue-admission
+answer, and never an export source.
+
+`HintCache` is the whole interface, and the guarantee is structural rather
+than procedural: its queries select `best_guess` alone, so no stored ERD,
+`max_remaining_depth`, or `solve_budget` has a path out of the module.  Do not
+widen them, and do not hand the historical file to anything that takes a
+`ScoreCache` — that type has `read_for_budget`, and any caller holding one can
+take an exact hit from it.
+
+The artifact is opened `mode=ro&immutable=1`, which is stricter than
+`read_only=True` on a `ScoreCache`: plain `mode=ro` still touches the `-shm`
+sidecar.  `immutable=1` in exchange ignores an uncheckpointed WAL, so the open
+refuses a nonempty `-wal` instead of silently reading a stale snapshot.
+
+The hint is applied at two levels, and both ask at the branch's own budget so
+the artifact's budget-specific rows are not passed over.
+`wordle_engine._hint_first` runs inside the recursion, on the budget the frame
+is solving at.  `_BranchWorker._hint_first_in_order` runs on the swarm's branch
+packing order, on `active_branches.budget` — written once by `create_branch`,
+never updated, and refused to a joiner at a different budget, which is what
+keeps `claim_next_bundle`'s shared `pack_cursor` indexing one stable order.
+`_packing_stats_cache` is keyed by `(branch_key, budget)` for the same reason:
+a finalized branch can be re-created at another budget, and the order left
+behind describes the old one.  Both sites are ordering; neither can change an
+optimum.
+
+**The hint must reach every frame, not just the entry one.**
+`_solve_subset` passes `hint_cache` to `evaluate_candidate` in its candidate
+loop as well as forwarding it into the sub-branch recursion.  Dropping either
+leaves deeper frames unhinted while every result assertion still passes, so
+`test_descendant_frames_get_their_own_ordering_hints` asserts on the branch
+sizes actually looked up.
+
+**Hint counters come in two populations and must not be mixed.**
+`hint_lookups`/`hint_hits`/`hint_accepted`/`hint_rejected` count *lookups* from
+both sites — a cooperative branch is looked up once per worker that computes
+its packing order — so they give coverage and legality rates, never branch
+counts.  `hint_inline_placements`/`hint_inline_wins` are the separate
+same-population pair: one worker owns an inline `_solve_subset` frame from
+placement to winner, so their ratio is meaningful.  A cooperative branch's
+winner is decided once, at finalize, and is recorded per branch in
+`branch_finalize_log.hint_was_winner` — never added to a process counter that
+several workers each contributed placements to.
 
 ### Completed work has two records, and they can disagree
 

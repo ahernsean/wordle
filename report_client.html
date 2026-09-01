@@ -1431,6 +1431,14 @@
       fragment.append(section("Search state",labeledFacts(search)));
       const cumulative=[["completed claims",worker.completed_claim_count],["cache hits",worker.cache_hit_count],["cache misses",worker.cache_miss_count],["opener work",worker.source_work_id],["scheduling",worker.scheduling_role_reason||worker.scheduling_role]];
       fragment.append(section("Cumulative worker counters",labeledFacts(cumulative)));
+      // Its own section, never mixed into the cache counters above: a hint is
+      // an ordering suggestion from a read-only historical artifact, not a
+      // cache hit.  Absent entirely on a run with no hint artifact, where
+      // every hint counter is null rather than a measured zero.
+      if(worker.hint_lookup_count!==null&&worker.hint_lookup_count!==undefined){
+        const hints=[["lookups",worker.hint_lookup_count],["named a word",worker.hint_hit_count],["legal in the pool",worker.hint_accepted_count],["rejected",worker.hint_rejected_count],["inline placements",worker.hint_inline_placement_count],["inline wins",worker.hint_inline_win_count]];
+        fragment.append(section("Hint cache (candidate order only)",labeledFacts(hints)));
+      }
       return fragment;
     }
     function renderWorkers(report,previous,state){
