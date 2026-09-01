@@ -259,12 +259,14 @@ class TestBestERDGuess(CliTestCase):
         gs = gs or self.gs
         gs.score_cache.write(
             ScoreCache.encode_subset(self.soln(gs).current_words),
-            ERD_ALL, word, score)
+            ERD_ALL, word, score, max_depth=4)
 
     def test_returns_the_cached_hit(self):
         self._cache_erd("trace")
+        # read_for_budget returns the full (best_guess, best_score,
+        # max_depth, solve_budget) tuple, not the bare 2-tuple read() gives.
         self.assertEqual(wordle._best_erd_guess(self.gs, self.soln()),
-                         ("trace", 3.142))
+                         ("trace", 3.142, 4, None))
 
     def test_none_when_uncached(self):
         self.assertIsNone(wordle._best_erd_guess(self.gs, self.soln()))
@@ -306,7 +308,7 @@ class TestCmdGuessDefault(CliTestCase):
     def _cache_erd(self, word, score=3.142):
         self.gs.score_cache.write(
             ScoreCache.encode_subset(self.soln().current_words),
-            ERD_ALL, word, score)
+            ERD_ALL, word, score, max_depth=4)
 
     def test_empty_entry_plays_the_best_erd_word(self):
         self._cache_erd("trace")
