@@ -32,9 +32,13 @@ class TestExportAndSend(unittest.TestCase):
         """)
         self._write_fake("podman", """\
             #!/usr/bin/env bash
-            printf '%s\\n' "$*" >> "$PODMAN_LOG"
+            printf 'argv: %s\\n' "$*" >> "$PODMAN_LOG"
             case "$1:$2" in
-                run:*) echo relay-container ;;
+                run:*)
+                    printf 'run environment: TS_AUTHKEY=%s\\n' \\
+                        "${TS_AUTHKEY:-<UNSET>}" >> "$PODMAN_LOG"
+                    echo relay-container
+                    ;;
                 container:exists)
                     [[ "${PODMAN_CONTAINER_EXISTS:-}" == 1 ]]
                     ;;
@@ -91,6 +95,7 @@ class TestExportAndSend(unittest.TestCase):
         env["PATH"] = f"{self.bin_dir}:{env['PATH']}"
         env["PODMAN_LOG"] = str(self.log_path)
         env["TMPDIR"] = str(self.workdir)
+        env["XDG_RUNTIME_DIR"] = str(self.workdir)
         return subprocess.run(
             ["bash", "./export_and_send.sh", *args], cwd=self.workdir,
             env=env, capture_output=True, text=True, check=False)
@@ -105,8 +110,13 @@ class TestExportAndSend(unittest.TestCase):
         self.assertIn("--env TS_AUTH_ONCE=true", commands)
         self.assertNotIn("--rm", commands)
         self.assertIn("--env TS_USERSPACE=true", commands)
+        self.assertIn("--cap-drop=ALL", commands)
         self.assertIn("--env TS_AUTHKEY", commands)
-        self.assertNotIn("TS_AUTHKEY=tskey-auth-bootstrap", commands)
+        podman_argv = "\n".join(
+            line for line in commands.splitlines() if line.startswith("argv:"))
+        self.assertNotIn("TS_AUTHKEY=tskey-auth-bootstrap", podman_argv)
+        self.assertIn(
+            "run environment: TS_AUTHKEY=tskey-auth-bootstrap", commands)
         self.assertIn("docker.io/tailscale/tailscale:stable", commands)
         self.assertIn("cp wordle_erd_export.sqlite3", commands)
         self.assertIn("tailscale file cp /exports/wordle_erd_export.sqlite3 ios-app:", commands)
@@ -117,7 +127,8 @@ class TestExportAndSend(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         commands = self.log_path.read_text()
-        self.assertNotIn("TS_AUTHKEY=", commands)
+        self.assertIn("run environment: TS_AUTHKEY=<UNSET>", commands)
+        self.assertNotIn("--env TS_AUTHKEY", commands)
 
     def test_ignores_an_ambient_bootstrap_key(self):
         with mock.patch.dict(os.environ, {"TAILSCALE_AUTHKEY": "ambient-key"}):
@@ -125,7 +136,8 @@ class TestExportAndSend(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         commands = self.log_path.read_text()
-        self.assertNotIn("TS_AUTHKEY", commands)
+        self.assertNotIn("--env TS_AUTHKEY", commands)
+        self.assertIn("run environment: TS_AUTHKEY=<UNSET>", commands)
 
     def test_stopped_relay_reports_its_bootstrap_error_without_exporting(self):
         result = self._run(PODMAN_RELAY_STOPS="1")

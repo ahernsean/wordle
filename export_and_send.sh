@@ -12,13 +12,22 @@
 # through `podman cp`, never a mount of this checkout.
 #
 # Bootstrap the relay once by generating an untagged, non-ephemeral auth key
-# in the Tailscale admin console, then run:
+# in the Tailscale admin console, then enter it without placing it in shell
+# history:
 #
-#   TAILSCALE_AUTHKEY=tskey-auth-... ./export_and_send.sh
+#   read -rs -p 'Tailscale auth key: ' TAILSCALE_AUTHKEY
+#   printf '\n'
+#   export TAILSCALE_AUTHKEY
+#   ./export_and_send.sh
+#   unset TAILSCALE_AUTHKEY
 #
 # Disable key expiry for the resulting `wordle-taildrop` machine in the
 # Tailscale admin console. Subsequent runs need no auth key. Do not put an auth
-# key in this repository or in the persistent state volume.
+# key in this repository or in the persistent state volume. That volume holds
+# the relay node's durable, user-level Tailnet credential. Protect it as you
+# would any other standing credential; restrict its ACL grants to the receiving
+# device where possible. To revoke it, remove `wordle-taildrop` in the
+# Tailscale admin console and delete its Podman state volume.
 #
 # The export snapshot is transitory: its job ends when the bytes reach the
 # phone. `tailscale file cp` blocks until the peer has received the file and
@@ -58,7 +67,7 @@ taildrop_state_volume="${WORDLE_TAILDROP_STATE_VOLUME:-wordle-taildrop-state}"
 taildrop_hostname="${WORDLE_TAILDROP_HOSTNAME:-wordle-taildrop}"
 taildrop_image="${WORDLE_TAILDROP_IMAGE:-docker.io/tailscale/tailscale:stable}"
 taildrop_container="wordle-taildrop"
-taildrop_lock_file="${WORDLE_TAILDROP_LOCK_FILE:-${TMPDIR:-/tmp}/wordle-taildrop-export.lock}"
+taildrop_lock_file="${WORDLE_TAILDROP_LOCK_FILE:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/wordle-taildrop-export.lock}"
 taildrop_started=false
 taildrop_temporary_output=""
 
@@ -89,6 +98,7 @@ start_taildrop_relay() {
         --name "$taildrop_container"
         --hostname "$taildrop_hostname"
         --security-opt no-new-privileges
+        --cap-drop=ALL
         --volume "$taildrop_state_volume:/var/lib/tailscale"
         --tmpfs /exports:rw,noexec,nosuid,nodev
         --env TS_AUTH_ONCE=true
@@ -109,7 +119,11 @@ start_taildrop_relay() {
         podman rm --force "$taildrop_container" >/dev/null
     fi
     podman_args+=("$taildrop_image")
-    podman "${podman_args[@]}" >/dev/null
+    if [ -n "${TAILSCALE_AUTHKEY:-}" ]; then
+        TS_AUTHKEY="$TAILSCALE_AUTHKEY" podman "${podman_args[@]}" >/dev/null
+    else
+        podman "${podman_args[@]}" >/dev/null
+    fi
     taildrop_started=true
 
     local attempt status_json relay_running
