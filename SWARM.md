@@ -760,11 +760,16 @@ The cooperative half of that question is answered per branch instead:
 row per finalized branch, so
 
 ```sql
-SELECT COUNT(*) FILTER (WHERE hint_was_winner = 1) * 1.0 / COUNT(*)
-FROM branch_finalize_log WHERE hint_word IS NOT NULL;
+SELECT AVG(hint_was_winner) FROM branch_finalize_log
+WHERE hint_was_winner IS NOT NULL;
 ```
 
-is the branch-level hit rate.  The same table's `first_best_at` and
+is the branch-level hit rate.  The filter is load-bearing: a branch finalized
+as a cut or a proven loss has a `hint_word` but a NULL `hint_was_winner`,
+because no candidate won for the hint to have matched.  Counting those in the
+denominator would score every no-contest branch as a miss.  `hint_word IS NOT
+NULL AND hint_was_winner IS NULL` is its own useful population — hinted
+branches that reached no winner at all.  The same table's `first_best_at` and
 `nodes_at_first_best`, against `created_at`, are the cost of reaching any bound
 at all — which is what a good hint is supposed to remove.
 

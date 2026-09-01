@@ -1884,7 +1884,7 @@ class _BranchWorker:
                 schedule_diagnostics=schedule_diagnostics,
                 first_best_at=first_best_at,
                 nodes_at_first_best=nodes_at_first_best,
-                **self._hint_outcome(branch_key, best_guess),
+                **self._hint_outcome(branch_key, best_guess, budget),
                 outcome='loss' if ceiling_proves_loss else ('cut' if cut else
                         ('exact' if best_guess is not None else 'loss')))
             spine_tokens = (spine or "").split()
@@ -1933,7 +1933,7 @@ class _BranchWorker:
         self._last_claim_complete = time.time()
         return True
 
-    def _hint_outcome(self, branch_key, best_guess):
+    def _hint_outcome(self, branch_key, best_guess, budget):
         """The branch's hint and whether the recomputed winner matched it.
 
         Empty on a run with no hint artifact, so the finalize row keeps NULL
@@ -1942,6 +1942,14 @@ class _BranchWorker:
         evaluation against the live cache, and this reads it to say whether
         the hint was worth consulting.
 
+        The lookup uses the branch's budget for the same reason
+        _hint_first_in_order does, and must use the *same* one: this records
+        which word the artifact supplied, so asking a different scope here
+        would log a word that never led the order — NULL where a budget-only
+        row was placed, or the unrestricted word where a budget-specific one
+        won.  Both shapes would misreport exactly the branches the
+        budget-scoped lookup exists to cover.
+
         hint_was_winner stays NULL when there is no winner to compare against
         — a cut or a proven loss — because "the hint did not win" would read as
         a hint that lost a contest the branch never held.
@@ -1949,7 +1957,7 @@ class _BranchWorker:
         if self.hint_cache is None:
             return {}
         hint_word = self.hint_cache.hint_candidate(
-            branch_key, ERD_ALL, None, count_lookup=False)
+            branch_key, ERD_ALL, budget, count_lookup=False)
         if hint_word is None or best_guess is None:
             return {"hint_word": hint_word, "hint_was_winner": None}
         return {"hint_word": hint_word,

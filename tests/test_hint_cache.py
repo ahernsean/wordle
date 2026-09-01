@@ -805,13 +805,13 @@ class SwarmCandidateOrderTest(_HintCacheTest):
         worker = self._worker(hint)
         key = ScoreCache.encode_subset(ANSWERS)
 
-        self.assertEqual(worker._hint_outcome(key, "bumpy"),
+        self.assertEqual(worker._hint_outcome(key, "bumpy", ROOT_BUDGET),
                          {"hint_word": "bumpy", "hint_was_winner": True})
-        self.assertEqual(worker._hint_outcome(key, "flesh"),
+        self.assertEqual(worker._hint_outcome(key, "flesh", ROOT_BUDGET),
                          {"hint_word": "bumpy", "hint_was_winner": False})
         # A cut or a loss has no winner, so there is no contest the hint could
         # have lost; the word is still on record.
-        self.assertEqual(worker._hint_outcome(key, None),
+        self.assertEqual(worker._hint_outcome(key, None, ROOT_BUDGET),
                          {"hint_word": "bumpy", "hint_was_winner": None})
         # Reporting must not inflate the lookup rate the payoff is measured
         # against.
@@ -820,7 +820,7 @@ class SwarmCandidateOrderTest(_HintCacheTest):
     def test_a_branch_the_artifact_does_not_cover_records_a_null_hint(self):
         hint = self.hints(self.write_history([]))
         outcome = self._worker(hint)._hint_outcome(
-            ScoreCache.encode_subset(ANSWERS), "flesh")
+            ScoreCache.encode_subset(ANSWERS), "flesh", ROOT_BUDGET)
         self.assertEqual(outcome, {"hint_word": None, "hint_was_winner": None})
 
     def test_a_worker_with_no_artifact_records_nothing_at_all(self):
@@ -828,7 +828,7 @@ class SwarmCandidateOrderTest(_HintCacheTest):
         fact from a measured miss."""
         self.assertEqual(
             self._worker(None)._hint_outcome(
-                ScoreCache.encode_subset(ANSWERS), "flesh"),
+                ScoreCache.encode_subset(ANSWERS), "flesh", ROOT_BUDGET),
             {})
 
 
@@ -1214,6 +1214,133 @@ class SupervisorLeavesTheArtifactAloneTest(_HintCacheTest):
         self.assertNotEqual(after, before)
         self.assertIn("branch_best_by_policy_and_budget", after[2])
         self.assertNotIn("branch_best_by_policy_and_budget", before[2])
+
+
+class LoggedHintIsThePlacedHintTest(_HintCacheTest):
+    """What finalize records must be the word that actually led the order.
+
+    The two sites read the artifact independently — packing when the branch is
+    claimed, finalize when it is retired — so they can disagree without either
+    one looking wrong on its own.  These tests assert the pair, not each half:
+    whatever `_hint_first_in_order` puts first is what `_hint_outcome` logs.
+    """
+
+    def _worker(self, hint_cache):
+        worker = erd_swarm._BranchWorker.__new__(erd_swarm._BranchWorker)
+        worker.hint_cache = hint_cache
+        worker.all_words = tuple(GUESSES)
+        return worker
+
+    def _placed_and_logged(self, worker, budget, winner):
+        key = ScoreCache.encode_subset(ANSWERS)
+        order = worker._hint_first_in_order(
+            key, list(range(len(GUESSES))), budget)
+        placed = GUESSES[order[0]]
+        return placed, worker._hint_outcome(key, winner, budget)
+
+    def test_a_budget_only_row_is_logged_not_dropped(self):
+        """The failure shape: packing leads with the budget-specific word
+        while finalize, asking the unrestricted scope, has nothing to record —
+        so the payoff telemetry silently omits every branch the artifact
+        covers only at a budget."""
+        hint = self.hints(self.write_history(
+            [(ANSWERS, "bumpy", 3.0, 4, ROOT_BUDGET)]))
+        placed, logged = self._placed_and_logged(
+            self._worker(hint), ROOT_BUDGET, "bumpy")
+
+        self.assertEqual(placed, "bumpy")
+        self.assertEqual(logged, {"hint_word": "bumpy", "hint_was_winner": True})
+
+    def test_conflicting_scopes_log_the_scope_that_ordered(self):
+        """The other failure shape: with both scopes present, packing leads
+        with the budget-specific word and finalize records the unrestricted
+        one — a hint that won is filed as a miss."""
+        hint = self.hints(self.write_history([
+            (ANSWERS, "clomp", 3.0, 4, None),
+            (ANSWERS, "bumpy", 3.0, 4, ROOT_BUDGET),
+        ]))
+        placed, logged = self._placed_and_logged(
+            self._worker(hint), ROOT_BUDGET, "bumpy")
+
+        self.assertEqual(placed, "bumpy")
+        self.assertEqual(logged, {"hint_word": "bumpy", "hint_was_winner": True})
+
+    def test_the_pair_agrees_at_every_budget_the_artifact_covers(self):
+        """Swept rather than spot-checked: at each budget the two sites must
+        name the same word, whichever scope answers there."""
+        hint = self.hints(self.write_history([
+            (ANSWERS, "clomp", 3.0, 4, None),
+            (ANSWERS, "bumpy", 3.0, 4, ROOT_BUDGET),
+        ]))
+        worker = self._worker(hint)
+        for budget in (None, ROOT_BUDGET, ROOT_BUDGET - 1, ROOT_BUDGET - 2):
+            with self.subTest(budget=budget):
+                placed, logged = self._placed_and_logged(
+                    worker, budget, "flesh")
+                self.assertEqual(logged["hint_word"], placed)
+        # And the two scopes really do differ, so the sweep is not agreeing
+        # because there is only one answer to give.
+        self.assertEqual(
+            self._placed_and_logged(worker, ROOT_BUDGET, "flesh")[0], "bumpy")
+        self.assertEqual(
+            self._placed_and_logged(worker, None, "flesh")[0], "clomp")
+
+
+class BranchLevelHintRateQueryTest(_HintCacheTest):
+    """The rate SWARM.md documents, run against real finalize rows.
+
+    A cut or a proven loss has a hint_word but a NULL hint_was_winner, because
+    no candidate won for the hint to have matched.  Counting those in the
+    denominator scores every no-contest branch as a miss.
+    """
+
+    DOCUMENTED_QUERY = """
+        SELECT AVG(hint_was_winner) FROM telemetry.branch_finalize_log
+        WHERE hint_was_winner IS NOT NULL
+    """
+
+    def _queue_with_rows(self, rows):
+        queue = ERDQueue(os.path.join(self._dir, "queue.sqlite3"))
+        self.addCleanup(queue.close)
+        for index, (hint_word, was_winner) in enumerate(rows):
+            queue.add_branch_finalize_log(
+                encode_subset(ANSWERS[index:index + 3]), None, 3, ROOT_BUDGET,
+                100, 200, 900, 12,
+                hint_word=hint_word, hint_was_winner=was_winner)
+        return queue
+
+    def test_no_contest_branches_are_excluded_from_the_denominator(self):
+        # Two hinted branches reached a winner and both matched; three more
+        # were hinted but finalized as a cut or a loss.
+        queue = self._queue_with_rows([
+            ("bumpy", True), ("clomp", True),
+            ("dwarf", None), ("crumb", None), ("flesh", None),
+        ])
+        rate = queue._conn.execute(self.DOCUMENTED_QUERY).fetchone()[0]
+        self.assertEqual(rate, 1.0)
+
+        # The denominator the prose used to name counts the no-contest rows,
+        # turning a perfect record into 40%.  This is what the filter fixes.
+        naive = queue._conn.execute("""
+            SELECT COUNT(*) FILTER (WHERE hint_was_winner = 1) * 1.0 / COUNT(*)
+            FROM telemetry.branch_finalize_log WHERE hint_word IS NOT NULL
+        """).fetchone()[0]
+        self.assertAlmostEqual(naive, 0.4)
+
+    def test_a_genuine_miss_still_lowers_the_rate(self):
+        queue = self._queue_with_rows([
+            ("bumpy", True), ("clomp", False), ("dwarf", None),
+        ])
+        self.assertAlmostEqual(
+            queue._conn.execute(self.DOCUMENTED_QUERY).fetchone()[0], 0.5)
+
+    def test_the_documented_query_is_the_one_in_the_guide(self):
+        """SWARM.md's example and this test must not drift apart."""
+        with open("SWARM.md") as guide:
+            text = guide.read()
+        for fragment in ("AVG(hint_was_winner)",
+                         "WHERE hint_was_winner IS NOT NULL"):
+            self.assertIn(fragment, text)
 
 
 if __name__ == "__main__":
