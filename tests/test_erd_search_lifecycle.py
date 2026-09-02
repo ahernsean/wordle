@@ -514,5 +514,39 @@ class QueueOperatorCommandTest(unittest.TestCase):
         ):
             erd_search.cmd_queue_priority(arguments)
         queue.set_priority.assert_called_once()
+
+    def test_opener_priority_handles_invalid_complete_ambiguous_and_updated(self):
+        arguments = SimpleNamespace(
+            queue="queue.sqlite3", word="raise", priority=5, opener_work_id=None,
+        )
+        queue = Mock()
+        with patch.object(erd_search, "check_source_priority_range", side_effect=ValueError("out of range")):
+            erd_search.cmd_queue_source_priority(arguments)
+
+        queue.source_work_rows.return_value = []
+        queue.source_work_candidates.return_value = []
+        with patch.object(erd_search, "ERDQueue", return_value=queue):
+            erd_search.cmd_queue_source_priority(arguments)
+
+        rows = [
+            {"source_work_id": 2, "source_word": "raise", "requested_at": 0,
+             "requested_priority": 1, "state": "queued", "root_count": 1, "branch_count": 2},
+            {"source_work_id": 3, "source_word": "raise", "requested_at": 0,
+             "requested_priority": 2, "state": "queued", "root_count": 1, "branch_count": 2},
+        ]
+        queue.reset_mock()
+        queue.source_work_rows.return_value = rows
+        queue.source_work_candidates.return_value = rows
+        with patch.object(erd_search, "ERDQueue", return_value=queue):
+            erd_search.cmd_queue_source_priority(arguments)
+        queue.set_source_work_priority.assert_not_called()
+
+        queue.reset_mock()
+        queue.source_work_rows.return_value = rows[:1]
+        queue.source_work_candidates.return_value = rows[:1]
+        queue.set_source_work_priority.return_value = True
+        with patch.object(erd_search, "ERDQueue", return_value=queue):
+            erd_search.cmd_queue_source_priority(arguments)
+        queue.set_source_work_priority.assert_called_once_with(2, 5)
 if __name__ == '__main__':
     unittest.main()
