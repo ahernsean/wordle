@@ -315,12 +315,13 @@ class OperatorHelperTest(unittest.TestCase):
         self.assertEqual(erd_search._view_watch_interval('0.2'), 0.2)
         with self.assertRaises(argparse.ArgumentTypeError):
             erd_search._view_watch_interval('0.1')
+        status_values = erd_search.BRANCH_STATUSES[:2]
         self.assertEqual(
-            erd_search._branch_status_filter('active,pending'),
-            ('active', 'pending'),
+            erd_search._branch_status_filter(','.join(status_values)),
+            status_values,
         )
         with self.assertRaises(argparse.ArgumentTypeError):
-            erd_search._branch_phase_filter('unknown')
+            erd_search._branch_worker_status_filter('unknown')
 
     def test_service_scope_noun_matches_the_selected_service(self):
         self.assertEqual(
