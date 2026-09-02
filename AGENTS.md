@@ -162,6 +162,35 @@ Only `branch_best_by_policy` is the "one row per branch" table.  Any count,
 report, or query that means branches must not union the two: a branch with
 results at three budgets is one branch.
 
+### A candidate's own ERD is derived, never stored
+
+A branch result is a certificate; a **candidate's** ERD at a branch is a *fold*
+over the results of that candidate's response groups, and the two are not
+alike.  `report_model._candidate_erd_summary` is the only thing that produces
+one, and it produces it on every read from the group facts the caller has
+already materialized.  Nothing persists it.
+
+The reason is that a fold has no way to defend itself.  It asserts "every one
+of my response groups is an exact result", and every path that deletes a branch
+result — a repair, a reverification, a `queue add --delete-erd-cache` — would
+falsify that assertion silently.  A stored fold is keyed by the *parent*
+branch, so given a deleted child there is no way to ask which folds read it; a
+reverse index would cost up to 243 rows per fold, and a generation counter
+would invalidate everything on each deletion anyway.  Deriving costs less than
+either: the callers already hold the rows, so a fold is arithmetic over memory
+(measured at ~40 µs per candidate across the whole vocabulary), and the report
+then describes the cache as it actually stands.
+
+**A fold must select each child at the budget the parent would use.**  Callers
+read group facts through `report_branch_states` or
+`report_branch_states_from_maps` at the branch's own `group_budget`, which
+applies `_exact_row_for_budget` and the same reusability gate `read_for_budget`
+does.  A child whose only exact result was solved at some other budget arrives
+as `missing`, and the candidate reads `pending` — never folded in.
+
+Do not reintroduce a durable memo for this value, and do not add one to
+`EXPORT_TABLES`/`TABLES`.
+
 ### A hint cache names a word and nothing else
 
 `--hint-cache` opens a quarantined historical cache alongside the live one.
@@ -767,13 +796,16 @@ erroring on a column the migration "already ran". Stopping costs nothing here:
 precache work has no deadline, `stop` drains cleanly, and in-progress claims
 survive a restart.
 
-**Only six tables cross between Linux and the phone.** `export_cache.py`'s
+**Only five tables cross between Linux and the phone.** `export_cache.py`'s
 `EXPORT_TABLES` and `import_cache.py`'s `TABLES` both move `answer_list`,
 `response_decomposition`, `branch_best_by_policy`,
-`branch_best_by_policy_and_budget`, `candidate_scores` and
-`candidate_erd_by_policy`. A cache table outside that list — the per-opener
-summaries, for instance — is written locally on each machine and never travels,
-so changing its shape cannot produce a file the other side fails to read.
+`branch_best_by_policy_and_budget` and `candidate_scores`. A cache table
+outside that list — the per-opener summaries, for instance — is written locally
+on each machine and never travels, so changing its shape cannot produce a file
+the other side fails to read.
+
+An older export may still carry `candidate_erd_by_policy`. It is not in either
+list, so it is skipped by the same path any unrecognized table takes.
 
 `import_cache.py` migrates the target itself: `main()` calls
 `_bootstrap_target_schema` before merging a single row, which opens the target

@@ -7,15 +7,13 @@ Usage
 
 Creates a trimmed export file with only the iPhone-useful tables:
 answer_list, response_decomposition, branch_best_by_policy,
-branch_best_by_policy_and_budget,
-candidate_scores, and candidate_erd_by_policy. A phone without a cached ERD
-result for its current position still needs candidate_scores' entropy/
-max-group-size numbers to rank candidates, and that need isn't limited to
-the opening guess, so the whole table is carried, not just one position's
-rows. candidate_erd_by_policy carries a candidate's own solved ERD once its
-whole tree is exact — without it the phone can still derive the same number
-by folding a candidate's response groups from branch_best_by_policy, just
-without the single-row shortcut.
+branch_best_by_policy_and_budget, and candidate_scores. A phone without a
+cached ERD result for its current position still needs candidate_scores'
+entropy/max-group-size numbers to rank candidates, and that need isn't
+limited to the opening guess, so the whole table is carried, not just one
+position's rows. A candidate's own ERD is derived where it is displayed, by
+folding that candidate's response groups from the branch tables, so there is
+nothing to carry for it.
 
 Safe to run while workers are active: WAL mode allows concurrent reads, so
 the export sees a consistent snapshot without stopping anything. Re-running
@@ -44,7 +42,7 @@ DEFAULT_EXPORT = 'wordle_erd_export.sqlite3'
 
 EXPORT_TABLES = ['answer_list', 'response_decomposition',
                   'branch_best_by_policy', 'branch_best_by_policy_and_budget',
-                  'candidate_scores', 'candidate_erd_by_policy']
+                  'candidate_scores']
 
 
 def cmd_export(args):

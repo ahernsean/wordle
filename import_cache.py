@@ -11,11 +11,16 @@ already does — adding rows from <source_db> not already present in
 --target across all five cache tables. After a successful merge the source
 file (and its -wal/-shm siblings) is deleted; pass --keep-source to retain
 it. The source is a transitory export snapshot, so an import that leaves
-nothing behind is the normal end of the export/import cycle. Four of them
-(answer_list, response_decomposition, candidate_scores,
-candidate_erd_by_policy) are deterministic given the same answer-word
-universe — matching keys imply identical values — so INSERT OR IGNORE is
-exact.
+nothing behind is the normal end of the export/import cycle. Three of them
+(answer_list, response_decomposition, candidate_scores) are deterministic
+given the same answer-word universe — matching keys imply identical values
+— so INSERT OR IGNORE is exact.
+
+An older export may carry candidate_erd_by_policy, a derived memo of a
+candidate's folded ERD that no longer has a reader on either machine. It is
+absent from TABLES, so such a source is merged for the tables that still
+mean something and that one is skipped by the same path any unknown table
+takes.
 
 A missing target restores a working cache rather than erroring: before any
 row is merged, the target is opened once through ScoreCache itself (the
@@ -77,7 +82,6 @@ TABLES = [
     'branch_best_by_policy',
     'branch_best_by_policy_and_budget',
     'candidate_scores',
-    'candidate_erd_by_policy',
 ]
 
 # A branch's budget-specific results live in their own table.  A source written

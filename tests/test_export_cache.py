@@ -99,6 +99,38 @@ class TestExportCandidateScores(unittest.TestCase):
         self.assertNotIn("response_decomposition", tables)
         self.assertIn("candidate_scores", tables)
 
+    def test_the_obsolete_candidate_erd_memo_does_not_travel(self):
+        # A cache old enough to still hold the table must not put it on the
+        # wire: the value is derived where it is displayed, so a stale row
+        # would be a wrong number syncing to the phone.
+        args = _make_args(self._tmp.name)
+        self._seed_candidate_scores(args.cache)
+        conn = sqlite3.connect(args.cache)
+        conn.execute("""
+            CREATE TABLE candidate_erd_by_policy (
+                subset_hash TEXT NOT NULL, candidate_word TEXT NOT NULL,
+                policy TEXT NOT NULL, answer_list_id TEXT NOT NULL,
+                erd REAL NOT NULL, max_remaining_depth INTEGER NOT NULL,
+                response_group_count INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (subset_hash, candidate_word, policy, answer_list_id)
+            )
+        """)
+        conn.execute(
+            "INSERT INTO candidate_erd_by_policy VALUES "
+            "('h', 'crane', 'erd_all', 'x', 3.5, 5, 120, 100)")
+        conn.commit()
+        conn.close()
+
+        export_cache.cmd_export(args)
+
+        out_conn = sqlite3.connect(args.output)
+        tables = {r[0] for r in out_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        out_conn.close()
+        self.assertNotIn("candidate_erd_by_policy", tables)
+        self.assertIn("candidate_scores", tables)
+
     def test_since_excludes_rows_not_updated_after_watermark(self):
         args = _make_args(self._tmp.name)
         self._seed_candidate_scores(args.cache)

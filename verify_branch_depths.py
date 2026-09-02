@@ -46,10 +46,9 @@ about a strategy — so it is applied only when the row's `best_score` agrees
 with its own fold, and withheld otherwise rather than extending the reach of a
 score this pass has just contradicted.
 
-A repair also drops the policy's `candidate_erd_by_policy` folds.  Those
-memoise folds over the rows being repaired and are trusted on a matching
-response-group count alone, which a depth repair does not change; a report
-would otherwise keep serving the pre-repair depth.
+A repaired row needs nothing invalidated above it.  A candidate's own ERD is
+folded from its response groups' rows on every read, so the next report sees
+the repaired depth.
 
 An audit-only run opens the cache read-only, so it can be run against a live
 one.  Stop the swarm before running with --repair.
@@ -185,7 +184,6 @@ class DepthAudit:
         self.score_stale = 0
         self.repaired = 0
         self.repair_withheld = 0
-        self.candidate_erds_dropped = 0
         self.depth_deltas = Counter()
         self.tainted_split = Counter()
         self.mismatch_sizes = Counter()
@@ -218,9 +216,6 @@ class DepthAudit:
             self._audit_row(row, list_limit)
             if progress is not None:
                 progress(self.checked)
-        if self.repaired:
-            self.candidate_erds_dropped = (
-                self._cache.delete_candidate_erds_for_policy(self._policy))
         return self
 
     def _audit_row(self, row, list_limit):
@@ -300,7 +295,6 @@ class DepthAudit:
             'score_stale': self.score_stale,
             'repaired': self.repaired,
             'repair_withheld': self.repair_withheld,
-            'candidate_erds_dropped': self.candidate_erds_dropped,
             'depth_deltas': {f'{was} -> {now}': count
                              for (was, now), count in sorted(self.depth_deltas.items())},
             'tainted_split': dict(sorted(self.tainted_split.items())),
@@ -397,8 +391,6 @@ def render_report(summary, elapsed, repair):
         lines.append(
             f"  repairs withheld (would widen reuse for a stale score): "
             f"{summary['repair_withheld']:,}")
-        lines.append(
-            f"  candidate ERD folds dropped: {summary['candidate_erds_dropped']:,}")
     for finding in summary['findings']:
         lines.append(
             f"    {finding['branch_reference']}  n={finding['branch_size']:,}  "
