@@ -88,6 +88,22 @@ class ReportModelTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     parse_report_branch_target(target)
 
+    def test_request_validation_rejects_filter_scope_mismatches(self):
+        word = parse_report_branch_target("raise")
+        branch = parse_report_branch_target("raise -----")
+        cases = (
+            (ReportRequest(filters=ReportFilters(source_states=("queued",))), "opener_state"),
+            (ReportRequest(filters=ReportFilters(source_offset=0)), "source_offset"),
+            (ReportRequest(filters=ReportFilters(sort="word")), "requires an opener"),
+            (ReportRequest(branch_target=branch, filters=ReportFilters(branch_statuses=("unqueued",))), "unqueued"),
+            (ReportRequest(report_kind="hotspots", hotspot_field="coordination", branch_target=word), "coordination"),
+            (ReportRequest(report_kind="openers", branch_target=branch), "accepts only"),
+        )
+        for request, message in cases:
+            with self.subTest(request=request):
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_report_request(request)
+
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         directory = self.temporary_directory.name
