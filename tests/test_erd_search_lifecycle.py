@@ -534,6 +534,43 @@ class QueueOperatorCommandTest(unittest.TestCase):
             erd_search.cmd_run(arguments)
         stop_event.set.assert_called()
         queue.checkpoint.assert_called_once_with()
+
+    def test_run_reaps_and_replaces_a_dead_worker_before_drain(self):
+        arguments = SimpleNamespace(
+            cache="cache.sqlite3", queue="queue.sqlite3", hint_cache=None,
+            workers=1, recycle_hours=1.0, worker_timeout_seconds=30,
+        )
+        queue = Mock()
+        queue.disk_stop.return_value = None
+        queue.reset_stale_in_progress.return_value = 0
+        queue.recover_active_branches.return_value = (0, 0)
+        queue.counts_by_status.side_effect = [{"pending": 1}, {"pending": 0, "in_progress": 0}]
+        queue.branches_in_progress.return_value = []
+        dead_worker = Mock()
+        dead_worker.is_alive.return_value = False
+        replacement = Mock()
+        replacement.is_alive.return_value = False
+        stop_event = Mock()
+        stop_event.is_set.side_effect = [False, False, True]
+        with (
+            patch.object(erd_search, "_hint_cache_is_usable", return_value=True),
+            patch.object(erd_search, "_checkpoint_cache_on_start"),
+            patch.object(erd_search, "ScoreCache"),
+            patch.object(erd_search, "ERDQueue", return_value=queue),
+            patch.object(erd_search, "disk_stats", return_value={"used_fraction": 0.1, "avail_bytes": 1}),
+            patch.object(erd_search, "_setup_supervisor_logging"),
+            patch.object(erd_search.multiprocessing, "Event", return_value=stop_event),
+            patch.object(erd_search.signal, "signal"),
+            patch.object(erd_search.time, "sleep"),
+            patch.object(erd_search, "_disk_guard", return_value=False),
+            patch.object(erd_search, "_maybe_quiesce_truncate"),
+            patch.object(erd_search, "_enforce_wal_hard_ceiling", return_value=False),
+            patch.object(erd_search, "_spawn_worker", side_effect=[(dead_worker, 0), (replacement, 0)]) as spawn,
+            patch.object(erd_search, "_reap_worker") as reap,
+        ):
+            erd_search.cmd_run(arguments)
+        self.assertEqual(spawn.call_count, 2)
+        reap.assert_called_once_with(queue, 0)
         queue.reset_mock()
         queue.reconcile_orphaned_branch_ownership.return_value = [4, 7]
         with patch.object(erd_search, "ERDQueue", return_value=queue):
