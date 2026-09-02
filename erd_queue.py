@@ -3985,8 +3985,8 @@ class ERDQueue:
         branch_statuses = tuple(self._report_filter_value(
             filters, "branch_statuses", ()
         ))
-        branch_phases = tuple(self._report_filter_value(
-            filters, "branch_phases", ()
+        branch_worker_statuses = tuple(self._report_filter_value(
+            filters, "branch_worker_statuses", ()
         ))
         minimum_answer_count = self._report_filter_value(
             filters, "minimum_answer_count"
@@ -3999,19 +3999,20 @@ class ERDQueue:
         spine_prefix = self._report_filter_value(filters, "spine_prefix")
         source_word = self._report_filter_value(filters, "source_word")
         branch_key = self._report_filter_value(filters, "branch_key")
-        branch_phase_expression = """CASE
-            WHEN pending_status = 'done' THEN 'complete'
+        branch_status_expression = """CASE
+            WHEN pending_status = 'done' THEN 'done'
             WHEN active_status = 'finalized' THEN 'finalizing'
             WHEN active_status = 'open' OR pending_status = 'in_progress'
                 THEN 'evaluating'
             WHEN pending_status = 'pending' THEN 'queued'
+            ELSE 'unqueued' END"""
+        branch_worker_status_expression = """CASE
+            WHEN pending_status = 'done' THEN NULL
+            WHEN active_status = 'finalized'
+              OR active_status = 'open' OR pending_status = 'in_progress'
+                THEN CASE WHEN worker_count > 0 THEN 'active' ELSE 'waiting' END
             ELSE NULL END"""
-        branch_status_expression = """CASE
-            WHEN pending_status = 'done' THEN 'done'
-            WHEN pending_status IS NULL AND active_status IS NULL THEN 'unqueued'
-            WHEN worker_count > 0 THEN 'active'
-            ELSE 'pending' END"""
-        active_only = branch_statuses == ("active",)
+        active_only = branch_worker_statuses == ("active",)
         completed_query = """
                 SELECT branch_id, COUNT(*) AS completed_candidate_count
                 FROM candidate_claims WHERE done = 1 GROUP BY branch_id
@@ -4085,7 +4086,7 @@ class ERDQueue:
             normalized AS (
                 SELECT *,
                        {branch_status_expression} AS branch_status,
-                       {branch_phase_expression} AS branch_phase,
+                       {branch_worker_status_expression} AS branch_worker_status,
                        COALESCE(active_priority, pending_priority, 0) AS priority,
                        COALESCE(active_answer_count, pending_answer_count) AS answer_count,
                        COALESCE(active_source_word, pending_source_word) AS source_word,
@@ -4102,10 +4103,10 @@ class ERDQueue:
             placeholders = ",".join("?" for _ in branch_statuses)
             conditions.append(f"branch_status IN ({placeholders})")
             parameters.extend(branch_statuses)
-        if branch_phases:
-            placeholders = ",".join("?" for _ in branch_phases)
-            conditions.append(f"branch_phase IN ({placeholders})")
-            parameters.extend(branch_phases)
+        if branch_worker_statuses:
+            placeholders = ",".join("?" for _ in branch_worker_statuses)
+            conditions.append(f"branch_worker_status IN ({placeholders})")
+            parameters.extend(branch_worker_statuses)
         if minimum_answer_count is not None:
             conditions.append("answer_count >= ?")
             parameters.append(minimum_answer_count)
@@ -4137,20 +4138,20 @@ class ERDQueue:
         where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
         summary_rows = self._conn.execute(
             base_query
-            + " SELECT branch_status, branch_phase, COUNT(*) AS branch_count"
+            + " SELECT branch_status, branch_worker_status, COUNT(*) AS branch_count"
             + " FROM normalized"
             + where_clause
-            + " GROUP BY branch_status, branch_phase",
+            + " GROUP BY branch_status, branch_worker_status",
             parameters,
         ).fetchall()
         by_status = {}
-        by_phase = {}
+        by_worker_status = {}
         for row in summary_rows:
             by_status[row["branch_status"]] = (
                 by_status.get(row["branch_status"], 0) + row["branch_count"]
             )
-            by_phase[row["branch_phase"]] = (
-                by_phase.get(row["branch_phase"], 0) + row["branch_count"]
+            by_worker_status[row["branch_worker_status"]] = (
+                by_worker_status.get(row["branch_worker_status"], 0) + row["branch_count"]
             )
         matched_rows = sum(by_status.values())
         sort_name = sort or self._report_filter_value(filters, "sort") or "default"
@@ -4162,7 +4163,7 @@ class ERDQueue:
             "nodes": "nodes_spent DESC, answer_count DESC, branch_key",
             "slowest": "nodes_spent DESC, created_at, branch_key",
             "default": (
-                "CASE branch_status WHEN 'active' THEN 0 ELSE 1 END, "
+                "CASE branch_worker_status WHEN 'active' THEN 0 ELSE 1 END, "
                 "priority DESC, answer_count DESC, branch_key"
             ),
         }[sort_name]
@@ -4184,7 +4185,7 @@ class ERDQueue:
                 "branch_key": bytes(row["branch_key"]),
                 "branch_key_hex": bytes(row["branch_key"]).hex(),
                 "branch_status": row["branch_status"],
-                "branch_phase": row["branch_phase"],
+                "branch_worker_status": row["branch_worker_status"],
                 "raw_status": row["pending_status"] or row["active_status"],
                 "is_cooperative": row["pending_status"] is None,
                 "answer_count": row["answer_count"],
@@ -4216,7 +4217,7 @@ class ERDQueue:
             "summary": {
                 "branch_count": matched_rows,
                 "branch_count_by_status": by_status,
-                "branch_count_by_phase": by_phase,
+                "branch_count_by_worker_status": by_worker_status,
             },
             "matched_rows": matched_rows,
             "rows": returned_rows,
@@ -4228,8 +4229,8 @@ class ERDQueue:
             "branch_statuses": self._report_filter_value(
                 filters, "branch_statuses", ()
             ) or (),
-            "branch_phases": self._report_filter_value(
-                filters, "branch_phases", ()
+            "branch_worker_statuses": self._report_filter_value(
+                filters, "branch_worker_statuses", ()
             ) or (),
             "minimum_answer_count": self._report_filter_value(
                 filters, "minimum_answer_count"

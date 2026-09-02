@@ -714,7 +714,7 @@ def _render_sections(report, previous_report, color, width, display_order):
     branch_columns = _branch_columns(display_order)
     for branch in branches:
         branch_key = branch["branch_key_hex"]
-        if branch["branch_status"] == "active":
+        if branch["branch_worker_status"] == "active":
             active_branch_keys.add(branch_key)
         branch_rows.append(
             _branch_display_row(branch, generated_at, display_order)
@@ -740,7 +740,7 @@ def _render_sections(report, previous_report, color, width, display_order):
         ))
         header_rendered = True
         branch_key = branch["branch_key_hex"]
-        if branch["branch_status"] != "active":
+        if branch["branch_worker_status"] != "active":
             continue
         live_branch_workers = [
             item for item in workers_by_branch.get(branch_key, [])
@@ -791,7 +791,7 @@ def _branch_columns(display_order):
             required=True,
         ),
         TerminalColumn("GuessD", "guess_depth", required=True, alignment="right"),
-        TerminalColumn("Phase", "display_phase", required=True),
+        TerminalColumn("Status", "display_status", required=True),
         TerminalColumn(
             "Done", _display_done, required=True, alignment="right",
             highlight_rule=_count_increase_rule("completed_candidate_count"),
@@ -852,9 +852,9 @@ def _branch_display_row(branch, generated_at, display_order):
     branch_row["display_hotkey"] = _hotkey_label(
         display_order, branch["branch_key_hex"]
     )
-    branch_row["display_phase"] = {
+    branch_row["display_status"] = {
         "finalizing": "final",
-    }.get(branch["branch_phase"], branch["branch_phase"] or "—")
+    }.get(branch["branch_status"], branch["branch_status"])
     branch_row["display_best"] = _display_best(branch)
     branch_row["display_eta"] = _abbreviate_duration(
         _branch_eta(branch, generated_at)
@@ -1048,14 +1048,14 @@ def _render_word_sections(report, previous_report, color, width, display_order):
         return (
             f"{hotkey:<{hotkey_width}}"
             f"{group['pattern']:<7}  {group['answer_count']:>7}  "
-            f"{group['branch_status']:<8}  {str(group['branch_phase'] or '—'):<10}  "
+            f"{group['branch_status']:<10}  {str(group['branch_worker_status'] or '—'):<8}  "
             f"{('not cached' if group['cache_state'] == 'missing' else group['cache_state']):<14}  "
             f"{_display_best(group):<10}  @{_display_reference(group['branch_reference'])}"
         )
 
     rows = [
         " " * hotkey_width
-        + "Pattern  Answers  Status    Phase       Cache           Best        Ref"
+        + "Pattern  Answers  Status      Worker    Cache           Best        Ref"
     ]
     for group in ordered_groups:
         line = _fit(group_line(group), width)
@@ -1116,7 +1116,7 @@ def _render_branch_sections(report, previous_report, color, width, display_order
     )
     header.append(_fit(
         f"  status={branch['branch_status']} "
-        f"phase={branch['branch_phase'] or '—'}",
+        f"worker={branch['branch_worker_status'] or '—'}",
         width,
     ))
     if branch["spine"]:
@@ -1134,7 +1134,8 @@ def _render_branch_sections(report, previous_report, color, width, display_order
         queue_lines = ["Queue", "  unqueued"]
     else:
         queue_facts = (
-            f"status={queue['branch_status']} phase={queue['branch_phase']}  "
+            f"status={queue['branch_status']} "
+            f"worker={queue['branch_worker_status'] or '—'}  "
             f"priority={queue['priority']} budget={queue.get('budget', '—')}  "
             f"best={queue['best_guess'] or '—'} "
             f"nodes={_abbreviate_number(queue['search_node_count'])}"
@@ -1406,7 +1407,7 @@ def _render_tree_sections(report, width, display_order):
             if node["branch_reference"]:
                 detail = (
                     f"  @{_display_reference(node['branch_reference'])} "
-                    f"{node['branch_status']}/{node['branch_phase']} "
+                    f"{node['branch_status']}/{node['branch_worker_status'] or '-'} "
                     f"n={node['answer_count']} workers={node['worker_count']}"
                 )
             if node["is_context"]:
@@ -1450,7 +1451,7 @@ def _render_queue_collection_sections(report, width, display_order):
     lines = [
         f"Queue rows: {data.get('matched_rows', 0)} matched",
         _fit(f"  status={summary.get('branch_count_by_status', {})}", width),
-        _fit(f"  phase={summary.get('branch_count_by_phase', {})}", width),
+        _fit(f"  worker={summary.get('branch_count_by_worker_status', {})}", width),
     ]
     for row in data.get("rows", []):
         hotkey = _hotkey_label(display_order, row.get("branch_key_hex"))
@@ -1463,7 +1464,7 @@ def _render_queue_collection_sections(report, width, display_order):
         )
         lines.append(_fit(
             f"  {hotkey_prefix}@{_display_reference(row['branch_reference'])} "
-            f"{row['branch_status']}/{row['branch_phase']} "
+            f"{row['branch_status']}/{row['branch_worker_status'] or '-'} "
             f"n={row['answer_count']} "
             f"guess_depth={guess_depth} "
             f"priority={row['priority']} workers={row['worker_count']}",
@@ -1706,7 +1707,7 @@ def _render_source_sections(report, width, display_order):
             f"    {hotkey_prefix}#{row['source_work_id']} "
             f"{(row['source_word'] or '-').upper()} "
             f"@{_display_reference(row['branch_reference'])} "
-            f"{row['branch_status']}/{row['branch_phase']} "
+            f"{row['branch_status']}/{row['branch_worker_status'] or '-'} "
             f"requested={row['requested_priority']} "
             f"effective={row['branch_effective_priority']} "
             f"({shared}{row['owner_count']} owner(s)) "

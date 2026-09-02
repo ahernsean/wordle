@@ -90,8 +90,12 @@ from datetime import datetime
 from cache_sqlite import ScoreCache
 from hint_cache import HintCacheError, open_hint_cache
 from report_model import (
-    BRANCH_PHASES,
     BRANCH_STATUSES,
+    BRANCH_WORKER_STATUSES,
+    OVERVIEW_BRANCH_STATUSES,
+    OVERVIEW_BRANCH_WORKER_STATUSES,
+    applied_branch_filters,
+    is_overview_request,
     SOURCE_SORT_FIELDS,
     SOURCE_STATES,
     ReportFilters,
@@ -149,8 +153,8 @@ def _branch_status_filter(value):
     return _comma_separated_filter(value, "branch status", BRANCH_STATUSES)
 
 
-def _branch_phase_filter(value):
-    return _comma_separated_filter(value, "branch phase", BRANCH_PHASES)
+def _branch_worker_status_filter(value):
+    return _comma_separated_filter(value, "branch worker status", BRANCH_WORKER_STATUSES)
 
 
 def _source_state_filter(value):
@@ -1405,40 +1409,38 @@ def main():
     p_view = sub.add_parser(
         'view', help='View shared swarm reports',
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""Branch status and phase
-  Status describes the branch's relationship to current work:
-    active    unfinished branch with at least one current worker
-    pending   unfinished branch without a current worker
-    done      result persisted; no work remains
-    unqueued  semantic branch with no scheduled or persisted work
+        epilog="""Branch status
+  A branch moves through one lifecycle, normally in order:
 
-  Phase describes the durable search milestone normally reached in order:
-    queued -> evaluating -> finalizing -> complete
+    unqueued -> queued -> evaluating -> finalizing -> done
 
-  The axes are related; these are the normal combinations:
-    unqueued / -           discovered, but not scheduled or cached
-    pending / queued       scheduled and waiting for a worker
-    active / evaluating    candidates are being evaluated now
-    pending / evaluating   partial evaluation is waiting for a worker
-    active / finalizing    a worker is persisting the completed evaluation
-    pending / finalizing   an interrupted finalization is waiting for a worker
-    done / complete        a reusable result has been persisted
+    unqueued    discovered, but not scheduled or cached
+    queued      scheduled and waiting for a worker
+    evaluating  candidates are being evaluated
+    finalizing  a worker is persisting the completed evaluation
+    done        a reusable result has been persisted
 
-  A branch normally moves through this lifecycle:
+  Worker presence only distinguishes evaluating and finalizing branches:
+    active      a worker is on the branch right now
+    waiting     no worker is on the branch right now
 
-    unqueued / -
-        -> pending / queued
-        -> active / evaluating <-> pending / evaluating
-        -> active / finalizing <-> pending / finalizing
-        -> done / complete
+  Cached or trivial branches can move directly to done.  Recovery may
+  briefly return an interrupted finalization to evaluating before retrying
+  it.  Removing unfinished work returns the branch to unqueued.
 
-  Worker arrival and departure change status without discarding phase progress.
-  Cached or trivial branches can move directly to done / complete.  Recovery
-  may briefly return an interrupted finalization to evaluating before retrying
-  it.  Removing unfinished work returns the branch to unqueued / -.
+  A word report derives its response groups from the answer list, so it is
+  the only report that can show an unqueued branch; every other report reads
+  its branches from the queue.  --branch-status unqueued is refused
+  elsewhere rather than matching nothing.
 
-  The overview defaults to --branch-status active.  Use comma-separated values
-  such as --branch-status active,pending, or use all to disable that filter.
+  The overview answers what the swarm is doing now, so it defaults to
+  --branch-status evaluating,finalizing --branch-worker-status active.
+  Every other report starts unfiltered.  Use comma-separated values such as
+  --branch-status queued,done, or use all to disable a filter.
+
+  Worker status narrows only the stages that carry one, so a status filter
+  selecting neither evaluating nor finalizing drops it rather than matching
+  nothing.
 """)
     p_view.add_argument('--watch', nargs='?', const=30.0,
                         type=_view_watch_interval, metavar='SECONDS')
@@ -1468,10 +1470,12 @@ def main():
              'for one opener')
     p_view.add_argument(
         '--branch-status', type=_branch_status_filter, metavar='STATUSES',
-        help='Comma-separated active,pending,done,unqueued, or all')
+        help='Comma-separated unqueued,queued,evaluating,finalizing,done, or '
+             'all (unqueued selects only on a word report)')
     p_view.add_argument(
-        '--branch-phase', type=_branch_phase_filter, metavar='PHASES',
-        help='Comma-separated queued,evaluating,finalizing,complete, or all')
+        '--branch-worker-status', type=_branch_worker_status_filter, metavar='STATUSES',
+        help='Comma-separated active,waiting, or all (meaningful only for '
+             'evaluating/finalizing branches)')
     p_view.add_argument(
         '--opener-state', type=_source_state_filter, metavar='STATES',
         help='Comma-separated queued,active,complete, or all (--openers only)')
@@ -1724,17 +1728,20 @@ def main():
             args.limit = 10
         if args.accuracy and args.limit is None:
             args.limit = 20
+        overview = is_overview_request(
+            args.report_kind, args.branch_target.kind, args.tree
+        )
         branch_statuses = args.branch_status
         if branch_statuses is None:
-            branch_statuses = (
-                ("active",)
-                if (args.report_kind == "auto"
-                    and args.branch_target.kind == "root" and not args.tree)
-                else ()
+            branch_statuses = OVERVIEW_BRANCH_STATUSES if overview else ()
+        branch_worker_statuses = args.branch_worker_status
+        if branch_worker_statuses is None:
+            branch_worker_statuses = (
+                OVERVIEW_BRANCH_WORKER_STATUSES if overview else ()
             )
-        args.filters = ReportFilters(
+        args.filters = applied_branch_filters(ReportFilters(
             branch_statuses=branch_statuses,
-            branch_phases=args.branch_phase or (),
+            branch_worker_statuses=branch_worker_statuses,
             minimum_answer_count=args.minimum_answer_count,
             maximum_answer_count=args.maximum_answer_count,
             budget=args.budget,
@@ -1742,7 +1749,7 @@ def main():
             sort=args.sort,
             source_states=args.opener_state or (),
             limit=args.limit,
-        )
+        ))
         args.hotspot_field = hotspot_field if args.hotspots else None
         args.sample_size = min(args.sample_size or 50_000, 1_000_000)
         if args.hotspots:

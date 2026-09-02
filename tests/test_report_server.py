@@ -132,14 +132,15 @@ class ReportServerTest(unittest.TestCase):
     def test_tree_and_branch_filters_reach_normalized_request(self):
         report_request = parse_report_request(
             "/api/view/queue",
-            "tree=true&branch_status=active,pending&branch_phase=evaluating&limit=4",
+            "tree=true&branch_status=evaluating,finalizing&"
+            "branch_worker_status=active&limit=4",
         )
         self.assertTrue(report_request.tree)
         self.assertEqual(
-            report_request.filters.branch_statuses, ("active", "pending")
+            report_request.filters.branch_statuses, ("evaluating", "finalizing")
         )
         self.assertEqual(
-            report_request.filters.branch_phases, ("evaluating",)
+            report_request.filters.branch_worker_statuses, ("active",)
         )
         self.assertEqual(report_request.filters.limit, 4)
 
@@ -176,13 +177,23 @@ class ReportServerTest(unittest.TestCase):
                 with self.assertRaisesRegex(InvalidRequest, message):
                     parse_report_request("/api/view", query)
 
-    def test_root_overview_defaults_to_active_and_all_disables_filter(self):
+    def test_root_overview_defaults_to_worked_branches_and_all_disables_filter(self):
         default_request = parse_report_request("/api/view", "")
-        all_request = parse_report_request("/api/view", "branch_status=all")
+        all_request = parse_report_request("/api/view", "branch_worker_status=all")
+        all_statuses = parse_report_request("/api/view", "branch_status=all")
         word_request = parse_report_request("/api/view", "branch_target=RAISE")
-        self.assertEqual(default_request.filters.branch_statuses, ("active",))
-        self.assertEqual(all_request.filters.branch_statuses, ())
+        self.assertEqual(
+            default_request.filters.branch_statuses, ("evaluating", "finalizing")
+        )
+        self.assertEqual(default_request.filters.branch_worker_statuses, ("active",))
+        self.assertEqual(all_request.filters.branch_worker_statuses, ())
+        self.assertEqual(all_statuses.filters.branch_statuses, ())
+        # Only the overview opens on a filter; every other report starts unfiltered.
         self.assertEqual(word_request.filters.branch_statuses, ())
+        self.assertEqual(word_request.filters.branch_worker_statuses, ())
+        queue_request = parse_report_request("/api/view/queue", "")
+        self.assertEqual(queue_request.filters.branch_statuses, ())
+        self.assertEqual(queue_request.filters.branch_worker_statuses, ())
 
     def test_http_and_terminal_compatibility_validation_is_shared(self):
         invalid_requests = (
@@ -192,6 +203,50 @@ class ReportServerTest(unittest.TestCase):
         for path, query in invalid_requests:
             with self.subTest(query=query), self.assertRaises(InvalidRequest):
                 parse_report_request(path, query)
+
+    def test_unqueued_branch_status_selects_only_on_a_word_report(self):
+        word_request = parse_report_request(
+            "/api/view", "branch_target=RAISE&branch_status=unqueued,done"
+        )
+        self.assertEqual(
+            word_request.filters.branch_statuses, ("unqueued", "done")
+        )
+        refused = (
+            ("/api/view", "branch_status=unqueued"),
+            ("/api/view/queue", "branch_status=unqueued"),
+            ("/api/view/workers", "branch_status=unqueued"),
+            ("/api/view/hotspots", "branch_status=unqueued"),
+            ("/api/view", "branch_target=RAISE&tree=1&branch_status=unqueued"),
+            ("/api/view", "branch_target=RAISE%20.....&branch_status=unqueued"),
+            ("/api/view", "branch_status=queued,unqueued"),
+        )
+        for path, query in refused:
+            with self.subTest(query=query):
+                with self.assertRaisesRegex(InvalidRequest, "unqueued"):
+                    parse_report_request(path, query)
+
+    def test_worker_status_filter_is_dropped_when_no_status_carries_one(self):
+        # A queued/done/unqueued branch has no worker status at all, so a
+        # worker filter applied alongside them would match nothing.
+        for query in (
+            "branch_status=queued&branch_worker_status=active",
+            "branch_status=done&branch_worker_status=waiting",
+            "branch_status=queued,done&branch_worker_status=active,waiting",
+        ):
+            with self.subTest(query=query):
+                request = parse_report_request("/api/view/queue", query)
+                self.assertEqual(request.filters.branch_worker_statuses, ())
+        kept = (
+            ("branch_status=evaluating&branch_worker_status=active", ("active",)),
+            ("branch_status=finalizing&branch_worker_status=waiting", ("waiting",)),
+            ("branch_status=queued,evaluating&branch_worker_status=active",
+             ("active",)),
+            ("branch_worker_status=waiting", ("waiting",)),
+        )
+        for query, expected in kept:
+            with self.subTest(query=query):
+                request = parse_report_request("/api/view/queue", query)
+                self.assertEqual(request.filters.branch_worker_statuses, expected)
 
     def test_every_explicit_endpoint_returns_its_kind(self):
         with running_server(fixture_configuration()) as base_url:
@@ -225,13 +280,13 @@ class ReportServerTest(unittest.TestCase):
 
     def test_comma_separated_status_is_accepted_but_parameters_do_not_repeat(self):
         report_request = parse_report_request(
-            "/api/view/queue", "branch_status=pending,done"
+            "/api/view/queue", "branch_status=evaluating,done"
         )
         self.assertEqual(
-            report_request.filters.branch_statuses, ("pending", "done")
+            report_request.filters.branch_statuses, ("evaluating", "done")
         )
         for query in (
-            "branch_status=pending&branch_status=done",
+            "branch_status=evaluating&branch_status=done",
             "limit=2&limit=3",
             "unknown=1",
         ):
@@ -242,8 +297,8 @@ class ReportServerTest(unittest.TestCase):
         invalid_queries = (
             "tree=yes", "limit=x", "branch_target=BAD", "limit=0",
             "sample_size=0", "minimum_answer_count=5&maximum_answer_count=2",
-            "branch_status=active,active", "branch_status=all,pending",
-            "branch_phase=evaluating,", "branch_phase=working",
+            "branch_status=evaluating,evaluating", "branch_status=all,done",
+            "branch_worker_status=active,", "branch_worker_status=working",
             "finalization_cursor=sideways:1:2", "finalization_cursor=after:1",
         )
         with running_server(fixture_configuration()) as base_url:
