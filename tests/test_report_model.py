@@ -68,6 +68,16 @@ class ReportModelTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     validate_report_request(request)
 
+    def test_rich_spine_and_row_helpers_preserve_legacy_shapes(self):
+        self.assertEqual(parse_rich_spine(None), [])
+        parsed = parse_rich_spine("2:RAISE:-----/4→-y---/2")
+        self.assertEqual(parsed, [(2, "RAISE", "-----", "4"), (None, None, "-y---", "2")])
+        normalized = normalize_worker_descent(parsed, {"raise"})
+        self.assertTrue(normalized[0]["word_is_answer"])
+        self.assertFalse(normalized[1]["word_is_answer"])
+        self.assertEqual(report_model._row_value(None, "missing", "fallback"), "fallback")
+        self.assertEqual(report_model._row_value({}, "missing", "fallback"), "fallback")
+
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         directory = self.temporary_directory.name
