@@ -430,5 +430,60 @@ class TestLegacyTableNameRegression(_TmpDB):
         self.assertCountEqual(scores, [("crane", 42.0), ("slate", 1.1)])
 
 
+class TestObsoleteCandidateErdMemo(_TmpDB):
+    """An older export still carrying the derived memo must not reintroduce it.
+
+    The table is absent from TABLES, so it is skipped by the same path any
+    unrecognized table takes: the tables that still mean something merge, and
+    the target is left without a table nothing reads.
+    """
+
+    def _source_with_the_memo(self):
+        source_path = self.path("source.sqlite3")
+        source = ScoreCache(source_path, WORDS)
+        source.write(ScoreCache.encode_subset(WORDS), ERD_ALL, "crane", 1.5,
+                     max_depth=2, solve_budget=None)
+        source.close()
+        conn = sqlite3.connect(source_path, isolation_level=None)
+        conn.execute("""
+            CREATE TABLE candidate_erd_by_policy (
+                subset_hash TEXT NOT NULL, candidate_word TEXT NOT NULL,
+                policy TEXT NOT NULL, answer_list_id TEXT NOT NULL,
+                erd REAL NOT NULL, max_remaining_depth INTEGER NOT NULL,
+                response_group_count INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (subset_hash, candidate_word, policy, answer_list_id)
+            )
+        """)
+        conn.execute(
+            "INSERT INTO candidate_erd_by_policy VALUES "
+            "('h', 'crane', ?, 'x', 3.5, 5, 120, 100)", (ERD_ALL,))
+        conn.commit()
+        conn.close()
+        return source_path
+
+    def test_the_memo_is_not_in_the_tables_that_travel(self):
+        self.assertNotIn("candidate_erd_by_policy", import_cache.TABLES)
+
+    def test_an_older_source_merges_without_reintroducing_the_memo(self):
+        source_path = self._source_with_the_memo()
+        target_path = self.path("target.sqlite3")
+
+        with mock.patch("sys.argv", [
+                "import_cache.py", source_path, "--target", target_path,
+                "--keep-source"]), mock.patch("sys.stdout", io.StringIO()):
+            import_cache.main()
+
+        target = ScoreCache(target_path, WORDS, checkpoint_on_close=False)
+        self.addCleanup(target.close)
+        tables = {row[0] for row in target._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        self.assertNotIn("candidate_erd_by_policy", tables)
+        # The branch result the memo folded did travel.
+        self.assertEqual(
+            target.read_with_depth(ScoreCache.encode_subset(WORDS), ERD_ALL),
+            ("crane", 1.5, 2, None))
+
+
 if __name__ == "__main__":
     unittest.main()

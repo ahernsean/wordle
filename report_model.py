@@ -1139,6 +1139,21 @@ def _response_group_is_solved(group, group_budget):
 def _candidate_erd_summary(response_groups, group_budget):
     """Fold a candidate's response groups into its own ERD and worst-case line.
 
+    The single place every caller (word report, leaderboard, sources view) gets
+    a candidate's own ERD, and it is derived on every read from the response
+    groups the caller has already materialized — never memoised.  A stored fold
+    would state that every group behind it is an exact branch result, and
+    nothing revalidates that: the branch a fold reads can be deleted by a
+    repair, a reverification, or a requeue, none of which can name the folds
+    that read it.  Folding from the groups in hand keeps a candidate's reported
+    state a description of the cache as it stands.
+
+    `response_groups` carry each group's branch fact as
+    `ScoreCache.report_branch_states` resolved it at `group_budget`, so a child
+    whose only exact result was solved at some other budget arrives here as
+    `missing` and leaves the candidate `pending` — the same scope rule the
+    solver reuses a child under.
+
     Playing the candidate spends one guess from this branch's budget; each
     response group is then solved independently.  So the candidate's ERD is the
     answer-weighted mean of the groups' ERDs plus one, and its worst-case line
@@ -1204,51 +1219,6 @@ def _candidate_erd_summary(response_groups, group_budget):
         "infeasible_group_count": infeasible_group_count,
         "response_group_count": len(response_groups),
     }
-
-
-def _resolved_candidate_erd(cache, branch_key, candidate_word, policy,
-                             response_groups, group_budget, stored_erd_map=None):
-    """A candidate's own ERD at a branch — the single place every caller
-    (word report, leaderboard, sources view) gets this number.
-
-    Once `_candidate_erd_summary` reports a candidate `complete`, the value is
-    an immutable fact: every response group behind it is itself an exact,
-    finalized branch row, and those do not change outside a reverification
-    pass.  So a `complete` fold is persisted the first time it is seen, and
-    every later call for the same (branch, candidate) is one stored-row lookup
-    instead of a fresh fold over the candidate's response groups.
-
-    `stored_erd_map`, when given, comes from `cache.candidate_erd_map` and
-    serves a whole-vocabulary pass (the leaderboard); omit it for a single
-    candidate, which does one direct lookup instead.  `cache` may be None when
-    the caller has no cache connection, leaving the fold unchanged but
-    unpersisted.
-    """
-    stored = None
-    if cache is not None:
-        stored = (
-            cache.candidate_erd_from_map(branch_key, candidate_word, stored_erd_map)
-            if stored_erd_map is not None
-            else cache.read_candidate_erd(branch_key, candidate_word, policy)
-        )
-    # A changed vocabulary reshapes a candidate's own grouping, so a stored row
-    # whose group count no longer matches describes a different partition.
-    if stored is not None and stored["response_group_count"] == len(response_groups):
-        return {
-            "state": "complete",
-            "erd": stored["erd"],
-            "max_remaining_depth": stored["max_remaining_depth"],
-            "resolved_group_count": stored["response_group_count"],
-            "infeasible_group_count": 0,
-            "response_group_count": stored["response_group_count"],
-        }
-    summary = _candidate_erd_summary(response_groups, group_budget)
-    if cache is not None and summary["state"] == "complete":
-        cache.write_candidate_erd(
-            branch_key, candidate_word, policy, summary["erd"],
-            summary["max_remaining_depth"], summary["response_group_count"],
-        )
-    return summary
 
 
 def _response_group_key(row: dict, group_by: str) -> tuple:
@@ -1431,11 +1401,10 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
         cache_states = cache.report_branch_states(
             branch_keys, ERD_ALL, group_budget
         )
-        # Resolved here, while the cache is open, and against the branch this
-        # word is played from — not the root, since a word report can sit at
-        # any spine.
-        erd_summary = _resolved_candidate_erd(
-            cache, resolved.branch_key, word, ERD_ALL,
+        # Folded here, from the branch states just read at this branch's own
+        # budget — the word report can sit at any spine, so `group_budget`
+        # follows the spine rather than assuming the root's.
+        erd_summary = _candidate_erd_summary(
             [
                 {
                     "pattern": row["pattern"],
@@ -2772,14 +2741,14 @@ def _candidate_group_skeletons(sources, all_answers, all_candidates, cache):
 def collect_leaderboard_report(sources: ReportSources, request: ReportRequest) -> dict:
     """Rank every candidate opener by its own ERD.
 
-    Each candidate's ERD is resolved exactly as the word report resolves it
-    (`_resolved_candidate_erd`), reusing the cache's reusability gate so the
-    numbers agree with `view WORD`.  Only openers whose whole tree is solved
-    have a finite ERD and appear ranked; the rest are summarized as pending or
-    infeasible.  A candidate found complete keeps its folded ERD, so a later
-    build reads one row per solved opener instead of re-folding its response
-    groups; an unsolved candidate is re-folded from current cache state every
-    time, since its value can still change.
+    Each candidate's ERD is folded exactly as the word report folds it
+    (`_candidate_erd_summary`), over branch states read through the cache's own
+    reusability gate, so the numbers agree with `view WORD`.  Only openers
+    whose whole tree is solved have a finite ERD and appear ranked; the rest
+    are summarized as pending or infeasible.  Every candidate is re-folded from
+    current cache state on every build: `report_branch_row_maps` loads the
+    whole policy's rows once, so the pass is one query plus arithmetic over
+    rows already in memory.
     """
     generated_at = int(time.time())
     all_answers = load_word_list(sources.answer_list_path)
@@ -2804,9 +2773,6 @@ def collect_leaderboard_report(sources: ReportSources, request: ReportRequest) -
             default=0,
         )
         exact_by_key, loss_by_key = cache.report_branch_row_maps(ERD_ALL)
-        stored_erd_map = cache.candidate_erd_map(ERD_ALL)
-        # Every candidate here is an opener, folded against the root branch.
-        root_branch_key = ScoreCache.encode_subset(all_answers)
         counts = {"complete": 0, "pending": 0, "infeasible": 0}
         ranked_rows = []
         for candidate, groups in skeletons:
@@ -2824,10 +2790,7 @@ def collect_leaderboard_report(sources: ReportSources, request: ReportRequest) -
                 }
                 for pattern, answer_count, branch_key in groups
             ]
-            summary = _resolved_candidate_erd(
-                cache, root_branch_key, candidate, ERD_ALL,
-                response_groups, group_budget, stored_erd_map,
-            )
+            summary = _candidate_erd_summary(response_groups, group_budget)
             counts[summary["state"]] += 1
             if summary["state"] == "complete":
                 ranked_rows.append({
@@ -3305,14 +3268,15 @@ def _grouped_source_words(rows, group_by, branch_totals, generated_at):
 
 def _source_word_erd_summaries(sources, source_words, report, cache,
                                all_answers):
-    """Resolve each word's own ERD, reusing folds until the cache changes.
+    """Fold each word's own ERD, reusing summaries until the cache changes.
 
     A source word's ERD is the whole point of queueing it.  It is derived from
     the cached result of each of the word's response groups, the same way the
-    word report derives it for one word, and a word whose whole tree is solved
-    keeps its folded value in `candidate_erd_by_policy` so later pages read one
-    row instead of re-folding ~150 groups.  ERD order requires every visible
-    source word's summary; unchanged cache files reuse the previous fold.
+    word report derives it for one word.  ERD order requires every visible
+    source word's summary, so the fold is held in `_SOURCE_ERD_SUMMARY_CACHE`
+    for the life of one cache generation — keyed on the cache file's signature,
+    including its WAL, so any write at all discards the whole set rather than
+    outliving the branch rows it folded.
     """
     summaries = {}
     if not source_words:
@@ -3330,9 +3294,6 @@ def _source_word_erd_summaries(sources, source_words, report, cache,
                 cache_version, cached_summaries)
         # An opener spends the first guess, leaving the rest for its groups.
         group_budget = GAME_GUESSES - 1
-        # Source words are always openers, so every one folds against the same
-        # branch: the whole answer list, before any guess is played.
-        root_branch_key = ScoreCache.encode_subset(all_answers)
         for word in source_words:
             if word is None:
                 continue
@@ -3356,8 +3317,7 @@ def _source_word_erd_summaries(sources, source_words, report, cache,
             states = cache.report_branch_states(
                 branch_keys, ERD_ALL, group_budget
             )
-            summary = _resolved_candidate_erd(
-                cache, root_branch_key, word, ERD_ALL,
+            summary = _candidate_erd_summary(
                 [
                     {
                         "pattern": row["pattern"],

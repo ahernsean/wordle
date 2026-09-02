@@ -682,10 +682,12 @@ unrestricted result; `budgeted_result_count` counts budget-specific results and
 for a branch count — a branch with results at three budgets is one branch.
 
 **Migration.**  Opening a pre-split cache moves its `solve_budget IS NOT NULL`
-rows into the budget table and clears `candidate_erd_by_policy`, whose every
-row memoised a fold under the old branch-row identity.  The canonical table is
-not rebuilt, so the migration is a row move on the minority rather than a
-rewrite of a multi-GB file.
+rows into the budget table.  The canonical table is not rebuilt, so the
+migration is a row move on the minority rather than a rewrite of a multi-GB
+file.  A second migration drops `candidate_erd_by_policy` outright: it memoised
+a candidate's folded ERD, which is now derived on every read, so the table is
+derived data with no reader.  An audit-only pass opens the cache read-only and
+skips both, which is what lets it run against a live file.
 
 **Deploy before syncing.**  The canonical table's shape is unchanged, so an
 older reader handed a newer export still consumes the unrestricted rows it
@@ -823,12 +825,9 @@ the row's `best_score` agrees with its own fold, and withheld otherwise rather
 than extending the reach of a score the same pass just contradicted.  The
 report counts what it withheld.
 
-A repair also drops the policy's `candidate_erd_by_policy` folds.  Each memoises
-a fold over the rows being repaired and is trusted on a matching
-response-group count alone — which a depth repair does not change — so a report
-would otherwise keep serving the pre-repair depth.  There is no reverse index
-from a branch to the folds that read it, so the whole policy goes; each is
-re-earned by one fold.
+A repair needs nothing invalidated above it.  A candidate's own ERD is folded
+from its response groups' rows on every read, so the next report serves the
+repaired depth without any invalidation step to get wrong.
 
 **A repair does not travel between caches.**  It moves `updated_at`, so an
 incremental `export_cache.py --since` carries the row, but `import_cache.py`

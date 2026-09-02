@@ -618,11 +618,10 @@ class SurfaceTest(_HintCacheTest):
             self.assertNotIn(column, source)
 
     def test_export_and_import_move_only_live_cache_tables(self):
-        """No hint-shaped table joins the six that cross to the phone."""
+        """No hint-shaped table joins the five that cross to the phone."""
         expected = {"answer_list", "response_decomposition",
                     "branch_best_by_policy",
-                    "branch_best_by_policy_and_budget", "candidate_scores",
-                    "candidate_erd_by_policy"}
+                    "branch_best_by_policy_and_budget", "candidate_scores"}
         self.assertEqual(set(export_cache.EXPORT_TABLES), expected)
         self.assertEqual(set(import_cache.TABLES), expected)
 

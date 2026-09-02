@@ -226,11 +226,6 @@ class ScoreCache:
                               best_guess/best_score columns stay short —
                               "best" is only ever read alongside the policy
                               that decided it
-      candidate_erd_by_policy — a candidate's own ERD at a branch, folded
-                              from its response groups' branch_best_by_policy
-                              rows once every one of them is exact; distinct
-                              from candidate_scores, whose methods are cheap
-                              pre-solve heuristics rather than exact results
       answer_list         — fingerprint of the answer word set
 
     All entries are keyed by answer_list_id so a different answer list
@@ -446,32 +441,6 @@ class ScoreCache:
                 updated_at     INTEGER NOT NULL,
                 PRIMARY KEY (branch_key, policy, answer_list_id)
             )
-        """)
-        # A candidate's own ERD at a branch: the fold of every one of its
-        # response groups, once every group is itself an exact
-        # branch_best_by_policy row.  Keyed by subset_hash rather than the raw
-        # branch_key blob (see candidate_scores._subset_hash) because one
-        # branch — most often the root, the whole answer list — accumulates a
-        # row per solved candidate, and the root's own key is the largest
-        # blob in the schema.  response_group_count lets a reader detect a
-        # stale row (a changed vocabulary reshapes a candidate's groups)
-        # without a second query.
-        self._conn.execute("""
-            CREATE TABLE IF NOT EXISTS candidate_erd_by_policy (
-                subset_hash          TEXT    NOT NULL,
-                candidate_word       TEXT    NOT NULL,
-                policy               TEXT    NOT NULL,
-                answer_list_id       TEXT    NOT NULL,
-                erd                  REAL    NOT NULL,
-                max_remaining_depth  INTEGER NOT NULL,
-                response_group_count INTEGER NOT NULL,
-                updated_at           INTEGER NOT NULL,
-                PRIMARY KEY (subset_hash, candidate_word, policy, answer_list_id)
-            )
-        """)
-        self._conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_candidate_erd_by_policy
-            ON candidate_erd_by_policy(answer_list_id, policy)
         """)
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS completed_source_summaries (
@@ -700,10 +669,7 @@ class ScoreCache:
             self._mark_migration_done('add_branch_references')
         # Budget-specific results used to share the canonical table's key, so
         # a branch's two facts overwrote one another.  Move them to the table
-        # that can hold both.  candidate_erd_by_policy goes with them: every
-        # row memoises a fold over branch rows under the old identity, and is
-        # trusted on a matching response-group count alone, so none of them can
-        # be relied on across the split.  Each is re-earned by one fold.
+        # that can hold both.
         if not self._is_migration_done('split_budget_specific_branch_results'):  # pragma: migration
             self._conn.execute("""
                 INSERT OR IGNORE INTO branch_best_by_policy_and_budget
@@ -716,8 +682,18 @@ class ScoreCache:
             """)
             self._conn.execute(
                 "DELETE FROM branch_best_by_policy WHERE solve_budget IS NOT NULL")
-            self._conn.execute("DELETE FROM candidate_erd_by_policy")
             self._mark_migration_done('split_budget_specific_branch_results')
+        # candidate_erd_by_policy memoised a candidate's folded ERD at a
+        # branch, keyed by a hash of the branch's word set.  Given a branch
+        # result there was no way to ask which folds had read it, so deleting
+        # one — a repair, a reverification, a requeue — left every fold over it
+        # asserting a candidate complete whose groups were gone.  The fold is
+        # now derived on each read from branch results already in memory, so
+        # the table is derived data with no reader: drop it outright rather
+        # than carry rows nothing consults.
+        if not self._is_migration_done('drop_candidate_erd_memo'):  # pragma: migration
+            self._conn.execute("DROP TABLE IF EXISTS candidate_erd_by_policy")
+            self._mark_migration_done('drop_candidate_erd_memo')
 
     def _purge_legacy_rows(self, where, params, migration_name=None):
         """One-time cleanup of stale branch_best_by_policy rows.
@@ -1152,24 +1128,6 @@ class ScoreCache:
         self._mem_cache.pop((branch_key, policy, solve_budget), None)
         return cursor.rowcount > 0
 
-    def delete_candidate_erds_for_policy(self, policy):
-        """Drop every folded candidate ERD for one policy, returning the count.
-
-        Each of those rows memoises a fold over branch_best_by_policy rows and
-        is trusted on a matching response-group count alone, so a change to any
-        branch row it folded leaves it stating a stale ERD and max_remaining_depth
-        that no read re-checks.  A repair pass changes branch rows without
-        changing any group count, and the memo is keyed by a hash of the
-        parent's word set, so there is no way to ask which folds touched a
-        given branch.  Dropping the policy's folds is therefore the narrowest
-        invalidation the schema supports; each is re-earned by one fold.
-        """
-        cursor = self._conn.execute("""
-            DELETE FROM candidate_erd_by_policy
-            WHERE policy = ? AND answer_list_id = ?
-        """, (policy, self.answer_list_id))
-        return cursor.rowcount
-
     def delete(self, branch_key, policy):
         """Remove every exact result for a branch so it gets recomputed.
 
@@ -1286,91 +1244,6 @@ class ScoreCache:
         except Exception:
             self._conn.execute("ROLLBACK")
             raise
-
-    # ------------------------------------------------------------------
-    # Candidate ERD cache (a candidate's own solved ERD at a branch)
-    # ------------------------------------------------------------------
-
-    def read_candidate_erd(self, branch_key, candidate_word, policy):
-        """Return a candidate's stored ERD summary at a branch, or None.
-
-        Only ever written once every one of the candidate's response groups
-        is itself an exact branch_best_by_policy row (see write_candidate_erd),
-        so a hit here needs no further reusability check beyond the caller
-        confirming response_group_count still matches its own grouping.
-        """
-        subset_hash = self._subset_hash(branch_key)
-        row = self._conn.execute("""
-            SELECT erd, max_remaining_depth, response_group_count, updated_at
-            FROM candidate_erd_by_policy
-            WHERE subset_hash = ? AND candidate_word = ? AND policy = ?
-              AND answer_list_id = ?
-        """, (subset_hash, candidate_word, policy, self.answer_list_id)).fetchone()
-        return dict(row) if row is not None else None
-
-    def candidate_erd_map(self, policy):
-        """Bulk-load every stored candidate ERD for a policy, keyed by
-        (subset_hash, candidate_word).
-
-        Mirrors report_branch_row_maps: folding a whole vocabulary one
-        candidate at a time would otherwise cost one query per candidate.
-        """
-        return {
-            (row["subset_hash"], row["candidate_word"]): dict(row)
-            for row in self._conn.execute("""
-                SELECT subset_hash, candidate_word, erd, max_remaining_depth,
-                       response_group_count, updated_at
-                FROM candidate_erd_by_policy
-                WHERE policy = ? AND answer_list_id = ?
-            """, (policy, self.answer_list_id))
-        }
-
-    def candidate_erd_from_map(self, branch_key, candidate_word, stored_map):
-        """Look up a candidate's stored ERD in a map from candidate_erd_map."""
-        return stored_map.get((self._subset_hash(branch_key), candidate_word))
-
-    def delete_candidate_erd(self, branch_key, candidate_word, policy):
-        """Drop a candidate's folded ERD at a branch.
-
-        The stored fold is a memo whose premise is that every response group
-        behind it is an exact branch_best_by_policy row (see
-        write_candidate_erd), and a reader trusts it without re-checking those
-        rows.  Deleting any of them breaks the premise, so whoever deletes them
-        drops this row in the same breath; the next read folds afresh and
-        persists again once the groups are solved.
-        """
-        self._conn.execute("""
-            DELETE FROM candidate_erd_by_policy
-            WHERE subset_hash = ? AND candidate_word = ? AND policy = ?
-              AND answer_list_id = ?
-        """, (self._subset_hash(branch_key), candidate_word, policy,
-              self.answer_list_id))
-
-    def write_candidate_erd(self, branch_key, candidate_word, policy, erd,
-                             max_remaining_depth, response_group_count):
-        """Persist a candidate's own solved ERD at a branch.
-
-        Every response group behind it is already an exact, finalized
-        branch_best_by_policy row by the time a caller has an `erd` to pass
-        here, so the value is immutable going forward — write-once in the
-        same sense those rows are. Disk I/O errors are logged and swallowed
-        like write().
-        """
-        subset_hash = self._subset_hash(branch_key)
-        now = int(time.time())
-        try:
-            self._conn.execute("""
-                INSERT OR REPLACE INTO candidate_erd_by_policy
-                    (subset_hash, candidate_word, policy, answer_list_id,
-                     erd, max_remaining_depth, response_group_count, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (subset_hash, candidate_word, policy, self.answer_list_id,
-                  erd, max_remaining_depth, response_group_count, now))
-        except sqlite3.OperationalError as exc:
-            if not _is_disk_io_error(exc):
-                raise
-            logger.warning("write_candidate_erd(%s, %s) failed: %s",
-                           policy, candidate_word, exc)
 
     def completed_source_summary_map(self, policy):
         return {row["source_word"].lower(): dict(row) for row in self._conn.execute("""

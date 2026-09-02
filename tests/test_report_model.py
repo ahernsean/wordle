@@ -22,7 +22,6 @@ from report_model import (
     _candidate_erd_summary,
     _candidate_eta,
     _source_word_group_key,
-    _resolved_candidate_erd,
     _grouped_response_groups,
     _response_group_is_solved,
     _response_group_key,
@@ -263,122 +262,91 @@ class ReportModelTest(unittest.TestCase):
          "max_remaining_depth": None, "cache_state": "exact"},
     ]
 
-    def test_resolved_candidate_erd_persists_a_complete_fold(self):
-        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
-        branch_key = ScoreCache.encode_subset(ANSWERS)
-        summary = _resolved_candidate_erd(
-            cache, branch_key, "salet", ERD_ALL, self._SALET_GROUPS, 5
-        )
+    def test_candidate_erd_summary_folds_the_groups_it_is_handed(self):
+        summary = _candidate_erd_summary(self._SALET_GROUPS, 5)
         self.assertEqual(summary["state"], "complete")
         self.assertAlmostEqual(summary["erd"], 1.75)
-        stored = cache.read_candidate_erd(branch_key, "salet", ERD_ALL)
-        self.assertEqual(stored["erd"], summary["erd"])
-        self.assertEqual(stored["response_group_count"], 4)
-        cache.close()
+        self.assertEqual(summary["resolved_group_count"], 4)
+        self.assertEqual(summary["response_group_count"], 4)
 
-    def test_resolved_candidate_erd_does_not_persist_a_pending_fold(self):
-        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
-        branch_key = ScoreCache.encode_subset(ANSWERS)
-        summary = _resolved_candidate_erd(
-            cache, branch_key, "nurdy", ERD_ALL,
-            [self._group("-----", 2, None, None, cache_state="missing")], 5,
-        )
-        self.assertEqual(summary["state"], "pending")
-        self.assertIsNone(cache.read_candidate_erd(branch_key, "nurdy", ERD_ALL))
-        cache.close()
-
-    def test_delete_candidate_erd_drops_only_the_named_fold(self):
-        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
-        branch_key = ScoreCache.encode_subset(ANSWERS)
-        other_key = ScoreCache.encode_subset(ANSWERS[:2])
-        cache.write_candidate_erd(branch_key, "salet", ERD_ALL, 1.75, 1, 4)
-        cache.write_candidate_erd(branch_key, "crane", ERD_ALL, 1.80, 1, 4)
-        cache.write_candidate_erd(other_key, "salet", ERD_ALL, 1.50, 1, 2)
-
-        cache.delete_candidate_erd(branch_key, "salet", ERD_ALL)
-
-        self.assertIsNone(cache.read_candidate_erd(branch_key, "salet", ERD_ALL))
-        self.assertIsNotNone(cache.read_candidate_erd(branch_key, "crane", ERD_ALL))
-        self.assertIsNotNone(cache.read_candidate_erd(other_key, "salet", ERD_ALL))
-        # Deleting a fold that was never stored is a no-op, not an error: the
-        # recompute path drops the row whether or not one was ever written.
-        cache.delete_candidate_erd(branch_key, "nurdy", ERD_ALL)
-        cache.close()
-
-    def test_resolved_candidate_erd_reads_the_stored_row_without_refolding(self):
-        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
-        branch_key = ScoreCache.encode_subset(ANSWERS)
-        cache.write_candidate_erd(branch_key, "salet", ERD_ALL, 1.75, 1, 4)
-        with patch("report_model._candidate_erd_summary") as folded:
-            summary = _resolved_candidate_erd(
-                cache, branch_key, "salet", ERD_ALL, self._SALET_GROUPS, 5
-            )
-        folded.assert_not_called()
-        self.assertEqual(summary, {
-            "state": "complete", "erd": 1.75, "max_remaining_depth": 1,
-            "resolved_group_count": 4, "infeasible_group_count": 0,
-            "response_group_count": 4,
-        })
-        cache.close()
-
-    def test_resolved_candidate_erd_refolds_when_the_stored_group_count_is_stale(self):
-        # A changed vocabulary reshapes a candidate's own grouping, so a row
-        # stored for the old shape must not answer for the new one.
-        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
-        branch_key = ScoreCache.encode_subset(ANSWERS)
-        cache.write_candidate_erd(branch_key, "salet", ERD_ALL, 1.75, 1, 4)
-        summary = _resolved_candidate_erd(
-            cache, branch_key, "salet", ERD_ALL,
-            [self._group("ggggg", 1, None, None),
+    def test_candidate_erd_summary_holds_no_state_between_calls(self):
+        # The fold is a pure function of the groups handed to it.  Folding a
+        # candidate complete and then folding the same candidate again with one
+        # group unresolved must report the second answer, not the first: that
+        # is the whole difference between deriving the value and memoising it.
+        # The changed group holds two answers, so its state genuinely turns on
+        # a cached branch result rather than on playing a lone survivor.
+        groups = [self._group("ggggg", 1, None, None),
+                  self._group("-----", 2, 1.5, 2)]
+        complete = _candidate_erd_summary(groups, 5)
+        self.assertEqual(complete["state"], "complete")
+        self.assertAlmostEqual(complete["erd"], 2.0)
+        degraded = _candidate_erd_summary(
+            [groups[0],
              self._group("-----", 2, None, None, cache_state="missing")],
             5,
         )
-        self.assertEqual(summary["state"], "pending")
-        self.assertEqual(summary["response_group_count"], 2)
-        cache.close()
+        self.assertEqual(degraded["state"], "pending")
+        self.assertIsNone(degraded["erd"])
+        self.assertEqual(degraded["resolved_group_count"], 1)
+        self.assertEqual(degraded["response_group_count"], 2)
 
-    def test_resolved_candidate_erd_without_a_cache_still_folds(self):
-        summary = _resolved_candidate_erd(
-            None, ScoreCache.encode_subset(ANSWERS), "salet", ERD_ALL,
-            self._SALET_GROUPS, 5,
-        )
-        self.assertEqual(summary["state"], "complete")
-        self.assertAlmostEqual(summary["erd"], 1.75)
-
-    def test_resolved_candidate_erd_stored_map_path_matches_direct_lookup(self):
-        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
-        branch_key = ScoreCache.encode_subset(ANSWERS)
-        cache.write_candidate_erd(branch_key, "salet", ERD_ALL, 1.75, 1, 4)
-        stored_map = cache.candidate_erd_map(ERD_ALL)
-        with patch("report_model._candidate_erd_summary") as folded:
-            summary = _resolved_candidate_erd(
-                cache, branch_key, "salet", ERD_ALL, self._SALET_GROUPS, 5,
-                stored_map,
-            )
-        folded.assert_not_called()
-        self.assertEqual(summary["erd"], 1.75)
-        cache.close()
-
-    def test_leaderboard_persists_and_then_reuses_each_complete_erd(self):
+    def test_leaderboard_refolds_every_candidate_on_every_build(self):
+        # No candidate's ERD survives a build.  Each row is folded from the
+        # branch results as they stand when the leaderboard is asked for, so a
+        # cache that has not changed gives the same ranking by recomputing it,
+        # never by reading a stored fold back.
         sources = self._leaderboard_sources(
             ["crane", "slate"], ["crane", "slate", "raise", "howdy"]
         )
         first = collect_report(sources, ReportRequest(report_kind="leaderboard"))
-        cache = ScoreCache(sources.cache_path, ["crane", "slate"],
-                            checkpoint_on_close=False)
-        stored = cache.candidate_erd_map(ERD_ALL)
-        cache.close()
-        # crane/slate/raise complete and are persisted; howdy never completes
-        # in this fixture (both answers collide in one unsolved group).
-        self.assertEqual(len(stored), 3)
         with patch(
             "report_model._candidate_erd_summary", wraps=_candidate_erd_summary,
         ) as folded:
             second = collect_report(
                 sources, ReportRequest(report_kind="leaderboard")
             )
-        self.assertEqual(folded.call_count, 1)   # howdy alone
+        self.assertEqual(folded.call_count, 4)   # every candidate, every build
         self.assertEqual(second["data"]["rows"], first["data"]["rows"])
+        self.assertEqual(second["data"]["counts"], first["data"]["counts"])
+
+    def test_leaderboard_drops_a_candidate_whose_child_result_is_deleted(self):
+        # HOWDY shares no letters with either answer, so both collide in one
+        # two-answer group -- the only candidate here whose completeness turns
+        # on a cached branch result rather than on playing a lone survivor.
+        sources = self._leaderboard_sources(
+            ["crane", "slate"], ["crane", "slate", "raise", "howdy"]
+        )
+        answers = ["crane", "slate"]
+        collided_key = ScoreCache.encode_subset(answers)
+        pending = collect_report(
+            sources, ReportRequest(report_kind="leaderboard"))["data"]
+        self.assertEqual(pending["counts"]["complete"], 3)
+        self.assertNotIn("howdy", {row["word"] for row in pending["rows"]})
+
+        cache = ScoreCache(sources.cache_path, answers,
+                           checkpoint_on_close=False)
+        cache.write(collided_key, ERD_ALL, "crane", 1.5,
+                    max_depth=2, solve_budget=None)
+        cache.close()
+        complete = collect_report(
+            sources, ReportRequest(report_kind="leaderboard"))["data"]
+        self.assertEqual(complete["counts"]["complete"], 4)
+        self.assertIn("howdy", {row["word"] for row in complete["rows"]})
+
+        # Nothing names HOWDY when this row goes, and nothing needs to: the
+        # next build folds HOWDY from the group that no longer resolves.
+        cache = ScoreCache(sources.cache_path, answers,
+                           checkpoint_on_close=False)
+        cache.delete(collided_key, ERD_ALL)
+        cache.close()
+
+        second = collect_report(
+            sources, ReportRequest(report_kind="leaderboard"))["data"]
+        self.assertEqual(second["counts"]["complete"], 3)
+        self.assertEqual(second["counts"]["pending"], 1)
+        self.assertNotIn("howdy", {row["word"] for row in second["rows"]})
+        self.assertEqual(second["rows"], pending["rows"])
 
     def test_collect_word_report_populates_candidate_erd_summary(self):
         request = ReportRequest(
@@ -778,14 +746,11 @@ class ReportModelTest(unittest.TestCase):
             5,
         ))
 
-    def test_response_group_breakdown_agrees_with_the_erd_line_after_a_recompute(self):
-        """The stored fold must not outlive the branch rows it folded.
+    def _solve_bebop_groups(self):
+        """Give BEBOP's every response group an exact result, and report it.
 
-        `_resolved_candidate_erd` trusts a matching `candidate_erd_by_policy`
-        row without re-reading the branches behind it, so before
-        `invalidate_branches_for_recompute` dropped that row a recomputed word
-        reported `complete` with every group resolved while each group's own
-        row was gone -- the ERD line counting groups the graph drew as unsolved.
+        Returns (branch_keys, report data) with the word reading `complete` —
+        the state every deletion regression below starts from.
         """
         target = parse_report_branch_target("bebop")
         groups = collect_report(
@@ -799,43 +764,119 @@ class ReportModelTest(unittest.TestCase):
             cache.write(branch_key, ERD_ALL, "salet", 1.5,
                         max_depth=2, solve_budget=None)
         cache.close()
-
         complete = collect_report(
             self.sources, ReportRequest(branch_target=target)
         )["data"]
         self.assertEqual(complete["erd_summary"]["state"], "complete")
         self.assertTrue(all(entry["solved"]
                             for entry in complete["response_group_breakdown"]))
-        root_branch_key = ScoreCache.encode_subset(ANSWERS)
-        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
-        self.assertIsNotNone(
-            cache.read_candidate_erd(root_branch_key, "bebop", ERD_ALL),
-            "the fold must be stored, or this proves nothing about dropping it",
-        )
-        cache.close()
+        self.assertEqual(complete["erd_summary"]["resolved_group_count"], 2)
+        return branch_keys, complete
 
-        # The real recompute sequence, not a hand-made approximation of it.
-        queue = self._open_queue()
-        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
-        erd_search.invalidate_branches_for_recompute(
-            queue, cache, branch_keys, root_branch_key, "bebop")
-        self.assertIsNone(
-            cache.read_candidate_erd(root_branch_key, "bebop", ERD_ALL))
-        cache.close()
-        queue.close()
-
-        recomputing = collect_report(
-            self.sources, ReportRequest(branch_target=target)
+    def _bebop_report(self):
+        return collect_report(
+            self.sources,
+            ReportRequest(branch_target=parse_report_branch_target("bebop")),
         )["data"]
+
+    def _assert_bebop_reads_pending(self, resolved_group_count):
+        data = self._bebop_report()
         solved = [entry["solved"]
-                  for entry in recomputing["response_group_breakdown"]]
-        self.assertEqual(solved, [False, False])
-        self.assertEqual(recomputing["erd_summary"]["state"], "pending")
+                  for entry in data["response_group_breakdown"]]
+        self.assertEqual(data["erd_summary"]["state"], "pending")
+        self.assertIsNone(data["erd_summary"]["erd"])
+        self.assertIsNone(data["erd_summary"]["max_remaining_depth"])
+        self.assertEqual(sum(solved), resolved_group_count)
         self.assertEqual(
-            sum(solved),
-            recomputing["erd_summary"]["resolved_group_count"],
+            data["erd_summary"]["resolved_group_count"], resolved_group_count,
             "the ERD line and the outlined groups must count the same groups",
         )
+        self.assertEqual(data["erd_summary"]["response_group_count"], 2,
+                         "every group is still counted, resolved or not")
+        return data
+
+    def test_a_complete_candidate_goes_pending_when_one_child_is_deleted(self):
+        """One deleted response group is enough to un-complete the word.
+
+        This is the failure #288 describes, reduced to its smallest form: no
+        caller announces the deletion, and nothing above the branch is
+        invalidated.  A word reads `complete` only because its groups are read
+        and folded afresh, so deleting one of them shows up on the next report
+        with no invalidation step in between to get right.
+        """
+        branch_keys, _ = self._solve_bebop_groups()
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        cache.delete(branch_keys[0], ERD_ALL)
+        cache.close()
+        self._assert_bebop_reads_pending(resolved_group_count=1)
+
+    def test_a_word_goes_pending_after_a_spot_check_deletes_a_branch(self):
+        # verify_erd_cache's reverification and wordle.py's "this root
+        # contradicts its own cached subtree" both reach the report through a
+        # bare ScoreCache.delete of a branch whose parents they cannot name.
+        branch_keys, _ = self._solve_bebop_groups()
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        for branch_key in branch_keys:
+            cache.delete(branch_key, ERD_ALL)
+        cache.close()
+        self._assert_bebop_reads_pending(resolved_group_count=0)
+
+    def test_a_word_goes_pending_after_a_repair_withdraws_a_child(self):
+        # verify_branch_depths repairs max_depth in place.  Raising a child's
+        # worst case past the budget it is read at withdraws its reuse, so the
+        # parent's fold must lose that group -- the case a memo keyed on an
+        # unchanged response-group count could not see at all.
+        branch_keys, _ = self._solve_bebop_groups()
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        group_budget = GAME_GUESSES - 1
+        self.assertTrue(cache.repair_max_depth(
+            branch_keys[0], ERD_ALL, group_budget + 1, None))
+        cache.close()
+        self._assert_bebop_reads_pending(resolved_group_count=1)
+
+    def test_a_word_goes_pending_after_the_recompute_path_deletes_its_groups(self):
+        # The real recompute sequence, not a hand-made approximation of it.
+        branch_keys, _ = self._solve_bebop_groups()
+        queue = self._open_queue()
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        erd_search.invalidate_branches_for_recompute(queue, cache, branch_keys)
+        cache.close()
+        queue.close()
+        self._assert_bebop_reads_pending(resolved_group_count=0)
+
+    def test_a_word_folds_a_childs_budget_specific_result_at_its_own_budget(self):
+        """A child solved at exactly this budget completes the fold; one solved
+        at another budget is not available to it.
+
+        Both facts can be stored for one branch, and only the scope the parent
+        would actually reuse may be folded -- `report_branch_states` picks it
+        with the same rule `read_for_budget` applies.
+        """
+        target = parse_report_branch_target("bebop")
+        groups = collect_report(
+            self.sources, ReportRequest(branch_target=target)
+        )["data"]["response_groups"]
+        branch_keys = [
+            bytes.fromhex(row["branch_key_hex"]) for row in groups
+        ]
+        group_budget = GAME_GUESSES - 1
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        # One child has only a result solved at the wrong budget ...
+        cache.write(branch_keys[0], ERD_ALL, "salet", 1.5,
+                    max_depth=2, solve_budget=group_budget - 1)
+        cache.write(branch_keys[1], ERD_ALL, "salet", 1.5,
+                    max_depth=2, solve_budget=None)
+        cache.close()
+        self._assert_bebop_reads_pending(resolved_group_count=1)
+
+        # ... and completes the fold once it holds one at this budget.
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        cache.write(branch_keys[0], ERD_ALL, "salet", 1.5,
+                    max_depth=2, solve_budget=group_budget)
+        cache.close()
+        data = self._bebop_report()
+        self.assertEqual(data["erd_summary"]["state"], "complete")
+        self.assertEqual(data["erd_summary"]["resolved_group_count"], 2)
 
     def test_response_group_breakdown_ignores_filters_and_the_display_limit(self):
         # The graph draws the whole decomposition; narrowing the rows listed
@@ -1877,10 +1918,10 @@ class SourceReportTest(unittest.TestCase):
 
     def test_each_source_word_carries_its_own_erd(self):
         # A word's ERD is why it was queued.  It is derived from the word's
-        # cached response groups, and kept once the whole tree is solved.
-        # NURDY is the one of these that leaves a two-answer group, so it is
-        # the one whose ERD needs the cache; the others partition this answer
-        # list into singletons, which are solved by playing them.
+        # cached response groups on every read.  NURDY is the one of these that
+        # leaves a two-answer group, so it is the one whose ERD needs the
+        # cache; the others partition this answer list into singletons, which
+        # are solved by playing them.
         self._queue_words(("nurdy", 5, 1), ("crane", 3, 1))
         cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
         response_cache = ResponseCache(ANSWERS, score_cache=None)
@@ -1920,16 +1961,15 @@ class SourceReportTest(unittest.TestCase):
         self.assertEqual(nurdy["resolved_group_count"], 2)
         self.assertEqual(nurdy["response_group_count"], 3)
 
-        # The solved word's fold is kept, so a later page reads it back
-        # instead of refolding; the unsolved one is not, since its value can
-        # still change.
+        # Neither word's fold is persisted anywhere: the report's numbers came
+        # from the branch tables and nothing else was written.
         cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
-        root_branch_key = ScoreCache.encode_subset(ANSWERS)
-        stored = cache.read_candidate_erd(root_branch_key, "crane", ERD_ALL)
-        self.assertEqual(stored["erd"], 1.75)
-        self.assertEqual(stored["max_remaining_depth"], 2)
-        self.assertIsNone(
-            cache.read_candidate_erd(root_branch_key, "nurdy", ERD_ALL))
+        self.assertEqual(
+            [row["name"] for row in cache._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'candidate_erd_by_policy'")],
+            [],
+        )
         cache.close()
 
     def test_branch_totals_count_a_shared_branch_once(self):

@@ -554,38 +554,27 @@ class RepairSideEffectsTest(_CacheFixture):
         self.assertEqual(self.audit(repair=True).repaired, 1)
         self.assertGreater(self.updated_at_of(parent), 0)
 
-    def candidate_erd_count(self):
-        score_cache = self.open_cache()
-        return score_cache._conn.execute(
-            "SELECT COUNT(*) FROM candidate_erd_by_policy "
-            "WHERE policy = ? AND answer_list_id = ?",
-            (ERD_ALL, score_cache.answer_list_id)).fetchone()[0]
+    def test_a_repair_touches_only_the_row_it_repairs(self):
+        """A repair has nothing to invalidate above it.
 
-    def seed_candidate_erd(self, fact):
-        row = self.row_for(*fact)
-        score_cache = self.open_cache()
-        score_cache.write_candidate_erd(fact[0], row['best_guess'], ERD_ALL,
-                                        row['best_score'], row['max_depth'], 2)
-
-    def test_a_repair_drops_the_candidate_erd_folds_it_invalidates(self):
-        # Those folds are trusted on a matching response-group count alone,
-        # and a depth repair does not change one — so a report would keep
-        # serving the pre-repair depth if they survived.
+        A candidate's own ERD is folded from its response groups' rows on
+        every read, so the repaired depth reaches the next report without an
+        invalidation step.  What the pass must not do is write anything beyond
+        the branch results it is auditing.
+        """
         parent = self.deepest_chain()[-2]
-        self.seed_candidate_erd(parent)
-        self.assertEqual(self.candidate_erd_count(), 1)
         self.understate(parent)
+        before = self.table_names()
 
         audit = self.audit(repair=True)
-        self.assertEqual(audit.candidate_erds_dropped, 1)
-        self.assertEqual(self.candidate_erd_count(), 0)
 
-    def test_an_audit_that_repairs_nothing_leaves_the_folds_in_place(self):
-        self.seed_candidate_erd(self.deepest_chain()[-2])
-        audit = self.audit(repair=True)
-        self.assertEqual(audit.repaired, 0)
-        self.assertEqual(audit.candidate_erds_dropped, 0)
-        self.assertEqual(self.candidate_erd_count(), 1)
+        self.assertEqual(audit.repaired, 1)
+        self.assertEqual(self.table_names(), before)
+        self.assertNotIn('candidate_erd_by_policy', before)
+
+    def table_names(self):
+        return {row[0] for row in self.open_cache()._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
 
 
 class ReadOnlyAuditTest(_CacheFixture):
@@ -686,7 +675,6 @@ class CommandLineTest(_CacheFixture):
              'unresolved_groups': 0,
              'depth_too_low': 1070, 'depth_too_high': 36, 'score_stale': 2500,
              'repaired': 1106, 'repair_withheld': 30,
-             'candidate_erds_dropped': 189,
              'depth_deltas': {'3 -> 4': 1065, '4 -> 5': 5},
              'tainted_split': {'tainted': 1070},
              'mismatch_sizes': {16: 500, 25: 570},

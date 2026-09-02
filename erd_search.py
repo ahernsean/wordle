@@ -228,17 +228,14 @@ def ladder_top_priority(lowest_queued, explicit_priority, step, n_words):
     return max(SOURCE_PRIORITY_MIN, lowest_queued - 1)
 
 
-def invalidate_branches_for_recompute(queue, score_cache, branch_keys,
-                                      parent_branch_key, candidate_word):
+def invalidate_branches_for_recompute(queue, score_cache, branch_keys):
     """Drop each branch's cached result and the work state that would keep it
     unclaimable, so it is genuinely recomputed.
 
-    The word's own folded ERD at the branch it is played from goes too.  That
-    row is a memo over exactly these branches' cached results, and a reader
-    trusts it without re-reading them, so leaving it behind would keep
-    reporting the word complete while the groups under it are being recomputed.
-    It is dropped whatever the branches below do, since a fold is only as good
-    as the rows it folded and a dropped memo costs one re-fold.
+    Nothing above these branches needs invalidating alongside them.  A word's
+    own ERD is folded from its response groups' cached results on every read,
+    so a group deleted here reports as unresolved immediately, and the word
+    reads as pending until it is solved again.
 
     A branch the queue finished keeps a `done` pending row, and can still
     hold candidate claims and an `active_branches` row.  Re-adding it leaves
@@ -255,7 +252,6 @@ def invalidate_branches_for_recompute(queue, score_cache, branch_keys,
 
     Returns (reset_count, busy_count).
     """
-    score_cache.delete_candidate_erd(parent_branch_key, candidate_word, ERD_ALL)
     reset_count = 0
     busy_count = 0
     for branch_key in branch_keys:
@@ -428,11 +424,8 @@ def cmd_queue_add(args):
                     if state['cache_state'] in ('exact', 'loss')}
 
                 if args.delete_erd_cache:
-                    # queue add only ever creates openers, so the branch these
-                    # groups are played from is the root.
                     word_reset, word_busy = invalidate_branches_for_recompute(
-                        queue, score_cache, branch_keys,
-                        encode_subset(all_answers), word)
+                        queue, score_cache, branch_keys)
                     n_reset += word_reset
                     n_busy += word_busy
                     rows_to_queue = rows

@@ -234,14 +234,35 @@ class MigrationTest(_CacheTest):
     """Opening a pre-split cache moves its budget-specific rows, once."""
 
     def legacy_cache(self, name="legacy.sqlite3"):
-        """A cache in the shape the split migration finds: budget-specific
-        results sharing the canonical table's key."""
+        """A cache in the shape the migrations find: budget-specific results
+        sharing the canonical table's key, and the obsolete candidate ERD memo
+        still present with rows in it."""
         path = os.path.join(self._dir, name)
         score_cache = ScoreCache(path, WORDS, checkpoint_on_close=False)
         answer_list_id = score_cache.answer_list_id
         score_cache._conn.execute(
             "DELETE FROM schema_migrations "
-            "WHERE name = 'split_budget_specific_branch_results'")
+            "WHERE name IN ('split_budget_specific_branch_results', "
+            "               'drop_candidate_erd_memo')")
+        # The memo's own schema, as a cache written before it was dropped
+        # carries it.
+        score_cache._conn.execute("""
+            CREATE TABLE candidate_erd_by_policy (
+                subset_hash          TEXT    NOT NULL,
+                candidate_word       TEXT    NOT NULL,
+                policy               TEXT    NOT NULL,
+                answer_list_id       TEXT    NOT NULL,
+                erd                  REAL    NOT NULL,
+                max_remaining_depth  INTEGER NOT NULL,
+                response_group_count INTEGER NOT NULL,
+                updated_at           INTEGER NOT NULL,
+                PRIMARY KEY (subset_hash, candidate_word, policy, answer_list_id)
+            )
+        """)
+        score_cache._conn.execute("""
+            CREATE INDEX idx_candidate_erd_by_policy
+            ON candidate_erd_by_policy(answer_list_id, policy)
+        """)
         rows = [
             (ScoreCache.encode_subset(WORDS), "crane", 2.0, 4, None),
             (ScoreCache.encode_subset(WORDS[:2]), "slate", 2.5, 3, 3),
@@ -290,12 +311,58 @@ class MigrationTest(_CacheTest):
         self.assertEqual(sorted(row[0] for row in score_cache._conn.execute(
             f"SELECT updated_at FROM {BUDGETED}")), [100, 100])
 
-    def test_the_derived_candidate_erd_folds_are_dropped(self):
-        # Every one memoised a fold under the old branch-row identity.
+    def _tables(self, score_cache):
+        return {row[0] for row in score_cache._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+
+    def test_the_obsolete_candidate_erd_memo_table_is_dropped(self):
+        # It memoised a candidate's folded ERD, which is now derived on every
+        # read, so the table is derived data with no reader.  Its index goes
+        # with it, since dropping a table drops the indexes over it.
         path = self.legacy_cache()
         score_cache = ScoreCache(path, WORDS, checkpoint_on_close=False)
         self.addCleanup(score_cache.close)
-        self.assertEqual(self.count(score_cache, "candidate_erd_by_policy"), 0)
+        self.assertNotIn("candidate_erd_by_policy", self._tables(score_cache))
+        self.assertEqual(
+            score_cache._conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' "
+                "AND name = 'idx_candidate_erd_by_policy'").fetchone()[0], 0)
+        # The branch results the memo folded are untouched by the drop.
+        self.assertEqual(self.count(score_cache, CANONICAL), 1)
+        self.assertEqual(self.count(score_cache, BUDGETED), 2)
+
+    def test_a_cache_that_never_had_the_memo_table_opens_cleanly(self):
+        # A fresh cache never creates it, so the drop must be a no-op rather
+        # than an error on a table that was never there.
+        path = os.path.join(self._dir, "fresh.sqlite3")
+        first = ScoreCache(path, WORDS, checkpoint_on_close=False)
+        self.assertNotIn("candidate_erd_by_policy", self._tables(first))
+        first.close()
+        second = ScoreCache(path, WORDS, checkpoint_on_close=False)
+        self.addCleanup(second.close)
+        self.assertNotIn("candidate_erd_by_policy", self._tables(second))
+
+    def test_a_pre_migration_cache_opens_read_only_without_being_written(self):
+        # An audit pass opens a live cache read-only, which skips every
+        # migration -- mode=ro would reject the DROP outright.  The obsolete
+        # table survives that open untouched, and no reader consults it.
+        path = self.legacy_cache("readonly.sqlite3")
+        read_only = ScoreCache(path, WORDS, read_only=True)
+        self.addCleanup(read_only.close)
+        self.assertIn("candidate_erd_by_policy", self._tables(read_only))
+        self.assertEqual(
+            read_only._conn.execute(
+                "SELECT COUNT(*) FROM candidate_erd_by_policy").fetchone()[0], 1)
+        # Reading branch state still works, which is what the pass is for.
+        self.assertEqual(
+            read_only.report_branch_state(self.key, ERD_ALL)["cache_state"],
+            "exact")
+        read_only.close()
+
+        # And the writable open that follows still performs the drop.
+        writable = ScoreCache(path, WORDS, checkpoint_on_close=False)
+        self.addCleanup(writable.close)
+        self.assertNotIn("candidate_erd_by_policy", self._tables(writable))
 
     def test_reopening_is_idempotent(self):
         path = self.legacy_cache()
