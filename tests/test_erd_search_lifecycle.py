@@ -447,6 +447,40 @@ class QueueOperatorCommandTest(unittest.TestCase):
         with patch.object(erd_search.os, "kill", side_effect=OSError("gone")):
             erd_search._dump_worker_stacks({1: (process, 0)})
 
+    def test_wal_ceiling_and_remaining_queue_commands_cover_operator_outcomes(self):
+        queue = Mock()
+        queue.wal_size_bytes.return_value = 0
+        self.assertFalse(erd_search._enforce_wal_hard_ceiling(queue, {}))
+
+        queue.reset_mock()
+        queue.wal_size_bytes.return_value = erd_search.QUEUE_WAL_HARD_CEILING_BYTES
+        queue.heartbeats_with_branch.return_value = [{
+            "worker_id": "one", "pid": 10, "cur_candidate": "raise",
+            "claim_started_at": None, "updated_at": None, "cur_nodes": 1,
+            "node_rate": 2,
+        }]
+        with patch.object(erd_search, "_dump_worker_stacks"), \
+             patch.object(erd_search.time, "sleep"):
+            self.assertTrue(erd_search._enforce_wal_hard_ceiling(queue, {}))
+        queue.set_disk_stop.assert_called_once()
+
+        queue.reset_mock()
+        queue.reset_stale_in_progress.return_value = 3
+        with patch.object(erd_search, "ERDQueue", return_value=queue):
+            erd_search.cmd_reset_stale(SimpleNamespace(queue="queue.sqlite3"))
+        queue.close.assert_called_once_with()
+
+        queue.reset_mock()
+        queue.reconcile_orphaned_branch_ownership.return_value = []
+        with patch.object(erd_search, "ERDQueue", return_value=queue):
+            erd_search.cmd_queue_reconcile_orphaned_ownership(
+                SimpleNamespace(queue="queue.sqlite3"))
+        queue.reset_mock()
+        queue.reconcile_orphaned_branch_ownership.return_value = [4, 7]
+        with patch.object(erd_search, "ERDQueue", return_value=queue):
+            erd_search.cmd_queue_reconcile_orphaned_ownership(
+                SimpleNamespace(queue="queue.sqlite3"))
+
     def test_clear_obeys_confirmation_and_closes_queue(self):
         queue = Mock()
         queue.counts_by_status.return_value = {"pending": 2, "done": 3}
