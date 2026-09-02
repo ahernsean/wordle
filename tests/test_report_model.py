@@ -45,6 +45,29 @@ ANSWERS = ["salet", "crane", "nurdy", "khaki"]
 
 
 class ReportModelTest(unittest.TestCase):
+    def test_disk_fill_rate_uses_fresh_samples_and_rejects_flat_time(self):
+        self.assertIsNone(report_model.disk_fill_rate([(0, 100)], 0))
+        self.assertIsNone(report_model.disk_fill_rate([(0, 100), (0, 90)], 0))
+        self.assertEqual(
+            report_model.disk_fill_rate([(0, 100), (10, 80), (-1000, 1)], 10),
+            2.0,
+        )
+
+    def test_request_validation_rejects_invalid_operator_combinations(self):
+        root = parse_report_branch_target(None)
+        cases = (
+            (ReportRequest(report_kind="cache", tree=True), "cannot be used"),
+            (ReportRequest(tree_parent="RAISE -----"), "require tree"),
+            (ReportRequest(raw_row_offset=1), "requires an accuracy"),
+            (ReportRequest(report_kind="accuracy", raw_row_offset=-1), "cannot be negative"),
+            (ReportRequest(worker_id="w1"), "workers report"),
+            (ReportRequest(report_kind="root_progress", branch_target=root), "requires a target"),
+        )
+        for request, message in cases:
+            with self.subTest(request=request):
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_report_request(request)
+
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         directory = self.temporary_directory.name

@@ -14,6 +14,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from erd_queue import ERDQueue, encode_subset
+import report_server
 from report_model import ReportSources, collect_report
 from report_server import (
     FIXTURE_FILENAMES,
@@ -487,6 +488,53 @@ class ReportServerMainTest(unittest.TestCase):
 
 
 class SourcesRequestTest(unittest.TestCase):
+    def test_request_validation_rejects_each_endpoint_specific_option(self):
+        cases = (
+            ("/api/view", "tree_parent=RAISE+-----", "require tree"),
+            ("/api/view", "tree=1&tree_cursor=oops", "five-letter"),
+            ("/api/view", "limit=0", "at least 1"),
+            ("/api/view", "minimum_answer_count=3&maximum_answer_count=2", "cannot exceed"),
+            ("/api/view", "sort=nope", "invalid sort"),
+            ("/api/view", "group_by=nope", "invalid group_by"),
+            ("/api/view", "by=nodes", "require the hotspots"),
+            ("/api/view/hotspots", "by=nope", "invalid hotspot"),
+            ("/api/view", "claims=1", "singular branch"),
+            ("/api/view", "answers=1", "answers requires"),
+        )
+        for path, query, message in cases:
+            with self.subTest(query=query):
+                with self.assertRaisesRegex(InvalidRequest, message):
+                    parse_report_request(path, query)
+
+    def test_request_validation_handles_cursor_and_boolean_failures(self):
+        for query, message in (
+            ("tree=maybe", "must be 1"),
+            ("limit=one", "must be an integer"),
+            ("finalization_cursor=after:bad:1", "finalization_cursor"),
+            ("since_seconds=0", "at least 1"),
+            ("sample_size=0", "at least 1"),
+        ):
+            with self.subTest(query=query):
+                with self.assertRaisesRegex(InvalidRequest, message):
+                    parse_report_request("/api/view", query)
+
+    def test_hotspots_default_and_tree_parent_are_normalized(self):
+        hotspots = parse_report_request("/api/view/hotspots", "")
+        self.assertEqual(hotspots.hotspot_field, "nodes")
+        self.assertEqual(hotspots.filters.limit, 10)
+        request = parse_report_request(
+            "/api/view", "tree=1&tree_parent=raise+-----"
+        )
+        self.assertEqual(request.tree_parent, "RAISE -----")
+
+    def test_configuration_uses_telemetry_only_for_the_default_queue(self):
+        defaults = ReportSources.defaults()
+        with patch("report_server.load_fixtures", return_value={}) as load:
+            configured = build_configuration("another.sqlite3", "cache.sqlite3", "fixtures")
+        self.assertIsNone(configured.sources.telemetry_path)
+        load.assert_called_once_with("fixtures")
+        self.assertEqual(defaults.queue_path, ReportSources.defaults().queue_path)
+
     def test_bare_endpoint_and_word_target_are_accepted(self):
         rooted = parse_report_request("/api/view/openers", "")
         worded = parse_report_request("/api/view/openers", "branch_target=SALET")

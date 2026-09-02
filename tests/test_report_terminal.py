@@ -2199,6 +2199,52 @@ class RootProgressRendererTest(unittest.TestCase):
         # for, unlike the cumulative total, which grows with every promotion.
         self.assertIn("524,184", output)
 
+class TerminalUtilityTest(unittest.TestCase):
+    def test_formatters_and_change_rules_cover_boundary_values(self):
+        self.assertEqual(report_terminal._percentage(1, 0), "—")
+        self.assertEqual(report_terminal._format_metric_value("best_erd", 2.5), "2.500")
+        self.assertEqual(report_terminal._format_branch_erd(None, 2), "—")
+        self.assertEqual(report_terminal._abbreviate_number(None), "—")
+        self.assertEqual(report_terminal._abbreviate_number(1_200), "1.2k")
+        self.assertEqual(report_terminal._abbreviate_duration(-1), "—")
+        self.assertEqual(report_terminal._abbreviate_duration(90), "1m")
+        self.assertEqual(report_terminal._format_fill_eta(30), "0 min")
+        self.assertEqual(report_terminal._format_fill_eta(200000), "2.3 d")
+        row = {"count": 2, "best_erd": 2.0, "current_candidate": "raise"}
+        previous = {"count": 1, "best_erd": 3.0, "current_candidate": "slate"}
+        self.assertEqual(report_terminal._count_increase_rule("count")(row, previous), "green")
+        self.assertEqual(report_terminal._any_count_increase_rule("count")(row, previous), "green")
+        self.assertEqual(report_terminal._best_erd_improvement_rule(row, previous), "green")
+        self.assertEqual(report_terminal._candidate_advance_rule(row, previous), "green")
+
+    def test_terminal_layout_helpers_handle_tight_widths(self):
+        column = report_terminal.TerminalColumn("word", "word", required=True,
+                                                truncation="tail")
+        self.assertEqual(report_terminal._fit("hello", 1), "h")
+        self.assertEqual(report_terminal._truncate_cell("hello", 3, "tail"), "…lo")
+        self.assertEqual(report_terminal._display_spine({"source_word": "raise", "source_pattern": "-----"}), "RAISE -----")
+        self.assertIsNone(report_terminal._table_layout([column], [{"word": "hello"}], 2))
+        stacked = report_terminal._render_table([column], [{"word": "hello"}], 2)
+        self.assertTrue(stacked)
+        self.assertEqual(report_terminal._wrap_fields(["long-field"], 4), ["  l…"])
+
+    def test_disk_status_and_worker_state_cover_nonsteady_paths(self):
+        unavailable = report_terminal.render_disk_status({"used_fraction": None})
+        self.assertEqual(unavailable, "Disk: unavailable")
+        disk = {
+            "total_bytes": 10 * 2 ** 30, "used_bytes": 9 * 2 ** 30,
+            "available_bytes": 1 * 2 ** 30, "used_fraction": .9,
+            "warning_fraction": .8, "stop_fraction": .95,
+            "queue_wal_bytes": 0, "fill_rate_bytes_per_second": 20_000,
+        }
+        self.assertIn("filling", report_terminal.render_disk_status(disk, color=True))
+        disk["fill_rate_bytes_per_second"] = -20_000
+        self.assertIn("freeing", report_terminal.render_disk_status(disk))
+        stalled = {"is_live": True, "current_node_count": 1, "nodes_per_second": 0}
+        self.assertEqual(report_terminal._rate_stall_rule(stalled, None), "red")
+        self.assertEqual(report_terminal._semantic_worker_class(
+            {"is_live": False, "updated_at": 0}, None, 1), "red")
+
 
 if __name__ == "__main__":
     unittest.main()
