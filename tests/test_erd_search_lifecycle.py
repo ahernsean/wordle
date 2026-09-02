@@ -417,5 +417,102 @@ class OperatorHelperTest(unittest.TestCase):
         with self.assertLogs(erd_search.logger, 'WARNING') as logs:
             erd_search._check_source_work_invariants(queue)
         self.assertIn('branch 17 has no owner', logs.output[-1])
+
+
+class QueueOperatorCommandTest(unittest.TestCase):
+    def test_clear_obeys_confirmation_and_closes_queue(self):
+        queue = Mock()
+        queue.counts_by_status.return_value = {"pending": 2, "done": 3}
+        queue.branches_in_progress.return_value = [object()]
+        arguments = SimpleNamespace(queue="queue.sqlite3", yes=False)
+        with patch.object(erd_search, "ERDQueue", return_value=queue), \
+             patch("builtins.input", return_value="n"):
+            erd_search.cmd_queue_clear(arguments)
+        queue.clear.assert_not_called()
+        queue.close.assert_called_once_with()
+
+        queue.reset_mock()
+        with patch.object(erd_search, "ERDQueue", return_value=queue):
+            erd_search.cmd_queue_clear(SimpleNamespace(queue="queue.sqlite3", yes=True))
+        queue.clear.assert_called_once_with()
+        queue.close.assert_called_once_with()
+
+    def test_disk_stop_commands_cover_empty_existing_and_warning_latches(self):
+        queue = Mock()
+        queue.disk_stop.return_value = None
+        with patch.object(erd_search, "ERDQueue", return_value=queue):
+            erd_search.cmd_queue_clear_disk_stop(SimpleNamespace(queue="queue.sqlite3"))
+        queue.clear_disk_stop.assert_not_called()
+
+        queue.reset_mock()
+        queue.disk_stop.return_value = {"reason": "full"}
+        with patch.object(erd_search, "ERDQueue", return_value=queue), \
+             patch.object(erd_search, "disk_stats", return_value={"used_fraction": 1.0}):
+            erd_search.cmd_queue_clear_disk_stop(SimpleNamespace(queue="queue.sqlite3"))
+        queue.clear_disk_stop.assert_called_once_with()
+
+        queue.reset_mock()
+        queue.set_disk_stop_if_unset.return_value = False
+        queue.disk_stop.return_value = {"reason": "operator"}
+        with patch.object(erd_search, "ERDQueue", return_value=queue):
+            erd_search.cmd_queue_set_disk_stop(SimpleNamespace(queue="queue.sqlite3", reason="operator"))
+        queue.close.assert_called_once_with()
+
+    def test_priority_opener_path_reports_success_and_validation_error(self):
+        queue = Mock()
+        queue.set_ownerless_active_priority.return_value = 2
+        arguments = SimpleNamespace(queue="queue.sqlite3", opener_word="raise", priority=7)
+        with patch.object(erd_search, "ERDQueue", return_value=queue):
+            erd_search.cmd_queue_priority(arguments)
+        queue.set_ownerless_active_priority.assert_called_once_with("raise", 7)
+
+        queue.reset_mock()
+        queue.set_ownerless_active_priority.side_effect = ValueError("no opener")
+        with patch.object(erd_search, "ERDQueue", return_value=queue):
+            erd_search.cmd_queue_priority(arguments)
+        queue.close.assert_called_once_with()
+
+    def test_remove_and_branch_priority_cover_active_and_missing_branch_paths(self):
+        score_cache = Mock()
+        response_cache = Mock()
+        response_cache.group_words.return_value = {0: ["cigar", "rebut"]}
+        queue = Mock()
+        arguments = SimpleNamespace(
+            queue="queue.sqlite3", cache="cache.sqlite3", word="raise",
+            pattern="-----", force=False, priority=9, opener_word=None,
+        )
+        with (
+            patch.object(erd_search, "load_word_list", return_value=["cigar", "rebut"]),
+            patch.object(erd_search, "ScoreCache", return_value=score_cache),
+            patch.object(erd_search, "ResponseCache", return_value=response_cache),
+            patch.object(erd_search, "ERDQueue", return_value=queue),
+        ):
+            queue.get_active_branch.return_value = object()
+            erd_search.cmd_queue_remove(arguments)
+        queue.remove_pending.assert_not_called()
+        queue.close.assert_called_once_with()
+
+        queue.reset_mock()
+        queue.get_active_branch.return_value = object()
+        arguments.force = True
+        with (
+            patch.object(erd_search, "load_word_list", return_value=["cigar", "rebut"]),
+            patch.object(erd_search, "ScoreCache", return_value=score_cache),
+            patch.object(erd_search, "ResponseCache", return_value=response_cache),
+            patch.object(erd_search, "ERDQueue", return_value=queue),
+        ):
+            erd_search.cmd_queue_remove(arguments)
+        queue.cancel_active_branch.assert_called_once()
+
+        queue.reset_mock()
+        queue.set_priority.return_value = False
+        with (
+            patch.object(erd_search, "load_word_list", return_value=["cigar", "rebut"]),
+            patch.object(erd_search, "ScoreCache", return_value=score_cache),
+            patch.object(erd_search, "ResponseCache", return_value=response_cache),
+            patch.object(erd_search, "ERDQueue", return_value=queue),
+        ):
+            erd_search.cmd_queue_priority(arguments)
+        queue.set_priority.assert_called_once()
 if __name__ == '__main__':
     unittest.main()
