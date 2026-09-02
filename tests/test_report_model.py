@@ -104,6 +104,22 @@ class ReportModelTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     validate_report_request(request)
 
+    def test_filter_and_lifecycle_helpers_cover_normalization_and_errors(self):
+        self.assertEqual(report_model.parse_branch_filter(" queued , done ", "status", ("queued", "done")), ("queued", "done"))
+        self.assertEqual(report_model.parse_branch_filter("all", "status", ("queued",)), ())
+        for value, message in (("", "comma"), ("all,queued", "combined"), ("nope", "unknown"), ("queued,queued", "duplicate")):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, message):
+                    report_model.parse_branch_filter(value, "status", ("queued",))
+        filters = ReportFilters(branch_statuses=("done",), branch_worker_statuses=("active",))
+        self.assertEqual(report_model.applied_branch_filters(filters).branch_worker_statuses, ())
+        active = report_model.applied_branch_filters(
+            replace(filters, branch_statuses=("evaluating",)))
+        self.assertEqual(active.branch_worker_statuses, ("active",))
+        self.assertEqual(report_model.branch_status_and_worker_status("pending", None, 0), ("queued", None))
+        self.assertEqual(report_model.branch_status_and_worker_status(None, "open", 1), ("evaluating", "active"))
+        self.assertEqual(report_model.branch_status_and_worker_status(None, "finalized", 0), ("finalizing", "waiting"))
+
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         directory = self.temporary_directory.name
