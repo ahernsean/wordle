@@ -195,6 +195,50 @@ class ReportServerTest(unittest.TestCase):
             with self.subTest(query=query), self.assertRaises(InvalidRequest):
                 parse_report_request(path, query)
 
+    def test_unqueued_branch_status_selects_only_on_a_word_report(self):
+        word_request = parse_report_request(
+            "/api/view", "branch_target=RAISE&branch_status=unqueued,done"
+        )
+        self.assertEqual(
+            word_request.filters.branch_statuses, ("unqueued", "done")
+        )
+        refused = (
+            ("/api/view", "branch_status=unqueued"),
+            ("/api/view/queue", "branch_status=unqueued"),
+            ("/api/view/workers", "branch_status=unqueued"),
+            ("/api/view/hotspots", "branch_status=unqueued"),
+            ("/api/view", "branch_target=RAISE&tree=1&branch_status=unqueued"),
+            ("/api/view", "branch_target=RAISE%20.....&branch_status=unqueued"),
+            ("/api/view", "branch_status=queued,unqueued"),
+        )
+        for path, query in refused:
+            with self.subTest(query=query):
+                with self.assertRaisesRegex(InvalidRequest, "unqueued"):
+                    parse_report_request(path, query)
+
+    def test_worker_status_filter_is_dropped_when_no_status_carries_one(self):
+        # A queued/done/unqueued branch has no worker status at all, so a
+        # worker filter applied alongside them would match nothing.
+        for query in (
+            "branch_status=queued&branch_worker_status=active",
+            "branch_status=done&branch_worker_status=waiting",
+            "branch_status=queued,done&branch_worker_status=active,waiting",
+        ):
+            with self.subTest(query=query):
+                request = parse_report_request("/api/view/queue", query)
+                self.assertEqual(request.filters.branch_worker_statuses, ())
+        kept = (
+            ("branch_status=evaluating&branch_worker_status=active", ("active",)),
+            ("branch_status=finalizing&branch_worker_status=waiting", ("waiting",)),
+            ("branch_status=queued,evaluating&branch_worker_status=active",
+             ("active",)),
+            ("branch_worker_status=waiting", ("waiting",)),
+        )
+        for query, expected in kept:
+            with self.subTest(query=query):
+                request = parse_report_request("/api/view/queue", query)
+                self.assertEqual(request.filters.branch_worker_statuses, expected)
+
     def test_every_explicit_endpoint_returns_its_kind(self):
         with running_server(fixture_configuration()) as base_url:
             for kind in ("queue", "workers", "cache", "hotspots", "openers"):

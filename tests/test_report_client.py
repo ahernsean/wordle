@@ -2871,6 +2871,53 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertFalse(states["tree"]["answers"])
         self.assertEqual(states["word"]["sort"], "size")
 
+    def test_unqueued_branch_status_is_kept_only_for_word_reports(self):
+        states = self.page.evaluate("""() => ({
+          word: parsePageState({search:'?branch_target=RAISE&branch_status=unqueued,done'}),
+          overview: parsePageState({search:'?branch_status=unqueued'}),
+          queue: parsePageState({search:'?kind=queue&branch_status=unqueued,done'}),
+          wordTree: parsePageState({search:'?branch_target=RAISE&tree=1&branch_status=unqueued'}),
+          branch: parsePageState({search:'?branch_target=RAISE%20.....&branch_status=unqueued'})
+        })""")
+        self.assertEqual(states["word"]["branch_status"], ["unqueued", "done"])
+        self.assertEqual(states["overview"]["branch_status"], [])
+        self.assertEqual(states["queue"]["branch_status"], ["done"])
+        self.assertEqual(states["wordTree"]["branch_status"], [])
+        self.assertEqual(states["branch"]["branch_status"], [])
+
+    def test_unqueued_checkbox_is_shown_only_for_word_reports(self):
+        selector = '[data-branch-status][value="unqueued"]'
+        self.page.locator("details.filters").evaluate("node => node.open = true")
+        self.assertFalse(self.page.locator(selector).is_visible())
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("text=word report")
+        self.page.locator("details.filters").evaluate("node => node.open = true")
+        self.assertTrue(self.page.locator(selector).is_visible())
+
+    def test_worker_status_checkboxes_gray_out_when_they_cannot_apply(self):
+        active = '[data-branch-worker-status][value="active"]'
+        waiting = '[data-branch-worker-status][value="waiting"]'
+        self.page.locator("details.filters").evaluate("node => node.open = true")
+        self.assertFalse(self.page.locator(active).is_disabled())
+        self.page.locator('[data-branch-status][value="queued"]').check()
+        self.page.wait_for_function(
+            "() => __reportClient.getState().branch_status.includes('queued')"
+        )
+        for selector in (active, waiting):
+            self.assertTrue(self.page.locator(selector).is_disabled())
+        self.assertEqual(
+            self.page.eval_on_selector(
+                active, "input => getComputedStyle(input.parentElement).opacity"
+            ),
+            "0.45",
+        )
+        self.page.locator('[data-branch-status][value="evaluating"]').check()
+        self.page.wait_for_function(
+            "() => __reportClient.getState().branch_status.includes('evaluating')"
+        )
+        for selector in (active, waiting):
+            self.assertFalse(self.page.locator(selector).is_disabled())
+
     def test_word_summary_keeps_unfiltered_totals(self):
         text = self.page.evaluate("""async () => {
           const report=await (await fetch('/api/view?branch_target=QUEUE')).json();

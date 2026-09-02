@@ -1923,6 +1923,12 @@ class ViewParserTest(unittest.TestCase):
             ["erd_search.py", "view", "RAISE", "--sort", "nodes"],
             ["erd_search.py", "view", "--openers", "RAISE", "-----"],
             ["erd_search.py", "view", "--openers", "@abcd"],
+            ["erd_search.py", "view", "--branch-status", "unqueued"],
+            ["erd_search.py", "view", "--queue", "--branch-status", "unqueued"],
+            ["erd_search.py", "view", "RAISE", "--tree",
+             "--branch-status", "unqueued"],
+            ["erd_search.py", "view", "RAISE -----",
+             "--branch-status", "unqueued"],
         ]
         for arguments in invalid_arguments:
             with self.subTest(arguments=arguments):
@@ -1930,6 +1936,42 @@ class ViewParserTest(unittest.TestCase):
                     with self.assertRaises(SystemExit) as raised:
                         erd_search.main()
                 self.assertEqual(raised.exception.code, 2)
+
+    def test_unqueued_branch_status_is_accepted_on_a_word_report(self):
+        with (
+            patch("sys.argv", ["erd_search.py", "view", "RAISE",
+                               "--branch-status", "unqueued,done"]),
+            patch("report_terminal.run_view") as run_view,
+        ):
+            erd_search.main()
+        self.assertEqual(
+            run_view.call_args.args[0].filters.branch_statuses,
+            ("unqueued", "done"),
+        )
+
+    def test_worker_status_filter_is_dropped_when_no_status_carries_one(self):
+        cases = [
+            (["--queue", "--branch-status", "queued",
+              "--branch-worker-status", "active"], ()),
+            (["--queue", "--branch-status", "done",
+              "--branch-worker-status", "active,waiting"], ()),
+            (["--queue", "--branch-status", "evaluating",
+              "--branch-worker-status", "active"], ("active",)),
+            (["--queue", "--branch-status", "queued,finalizing",
+              "--branch-worker-status", "waiting"], ("waiting",)),
+            (["--queue", "--branch-worker-status", "waiting"], ("waiting",)),
+        ]
+        for options, worker_statuses in cases:
+            with self.subTest(options=options):
+                with (
+                    patch("sys.argv", ["erd_search.py", "view", *options]),
+                    patch("report_terminal.run_view") as run_view,
+                ):
+                    erd_search.main()
+                self.assertEqual(
+                    run_view.call_args.args[0].filters.branch_worker_statuses,
+                    worker_statuses,
+                )
 
     def test_branch_filters_are_comma_separated_and_overview_defaults_active(self):
         cases = [

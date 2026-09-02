@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, urlsplit
 from report_model import (
     BRANCH_STATUSES,
     BRANCH_WORKER_STATUSES,
+    applied_branch_filters,
     GROUP_BY_STRATEGIES,
     SCHEMA_VERSION,
     SOURCE_GROUP_BY_STRATEGIES,
@@ -297,7 +298,7 @@ def parse_report_request(path, query):
         include_claims=include_claims,
         include_answers=include_answers,
         tree=tree,
-        filters=filters,
+        filters=applied_branch_filters(filters),
         worker_id=worker_id,
         hotspot_field=hotspot_field,
         epoch=integer_values["epoch"],

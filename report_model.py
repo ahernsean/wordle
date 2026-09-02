@@ -180,6 +180,22 @@ def parse_branch_filter(value, filter_name, allowed_values):
     return values
 
 
+def applied_branch_filters(filters: "ReportFilters") -> "ReportFilters":
+    """Drop a worker-status filter that the status filter leaves inapplicable.
+
+    Worker presence distinguishes only evaluating and finalizing branches, so
+    a status filter selecting neither leaves no row the worker filter could
+    narrow: every branch it selects carries no worker status at all.  Applied
+    anyway it would match nothing, which reads as "no such branches" rather
+    than "that question does not apply here".
+    """
+    if not filters.branch_worker_statuses or not filters.branch_statuses:
+        return filters
+    if set(filters.branch_statuses) & {"evaluating", "finalizing"}:
+        return filters
+    return replace(filters, branch_worker_statuses=())
+
+
 def branch_status_and_worker_status(
     pending_status, active_status, worker_count, cache_state=None,
 ):
@@ -290,6 +306,16 @@ def validate_report_request(request: ReportRequest) -> None:
             raise ValueError(
                 f"--sort {request.filters.sort} requires an opener report"
             )
+    # A word report derives its response groups from the answer list, so it
+    # can show a branch that holds no queue row at all.  Every other report
+    # reads its branches from the queue tables, where such a branch has
+    # nothing to be selected from.
+    if "unqueued" in request.filters.branch_statuses and not (
+        report_kind == "auto"
+        and branch_target_kind == "word"
+        and not request.tree
+    ):
+        raise ValueError("branch status unqueued requires a word report")
     historical_hotspot = request.hotspot_field in (
         "evaluated-candidates", "bulk-completed-candidates",
         "one-level-erd-prunes", "two-level-erd-prunes",

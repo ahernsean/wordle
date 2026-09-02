@@ -92,6 +92,7 @@ from hint_cache import HintCacheError, open_hint_cache
 from report_model import (
     BRANCH_STATUSES,
     BRANCH_WORKER_STATUSES,
+    applied_branch_filters,
     SOURCE_SORT_FIELDS,
     SOURCE_STATES,
     ReportFilters,
@@ -1424,6 +1425,11 @@ def main():
   briefly return an interrupted finalization to evaluating before retrying
   it.  Removing unfinished work returns the branch to unqueued.
 
+  A word report derives its response groups from the answer list, so it is
+  the only report that can show an unqueued branch; every other report reads
+  its branches from the queue.  --branch-status unqueued is refused
+  elsewhere rather than matching nothing.
+
   The overview defaults to --branch-worker-status active.  Use comma-
   separated values such as --branch-status evaluating,finalizing, or use
   all to disable a filter.
@@ -1456,7 +1462,8 @@ def main():
              'for one opener')
     p_view.add_argument(
         '--branch-status', type=_branch_status_filter, metavar='STATUSES',
-        help='Comma-separated unqueued,queued,evaluating,finalizing,done, or all')
+        help='Comma-separated unqueued,queued,evaluating,finalizing,done, or '
+             'all (unqueued selects only on a word report)')
     p_view.add_argument(
         '--branch-worker-status', type=_branch_worker_status_filter, metavar='STATUSES',
         help='Comma-separated active,waiting, or all (meaningful only for '
@@ -1721,7 +1728,7 @@ def main():
                     and args.branch_target.kind == "root" and not args.tree)
                 else ()
             )
-        args.filters = ReportFilters(
+        args.filters = applied_branch_filters(ReportFilters(
             branch_statuses=args.branch_status or (),
             branch_worker_statuses=branch_worker_statuses,
             minimum_answer_count=args.minimum_answer_count,
@@ -1731,7 +1738,7 @@ def main():
             sort=args.sort,
             source_states=args.opener_state or (),
             limit=args.limit,
-        )
+        ))
         args.hotspot_field = hotspot_field if args.hotspots else None
         args.sample_size = min(args.sample_size or 50_000, 1_000_000)
         if args.hotspots:

@@ -257,7 +257,11 @@ status, branch worker status, answer-count bounds, budget, priority, sort, and
 limit. Status tracks durable search progress: unqueued, queued, evaluating,
 finalizing, or done. Worker status distinguishes evaluating and finalizing
 branches by whether a worker is on them right now (active or waiting); run
-`erd_search.py view --help` for the lifecycle diagram. Historical hotspots
+`erd_search.py view --help` for the lifecycle diagram. Only a word report
+derives its response groups from the answer list, so it is the only report
+that can show an unqueued branch — every other report reads its branches
+from the queue, and `--branch-status unqueued` is refused there rather than
+matching nothing. Historical hotspots
 are explicitly bounded by epoch, time window, and sample size. `--tree` uses
 only extant queue topology; cache rows never reconstruct historical trees.
 

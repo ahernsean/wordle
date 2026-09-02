@@ -78,6 +78,8 @@
     .status-line > .label { color:var(--dim); }
     .statuses { display:flex; flex-wrap:wrap; gap:.5rem; align-items:baseline; }
     .statuses label { display:inline-flex; gap:.25rem; align-items:center; white-space:nowrap; }
+    .statuses label[hidden] { display:none; }
+    .statuses label.inert { opacity:.45; }
     .conn-wrap { position:relative; margin-left:auto; }
     #connection { color:var(--green); padding:.1rem .3rem; white-space:nowrap; cursor:pointer; border-radius:4px; user-select:none; }
     #connection.disconnected { color:#ffffff; background:var(--red); border-radius:4px; }
@@ -477,6 +479,9 @@
       if(normalized.kind!=="workers")normalized.worker_id=null;
       if(normalized.kind==="auto"&&normalized.branch_target===""){normalized.answers=false;normalized.claims=false;}
       const inferredWord=isInferredWordState(normalized.kind,normalized.branch_target);
+      // Only a word report derives branches from the answer list; every other
+      // report reads them from the queue, which holds no unqueued branch.
+      if(!(inferredWord&&!normalized.tree))normalized.branch_status=normalized.branch_status.filter(value=>value!=="unqueued");
       if(inferredWord&&!['size','workers','priority'].includes(normalized.sort))normalized.sort="size";
       if(inferredWord&&!GROUP_BY_OPTIONS_WORD.some(([value])=>value===normalized.group_by))normalized.group_by="";
       if(!inferredWord&&normalized.kind!=="openers")normalized.group_by="";
@@ -552,8 +557,11 @@
       sortSelect.value=currentState.sort||(isSources?"completed":"");byId("by").value=currentState.by;groupSelect.value=currentState.group_by;
       const isOverview=currentState.kind==="auto"&&currentState.branch_target===""&&!currentState.tree;
       document.querySelectorAll("[data-kind]").forEach(button=>button.setAttribute("aria-current",(button.dataset.overview?isOverview:button.dataset.kind===currentState.kind)?"page":"false"));
-      document.querySelectorAll("[data-branch-status]").forEach(input=>input.checked=currentState.branch_status.includes(input.value));
-      document.querySelectorAll("[data-branch-worker-status]").forEach(input=>input.checked=currentState.branch_worker_status.includes(input.value));
+      document.querySelectorAll("[data-branch-status]").forEach(input=>{input.checked=currentState.branch_status.includes(input.value);if(input.value==="unqueued")input.parentElement.hidden=!wordReport||currentState.tree;});
+      // Worker presence distinguishes only evaluating and finalizing branches,
+      // so a status filter selecting neither leaves these nothing to narrow.
+      const workerStatusApplies=!currentState.branch_status.length||currentState.branch_status.some(value=>value==="evaluating"||value==="finalizing");
+      document.querySelectorAll("[data-branch-worker-status]").forEach(input=>{input.checked=currentState.branch_worker_status.includes(input.value);input.disabled=!workerStatusApplies;input.parentElement.classList.toggle("inert",!workerStatusApplies);input.parentElement.title=workerStatusApplies?"":"Applies only to evaluating or finalizing branches";});
       document.querySelectorAll("[data-source-state]").forEach(input=>input.checked=currentState.opener_state.includes(input.value));
       const historicalHotspot=isHotspots&&["evaluated-candidates","bulk-completed-candidates","one-level-erd-prunes","two-level-erd-prunes","cut-reuse","coordination"].includes(currentState.by);
       byId("filters-group").hidden=kind==="cache"||historicalHotspot;
