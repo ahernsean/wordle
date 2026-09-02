@@ -2249,6 +2249,23 @@ class TerminalUtilityTest(unittest.TestCase):
         self.assertIn("CIGAR…", lines[1])
         self.assertIn("spine=RAISE -----", lines[2])
 
+    def test_overview_renderer_covers_empty_and_hint_summary_states(self):
+        report = overview_report()
+        report["data"]["branches"] = []
+        report["data"]["workers"] = []
+        report["sources"]["queue"].update({"epoch": 8, "label": "test", "git_sha": "deadbeef"})
+        totals = report["data"]["worker_totals"]
+        totals.update({
+            "hint_lookup_count": 4, "hint_hit_count": 2,
+            "hint_accepted_count": 1, "hint_inline_placement_count": 1,
+            "hint_inline_win_count": 1,
+        })
+        output = report_terminal.render_overview(report, width=120)
+        self.assertIn("sources ok", output)
+        self.assertIn("epoch=8 test revision=deadbeef", output)
+        self.assertIn("Hints (ordering only):", output)
+        self.assertIn("Branches (status=all)\n  none", output)
+
     def test_formatters_and_change_rules_cover_boundary_values(self):
         self.assertEqual(report_terminal._percentage(1, 0), "—")
         self.assertEqual(report_terminal._format_metric_value("best_erd", 2.5), "2.500")
