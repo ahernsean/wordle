@@ -475,6 +475,34 @@ class QueueOperatorCommandTest(unittest.TestCase):
         with patch.object(erd_search, "ERDQueue", return_value=queue):
             erd_search.cmd_queue_reconcile_orphaned_ownership(
                 SimpleNamespace(queue="queue.sqlite3"))
+
+    def test_run_refuses_unusable_hint_latch_and_full_disk_before_workers(self):
+        arguments = SimpleNamespace(cache="cache.sqlite3", queue="queue.sqlite3")
+        with patch.object(erd_search, "_hint_cache_is_usable", return_value=False):
+            erd_search.cmd_run(arguments)
+
+        queue = Mock()
+        queue.disk_stop.return_value = {"reason": "full", "at": None}
+        with (
+            patch.object(erd_search, "_hint_cache_is_usable", return_value=True),
+            patch.object(erd_search, "_checkpoint_cache_on_start"),
+            patch.object(erd_search, "ScoreCache"),
+            patch.object(erd_search, "ERDQueue", return_value=queue),
+        ):
+            erd_search.cmd_run(arguments)
+        queue.close.assert_called_once_with()
+
+        queue.reset_mock()
+        queue.disk_stop.return_value = None
+        with (
+            patch.object(erd_search, "_hint_cache_is_usable", return_value=True),
+            patch.object(erd_search, "_checkpoint_cache_on_start"),
+            patch.object(erd_search, "ScoreCache"),
+            patch.object(erd_search, "ERDQueue", return_value=queue),
+            patch.object(erd_search, "disk_stats", return_value={"used_fraction": 1.0}),
+        ):
+            erd_search.cmd_run(arguments)
+        queue.set_disk_stop.assert_called_once()
         queue.reset_mock()
         queue.reconcile_orphaned_branch_ownership.return_value = [4, 7]
         with patch.object(erd_search, "ERDQueue", return_value=queue):
