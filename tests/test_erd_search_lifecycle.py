@@ -10,6 +10,7 @@ import argparse
 import io
 import json
 import os
+import sqlite3
 import tempfile
 import time
 from types import SimpleNamespace
@@ -380,5 +381,30 @@ class OperatorHelperTest(unittest.TestCase):
         ):
             self.assertTrue(erd_search._hint_cache_is_usable(arguments))
         hint.close.assert_called_once_with()
+
+    def test_checkpoint_cache_reports_success_and_sqlite_failure(self):
+        connection = Mock()
+        with patch('sqlite3.connect', return_value=connection):
+            erd_search._checkpoint_cache_on_start('cache.sqlite3')
+        connection.execute.assert_any_call('PRAGMA wal_checkpoint(TRUNCATE)')
+        connection.close.assert_called_once_with()
+
+        with patch('sqlite3.connect', side_effect=sqlite3.Error('locked')):
+            erd_search._checkpoint_cache_on_start('cache.sqlite3')
+
+    def test_reap_and_stack_dump_handle_live_and_dead_workers(self):
+        queue = Mock()
+        queue.reclaim_claims_of_worker.return_value = 3
+        erd_search._reap_worker(queue, 2)
+        queue.reclaim_claims_of_worker.assert_called_once_with('worker-2')
+        queue.clear_heartbeat.assert_called_once_with('worker-2')
+
+        live_process = Mock(pid=12)
+        live_process.is_alive.return_value = True
+        dead_process = Mock(pid=13)
+        dead_process.is_alive.return_value = False
+        with patch.object(erd_search.os, 'kill') as kill:
+            erd_search._dump_worker_stacks({2: (live_process, 0), 3: (dead_process, 0)})
+        kill.assert_called_once_with(12, erd_search.signal.SIGUSR1)
 if __name__ == '__main__':
     unittest.main()
