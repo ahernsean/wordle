@@ -122,7 +122,7 @@ branch is still in the queue.
 Focused collections and live topology use the same report model:
 
 ```bash
-python3.13 erd_search.py view --queue --branch-status evaluating,finalizing --sort size --limit 25
+python3.13 erd_search.py view --queue --branch-status queued,evaluating,finalizing --sort size --limit 25
 python3.13 erd_search.py view --queue --tree "CRANE .y..g"
 python3.13 erd_search.py view --workers
 python3.13 erd_search.py view --worker 2
