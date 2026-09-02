@@ -21,6 +21,7 @@ source =
     hint_cache
     erd_swarm
     erd_queue
+    erd_search
     runtime_paths
     wordle_ui
     export_cache

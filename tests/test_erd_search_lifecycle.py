@@ -6,6 +6,7 @@ test_report_terminal.py, which mocks the whole command function and never
 reaches this logic.
 """
 
+import argparse
 import io
 import json
 import os
@@ -13,7 +14,7 @@ import tempfile
 import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import ANY, patch
+from unittest.mock import ANY, Mock, patch
 
 import erd_search
 from erd_queue import ERDQueue
@@ -308,5 +309,76 @@ class EpochCommandTest(unittest.TestCase):
         self.assertEqual(handler.call_args.args[0].queue, 'custom.sqlite3')
 
 
+class OperatorHelperTest(unittest.TestCase):
+    def test_view_watch_interval_and_filters_reject_invalid_values(self):
+        self.assertEqual(erd_search._view_watch_interval('0.2'), 0.2)
+        with self.assertRaises(argparse.ArgumentTypeError):
+            erd_search._view_watch_interval('0.1')
+        self.assertEqual(
+            erd_search._branch_status_filter('active,pending'),
+            ('active', 'pending'),
+        )
+        with self.assertRaises(argparse.ArgumentTypeError):
+            erd_search._branch_phase_filter('unknown')
+
+    def test_service_scope_noun_matches_the_selected_service(self):
+        self.assertEqual(
+            erd_search._service_scope_noun(_args()),
+            'Supervisor and report server',
+        )
+        self.assertEqual(
+            erd_search._service_scope_noun(_args(swarm_only=True)),
+            'Supervisor',
+        )
+        self.assertEqual(
+            erd_search._service_scope_noun(_args(web_only=True)),
+            'Report server',
+        )
+
+    def test_system_commands_return_subprocess_exit_codes(self):
+        completed_process = SimpleNamespace(returncode=7)
+        with patch('subprocess.run', return_value=completed_process) as run:
+            self.assertEqual(
+                erd_search._run_systemctl('wordle-erd', 'start'), 7)
+            self.assertEqual(erd_search._run_journalctl('wordle-erd', 12.5), 7)
+        self.assertEqual(run.call_count, 2)
+
+    def test_current_git_sha_handles_missing_git_and_output(self):
+        with patch('subprocess.run', side_effect=OSError):
+            self.assertIsNone(erd_search._current_git_sha())
+        with patch('subprocess.run', return_value=SimpleNamespace(stdout='abc123\n')):
+            self.assertEqual(erd_search._current_git_sha(), 'abc123')
+
+    def test_view_and_nested_path_helpers_dispatch_only_in_scope(self):
+        arguments = SimpleNamespace(report_kind='queue')
+        with patch('report_terminal.run_view') as run_view:
+            erd_search.cmd_view(arguments)
+        run_view.assert_called_once_with(arguments)
+
+        queue_arguments = SimpleNamespace(cmd='queue', queue_path='queue.sqlite3')
+        erd_search._normalize_queue_cli_args(queue_arguments)
+        self.assertEqual(queue_arguments.queue, 'queue.sqlite3')
+
+        epoch_arguments = SimpleNamespace(cmd='epoch', queue_path=None)
+        erd_search._normalize_epoch_cli_args(epoch_arguments)
+        self.assertEqual(epoch_arguments.queue, erd_search.DEFAULT_QUEUE)
+
+    def test_hint_cache_preflight_reports_refusal_and_closes_artifact(self):
+        arguments = SimpleNamespace(hint_cache='history.sqlite3', cache='live.sqlite3')
+        with (
+            patch.object(erd_search, 'load_word_list', return_value=['crane']),
+            patch.object(erd_search, 'open_hint_cache',
+                         side_effect=erd_search.HintCacheError('bad artifact')),
+        ):
+            self.assertFalse(erd_search._hint_cache_is_usable(arguments))
+
+        hint = SimpleNamespace(db_path='history.sqlite3', namespace_branch_count=12,
+                               close=Mock())
+        with (
+            patch.object(erd_search, 'load_word_list', return_value=['crane']),
+            patch.object(erd_search, 'open_hint_cache', return_value=hint),
+        ):
+            self.assertTrue(erd_search._hint_cache_is_usable(arguments))
+        hint.close.assert_called_once_with()
 if __name__ == '__main__':
     unittest.main()
