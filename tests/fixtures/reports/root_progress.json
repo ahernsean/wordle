@@ -509,8 +509,8 @@
   "work_started_at": 1785575213
  },
  "filters": {
-  "branch_phases": [],
   "branch_statuses": [],
+  "branch_worker_statuses": [],
   "budget": null,
   "limit": null,
   "maximum_answer_count": null,

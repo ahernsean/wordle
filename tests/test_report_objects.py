@@ -122,7 +122,7 @@ class SemanticReportTest(unittest.TestCase):
         self.assertEqual(report["report_kind"], "word")
         self.assertEqual(row["pattern"], fmt_pattern(pattern_code))
         self.assertEqual(row["branch_status"], "done")
-        self.assertEqual(row["branch_phase"], "complete")
+        self.assertIsNone(row["branch_worker_status"])
         self.assertEqual(row["cache_state"], "exact")
         self.assertNotIn("answer_words", row)
         trivial_rows = [
@@ -135,7 +135,7 @@ class SemanticReportTest(unittest.TestCase):
         ))
         self.assertTrue(all(
             group["branch_status"] == "done"
-            and group["branch_phase"] == "complete"
+            and group["branch_worker_status"] is None
             for group in trivial_rows
         ))
         self.assertGreater(
@@ -226,7 +226,7 @@ class SemanticReportTest(unittest.TestCase):
         )
         self.assertEqual(report["report_kind"], "branch")
         self.assertEqual(report["data"]["queue"]["branch_status"], "done")
-        self.assertEqual(report["data"]["queue"]["branch_phase"], "complete")
+        self.assertIsNone(report["data"]["queue"]["branch_worker_status"])
         self.assertEqual(
             set(report["data"]["branch"]["answer_words"]), set(answer_words)
         )
@@ -428,8 +428,8 @@ class SemanticReportTest(unittest.TestCase):
             b"modelkarma", 2, 4, budget=5, spine="RAISE -----"
         )
         fully_filtered = queue.report_queue_rows(ReportFilters(
-            branch_statuses=("pending",),
-            branch_phases=("evaluating",),
+            branch_statuses=("evaluating",),
+            branch_worker_statuses=("waiting",),
             maximum_answer_count=2,
             budget=5,
             priority=0,
@@ -450,7 +450,7 @@ class SemanticReportTest(unittest.TestCase):
         self.assertTrue(any("spine LIKE" in statement for statement in statements))
         queue.close()
 
-    def test_branch_phase_distinguishes_evaluating_and_finalizing(self):
+    def test_branch_status_distinguishes_evaluating_and_finalizing(self):
         queue = ERDQueue(self.queue_path, telemetry_path=self.telemetry_path)
         active_key = b"cigarrebut"
         finalizing_key = b"awakeblush"
@@ -458,32 +458,32 @@ class SemanticReportTest(unittest.TestCase):
         queue.create_branch(finalizing_key, 2, 4)
         queue.try_finalize_branch(finalizing_key)
         result = queue.report_queue_rows(ReportFilters(
-            branch_phases=("evaluating",)
+            branch_statuses=("evaluating",)
         ))
         self.assertEqual([row["branch_key"] for row in result["rows"]], [active_key])
         queue.close()
 
-    def test_branch_status_tracks_workers_without_losing_phase(self):
+    def test_branch_worker_status_tracks_workers_without_losing_status(self):
         now = int(time.time())
         branch_key = b"cigarrebut"
         queue = ERDQueue(self.queue_path, telemetry_path=self.telemetry_path)
         queue.create_branch(branch_key, 2, 4)
 
         row = queue.report_queue_rows()["rows"][0]
-        self.assertEqual((row["branch_status"], row["branch_phase"]), (
-            "pending", "evaluating",
+        self.assertEqual((row["branch_status"], row["branch_worker_status"]), (
+            "evaluating", "waiting",
         ))
 
         queue.heartbeat("worker-1", 1, branch_key, 0, now, 0)
         row = queue.report_queue_rows()["rows"][0]
-        self.assertEqual((row["branch_status"], row["branch_phase"]), (
-            "active", "evaluating",
+        self.assertEqual((row["branch_status"], row["branch_worker_status"]), (
+            "evaluating", "active",
         ))
 
         queue.try_finalize_branch(branch_key)
         row = queue.report_queue_rows()["rows"][0]
-        self.assertEqual((row["branch_status"], row["branch_phase"]), (
-            "active", "finalizing",
+        self.assertEqual((row["branch_status"], row["branch_worker_status"]), (
+            "finalizing", "active",
         ))
 
         queue._conn.execute(
@@ -491,8 +491,8 @@ class SemanticReportTest(unittest.TestCase):
             (now - WORKER_LIVENESS_SECONDS - 1, "worker-1"),
         )
         row = queue.report_queue_rows()["rows"][0]
-        self.assertEqual((row["branch_status"], row["branch_phase"]), (
-            "pending", "finalizing",
+        self.assertEqual((row["branch_status"], row["branch_worker_status"]), (
+            "finalizing", "waiting",
         ))
         queue.close()
 
@@ -773,7 +773,7 @@ class SemanticReportTest(unittest.TestCase):
         ))
         self.assertEqual(report["data"]["cache"]["cache_state"], "missing")
 
-    def test_branch_status_has_same_meaning_for_word_groups(self):
+    def test_branch_worker_status_has_same_meaning_for_word_groups(self):
         pattern_code, answer_words, branch_key = self._largest_group()
         queue = ERDQueue(self.queue_path, telemetry_path=self.telemetry_path)
         queue.create_branch(
@@ -785,7 +785,7 @@ class SemanticReportTest(unittest.TestCase):
         queue.close()
         report = collect_report(self.sources, ReportRequest(
             branch_target=parse_report_branch_target("RAISE"),
-            filters=ReportFilters(branch_statuses=("active",)),
+            filters=ReportFilters(branch_worker_statuses=("active",)),
         ))
         self.assertEqual(report["data"]["matched_rows"], 1)
         self.assertGreater(report["data"]["total_rows"], 1)
@@ -798,7 +798,7 @@ class SemanticReportTest(unittest.TestCase):
             1,
         )
         self.assertTrue(all(
-            row["branch_status"] == "active"
+            row["branch_worker_status"] == "active"
             for row in report["data"]["response_groups"]
         ))
 

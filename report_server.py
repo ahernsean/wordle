@@ -15,8 +15,8 @@ from threading import Event, Lock
 from urllib.parse import parse_qs, urlsplit
 
 from report_model import (
-    BRANCH_PHASES,
     BRANCH_STATUSES,
+    BRANCH_WORKER_STATUSES,
     GROUP_BY_STRATEGIES,
     SCHEMA_VERSION,
     SOURCE_GROUP_BY_STRATEGIES,
@@ -58,7 +58,7 @@ INTEGER_PARAMETERS = {
 }
 SCALAR_PARAMETERS = {
     "branch_target", "sort", "group_by", "by", "worker", "branch_status",
-    "branch_phase", "opener_state", "finalization_cursor", "tree_parent",
+    "branch_worker_status", "opener_state", "finalization_cursor", "tree_parent",
     "tree_cursor",
     *BOOLEAN_PARAMETERS,
     *INTEGER_PARAMETERS,
@@ -171,23 +171,26 @@ def parse_report_request(path, query):
     if tree_cursor is not None and not re.fullmatch(r"[a-z]{5}", tree_cursor):
         raise InvalidRequest("tree_cursor must be a five-letter word")
     branch_status_value = _single_value(parameters, "branch_status")
-    branch_phase_value = _single_value(parameters, "branch_phase")
+    branch_worker_status_value = _single_value(parameters, "branch_worker_status")
     source_state_value = _single_value(parameters, "opener_state")
     try:
         branch_statuses = (
             parse_branch_filter(
                 branch_status_value, "branch status", BRANCH_STATUSES
             )
-            if branch_status_value is not None
+            if branch_status_value is not None else ()
+        )
+        branch_worker_statuses = (
+            parse_branch_filter(
+                branch_worker_status_value, "branch worker status",
+                BRANCH_WORKER_STATUSES,
+            )
+            if branch_worker_status_value is not None
             else (
                 ("active",)
                 if explicit_kind == "auto" and branch_target.kind == "root" and not tree
                 else ()
             )
-        )
-        branch_phases = (
-            parse_branch_filter(branch_phase_value, "branch phase", BRANCH_PHASES)
-            if branch_phase_value is not None else ()
         )
         source_states = (
             parse_branch_filter(source_state_value, "opener state", SOURCE_STATES)
@@ -273,7 +276,7 @@ def parse_report_request(path, query):
 
     filters = ReportFilters(
         branch_statuses=branch_statuses,
-        branch_phases=branch_phases,
+        branch_worker_statuses=branch_worker_statuses,
         minimum_answer_count=minimum_answer_count,
         maximum_answer_count=maximum_answer_count,
         budget=integer_values["budget"],

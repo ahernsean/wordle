@@ -79,8 +79,8 @@ def overview_report():
             "branches": [{
                 "branch_reference": "0123456789ab",
                 "branch_key_hex": "010203",
-                "branch_status": "active",
-                "branch_phase": "evaluating",
+                "branch_status": "evaluating",
+                "branch_worker_status": "active",
                 "raw_status": "in_progress",
                 "answer_count": 33,
                 "candidate_count": 100,
@@ -255,19 +255,19 @@ class OverviewRendererTest(unittest.TestCase):
         self.assertIn("@0123", output)
         self.assertIn("w2", output)
         self.assertIn("Ref", output)
-        self.assertIn("Phase", output)
+        self.assertIn("Status", output)
 
-    def test_branch_table_shows_phase_not_status(self):
+    def test_branch_table_shows_status_abbreviated(self):
         report = overview_report()
         branch = report["data"]["branches"][0]
-        branch["branch_status"] = "active"
-        branch["branch_phase"] = "finalizing"
+        branch["branch_status"] = "finalizing"
+        branch["branch_worker_status"] = "active"
         output = render_overview(report, color=False, width=100)
         branch_line = next(
             line for line in output.splitlines() if "@0123" in line
         )
         self.assertIn("final", branch_line)
-        self.assertNotIn("active", branch_line)
+        self.assertNotIn("finalizing", branch_line)
 
     def test_progress_is_highlighted_by_cell_rules(self):
         previous = overview_report()
@@ -341,20 +341,20 @@ class OverviewRendererTest(unittest.TestCase):
         # each threshold below is the narrowest width at which the columns
         # listed still fit.
         expected_branch_headings = {
-            54: ("Ref", "GuessD", "Phase", "Done", "W", "Ans"),
-            59: ("Ref", "GuessD", "Phase", "Done", "W", "Ans"),
-            63: ("Ref", "GuessD", "Phase", "Done", "W", "Ans", "ERD1/2"),
-            64: ("Ref", "GuessD", "Phase", "Done", "W", "Ans", "ERD1/2"),
+            54: ("Ref", "GuessD", "Status", "Done", "W", "Ans"),
+            59: ("Ref", "GuessD", "Status", "Done", "W", "Ans"),
+            63: ("Ref", "GuessD", "Status", "Done", "W", "Ans", "ERD1/2"),
+            64: ("Ref", "GuessD", "Status", "Done", "W", "Ans", "ERD1/2"),
             83: (
-                "Ref", "GuessD", "Phase", "Done", "W", "Ans", "ERD1/2",
+                "Ref", "GuessD", "Status", "Done", "W", "Ans", "ERD1/2",
                 "Best", "MaxRD",
             ),
             84: (
-                "Ref", "GuessD", "Phase", "Done", "W", "Ans", "ERD1/2",
+                "Ref", "GuessD", "Status", "Done", "W", "Ans", "ERD1/2",
                 "Best", "MaxRD",
             ),
             124: (
-                "Ref", "GuessD", "Phase", "Done", "W", "Ans", "ERD1/2",
+                "Ref", "GuessD", "Status", "Done", "W", "Ans", "ERD1/2",
                 "Best", "MaxRD", "ETA",
             ),
         }
@@ -379,7 +379,7 @@ class OverviewRendererTest(unittest.TestCase):
         narrow_branch_header = next(
             line for line in narrow.splitlines() if "Ref" in line and "GuessD" in line
         )
-        self.assertIn("Phase", narrow_branch_header)
+        self.assertIn("Status", narrow_branch_header)
         self.assertIn("Done", narrow_branch_header)
         self.assertNotIn("Spine", narrow_branch_header)
 
@@ -544,7 +544,7 @@ class OverviewRendererTest(unittest.TestCase):
                 {
                     "pattern": "-----", "answer_count": 8,
                     "branch_reference": "aaaaaaaaaaaa", "branch_key_hex": "aa",
-                    "branch_status": "unqueued", "branch_phase": None,
+                    "branch_status": "unqueued", "branch_worker_status": None,
                     "priority": None, "worker_count": 0,
                     "cache_state": "missing", "best_guess": None,
                     "best_erd": None, "max_remaining_depth": None,
@@ -553,7 +553,7 @@ class OverviewRendererTest(unittest.TestCase):
                 {
                     "pattern": "y----", "answer_count": 4,
                     "branch_reference": "bbbbbbbbbbbb", "branch_key_hex": "bb",
-                    "branch_status": "unqueued", "branch_phase": None,
+                    "branch_status": "unqueued", "branch_worker_status": None,
                     "priority": None, "worker_count": 0,
                     "cache_state": "missing", "best_guess": None,
                     "best_erd": None, "max_remaining_depth": None,
@@ -585,8 +585,8 @@ class OverviewRendererTest(unittest.TestCase):
                 "guess_depth": 1,
                 "answer_count": 8,
                 "budget": 5,
-                "branch_status": "active",
-                "branch_phase": "evaluating",
+                "branch_status": "evaluating",
+                "branch_worker_status": "active",
             },
             "queue": None,
             "cache": {
@@ -615,10 +615,10 @@ class OverviewRendererTest(unittest.TestCase):
             "branch": {
                 "branch_reference": "0123456789ab", "branch_key_hex": "010203",
                 "spine": [], "guess_depth": 0, "answer_count": 3, "budget": 6,
-                "branch_status": "active", "branch_phase": "evaluating",
+                "branch_status": "evaluating", "branch_worker_status": "active",
             },
             "queue": {
-                "branch_status": "active", "branch_phase": "evaluating",
+                "branch_status": "evaluating", "branch_worker_status": "active",
                 "priority": 0, "budget": 6, "best_guess": None,
                 "ceiling": None, "search_node_count": 0,
                 "candidate_count": 3, "completed_candidate_count": 0,
@@ -661,13 +661,13 @@ class OverviewRendererTest(unittest.TestCase):
         report = overview_report()
         report["report_kind"] = "branch"
         report["filters"] = {
-            "branch_statuses": ["active"], "branch_phases": [],
+            "branch_statuses": [], "branch_worker_statuses": ["active"],
         }
         report["data"] = {
             "branch": {
                 "branch_reference": "0123456789ab", "branch_key_hex": "010203",
                 "spine": [], "guess_depth": 0, "answer_count": 3, "budget": 6,
-                "branch_status": "done", "branch_phase": "complete",
+                "branch_status": "done", "branch_worker_status": None,
             },
             "queue": None,
             "cache": {
@@ -679,18 +679,18 @@ class OverviewRendererTest(unittest.TestCase):
         }
         output = render_report(report, width=100)
         self.assertIn("Branch @0123", output)
-        self.assertIn("status=done phase=complete", output)
+        self.assertIn("status=done worker=—", output)
         self.assertNotIn("no longer matches the parent filter", output)
 
     def test_pending_queued_overview_renders_without_candidate_total(self):
         report = overview_report()
         report["filters"] = {
-            "branch_statuses": ["pending"], "branch_phases": [],
+            "branch_statuses": ["queued"], "branch_worker_statuses": [],
         }
         branch = report["data"]["branches"][0]
         branch.update({
-            "branch_status": "pending",
-            "branch_phase": "queued",
+            "branch_status": "queued",
+            "branch_worker_status": None,
             "candidate_count": None,
             "completed_candidate_count": 0,
             "created_at": None,
@@ -698,7 +698,7 @@ class OverviewRendererTest(unittest.TestCase):
         })
         report["data"]["workers"] = []
         output = render_report(report, width=120)
-        self.assertIn("Branches (status=pending)", output)
+        self.assertIn("Branches (status=queued)", output)
         self.assertIn("0/—", output)
 
     def test_hotspot_render_rounds_erd_and_ceiling_bounds(self):
@@ -826,10 +826,10 @@ class CandidateSweepBarTest(unittest.TestCase):
                 "branch": {
                     "branch_reference": "0123456789ab", "branch_key_hex": "010203",
                     "spine": [], "guess_depth": 0, "answer_count": 8, "budget": 6,
-                    "branch_status": "active", "branch_phase": "evaluating",
+                    "branch_status": "evaluating", "branch_worker_status": "active",
                 },
                 "queue": {
-                    "branch_status": "active", "branch_phase": "evaluating",
+                    "branch_status": "evaluating", "branch_worker_status": "active",
                     "priority": 1, "candidate_count": 80,
                     "completed_candidate_count": 40,
                     "bulk_completed_candidate_count": 0,
@@ -1003,8 +1003,8 @@ class CollectionRendererTest(unittest.TestCase):
                 ),
                 "branch_key_hex": node_id if word is not None else None,
                 "branch_reference": node_id[:12] if word is not None else None,
-                "branch_status": "active" if word is not None else None,
-                "branch_phase": "evaluating" if word is not None else None,
+                "branch_status": "evaluating" if word is not None else None,
+                "branch_worker_status": "active" if word is not None else None,
                 "answer_count": 2 if word is not None else None,
                 "guess_depth": guess_depth,
                 "worker_count": 0,
@@ -1064,14 +1064,14 @@ class CollectionRendererTest(unittest.TestCase):
     def test_queue_worker_and_cache_collections_are_semantically_formatted(self):
         queue_report = self._report("queue", {
             "summary": {
-                "branch_count_by_status": {"active": 1},
-                "branch_count_by_phase": {"evaluating": 1},
+                "branch_count_by_status": {"evaluating": 1},
+                "branch_count_by_worker_status": {"active": 1},
             },
             "matched_rows": 1,
             "rows": [{
                 "branch_reference": "0123456789ab",
-                "branch_status": "active",
-                "branch_phase": "evaluating",
+                "branch_status": "evaluating",
+                "branch_worker_status": "active",
                 "answer_count": 2,
                 "spine": [
                     {"word": "raise", "pattern": "-----", "word_is_answer": False},
@@ -1092,14 +1092,14 @@ class CollectionRendererTest(unittest.TestCase):
 
         fallback_queue_report = self._report("queue", {
             "summary": {
-                "branch_count_by_status": {"pending": 1},
-                "branch_count_by_phase": {"evaluating": 1},
+                "branch_count_by_status": {"evaluating": 1},
+                "branch_count_by_worker_status": {"waiting": 1},
             },
             "matched_rows": 1,
             "rows": [{
                 "branch_reference": "fedcba987654",
-                "branch_status": "pending",
-                "branch_phase": "evaluating",
+                "branch_status": "evaluating",
+                "branch_worker_status": "waiting",
                 "answer_count": 2,
                 "source_word": "raise",
                 "source_pattern": "-----",
@@ -1437,7 +1437,7 @@ class ViewSessionTest(unittest.TestCase):
 
     def test_back_restores_complete_prior_request(self):
         filters = ReportFilters(
-            branch_statuses=("active",), minimum_answer_count=10,
+            branch_statuses=("evaluating",), minimum_answer_count=10,
             sort="size", limit=4,
         )
         session = WatchSession(view_args(
@@ -1462,7 +1462,7 @@ class ViewSessionTest(unittest.TestCase):
         session._update_navigation_targets(report)
         letter = session.branch_letter_by_key["010203"]
         finalizing = deepcopy(report)
-        finalizing["data"]["branches"][0]["branch_phase"] = "finalizing"
+        finalizing["data"]["branches"][0]["branch_status"] = "finalizing"
         session._update_navigation_targets(finalizing)
         self.assertEqual(session.branch_hotkeys[letter], "010203")
 
@@ -1907,14 +1907,14 @@ class ViewParserTest(unittest.TestCase):
     def test_incompatible_report_options_and_invalid_branch_filters_are_rejected(self):
         invalid_arguments = [
             ["erd_search.py", "view", "--cache", "--tree"],
-            ["erd_search.py", "view", "--branch-status", "active,active"],
-            ["erd_search.py", "view", "--branch-status", "all,pending"],
-            ["erd_search.py", "view", "--branch-phase", "unknown"],
+            ["erd_search.py", "view", "--branch-status", "evaluating,evaluating"],
+            ["erd_search.py", "view", "--branch-status", "all,done"],
+            ["erd_search.py", "view", "--branch-worker-status", "unknown"],
             ["erd_search.py", "view", "--queue", "--claims"],
             ["erd_search.py", "view", "--tree", "--answers"],
             ["erd_search.py", "view", "--hotspots", "--tree"],
             ["erd_search.py", "view", "--hotspots", "--by", "cut-reuse",
-             "--branch-status", "active"],
+             "--branch-status", "evaluating"],
             ["erd_search.py", "view", "--hotspots", "--by", "coordination",
              "RAISE"],
             ["erd_search.py", "view", "--by", "nodes"],
@@ -1933,14 +1933,14 @@ class ViewParserTest(unittest.TestCase):
 
     def test_branch_filters_are_comma_separated_and_overview_defaults_active(self):
         cases = [
-            ([], ("active",), ()),
-            (["--branch-status", "active,pending"], ("active", "pending"), ()),
-            (["--branch-status", "all"], (), ()),
-            (["--branch-phase", "evaluating,finalizing"],
-             ("active",), ("evaluating", "finalizing")),
+            ([], (), ("active",)),
+            (["--branch-status", "evaluating,finalizing"],
+             ("evaluating", "finalizing"), ("active",)),
+            (["--branch-worker-status", "all"], (), ()),
+            (["--branch-status", "all"], (), ("active",)),
             (["--queue"], (), ()),
         ]
-        for options, statuses, phases in cases:
+        for options, statuses, worker_statuses in cases:
             with self.subTest(options=options):
                 with (
                     patch("sys.argv", ["erd_search.py", "view", *options]),
@@ -1949,7 +1949,7 @@ class ViewParserTest(unittest.TestCase):
                     erd_search.main()
                 filters = run_view.call_args.args[0].filters
                 self.assertEqual(filters.branch_statuses, statuses)
-                self.assertEqual(filters.branch_phases, phases)
+                self.assertEqual(filters.branch_worker_statuses, worker_statuses)
 
     def test_hotspot_defaults_and_sample_cap_are_normalized(self):
         with (

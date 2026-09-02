@@ -122,7 +122,7 @@ branch is still in the queue.
 Focused collections and live topology use the same report model:
 
 ```bash
-python3.13 erd_search.py view --queue --branch-status active,pending --sort size --limit 25
+python3.13 erd_search.py view --queue --branch-status evaluating,finalizing --sort size --limit 25
 python3.13 erd_search.py view --queue --tree "CRANE .y..g"
 python3.13 erd_search.py view --workers
 python3.13 erd_search.py view --worker 2
@@ -253,11 +253,11 @@ card.
 
 Use `--answers` for answer-word arrays on word or branch reports and `--claims`
 for sparse candidate detail on one branch. Collection filters include branch
-status, branch phase, answer-count bounds, budget, priority, sort, and limit.
-Status tracks the branch's relationship to current work: active, pending, done,
-or unqueued. Phase tracks durable search progress from queued through evaluating
-and finalizing to complete. The two axes have a constrained set of combinations; run
-`erd_search.py view --help` for their transition diagram. Historical hotspots
+status, branch worker status, answer-count bounds, budget, priority, sort, and
+limit. Status tracks durable search progress: unqueued, queued, evaluating,
+finalizing, or done. Worker status distinguishes evaluating and finalizing
+branches by whether a worker is on them right now (active or waiting); run
+`erd_search.py view --help` for the lifecycle diagram. Historical hotspots
 are explicitly bounded by epoch, time window, and sample size. `--tree` uses
 only extant queue topology; cache rows never reconstruct historical trees.
 

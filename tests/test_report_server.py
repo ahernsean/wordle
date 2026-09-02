@@ -132,14 +132,15 @@ class ReportServerTest(unittest.TestCase):
     def test_tree_and_branch_filters_reach_normalized_request(self):
         report_request = parse_report_request(
             "/api/view/queue",
-            "tree=true&branch_status=active,pending&branch_phase=evaluating&limit=4",
+            "tree=true&branch_status=evaluating,finalizing&"
+            "branch_worker_status=active&limit=4",
         )
         self.assertTrue(report_request.tree)
         self.assertEqual(
-            report_request.filters.branch_statuses, ("active", "pending")
+            report_request.filters.branch_statuses, ("evaluating", "finalizing")
         )
         self.assertEqual(
-            report_request.filters.branch_phases, ("evaluating",)
+            report_request.filters.branch_worker_statuses, ("active",)
         )
         self.assertEqual(report_request.filters.limit, 4)
 
@@ -176,13 +177,14 @@ class ReportServerTest(unittest.TestCase):
                 with self.assertRaisesRegex(InvalidRequest, message):
                     parse_report_request("/api/view", query)
 
-    def test_root_overview_defaults_to_active_and_all_disables_filter(self):
+    def test_root_overview_defaults_to_active_worker_and_all_disables_filter(self):
         default_request = parse_report_request("/api/view", "")
-        all_request = parse_report_request("/api/view", "branch_status=all")
+        all_request = parse_report_request("/api/view", "branch_worker_status=all")
         word_request = parse_report_request("/api/view", "branch_target=RAISE")
-        self.assertEqual(default_request.filters.branch_statuses, ("active",))
-        self.assertEqual(all_request.filters.branch_statuses, ())
-        self.assertEqual(word_request.filters.branch_statuses, ())
+        self.assertEqual(default_request.filters.branch_worker_statuses, ("active",))
+        self.assertEqual(all_request.filters.branch_worker_statuses, ())
+        self.assertEqual(word_request.filters.branch_worker_statuses, ())
+        self.assertEqual(default_request.filters.branch_statuses, ())
 
     def test_http_and_terminal_compatibility_validation_is_shared(self):
         invalid_requests = (
@@ -225,13 +227,13 @@ class ReportServerTest(unittest.TestCase):
 
     def test_comma_separated_status_is_accepted_but_parameters_do_not_repeat(self):
         report_request = parse_report_request(
-            "/api/view/queue", "branch_status=pending,done"
+            "/api/view/queue", "branch_status=evaluating,done"
         )
         self.assertEqual(
-            report_request.filters.branch_statuses, ("pending", "done")
+            report_request.filters.branch_statuses, ("evaluating", "done")
         )
         for query in (
-            "branch_status=pending&branch_status=done",
+            "branch_status=evaluating&branch_status=done",
             "limit=2&limit=3",
             "unknown=1",
         ):
@@ -242,8 +244,8 @@ class ReportServerTest(unittest.TestCase):
         invalid_queries = (
             "tree=yes", "limit=x", "branch_target=BAD", "limit=0",
             "sample_size=0", "minimum_answer_count=5&maximum_answer_count=2",
-            "branch_status=active,active", "branch_status=all,pending",
-            "branch_phase=evaluating,", "branch_phase=working",
+            "branch_status=evaluating,evaluating", "branch_status=all,done",
+            "branch_worker_status=active,", "branch_worker_status=working",
             "finalization_cursor=sideways:1:2", "finalization_cursor=after:1",
         )
         with running_server(fixture_configuration()) as base_url:

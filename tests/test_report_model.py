@@ -423,7 +423,7 @@ class ReportModelTest(unittest.TestCase):
     def test_response_group_key_orders_status_by_lifecycle(self):
         order = [
             _response_group_key({"branch_status": status}, "status")[0]
-            for status in ("active", "pending", "done", "unqueued")
+            for status in ("unqueued", "queued", "evaluating", "finalizing", "done")
         ]
         self.assertEqual(order, sorted(order))
 
@@ -447,7 +447,7 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(len(completed), 1)
         self.assertEqual(completed[0]["branch_reference"], branch_reference(branch_key))
         self.assertEqual(completed[0]["branch_status"], "done")
-        self.assertEqual(completed[0]["branch_phase"], "complete")
+        self.assertIsNone(completed[0]["branch_worker_status"])
         self.assertTrue(completed[0]["recently_completed"])
         self.assertEqual(completed[0]["finalized_at"], now - 1)
 
@@ -521,11 +521,11 @@ class ReportModelTest(unittest.TestCase):
         rows = [
             {"branch_status": "done", "answer_count": 3, "cache_state": "exact"},
             {"branch_status": "unqueued", "answer_count": 10, "cache_state": "missing"},
-            {"branch_status": "active", "answer_count": 1, "cache_state": "not_applicable"},
+            {"branch_status": "evaluating", "answer_count": 1, "cache_state": "not_applicable"},
         ]
         groups = _grouped_response_groups(rows, "status")
         self.assertEqual(
-            [group["label"] for group in groups], ["active", "done", "unqueued"]
+            [group["label"] for group in groups], ["unqueued", "evaluating", "done"]
         )
         self.assertEqual(
             sum(group["rollup"]["answer_count"] for group in groups),
@@ -1233,8 +1233,8 @@ class ReportModelTest(unittest.TestCase):
             report = collect_overview_report(self.sources)
         branch = report["data"]["branches"][0]
         worker = report["data"]["workers"][0]
-        self.assertEqual(branch["branch_status"], "active")
-        self.assertEqual(branch["branch_phase"], "evaluating")
+        self.assertEqual(branch["branch_status"], "evaluating")
+        self.assertEqual(branch["branch_worker_status"], "active")
         self.assertEqual(branch["raw_status"], "in_progress")
         self.assertFalse(branch["is_cooperative"])
         self.assertEqual(branch["guess_depth"], 2)
@@ -1344,7 +1344,7 @@ class ReportModelTest(unittest.TestCase):
         queue._conn.execute("COMMIT")
 
         started_at = time.monotonic()
-        result = queue.report_queue_rows({"branch_statuses": ("active",)})
+        result = queue.report_queue_rows({"branch_worker_statuses": ("active",)})
         elapsed_seconds = time.monotonic() - started_at
         queue.close()
 
@@ -1416,10 +1416,10 @@ class ReportModelTest(unittest.TestCase):
         branches = {
             row["branch_key_hex"]: row for row in report["data"]["branches"]
         }
-        self.assertEqual(branches[live_key.hex()]["branch_status"], "active")
-        self.assertEqual(branches[live_key.hex()]["branch_phase"], "finalizing")
-        self.assertEqual(branches[dead_key.hex()]["branch_status"], "pending")
-        self.assertEqual(branches[dead_key.hex()]["branch_phase"], "finalizing")
+        self.assertEqual(branches[live_key.hex()]["branch_status"], "finalizing")
+        self.assertEqual(branches[live_key.hex()]["branch_worker_status"], "active")
+        self.assertEqual(branches[dead_key.hex()]["branch_status"], "finalizing")
+        self.assertEqual(branches[dead_key.hex()]["branch_worker_status"], "waiting")
         self.assertEqual(
             set(branches), {live_key.hex(), dead_key.hex()}
         )
@@ -1489,7 +1489,7 @@ class ReportModelTest(unittest.TestCase):
         queue.close()
 
         active_request = ReportRequest(filters=ReportFilters(
-            branch_statuses=("active",)
+            branch_worker_statuses=("active",)
         ))
         with patch("report_model.time.time", return_value=now):
             active_report = collect_report(self.sources, active_request)
@@ -1506,13 +1506,13 @@ class ReportModelTest(unittest.TestCase):
         queue.close()
         with patch("report_model.time.time", return_value=now):
             active_report = collect_report(self.sources, active_request)
-            pending_report = collect_report(self.sources, ReportRequest(
-                filters=ReportFilters(branch_statuses=("pending",), limit=1)
+            waiting_report = collect_report(self.sources, ReportRequest(
+                filters=ReportFilters(branch_worker_statuses=("waiting",), limit=1)
             ))
         self.assertEqual(active_report["data"]["branches"], [])
-        self.assertEqual(len(pending_report["data"]["branches"]), 1)
+        self.assertEqual(len(waiting_report["data"]["branches"]), 1)
         self.assertEqual(
-            pending_report["data"]["branches"][0]["branch_status"], "pending"
+            waiting_report["data"]["branches"][0]["branch_worker_status"], "waiting"
         )
 
     def test_pending_overview_includes_scheduled_branch_before_evaluation(self):
@@ -1522,13 +1522,13 @@ class ReportModelTest(unittest.TestCase):
         queue.close()
 
         report = collect_report(self.sources, ReportRequest(
-            filters=ReportFilters(branch_statuses=("pending",))
+            filters=ReportFilters(branch_statuses=("queued",))
         ))
         self.assertEqual(len(report["data"]["branches"]), 1)
         branch = report["data"]["branches"][0]
         self.assertEqual(branch["branch_key_hex"], branch_key.hex())
-        self.assertEqual(branch["branch_status"], "pending")
-        self.assertEqual(branch["branch_phase"], "queued")
+        self.assertEqual(branch["branch_status"], "queued")
+        self.assertIsNone(branch["branch_worker_status"])
         self.assertIsNone(branch["candidate_count"])
 
     def test_candidate_progress_batch_handles_all_states(self):
@@ -2202,8 +2202,8 @@ class SourceReportTest(unittest.TestCase):
         self.assertEqual(rows["crane"]["branch_effective_priority"], 9)
         self.assertTrue(rows["salet"]["is_shared"])
         self.assertEqual(rows["salet"]["owner_count"], 2)
-        self.assertEqual(rows["salet"]["branch_status"], "pending")
-        self.assertEqual(rows["salet"]["branch_phase"], "queued")
+        self.assertEqual(rows["salet"]["branch_status"], "queued")
+        self.assertIsNone(rows["salet"]["branch_worker_status"])
 
     def test_source_report_filters_by_word_but_keeps_global_shared_detection(self):
         branch_key = ScoreCache.encode_subset(ANSWERS[:2])

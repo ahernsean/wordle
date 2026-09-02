@@ -15,10 +15,10 @@
     "total_rows": 4,
     "matched_rows": 4,
     "response_groups": [
-      {"pattern": "-----", "answer_count": 8, "branch_reference": "111111111111", "branch_key_hex": "01", "branch_status": "done", "branch_phase": "complete", "priority": 5, "worker_count": 1, "cache_state": "exact", "best_guess": "crane", "best_guess_is_answer": true, "best_erd": 2.1, "max_remaining_depth": 3, "updated_at": 990},
-      {"pattern": "y----", "answer_count": 5, "branch_reference": "222222222222", "branch_key_hex": "02", "branch_status": "done", "branch_phase": "complete", "priority": 2, "worker_count": 0, "cache_state": "loss", "best_guess": null, "best_guess_is_answer": false, "best_erd": null, "max_remaining_depth": null, "updated_at": 980},
-      {"pattern": "-y---", "answer_count": 3, "branch_reference": "333333333333", "branch_key_hex": "03", "branch_status": "unqueued", "branch_phase": null, "priority": null, "worker_count": 0, "cache_state": "missing", "best_guess": null, "best_guess_is_answer": false, "best_erd": null, "max_remaining_depth": null, "updated_at": null},
-      {"pattern": "ggggg", "answer_count": 1, "branch_reference": "444444444444", "branch_key_hex": "04", "branch_status": "done", "branch_phase": "complete", "priority": null, "worker_count": 0, "cache_state": "not_applicable", "best_guess": null, "best_guess_is_answer": false, "best_erd": null, "max_remaining_depth": null, "updated_at": null}
+      {"pattern": "-----", "answer_count": 8, "branch_reference": "111111111111", "branch_key_hex": "01", "branch_status": "done", "branch_worker_status": null, "priority": 5, "worker_count": 1, "cache_state": "exact", "best_guess": "crane", "best_guess_is_answer": true, "best_erd": 2.1, "max_remaining_depth": 3, "updated_at": 990},
+      {"pattern": "y----", "answer_count": 5, "branch_reference": "222222222222", "branch_key_hex": "02", "branch_status": "done", "branch_worker_status": null, "priority": 2, "worker_count": 0, "cache_state": "loss", "best_guess": null, "best_guess_is_answer": false, "best_erd": null, "max_remaining_depth": null, "updated_at": 980},
+      {"pattern": "-y---", "answer_count": 3, "branch_reference": "333333333333", "branch_key_hex": "03", "branch_status": "unqueued", "branch_worker_status": null, "priority": null, "worker_count": 0, "cache_state": "missing", "best_guess": null, "best_guess_is_answer": false, "best_erd": null, "max_remaining_depth": null, "updated_at": null},
+      {"pattern": "ggggg", "answer_count": 1, "branch_reference": "444444444444", "branch_key_hex": "04", "branch_status": "done", "branch_worker_status": null, "priority": null, "worker_count": 0, "cache_state": "not_applicable", "best_guess": null, "best_guess_is_answer": false, "best_erd": null, "max_remaining_depth": null, "updated_at": null}
     ],
     "response_group_breakdown": [
       {"pattern": "-----", "answer_count": 8, "solved": true},
