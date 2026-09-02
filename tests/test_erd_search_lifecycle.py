@@ -438,6 +438,25 @@ class QueueOperatorCommandTest(unittest.TestCase):
         self.assertEqual(arguments.limit, 10)
         self.assertEqual(arguments.since_seconds, 3600)
 
+    def test_main_rejects_invalid_view_and_priority_argument_combinations(self):
+        cases = (
+            (["view", "--format", "json", "--watch", "1"], "json cannot"),
+            (["queue", "priority", "--word", "raise", "--priority", "1"], "pattern is required"),
+            (["view", "--limit", "0"], "limit must"),
+            (["view", "--minimum-answer-count", "2", "--maximum-answer-count", "1"], "cannot exceed"),
+            (["view", "--by", "nodes"], "requires --hotspots"),
+            (["view", "--accuracy-offset", "1"], "requires --accuracy"),
+        )
+        for arguments, message in cases:
+            with self.subTest(arguments=arguments), \
+                 patch("sys.argv", ["erd_search.py", *arguments]), \
+                 patch.object(erd_search, "ensure_runtime_dir"), \
+                 patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                with self.assertRaises(SystemExit) as raised:
+                    erd_search.main()
+            self.assertEqual(raised.exception.code, 2)
+            self.assertIn(message, stderr.getvalue())
+
     def test_supervisor_disk_and_wal_helpers_cover_failure_paths(self):
         queue = Mock()
         with patch.object(erd_search, "disk_stats", return_value={"used_fraction": 0.1}):
