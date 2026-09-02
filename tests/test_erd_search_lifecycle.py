@@ -592,6 +592,45 @@ class QueueOperatorCommandTest(unittest.TestCase):
             erd_search._setup_supervisor_logging()
         handler.setFormatter.assert_called_once()
 
+    def test_run_recycles_an_old_worker_before_drain(self):
+        arguments = SimpleNamespace(
+            cache="cache.sqlite3", queue="queue.sqlite3", hint_cache=None,
+            workers=1, recycle_hours=0.001, worker_timeout_seconds=30,
+        )
+        queue = Mock()
+        queue.disk_stop.return_value = None
+        queue.reset_stale_in_progress.return_value = 0
+        queue.recover_active_branches.return_value = (0, 0)
+        queue.counts_by_status.side_effect = [{"pending": 1}, {"pending": 0, "in_progress": 0}]
+        queue.branches_in_progress.return_value = []
+        old_worker = Mock()
+        old_worker.is_alive.side_effect = [True, False]
+        replacement = Mock()
+        replacement.is_alive.return_value = False
+        stop_event = Mock()
+        stop_event.is_set.side_effect = [False, False, True]
+        with (
+            patch.object(erd_search, "_hint_cache_is_usable", return_value=True),
+            patch.object(erd_search, "_checkpoint_cache_on_start"),
+            patch.object(erd_search, "ScoreCache"),
+            patch.object(erd_search, "ERDQueue", return_value=queue),
+            patch.object(erd_search, "disk_stats", return_value={"used_fraction": 0.1, "avail_bytes": 1}),
+            patch.object(erd_search, "_setup_supervisor_logging"),
+            patch.object(erd_search.multiprocessing, "Event", return_value=stop_event),
+            patch.object(erd_search.signal, "signal"),
+            patch.object(erd_search.time, "sleep"),
+            patch.object(erd_search.time, "time", return_value=100),
+            patch.object(erd_search, "_disk_guard", return_value=False),
+            patch.object(erd_search, "_maybe_quiesce_truncate"),
+            patch.object(erd_search, "_enforce_wal_hard_ceiling", return_value=False),
+            patch.object(erd_search, "_spawn_worker", side_effect=[(old_worker, 0), (replacement, 100)]),
+            patch.object(erd_search, "_reap_worker") as reap,
+        ):
+            erd_search.cmd_run(arguments)
+        old_worker.terminate.assert_called_once_with()
+        old_worker.join.assert_called_once_with(timeout=10)
+        reap.assert_called_once_with(queue, 0)
+
     def test_clear_obeys_confirmation_and_closes_queue(self):
         queue = Mock()
         queue.counts_by_status.return_value = {"pending": 2, "done": 3}
