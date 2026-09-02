@@ -9,7 +9,7 @@ import os
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -428,6 +428,33 @@ class ReportServerTest(unittest.TestCase):
         self.assertEqual(status, 500)
         self.assertNotIn("secret", body.decode())
 
+    def test_missing_browser_client_and_ambiguous_reference_have_normal_responses(self):
+        missing_client = ServerConfiguration(self.sources, "missing-client.html")
+        with running_server(missing_client) as base_url:
+            status, _headers, body = request(base_url, "/")
+        self.assertEqual(status, 500)
+        self.assertEqual(json.loads(body)["error"]["kind"], "server_error")
+
+        class AmbiguousReference(ValueError):
+            candidates = [object()]
+
+        report = {"report_kind": "branch_reference_matches"}
+        with (
+            patch("report_server.collect_report", side_effect=AmbiguousReference("ambiguous")),
+            patch("report_server.collect_ambiguous_branch_reference_report", return_value=report),
+            running_server(self.live_configuration) as base_url,
+        ):
+            status, _headers, body = request(base_url, "/api/view?branch_target=%401234")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), report)
+
+    def test_leaderboard_collection_failure_is_shared_and_returned_as_server_error(self):
+        with patch("report_server.collect_report", side_effect=RuntimeError("failed")):
+            with running_server(self.live_configuration) as base_url:
+                status, _headers, body = request(base_url, "/api/view/leaderboard")
+        self.assertEqual(status, 500)
+        self.assertEqual(json.loads(body)["error"]["kind"], "server_error")
+
     def test_concurrent_leaderboard_requests_share_one_collection(self):
         started = Event()
         release = Event()
@@ -485,6 +512,18 @@ class ReportServerMainTest(unittest.TestCase):
                     main()
             self.assertEqual(raised.exception.code, 1)
             self.assertIn("already in use", stderr.getvalue())
+
+    def test_main_closes_server_after_keyboard_interrupt(self):
+        server = Mock()
+        server.serve_forever.side_effect = KeyboardInterrupt
+        with (
+            patch("sys.argv", ["report_server.py"]),
+            patch("report_server.ensure_runtime_dir"),
+            patch("report_server.build_configuration", return_value=fixture_configuration()),
+            patch("report_server.ThreadingHTTPServer", return_value=server),
+        ):
+            main()
+        server.server_close.assert_called_once_with()
 
 
 class SourcesRequestTest(unittest.TestCase):
