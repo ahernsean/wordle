@@ -78,6 +78,16 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(report_model._row_value(None, "missing", "fallback"), "fallback")
         self.assertEqual(report_model._row_value({}, "missing", "fallback"), "fallback")
 
+    def test_branch_target_parser_rejects_invalid_reference_and_word_tokens(self):
+        for target, message in (
+            ("@xyz", "expected @"),
+            ("toolong", "five-letter word"),
+            ("raise wrong", "response pattern"),
+        ):
+            with self.subTest(target=target):
+                with self.assertRaisesRegex(ValueError, message):
+                    parse_report_branch_target(target)
+
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         directory = self.temporary_directory.name
