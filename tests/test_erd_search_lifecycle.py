@@ -571,11 +571,26 @@ class QueueOperatorCommandTest(unittest.TestCase):
             erd_search.cmd_run(arguments)
         self.assertEqual(spawn.call_count, 2)
         reap.assert_called_once_with(queue, 0)
-        queue.reset_mock()
-        queue.reconcile_orphaned_branch_ownership.return_value = [4, 7]
-        with patch.object(erd_search, "ERDQueue", return_value=queue):
-            erd_search.cmd_queue_reconcile_orphaned_ownership(
-                SimpleNamespace(queue="queue.sqlite3"))
+
+    def test_worker_spawn_and_supervisor_logging_build_expected_resources(self):
+        process = Mock(pid=44)
+        arguments = SimpleNamespace(cache="cache.sqlite3", queue="queue.sqlite3", workers=2,
+                                    hint_cache="hints.sqlite3")
+        stop_event = object()
+        with patch.object(erd_search.multiprocessing, "Process", return_value=process) as process_class, \
+             patch.object(erd_search.time, "time", return_value=123):
+            spawned, started_at = erd_search._spawn_worker(3, arguments, stop_event)
+        self.assertIs(spawned, process)
+        self.assertEqual(started_at, 123)
+        process.start.assert_called_once_with()
+        self.assertEqual(process_class.call_args.kwargs["name"], "erd-worker-3")
+
+        handler = Mock()
+        with patch.object(erd_search.logging, "FileHandler", return_value=handler), \
+             patch.object(erd_search.logger, "addHandler"), \
+             patch.object(erd_search.logger, "setLevel"):
+            erd_search._setup_supervisor_logging()
+        handler.setFormatter.assert_called_once()
 
     def test_clear_obeys_confirmation_and_closes_queue(self):
         queue = Mock()
