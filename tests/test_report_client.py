@@ -2398,9 +2398,11 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.wait_for_selector("h1")
         self.page.locator("#branch-target-input").fill("CRANE")
         self.page.locator("details.filters").evaluate("node => node.open = true")
-        self.page.locator('[data-branch-status][value="queued"]').check()
+        # The overview offers only the stages it reports on, so the filter
+        # change is made with one of those.
+        self.page.locator('[data-branch-status][value="finalizing"]').uncheck()
         self.page.wait_for_function(
-            "() => __reportClient.getState().branch_status.includes('queued')"
+            "() => !__reportClient.getState().branch_status.includes('finalizing')"
         )
         self.assertEqual(
             self.page.evaluate("() => __reportClient.getState().branch_target"), ""
@@ -2458,6 +2460,13 @@ class ReportClientBrowserTest(unittest.TestCase):
             self.page.eval_on_selector_all("#sort option", "options => options.map(o => o.value)"),
             ["", "age", "size", "workers", "priority", "nodes", "slowest"],
         )
+        # Every option names what it orders by; none is labelled "default"
+        # alone, which names no field a reader could sort on.
+        labels = self.page.eval_on_selector_all(
+            "#sort option", "options => options.map(o => o.textContent)"
+        )
+        self.assertEqual(labels[0], "worked first, then priority (default)")
+        self.assertNotIn("default", labels[1:])
 
     def test_refresh_popover_toggles_open_and_closed(self):
         self.assertEqual(self.page.locator(".conn-wrap.open").count(), 0)
@@ -2507,6 +2516,80 @@ class ReportClientBrowserTest(unittest.TestCase):
             ".gridTemplateColumns.split(' ').filter(Boolean).length"
         )
         self.assertEqual(columns, 2)
+
+    def test_held_completion_keeps_its_place_in_an_imposed_sort(self):
+        """A finished branch is held where its size puts it, not at the end.
+
+        The hold is added after the server has ordered its rows, so appending
+        it would drop the largest branch below every smaller one still running.
+        """
+        result = self.page.evaluate(self.grid_script("""
+          const base=await overviewReport();
+          const sorted={...__reportClient.getState(),sort:'size'};
+          const sized=(names,counts)=>{
+            const report=namedBranches(base,names);
+            report.data.branches.forEach((row,index)=>{row.answer_count=counts[index];});
+            return report;
+          };
+          const identities=()=>[...document.querySelectorAll(
+            '[data-grid-key="branches"] > [data-identity]')]
+            .map(node=>node.dataset.identity);
+          const all=sized(['big','mid','small'],[100,50,10]);
+          all.data.branches[0].branch_status='finalizing';
+          const departed=sized(['mid','small'],[50,10]);
+          applyReport(all,null,sorted);await settled();
+          applyReport(departed,all,sorted);await settled();
+          const card=document.querySelector('[data-identity="big"]');
+          return {order:identities(),className:card?card.className:null};
+        """))
+        self.assertEqual(result["order"], ["big", "mid", "small"])
+        self.assertIn("recently-completed", result["className"])
+
+    def test_overview_sort_menu_names_its_unsorted_default(self):
+        """Choosing a sort must be reversible, so the packing is an option too."""
+        self.page.locator("details.filters").evaluate("node => node.open = true")
+        labels = self.page.eval_on_selector_all(
+            "#sort option", "options => options.map(o => o.textContent)"
+        )
+        self.assertEqual(labels[0], "unsorted (default)")
+        self.assertIn("# of answers", labels)
+        self.assertEqual(
+            self.page.evaluate("() => __reportClient.getState().sort"), ""
+        )
+        self.page.select_option("#sort", "size")
+        self.page.wait_for_function(
+            "() => __reportClient.getState().sort === 'size'"
+        )
+        self.page.select_option("#sort", "")
+        self.page.wait_for_function("() => __reportClient.getState().sort === ''")
+
+    def test_overview_follows_an_imposed_sort_instead_of_its_packing(self):
+        """Packing holds each card's place, so it answers only for the default.
+
+        The server has already ordered the rows for an imposed sort, so the
+        grid must read in the order it was sent rather than the one the cards
+        happen to be sitting in.
+        """
+        order = self.page.evaluate(self.grid_script("""
+          const base=await overviewReport();
+          const identities=()=>[...document.querySelectorAll(
+            '[data-grid-key="branches"] > [data-identity]')]
+            .map(node=>node.dataset.identity);
+          const packed={...__reportClient.getState(),sort:''};
+          const sorted={...__reportClient.getState(),sort:'size'};
+          const first=namedBranches(base,['A','B','C']);
+          const reordered=namedBranches(base,['C','A','B']);
+          applyReport(first,null,packed);await settled();
+          applyReport(reordered,first,packed);await settled();
+          const held=identities();
+          applyReport(first,null,sorted);await settled();
+          applyReport(reordered,first,sorted);await settled();
+          return {held,followed:identities()};
+        """))
+        # Default order: the cards keep the places the packing gave them.
+        self.assertEqual(order["held"], ["A", "B", "C"])
+        # Imposed order: the grid reads in the order the server sent.
+        self.assertEqual(order["followed"], ["C", "A", "B"])
 
     def test_overview_departure_compacts_within_its_own_column(self):
         self.two_column_overview()
@@ -2568,6 +2651,32 @@ class ReportClientBrowserTest(unittest.TestCase):
             [cells[name] for name in ("P", "Q", "R", "S", "T")],
             [[0, 0], [0, 1], [1, 0], [1, 1], [2, 0]],
         )
+
+    def test_overview_holds_completed_branch_under_each_stage_filter(self):
+        """The hold survives narrowing the overview to one worked stage.
+
+        A branch leaves the overview both when it finishes and when it merely
+        loses its worker, and the hold is what tells those apart — so it cannot
+        depend on the status filter standing at exactly its default.
+        """
+        for statuses in (["evaluating"], ["finalizing"], ["evaluating", "finalizing"]):
+            with self.subTest(branch_status=statuses):
+                held = self.page.evaluate(
+                    self.grid_script("""
+                      const base=await overviewReport();
+                      const state={...__reportClient.getState(),
+                                   branch_status:%s,branch_worker_status:['active']};
+                      const finalizing=namedBranches(base,['complete']);
+                      finalizing.data.branches[0].branch_status='finalizing';
+                      const empty=namedBranches(base,[]);
+                      applyReport(finalizing,null,state);await settled();
+                      applyReport(empty,finalizing,state);
+                      const card=document.querySelector('[data-identity="complete"]');
+                      return card?card.className:null;
+                    """ % json.dumps(statuses))
+                )
+                self.assertIsNotNone(held)
+                self.assertIn("recently-completed", held)
 
     def test_overview_holds_completed_branch_before_its_departure(self):
         """A completed branch stays visible long enough to explain its exit."""
@@ -2862,7 +2971,9 @@ class ReportClientBrowserTest(unittest.TestCase):
           tree: parsePageState({search:'?branch_target=RAISE%20.....&tree=1&claims=1&answers=1'}),
           word: parsePageState({search:'?branch_target=RAISE&sort=nodes'})
         })""")
-        self.assertEqual(states["overview"]["branch_status"], [])
+        self.assertEqual(
+            states["overview"]["branch_status"], ["evaluating", "finalizing"]
+        )
         self.assertEqual(states["overview"]["branch_worker_status"], ["active"])
         self.assertEqual(states["all"]["branch_worker_status"], [])
         self.assertEqual(states["historical"]["branch_status"], [])
@@ -2894,14 +3005,38 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.locator("details.filters").evaluate("node => node.open = true")
         self.assertTrue(self.page.locator(selector).is_visible())
 
+    def test_overview_offers_and_defaults_to_the_worked_stages(self):
+        state = self.page.evaluate("() => parsePageState({search:''})")
+        self.assertEqual(state["branch_status"], ["evaluating", "finalizing"])
+        self.assertEqual(state["branch_worker_status"], ["active"])
+        self.page.locator("details.filters").evaluate("node => node.open = true")
+        shown = self.page.eval_on_selector_all(
+            "[data-branch-status]",
+            "inputs => inputs.filter(input => !input.parentElement.hidden)"
+            ".map(input => input.value)",
+        )
+        self.assertEqual(shown, ["evaluating", "finalizing"])
+        # A stage the overview does not report on cannot arrive by URL either.
+        carried = self.page.evaluate(
+            "() => parsePageState({search:'?branch_status=queued,done,evaluating'})"
+        )
+        self.assertEqual(carried["branch_status"], ["evaluating"])
+
     def test_worker_status_checkboxes_gray_out_when_they_cannot_apply(self):
         active = '[data-branch-worker-status][value="active"]'
         waiting = '[data-branch-worker-status][value="waiting"]'
+        # The queue report offers every stage, including the ones that carry no
+        # worker status; the overview offers only the two that do.
+        self.page.locator("[data-kind=queue]").click()
+        self.page.wait_for_selector("text=queue report")
         self.page.locator("details.filters").evaluate("node => node.open = true")
         self.assertFalse(self.page.locator(active).is_disabled())
+        for value in ("evaluating", "finalizing"):
+            self.page.locator(f'[data-branch-status][value="{value}"]').uncheck()
         self.page.locator('[data-branch-status][value="queued"]').check()
         self.page.wait_for_function(
-            "() => __reportClient.getState().branch_status.includes('queued')"
+            "() => JSON.stringify(__reportClient.getState().branch_status)"
+            " === JSON.stringify(['queued'])"
         )
         for selector in (active, waiting):
             self.assertTrue(self.page.locator(selector).is_disabled())

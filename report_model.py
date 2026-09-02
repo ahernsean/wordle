@@ -129,6 +129,12 @@ class ReportFilters:
 
 BRANCH_STATUSES = ("unqueued", "queued", "evaluating", "finalizing", "done")
 BRANCH_WORKER_STATUSES = ("active", "waiting")
+# The overview answers "what is the swarm doing right now", so it opens on the
+# two stages a branch is worked in and on the ones a worker holds.  Both stages
+# carry a worker status, which is what keeps the two filters independent here:
+# neither can select a branch the other has nothing to say about.
+OVERVIEW_BRANCH_STATUSES = ("evaluating", "finalizing")
+OVERVIEW_BRANCH_WORKER_STATUSES = ("active",)
 # A source word's lifecycle is its own: it is queued until a worker picks one
 # of its requests up, and complete only once every request behind it is.  These
 # are deliberately not the branch statuses, which describe a single branch.
@@ -178,6 +184,11 @@ def parse_branch_filter(value, filter_name, allowed_values):
     if len(set(values)) != len(values):
         raise ValueError(f"{filter_name} contains a duplicate value")
     return values
+
+
+def is_overview_request(report_kind, branch_target_kind, tree) -> bool:
+    """Whether a request selects the root overview, which both clients open on."""
+    return report_kind == "auto" and branch_target_kind == "root" and not tree
 
 
 def applied_branch_filters(filters: "ReportFilters") -> "ReportFilters":
@@ -969,7 +980,10 @@ def _queue_overview(sources, generated_at, answer_set, report):
         }
         report["data"]["worker_totals"] = worker_totals
         report["data"]["branches"] = normalized_rows
-        if not filters.get("branch_worker_statuses") or filters.get("branch_worker_statuses") == ["active"]:
+        # Completions explain a departure from the view, so they are sent to
+        # any overview still showing the branches a worker is on.
+        worker_statuses = filters.get("branch_worker_statuses") or ()
+        if not worker_statuses or "active" in worker_statuses:
             report["data"]["recently_completed_branches"] = [
                 _normalize_recent_finalized_branch(row, answer_set)
                 for row in queue.recent_finalized_branches(

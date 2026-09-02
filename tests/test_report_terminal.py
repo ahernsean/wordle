@@ -1975,10 +1975,9 @@ class ViewParserTest(unittest.TestCase):
 
     def test_branch_filters_are_comma_separated_and_overview_defaults_active(self):
         cases = [
-            ([], (), ("active",)),
-            (["--branch-status", "evaluating,finalizing"],
-             ("evaluating", "finalizing"), ("active",)),
-            (["--branch-worker-status", "all"], (), ()),
+            ([], ("evaluating", "finalizing"), ("active",)),
+            (["--branch-status", "evaluating"], ("evaluating",), ("active",)),
+            (["--branch-worker-status", "all"], ("evaluating", "finalizing"), ()),
             (["--branch-status", "all"], (), ("active",)),
             (["--queue"], (), ()),
         ]

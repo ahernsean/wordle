@@ -17,7 +17,10 @@ from urllib.parse import parse_qs, urlsplit
 from report_model import (
     BRANCH_STATUSES,
     BRANCH_WORKER_STATUSES,
+    OVERVIEW_BRANCH_STATUSES,
+    OVERVIEW_BRANCH_WORKER_STATUSES,
     applied_branch_filters,
+    is_overview_request,
     GROUP_BY_STRATEGIES,
     SCHEMA_VERSION,
     SOURCE_GROUP_BY_STRATEGIES,
@@ -175,11 +178,13 @@ def parse_report_request(path, query):
     branch_worker_status_value = _single_value(parameters, "branch_worker_status")
     source_state_value = _single_value(parameters, "opener_state")
     try:
+        overview = is_overview_request(explicit_kind, branch_target.kind, tree)
         branch_statuses = (
             parse_branch_filter(
                 branch_status_value, "branch status", BRANCH_STATUSES
             )
-            if branch_status_value is not None else ()
+            if branch_status_value is not None
+            else (OVERVIEW_BRANCH_STATUSES if overview else ())
         )
         branch_worker_statuses = (
             parse_branch_filter(
@@ -187,11 +192,7 @@ def parse_report_request(path, query):
                 BRANCH_WORKER_STATUSES,
             )
             if branch_worker_status_value is not None
-            else (
-                ("active",)
-                if explicit_kind == "auto" and branch_target.kind == "root" and not tree
-                else ()
-            )
+            else (OVERVIEW_BRANCH_WORKER_STATUSES if overview else ())
         )
         source_states = (
             parse_branch_filter(source_state_value, "opener state", SOURCE_STATES)

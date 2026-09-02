@@ -177,14 +177,23 @@ class ReportServerTest(unittest.TestCase):
                 with self.assertRaisesRegex(InvalidRequest, message):
                     parse_report_request("/api/view", query)
 
-    def test_root_overview_defaults_to_active_worker_and_all_disables_filter(self):
+    def test_root_overview_defaults_to_worked_branches_and_all_disables_filter(self):
         default_request = parse_report_request("/api/view", "")
         all_request = parse_report_request("/api/view", "branch_worker_status=all")
+        all_statuses = parse_report_request("/api/view", "branch_status=all")
         word_request = parse_report_request("/api/view", "branch_target=RAISE")
+        self.assertEqual(
+            default_request.filters.branch_statuses, ("evaluating", "finalizing")
+        )
         self.assertEqual(default_request.filters.branch_worker_statuses, ("active",))
         self.assertEqual(all_request.filters.branch_worker_statuses, ())
+        self.assertEqual(all_statuses.filters.branch_statuses, ())
+        # Only the overview opens on a filter; every other report starts unfiltered.
+        self.assertEqual(word_request.filters.branch_statuses, ())
         self.assertEqual(word_request.filters.branch_worker_statuses, ())
-        self.assertEqual(default_request.filters.branch_statuses, ())
+        queue_request = parse_report_request("/api/view/queue", "")
+        self.assertEqual(queue_request.filters.branch_statuses, ())
+        self.assertEqual(queue_request.filters.branch_worker_statuses, ())
 
     def test_http_and_terminal_compatibility_validation_is_shared(self):
         invalid_requests = (

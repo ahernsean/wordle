@@ -92,7 +92,10 @@ from hint_cache import HintCacheError, open_hint_cache
 from report_model import (
     BRANCH_STATUSES,
     BRANCH_WORKER_STATUSES,
+    OVERVIEW_BRANCH_STATUSES,
+    OVERVIEW_BRANCH_WORKER_STATUSES,
     applied_branch_filters,
+    is_overview_request,
     SOURCE_SORT_FIELDS,
     SOURCE_STATES,
     ReportFilters,
@@ -1430,9 +1433,14 @@ def main():
   its branches from the queue.  --branch-status unqueued is refused
   elsewhere rather than matching nothing.
 
-  The overview defaults to --branch-worker-status active.  Use comma-
-  separated values such as --branch-status evaluating,finalizing, or use
-  all to disable a filter.
+  The overview answers what the swarm is doing now, so it defaults to
+  --branch-status evaluating,finalizing --branch-worker-status active.
+  Every other report starts unfiltered.  Use comma-separated values such as
+  --branch-status queued,done, or use all to disable a filter.
+
+  Worker status narrows only the stages that carry one, so a status filter
+  selecting neither evaluating nor finalizing drops it rather than matching
+  nothing.
 """)
     p_view.add_argument('--watch', nargs='?', const=30.0,
                         type=_view_watch_interval, metavar='SECONDS')
@@ -1720,16 +1728,19 @@ def main():
             args.limit = 10
         if args.accuracy and args.limit is None:
             args.limit = 20
+        overview = is_overview_request(
+            args.report_kind, args.branch_target.kind, args.tree
+        )
+        branch_statuses = args.branch_status
+        if branch_statuses is None:
+            branch_statuses = OVERVIEW_BRANCH_STATUSES if overview else ()
         branch_worker_statuses = args.branch_worker_status
         if branch_worker_statuses is None:
             branch_worker_statuses = (
-                ("active",)
-                if (args.report_kind == "auto"
-                    and args.branch_target.kind == "root" and not args.tree)
-                else ()
+                OVERVIEW_BRANCH_WORKER_STATUSES if overview else ()
             )
         args.filters = applied_branch_filters(ReportFilters(
-            branch_statuses=args.branch_status or (),
+            branch_statuses=branch_statuses,
             branch_worker_statuses=branch_worker_statuses,
             minimum_answer_count=args.minimum_answer_count,
             maximum_answer_count=args.maximum_answer_count,

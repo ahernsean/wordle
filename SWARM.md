@@ -261,7 +261,11 @@ branches by whether a worker is on them right now (active or waiting); run
 derives its response groups from the answer list, so it is the only report
 that can show an unqueued branch — every other report reads its branches
 from the queue, and `--branch-status unqueued` is refused there rather than
-matching nothing. Historical hotspots
+matching nothing. Worker status narrows only the stages that carry one, so a
+status filter selecting neither evaluating nor finalizing drops it instead of
+matching nothing. The overview answers what the swarm is doing now and so
+defaults to `--branch-status evaluating,finalizing --branch-worker-status
+active`; every other report starts unfiltered. Historical hotspots
 are explicitly bounded by epoch, time window, and sample size. `--tree` uses
 only extant queue topology; cache rows never reconstruct historical trees.
 
