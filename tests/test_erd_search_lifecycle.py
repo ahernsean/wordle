@@ -420,6 +420,33 @@ class OperatorHelperTest(unittest.TestCase):
 
 
 class QueueOperatorCommandTest(unittest.TestCase):
+    def test_supervisor_disk_and_wal_helpers_cover_failure_paths(self):
+        queue = Mock()
+        with patch.object(erd_search, "disk_stats", return_value={"used_fraction": 0.1}):
+            self.assertFalse(erd_search._disk_guard(queue, "queue.sqlite3"))
+        with patch.object(erd_search, "disk_stats", return_value={"used_fraction": 1.0}):
+            queue.set_disk_stop.side_effect = sqlite3.OperationalError("locked")
+            self.assertTrue(erd_search._disk_guard(queue, "queue.sqlite3"))
+
+        queue.reset_mock()
+        queue.wal_size_bytes.return_value = 0
+        erd_search._maybe_quiesce_truncate(queue)
+        queue.checkpoint.assert_not_called()
+
+        queue.reset_mock()
+        queue.wal_size_bytes.return_value = erd_search.QUEUE_WAL_QUIESCE_BYTES
+        queue.checkpoint.return_value = (0, 0, 0)
+        erd_search._maybe_quiesce_truncate(queue)
+        self.assertEqual(
+            queue.set_checkpoint_pause.call_args_list,
+            [((True,), {}), ((False,), {})],
+        )
+
+        process = Mock(pid=1)
+        process.is_alive.return_value = True
+        with patch.object(erd_search.os, "kill", side_effect=OSError("gone")):
+            erd_search._dump_worker_stacks({1: (process, 0)})
+
     def test_clear_obeys_confirmation_and_closes_queue(self):
         queue = Mock()
         queue.counts_by_status.return_value = {"pending": 2, "done": 3}
