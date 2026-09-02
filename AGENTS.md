@@ -695,6 +695,24 @@ the local single-file invocation was exposed. (Clear the data files with `find
 -delete`: under zsh a `.coverage.*` glob that matches nothing aborts the whole
 command, silently skipping the run chained after it.)
 
+### Coverage source inventory
+
+`.coveragerc`'s `source` list is the production Python inventory admitted to
+the 98% gate, not a hand-picked subset selected to preserve the percentage.
+Every module that implements the game, solver/kernel, cache, swarm, operator
+CLI, reporting interfaces, or a shared production utility must either be in
+that list or be named in an active, staged coverage-backfill issue. A module
+is not exempt because another covered module imports it: coverage only records
+files named in `source`.
+
+Test helpers, one-off dataset and diagnostic scripts, and `verify_*.py` audit
+passes are outside the gate. Any other exclusion needs a comment in
+`.coveragerc` explaining why it is not production code or naming its active
+backfill issue. When adding, removing, or materially repurposing a top-level
+Python module, review this inventory in the same change and run the combined
+coverage gate. If the expanded scope falls below 98%, add tests for the missing
+production behavior rather than narrowing the inventory.
+
 Commits with failing tests must not be pushed.
 
 A commit whose diff is entirely markdown, documentation, or other non-code

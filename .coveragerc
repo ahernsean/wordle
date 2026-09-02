@@ -1,12 +1,10 @@
 # Coverage configuration for the Wordle solver.
 #
-# Scope: application core (wordle.py, wordle_engine.py, cache_sqlite.py,
-# hint_cache.py), parallel ERD precache coordination (erd_swarm.py,
-# erd_queue.py), and the cache sync utilities (export_cache.py,
-# import_cache.py).
-# Out of scope: erd_search.py (supervisor/process-spawn/terminal CLI layer),
-# the verify_*.py re-verification and audit passes, and the one-off diagnostic
-# and dataset scripts.
+# Scope: the game, engine/kernel, caches, swarm workers, cache sync utilities,
+# and shared runtime/UI helpers.  Operator and reporting modules are covered by
+# the staged production-coverage backfill tracked in #316.
+# Out of scope: test support, the verify_*.py re-verification and audit passes,
+# and the one-off diagnostic and dataset scripts.
 [run]
 branch = True
 # CI splits the suite across three jobs and combines their data files, so each
@@ -17,10 +15,14 @@ disable_warnings = module-not-imported
 source =
     wordle
     wordle_engine
+    pattern_matrix
+    erd_lattice
     cache_sqlite
     hint_cache
     erd_swarm
     erd_queue
+    runtime_paths
+    wordle_ui
     export_cache
     import_cache
 
