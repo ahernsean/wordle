@@ -406,5 +406,15 @@ class OperatorHelperTest(unittest.TestCase):
         with patch.object(erd_search.os, 'kill') as kill:
             erd_search._dump_worker_stacks({2: (live_process, 0), 3: (dead_process, 0)})
         kill.assert_called_once_with(12, erd_search.signal.SIGUSR1)
+
+    def test_source_work_invariant_check_accepts_empty_and_logs_rows(self):
+        queue = Mock()
+        queue.check_source_work_invariants.return_value = []
+        erd_search._check_source_work_invariants(queue)
+
+        queue.check_source_work_invariants.return_value = ['branch 17 has no owner']
+        with self.assertLogs(erd_search.logger, 'WARNING') as logs:
+            erd_search._check_source_work_invariants(queue)
+        self.assertIn('branch 17 has no owner', logs.output[-1])
 if __name__ == '__main__':
     unittest.main()
