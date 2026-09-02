@@ -2200,6 +2200,55 @@ class RootProgressRendererTest(unittest.TestCase):
         self.assertIn("524,184", output)
 
 class TerminalUtilityTest(unittest.TestCase):
+    def test_terminal_labels_sweeps_and_change_highlighting_cover_edge_cases(self):
+        display_order = report_terminal.DisplayOrder()
+        display_order.hotkey_letters["key"] = "a"
+        self.assertEqual(report_terminal._hotkey_label(display_order, "key"), "[a]")
+        self.assertEqual(report_terminal._hotkey_label(display_order, "other"), "")
+        self.assertEqual(report_terminal._worker_number_label(None), "—")
+        self.assertEqual(report_terminal._worker_number_label("worker-alpha"), "worker-alpha")
+        self.assertEqual(report_terminal._worker_number_label("worker-12"), "w12")
+        self.assertEqual(report_terminal.candidate_sweep_bar(2, [-1, None, 0, 0], [(None, 1), (-1, 2)], 2), "█ ")
+        self.assertEqual(report_terminal.candidate_sweep_bar(1, [0], [(0, 1), (0, 2)], 1), "2")
+        self.assertEqual(report_terminal._highlight_changes("same", "same"), "same")
+        self.assertEqual(
+            report_terminal._highlight_changes("ab", "ax"),
+            "a" + report_terminal.RED + "b" + report_terminal.RESET,
+        )
+
+    def test_terminal_display_rows_render_optional_status_fields(self):
+        branch = {
+            "branch_key_hex": "key", "branch_status": "finalizing",
+            "best_guess": "raise", "best_guess_is_answer": True, "best_erd": 2.5,
+            "completed_candidate_count": 2, "candidate_count": 4,
+            "created_at": 10, "spine": [],
+        }
+        display_order = report_terminal.DisplayOrder()
+        self.assertEqual(report_terminal._display_done(branch), "2/4")
+        self.assertEqual(report_terminal._display_erd_prunes({}), "0/0")
+        self.assertEqual(report_terminal._display_best(branch), "RAISE*/2.500")
+        self.assertEqual(report_terminal._branch_display_row(branch, 20, display_order)["display_status"], "final")
+        worker = {
+            "worker_id": "worker-2", "updated_at": 10, "current_candidate": "raise",
+            "current_candidate_is_answer": True, "current_max_guess_depth": 3,
+            "nodes_per_second": 1200, "scheduling_role": "preferred",
+        }
+        row = report_terminal._worker_display_row(worker, 20, "finalizing")
+        self.assertEqual(row["display_state"], "final")
+        self.assertEqual(row["display_candidate"], "RAISE*")
+
+    def test_ambiguous_reference_renderer_lists_preview_and_spine(self):
+        report = {"data": {"candidates": [{
+            "branch_reference": "abcd", "answer_count": 2,
+            "answer_preview": ["cigar"],
+            "spine": [{"word": "raise", "pattern": "-----"}],
+        }]}}
+        with patch("report_terminal.collect_ambiguous_branch_reference_report", return_value=report):
+            lines = report_terminal._ambiguous_reference_lines(
+                ValueError("ambiguous"), object(), object())
+        self.assertIn("CIGAR…", lines[1])
+        self.assertIn("spine=RAISE -----", lines[2])
+
     def test_formatters_and_change_rules_cover_boundary_values(self):
         self.assertEqual(report_terminal._percentage(1, 0), "—")
         self.assertEqual(report_terminal._format_metric_value("best_erd", 2.5), "2.500")
