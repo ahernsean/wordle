@@ -420,6 +420,24 @@ class OperatorHelperTest(unittest.TestCase):
 
 
 class QueueOperatorCommandTest(unittest.TestCase):
+    def test_main_builds_the_full_operator_parser(self):
+        with patch("sys.argv", ["erd_search.py", "--help"]):
+            with self.assertRaises(SystemExit) as raised:
+                erd_search.main()
+        self.assertEqual(raised.exception.code, 0)
+
+    def test_main_normalizes_a_view_request_before_dispatch(self):
+        with (
+            patch("sys.argv", ["erd_search.py", "view", "--hotspots"]),
+            patch.object(erd_search, "ensure_runtime_dir"),
+            patch.object(erd_search, "cmd_view") as view,
+        ):
+            erd_search.main()
+        arguments = view.call_args.args[0]
+        self.assertEqual(arguments.report_kind, "hotspots")
+        self.assertEqual(arguments.limit, 10)
+        self.assertEqual(arguments.since_seconds, 3600)
+
     def test_supervisor_disk_and_wal_helpers_cover_failure_paths(self):
         queue = Mock()
         with patch.object(erd_search, "disk_stats", return_value={"used_fraction": 0.1}):
