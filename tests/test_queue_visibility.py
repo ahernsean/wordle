@@ -559,8 +559,8 @@ class QueueVisibilityTests(unittest.TestCase):
             "worker-1", 1, self.user_key, len(WORDS), int(time.time()), 0
         )
         result = self.q.report_queue_rows({
-            "branch_statuses": ("active",),
-            "branch_phases": ("evaluating",),
+            "branch_statuses": ("evaluating",),
+            "branch_worker_statuses": ("active",),
             "minimum_answer_count": len(WORDS),
             "maximum_answer_count": len(WORDS),
             "budget": 4,
@@ -568,8 +568,8 @@ class QueueVisibilityTests(unittest.TestCase):
             "limit": 1,
         })
         self.assertEqual(result["matched_rows"], 1)
-        self.assertEqual(result["rows"][0]["branch_status"], "active")
-        self.assertEqual(result["rows"][0]["branch_phase"], "evaluating")
+        self.assertEqual(result["rows"][0]["branch_status"], "evaluating")
+        self.assertEqual(result["rows"][0]["branch_worker_status"], "active")
         self.q._conn.execute("DELETE FROM run_meta WHERE key = 'epoch'")
         self.assertIsNone(self.q.epoch_metadata())
 
