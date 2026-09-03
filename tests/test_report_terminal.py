@@ -655,6 +655,15 @@ class OverviewRendererTest(unittest.TestCase):
                     {"worker_id": "worker-2", "done_count": 6335},
                 ],
             },
+            "recent_finalizations": [{
+                "spine": "RAISE -----", "outcome": "exact", "epoch": 2,
+                "search_node_count": 100, "evaluated_candidate_count": 2,
+                "one_level_erd_pruned_candidate_count": 1,
+                "two_level_erd_pruned_candidate_count": 0,
+            }],
+            "finalization_total_count": 2,
+            "cut_reuse_misses": [{"epoch": 2, "budget": 4,
+                                  "available_bound": 2.5, "answer_count": 2}],
             "provenance_unknown": False,
         }
         output = render_report(report, width=100)
@@ -670,6 +679,8 @@ class OverviewRendererTest(unittest.TestCase):
         self.assertIn("scaling 1→2 workers", output)
         self.assertIn("1 re-queued (up to 2x each)", output)
         self.assertIn("worker evals w0:6,484 w2:6,335", output)
+        self.assertIn("and 1 more reaching this same answer set", output)
+        self.assertIn("cut reuse miss epoch=2 budget=4", output)
         self.assertNotIn("idx=", output)
 
     def test_unqueued_branch_renders_claim_progress_and_answer_preview(self):
