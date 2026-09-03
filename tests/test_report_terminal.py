@@ -2390,6 +2390,7 @@ class TerminalUtilityTest(unittest.TestCase):
         stacked = report_terminal._render_table([column], [{"word": "hello"}], 2)
         self.assertTrue(stacked)
         self.assertEqual(report_terminal._wrap_fields(["long-field"], 4), ["  l…"])
+        self.assertEqual(report_terminal._wrap_fields(["ab", "cdef"], 5), ["  ab", "  cd…"])
         columns = [
             report_terminal.TerminalColumn("name", "name", required=True),
             report_terminal.TerminalColumn("detail", "detail", truncation="tail"),
