@@ -1198,6 +1198,15 @@ class CollectionRendererTest(unittest.TestCase):
 
 
 class ViewSessionTest(unittest.TestCase):
+    def test_identity_rows_includes_one_branch_without_duplicate_identities(self):
+        report = {"data": {
+            "branches": [{"branch_key_hex": "one"}],
+            "rows": [{"branch_key_hex": "one"}, {"branch_key_hex": "two"}],
+            "branch": {"branch_key_hex": "three"},
+        }}
+        rows = WatchSession._identity_rows(report, "branch_key_hex")
+        self.assertEqual([row["branch_key_hex"] for row in rows], ["one", "two", "three"])
+
     def test_branch_navigation_targets_use_spine_then_reference_fallback(self):
         session = WatchSession(view_args(), FakeInput(), io.StringIO())
         from_list = session._branch_target({
