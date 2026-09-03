@@ -2447,6 +2447,33 @@ class TerminalUtilityTest(unittest.TestCase):
             "response_group_count": 4,
         }), "2/4")
 
+    def test_collection_renderers_include_queue_worker_cache_and_hotspot_rows(self):
+        report = overview_report()
+        report.update({"report_kind": "queue", "tree": False})
+        report["data"] = {
+            "summary": {"branch_count_by_status": {"evaluating": 1},
+                        "branch_count_by_worker_status": {"active": 1}},
+            "matched_rows": 1,
+            "rows": [{
+                "branch_key_hex": "key", "branch_reference": "abcdefgh",
+                "branch_status": "evaluating", "branch_worker_status": "active",
+                "answer_count": 2, "priority": 4, "worker_count": 1,
+                "spine": [{"word": "raise", "pattern": "-----"}],
+            }],
+        }
+        self.assertIn("spine=RAISE -----", report_terminal.render_report(report, width=100))
+        report["report_kind"] = "hotspots"
+        report["data"] = {
+            "field": "nodes", "population": "queue", "epoch": 1,
+            "since_seconds": 30, "sample_size": 2, "sampled_row_count": 1,
+            "sample_truncated": False,
+            "rows": [{"row_id": "bucket", "best_erd": 2.5,
+                      "spine": "RAISE -----"}],
+        }
+        output = report_terminal.render_report(report, width=100)
+        self.assertIn("bucket", output)
+        self.assertIn("best_erd=2.500", output)
+
 
 if __name__ == "__main__":
     unittest.main()
