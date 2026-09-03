@@ -118,6 +118,7 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(active.branch_worker_statuses, ("active",))
         self.assertEqual(report_model.branch_status_and_worker_status("pending", None, 0), ("queued", None))
         self.assertEqual(report_model.branch_status_and_worker_status(None, "open", 1), ("evaluating", "active"))
+        self.assertEqual(report_model._response_group_key({}, "none"), (0, "all"))
         self.assertEqual(report_model.branch_status_and_worker_status(None, "finalized", 0), ("finalizing", "waiting"))
 
     def test_branch_reference_resolution_and_ambiguity_report(self):
