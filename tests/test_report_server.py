@@ -16,7 +16,13 @@ from urllib.request import Request, urlopen
 
 from erd_queue import ERDQueue, encode_subset
 import report_server
-from report_model import ReportSources, collect_report
+from report_model import (
+    ReportFilters,
+    ReportRequest,
+    ReportSources,
+    _tree_layout,
+    collect_report,
+)
 from report_server import (
     FIXTURE_FILENAMES,
     InvalidRequest,
@@ -179,11 +185,57 @@ class ReportServerTest(unittest.TestCase):
         for query, message in (
             ("tree_cursor=raise", "require tree"),
             ("tree=1&tree_parent=RAISE", "complete spine"),
-            ("tree=1&tree_cursor=not-a-word", "five-letter word"),
+            ("tree=1&tree_cursor=not-a-word", "tree page group"),
+            ("tree=1&tree_cursor=unknown:1:zzzz", "tree page group"),
         ):
             with self.subTest(query=query):
                 with self.assertRaisesRegex(InvalidRequest, message):
                     parse_report_request("/api/view", query)
+        spineless = parse_report_request(
+            "/api/view", "tree=1&tree_cursor=unknown:1:abcdef",
+        )
+        self.assertEqual(spineless.tree_cursor, "unknown:1:abcdef")
+
+    def test_every_tree_page_cursor_the_model_emits_parses_as_a_request(self):
+        # The client hands paging.next_cursor straight back as tree_cursor, so
+        # a cursor the model emits and the parser refuses breaks paging.
+        spineless_key = encode_subset(["khaki"])
+        worded_key = encode_subset(["crane"])
+        rows = [
+            {
+                "branch_key": spineless_key,
+                "branch_key_hex": spineless_key.hex(),
+                "branch_status": "queued",
+                "branch_worker_status": None,
+                "answer_count": 1,
+                "worker_count": 0,
+                "priority": 1,
+                "completed_candidate_count": 0,
+                "candidate_count": 3,
+            },
+            {
+                "branch_key": worded_key,
+                "branch_key_hex": worded_key.hex(),
+                "spine": "CRANE y----",
+                "branch_status": "queued",
+                "branch_worker_status": None,
+                "answer_count": 1,
+                "worker_count": 0,
+                "priority": 1,
+                "completed_candidate_count": 0,
+                "candidate_count": 3,
+            },
+        ]
+        request = ReportRequest(
+            report_kind="queue", tree=True, filters=ReportFilters(limit=1),
+        )
+        layout = _tree_layout(rows, request, "", rows, {"khaki", "crane"})
+        cursor = layout["paging"]["next_cursor"]
+        self.assertEqual(cursor, "unknown:1:" + spineless_key.hex())
+        parsed = parse_report_request(
+            "/api/view", f"tree=1&tree_cursor={cursor}",
+        )
+        self.assertEqual(parsed.tree_cursor, cursor)
 
     def test_a_boolean_parameter_accepts_both_spellings_of_false(self):
         for query in ("tree=0", "tree=false", "tree=FALSE"):
@@ -565,7 +617,7 @@ class SourcesRequestTest(unittest.TestCase):
     def test_request_validation_rejects_each_endpoint_specific_option(self):
         cases = (
             ("/api/view", "tree_parent=RAISE+-----", "require tree"),
-            ("/api/view", "tree=1&tree_cursor=oops", "five-letter"),
+            ("/api/view", "tree=1&tree_cursor=oops", "tree page group"),
             ("/api/view", "limit=0", "at least 1"),
             ("/api/view", "minimum_answer_count=3&maximum_answer_count=2", "cannot exceed"),
             ("/api/view", "sort=nope", "invalid sort"),

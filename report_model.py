@@ -36,6 +36,13 @@ from wordle_ui import fmt_pattern, parse_pattern
 SCHEMA_VERSION = 3
 WORKER_STALE_SECONDS = 20
 DEFAULT_TREE_PAGE_SIZE = 10
+# A tree page groups sibling nodes by the guess word on their spine, and a page
+# cursor names one of those groups.  A node with no spine has no word to group
+# by and carries a synthetic id instead, which sorts ahead of every worded
+# group, so the two kinds of key do not order against each other as plain
+# strings.  The shape is stated here, beside the code that emits it, because
+# report_server validates incoming cursors against it.
+TREE_CURSOR_PATTERN = re.compile(r"[a-z]{5}|unknown:\d+:([0-9a-f]+)")
 BRANCH_ETA_WINDOW_SECONDS = 10 * 60
 BRANCH_ETA_ROUGH_SAMPLE_SECONDS = 3 * 60
 BRANCH_ETA_STABLE_SAMPLE_SECONDS = 10 * 60
@@ -2458,6 +2465,18 @@ def _tree_node_id(steps):
     return "/".join(f"{step.word}:{step.pattern}" for step in steps)
 
 
+def _spineless_tree_node_id(guess_depth, branch_key_hex):
+    return f"unknown:{guess_depth}:{branch_key_hex}"
+
+
+def _tree_group_sort_key(group_key):
+    """Order a group key the way _tree_layout orders the groups themselves."""
+    spineless = TREE_CURSOR_PATTERN.fullmatch(group_key)
+    if spineless and spineless.group(1):
+        return (0, spineless.group(1))
+    return (1, group_key)
+
+
 def _tree_layout(rows, request, prefix, unfiltered_rows, answer_set):
     if not rows:
         return {
@@ -2508,7 +2527,9 @@ def _tree_layout(rows, request, prefix, unfiltered_rows, answer_set):
             )
             parent_id = None
             for guess_depth_value in range(1, max(guess_depth, 1) + 1):
-                node_id = f"unknown:{guess_depth_value}:{row['branch_key_hex']}"
+                node_id = _spineless_tree_node_id(
+                    guess_depth_value, row["branch_key_hex"]
+                )
                 nodes.setdefault(node_id, {
                     "node_id": node_id,
                     "parent_node_id": parent_id,
@@ -2577,12 +2598,11 @@ def _tree_layout(rows, request, prefix, unfiltered_rows, answer_set):
         grouped_nodes.setdefault(group_key, []).append(node)
     group_keys = list(grouped_nodes)
     if request.tree_cursor is not None:
-        try:
-            cursor_index = group_keys.index(request.tree_cursor)
-        except ValueError:
-            group_keys = [key for key in group_keys if key > request.tree_cursor]
-        else:
-            group_keys = group_keys[cursor_index + 1:]
+        cursor_sort_key = _tree_group_sort_key(request.tree_cursor)
+        group_keys = [
+            key for key in group_keys
+            if _tree_group_sort_key(key) > cursor_sort_key
+        ]
     page_size = request.filters.limit or DEFAULT_TREE_PAGE_SIZE
     page_keys = group_keys[:page_size]
     page_nodes = [node for key in page_keys for node in grouped_nodes[key]]
