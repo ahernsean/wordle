@@ -389,6 +389,28 @@ class ReportModelTest(unittest.TestCase):
         self.assertTrue(payload["is_shared"])
         self.assertEqual(payload["parent_branch_reference"], branch_reference(parent_key))
 
+    def test_source_erd_summary_reuses_the_current_cache_generation(self):
+        branch_key = ScoreCache.encode_subset(["salet"])
+        cache = Mock(answer_list_id="answers")
+        cache.report_branch_states.return_value = {
+            branch_key: {"best_erd": 1.0, "max_remaining_depth": 1, "cache_state": "exact"},
+        }
+        response_cache = Mock()
+        response_cache.group_words.return_value = {0: ["salet"]}
+        report_model._SOURCE_ERD_SUMMARY_CACHE = {}
+        report = {"sources": {"cache": {"ok": False, "error": None}}}
+        with (
+            patch("report_model.ResponseCache", return_value=response_cache),
+            patch("report_model._score_cache_file_signature", return_value=((1, 1), None)),
+        ):
+            first = report_model._source_word_erd_summaries(
+                self.sources, ["raise"], report, cache, ANSWERS)
+            second = report_model._source_word_erd_summaries(
+                self.sources, ["raise"], report, cache, ANSWERS)
+        self.assertTrue(report["sources"]["cache"]["ok"])
+        self.assertEqual(first, second)
+        self.assertEqual(response_cache.group_words.call_count, 1)
+
     def test_queue_and_current_hotspot_reports_normalize_rows(self):
         branch_key = ScoreCache.encode_subset(["salet"])
         queue = Mock(epoch=12)
