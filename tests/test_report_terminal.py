@@ -1235,6 +1235,16 @@ class ViewSessionTest(unittest.TestCase):
         with patch("report_terminal._ambiguous_reference_lines", side_effect=OSError("offline")):
             self.assertEqual(session._error_lines(error), ["view: ambiguous"])
 
+    def test_jsonl_watch_emits_errors_and_keeps_polling(self):
+        output = io.StringIO()
+        errors = io.StringIO()
+        with (
+            patch("report_terminal.collect_report", side_effect=[ValueError("offline"), KeyboardInterrupt]),
+            patch("report_terminal.time.sleep", return_value=None),
+        ):
+            WatchSession(view_args(format="jsonl", watch=1.0), FakeInput(), output, errors).run()
+        self.assertIn("view: offline", errors.getvalue())
+
     def test_branch_navigation_targets_use_spine_then_reference_fallback(self):
         session = WatchSession(view_args(), FakeInput(), io.StringIO())
         from_list = session._branch_target({
