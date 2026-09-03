@@ -252,6 +252,39 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(report["data"]["summary"]["worker_count"], 1)
         self.assertEqual(report["data"]["rows"][0]["state"], "working")
 
+    def test_cache_report_collects_recent_cache_rows_without_a_live_queue(self):
+        branch_key = ScoreCache.encode_subset(["salet"])
+        cache = Mock()
+        cache.report_recent_rows.return_value = [{
+            "branch_key": branch_key, "best_guess": "salet",
+        }]
+        cache.erd_report_summary.return_value = {"exact_branch_count": 1}
+        cache.report_cache_distributions.return_value = {"answer_count": []}
+        with (
+            patch("report_model._open_report_queue", side_effect=sqlite3.OperationalError("queue offline")),
+            patch("report_model.ScoreCache", return_value=cache),
+            patch("report_model.load_word_list", return_value=ANSWERS),
+        ):
+            report = report_model.collect_cache_report(
+                self.sources, ReportRequest(report_kind="cache"))
+        self.assertEqual(report["sources"]["queue"]["error"], "queue offline")
+        self.assertTrue(report["sources"]["cache"]["ok"])
+        self.assertEqual(report["data"]["recent_rows"][0]["branch_reference"], branch_reference(branch_key))
+        cache.close.assert_called_once()
+
+    def test_cache_report_keeps_a_queue_report_when_cache_open_fails(self):
+        queue = Mock()
+        with (
+            patch("report_model._open_report_queue", return_value=queue),
+            patch("report_model.ScoreCache", side_effect=sqlite3.OperationalError("cache offline")),
+            patch("report_model.load_word_list", return_value=ANSWERS),
+        ):
+            report = report_model.collect_cache_report(
+                self.sources, ReportRequest(report_kind="cache"))
+        self.assertTrue(report["sources"]["queue"]["ok"])
+        self.assertEqual(report["sources"]["cache"]["error"], "cache offline")
+        queue.close.assert_called_once()
+
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         directory = self.temporary_directory.name
