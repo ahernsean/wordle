@@ -1013,3 +1013,43 @@ class SupervisorLoopTest(unittest.TestCase):
         )
         stale.terminate.assert_called_once_with()
         stale.kill.assert_called_once_with()
+
+
+class SupervisorSafetyAndDispatchTest(unittest.TestCase):
+    def test_a_wal_ceiling_latch_that_cannot_be_written_is_logged(self):
+        queue = Mock()
+        queue.wal_size_bytes.return_value = (
+            erd_search.QUEUE_WAL_HARD_CEILING_BYTES + 1
+        )
+        queue.set_disk_stop.side_effect = sqlite3.OperationalError("locked")
+        queue.heartbeats_with_branch.return_value = []
+        worker = Mock()
+        worker.is_alive.return_value = False
+        with (
+            patch.object(erd_search, "_dump_worker_stacks"),
+            patch.object(erd_search.time, "sleep"),
+        ):
+            # The latch is best effort; the swarm still stops either way.
+            self.assertTrue(
+                erd_search._enforce_wal_hard_ceiling(queue, {0: (worker, 0.0)})
+            )
+
+    def test_stop_reports_a_report_server_that_will_not_stop(self):
+        with (
+            patch.object(erd_search, "_run_systemctl", side_effect=[0, 3]),
+            patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                erd_search.cmd_stop(_args())
+        self.assertEqual(raised.exception.code, 3)
+        self.assertIn("report server", stderr.getvalue())
+
+    def test_a_failing_epoch_command_sets_the_exit_code(self):
+        with (
+            patch("sys.argv", ["erd_search.py", "epoch", "show"]),
+            patch.object(erd_search, "ensure_runtime_dir"),
+            patch.object(erd_search, "cmd_epoch_show", return_value=2),
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                erd_search.main()
+        self.assertEqual(raised.exception.code, 2)
