@@ -300,6 +300,13 @@ class ReportModelTest(unittest.TestCase):
         self.assertGreater(report["data"]["summary"]["response_group_count"], 0)
         self.assertIn("branch_reference", report["data"]["rows"][0])
 
+    def test_cache_branch_report_uses_the_spine_budget(self):
+        report = report_model.collect_cache_report(
+            self.sources, ReportRequest(
+                report_kind="cache", branch_target=parse_report_branch_target("RAISE -----")))
+        self.assertIn("cache", report["data"])
+        self.assertIn("branch_reference", report["data"])
+
     def test_queue_and_current_hotspot_reports_normalize_rows(self):
         branch_key = ScoreCache.encode_subset(["salet"])
         queue = Mock(epoch=12)
