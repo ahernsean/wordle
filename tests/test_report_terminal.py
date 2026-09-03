@@ -2341,6 +2341,11 @@ class TerminalUtilityTest(unittest.TestCase):
         self.assertEqual(report_terminal._any_count_increase_rule("count")(row, previous), "green")
         self.assertEqual(report_terminal._best_erd_improvement_rule(row, previous), "green")
         self.assertEqual(report_terminal._candidate_advance_rule(row, previous), "green")
+        self.assertIsNone(report_terminal._count_increase_rule("count")(row, None))
+        self.assertIsNone(report_terminal._any_count_increase_rule("count")(row, None))
+        self.assertIsNone(report_terminal._best_erd_improvement_rule(row, None))
+        self.assertIsNone(report_terminal._candidate_advance_rule(row, None))
+        self.assertEqual(report_terminal._abbreviate_duration(7200), "2.0h")
 
     def test_terminal_layout_helpers_handle_tight_widths(self):
         column = report_terminal.TerminalColumn("word", "word", required=True,
@@ -2352,6 +2357,15 @@ class TerminalUtilityTest(unittest.TestCase):
         stacked = report_terminal._render_table([column], [{"word": "hello"}], 2)
         self.assertTrue(stacked)
         self.assertEqual(report_terminal._wrap_fields(["long-field"], 4), ["  l…"])
+        columns = [
+            report_terminal.TerminalColumn("name", "name", required=True),
+            report_terminal.TerminalColumn("detail", "detail", truncation="tail"),
+        ]
+        stacked = report_terminal._render_stacked_rows(
+            columns, [{"name": "alpha", "detail": "long-value"}], 8, "", ["green"], False)
+        self.assertIn("detail:", stacked)
+        self.assertEqual(report_terminal._truncate_cell("hello", 1, "tail"), "h")
+        self.assertEqual(report_terminal._truncate_cell("hello", 3, None), "he…")
 
     def test_disk_status_and_worker_state_cover_nonsteady_paths(self):
         unavailable = report_terminal.render_disk_status({"used_fraction": None})
