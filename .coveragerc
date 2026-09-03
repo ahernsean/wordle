@@ -1,8 +1,7 @@
 # Coverage configuration for the Wordle solver.
 #
 # Scope: the game, engine/kernel, caches, swarm workers, cache sync utilities,
-# and shared runtime/UI helpers.  Operator and reporting modules are covered by
-# the staged production-coverage backfill tracked in #316.
+# operator/reporting interfaces, and shared runtime/UI helpers.
 # Out of scope: test support, the verify_*.py re-verification and audit passes,
 # and the one-off diagnostic and dataset scripts.
 [run]
@@ -21,6 +20,10 @@ source =
     hint_cache
     erd_swarm
     erd_queue
+    erd_search
+    report_model
+    report_server
+    report_terminal
     runtime_paths
     wordle_ui
     export_cache

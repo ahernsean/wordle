@@ -1,6 +1,7 @@
 """Tests for the read-only HTTP report adapter."""
 
 from contextlib import contextmanager
+import errno
 from http.server import ThreadingHTTPServer
 from threading import Event, Lock, Thread
 import io
@@ -9,11 +10,12 @@ import os
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from erd_queue import ERDQueue, encode_subset
+import report_server
 from report_model import (
     ReportFilters,
     ReportRequest,
@@ -70,6 +72,12 @@ def fixture_configuration():
 
 
 class ReportServerTest(unittest.TestCase):
+    def test_request_parser_rejects_invalid_boolean_and_tree_parent(self):
+        with self.assertRaisesRegex(InvalidRequest, "must be 1, 0, true, or false"):
+            parse_report_request("/api/view", "tree=maybe")
+        with self.assertRaisesRegex(InvalidRequest, "complete spine"):
+            parse_report_request("/api/view", "tree=1&tree_parent=RAISE")
+
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
@@ -228,6 +236,17 @@ class ReportServerTest(unittest.TestCase):
             "/api/view", f"tree=1&tree_cursor={cursor}",
         )
         self.assertEqual(parsed.tree_cursor, cursor)
+
+    def test_a_boolean_parameter_accepts_both_spellings_of_false(self):
+        for query in ("tree=0", "tree=false", "tree=FALSE"):
+            with self.subTest(query=query):
+                self.assertFalse(parse_report_request("/api/view", query).tree)
+
+    def test_a_tree_parent_that_is_not_a_branch_target_is_an_invalid_request(self):
+        # parse_report_branch_target raises ValueError on a malformed token,
+        # which reaches the reader as a bad request rather than a crash.
+        with self.assertRaisesRegex(InvalidRequest, "hexadecimal"):
+            parse_report_request("/api/view", "tree=1&tree_parent=@zz")
 
     def test_root_overview_defaults_to_worked_branches_and_all_disables_filter(self):
         default_request = parse_report_request("/api/view", "")
@@ -479,6 +498,33 @@ class ReportServerTest(unittest.TestCase):
         self.assertEqual(status, 500)
         self.assertNotIn("secret", body.decode())
 
+    def test_missing_browser_client_and_ambiguous_reference_have_normal_responses(self):
+        missing_client = ServerConfiguration(self.sources, "missing-client.html")
+        with running_server(missing_client) as base_url:
+            status, _headers, body = request(base_url, "/")
+        self.assertEqual(status, 500)
+        self.assertEqual(json.loads(body)["error"]["kind"], "server_error")
+
+        class AmbiguousReference(ValueError):
+            candidates = [object()]
+
+        report = {"report_kind": "branch_reference_matches"}
+        with (
+            patch("report_server.collect_report", side_effect=AmbiguousReference("ambiguous")),
+            patch("report_server.collect_ambiguous_branch_reference_report", return_value=report),
+            running_server(self.live_configuration) as base_url,
+        ):
+            status, _headers, body = request(base_url, "/api/view?branch_target=%401234")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), report)
+
+    def test_leaderboard_collection_failure_is_shared_and_returned_as_server_error(self):
+        with patch("report_server.collect_report", side_effect=RuntimeError("failed")):
+            with running_server(self.live_configuration) as base_url:
+                status, _headers, body = request(base_url, "/api/view/leaderboard")
+        self.assertEqual(status, 500)
+        self.assertEqual(json.loads(body)["error"]["kind"], "server_error")
+
     def test_concurrent_leaderboard_requests_share_one_collection(self):
         started = Event()
         release = Event()
@@ -537,8 +583,84 @@ class ReportServerMainTest(unittest.TestCase):
             self.assertEqual(raised.exception.code, 1)
             self.assertIn("already in use", stderr.getvalue())
 
+    def test_main_closes_server_after_keyboard_interrupt(self):
+        server = Mock()
+        server.serve_forever.side_effect = KeyboardInterrupt
+        with (
+            patch("sys.argv", ["report_server.py"]),
+            patch("report_server.ensure_runtime_dir"),
+            patch("report_server.build_configuration", return_value=fixture_configuration()),
+            patch("report_server.ThreadingHTTPServer", return_value=server),
+        ):
+            main()
+        server.server_close.assert_called_once_with()
+
+
+class ReportServerStartupTest(unittest.TestCase):
+    def test_a_startup_failure_that_is_not_a_port_collision_is_raised(self):
+        refused = OSError(errno.EACCES, "permission denied")
+        with (
+            patch("sys.argv", ["report_server.py"]),
+            patch("report_server.ensure_runtime_dir"),
+            patch(
+                "report_server.build_configuration",
+                return_value=fixture_configuration(),
+            ),
+            patch("report_server.ThreadingHTTPServer", side_effect=refused),
+        ):
+            with self.assertRaises(OSError) as raised:
+                main()
+        self.assertEqual(raised.exception.errno, errno.EACCES)
+
 
 class SourcesRequestTest(unittest.TestCase):
+    def test_request_validation_rejects_each_endpoint_specific_option(self):
+        cases = (
+            ("/api/view", "tree_parent=RAISE+-----", "require tree"),
+            ("/api/view", "tree=1&tree_cursor=oops", "tree page group"),
+            ("/api/view", "limit=0", "at least 1"),
+            ("/api/view", "minimum_answer_count=3&maximum_answer_count=2", "cannot exceed"),
+            ("/api/view", "sort=nope", "invalid sort"),
+            ("/api/view", "group_by=nope", "invalid group_by"),
+            ("/api/view", "by=nodes", "require the hotspots"),
+            ("/api/view/hotspots", "by=nope", "invalid hotspot"),
+            ("/api/view", "claims=1", "singular branch"),
+            ("/api/view", "answers=1", "answers requires"),
+        )
+        for path, query, message in cases:
+            with self.subTest(query=query):
+                with self.assertRaisesRegex(InvalidRequest, message):
+                    parse_report_request(path, query)
+
+    def test_request_validation_handles_cursor_and_boolean_failures(self):
+        for query, message in (
+            ("tree=maybe", "must be 1"),
+            ("limit=one", "must be an integer"),
+            ("finalization_cursor=after:bad:1", "finalization_cursor"),
+            ("since_seconds=0", "at least 1"),
+            ("sample_size=0", "at least 1"),
+        ):
+            with self.subTest(query=query):
+                with self.assertRaisesRegex(InvalidRequest, message):
+                    parse_report_request("/api/view", query)
+
+    def test_hotspots_default_and_tree_parent_are_normalized(self):
+        hotspots = parse_report_request("/api/view/hotspots", "")
+        self.assertEqual(hotspots.hotspot_field, "nodes")
+        self.assertEqual(hotspots.filters.limit, 10)
+        request = parse_report_request(
+            "/api/view", "tree=1&tree_parent=raise+-----"
+        )
+        self.assertEqual(request.tree_parent, "RAISE -----")
+
+    def test_configuration_uses_telemetry_only_for_the_default_queue(self):
+        defaults = ReportSources.defaults()
+        with patch("report_server.load_fixtures", return_value={}) as load:
+            configured = build_configuration("another.sqlite3", "cache.sqlite3", "fixtures")
+        self.assertIsNone(configured.sources.telemetry_path)
+        load.assert_called_once_with("fixtures")
+        self.assertEqual(defaults.queue_path, ReportSources.defaults().queue_path)
+
     def test_bare_endpoint_and_word_target_are_accepted(self):
         rooted = parse_report_request("/api/view/openers", "")
         worded = parse_report_request("/api/view/openers", "branch_target=SALET")

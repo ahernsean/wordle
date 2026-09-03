@@ -608,6 +608,45 @@ class OverviewRendererTest(unittest.TestCase):
         )
         self.assertLess(output.index("w2"), output.index("w1"))
 
+    def test_claim_progress_reports_only_the_counts_it_has(self):
+        report = overview_report()
+        report["report_kind"] = "branch"
+        report["data"] = {
+            "branch": {
+                "branch_reference": "0123456789ab", "branch_key_hex": "010203",
+                "spine": [], "guess_depth": 0, "answer_count": 3, "budget": 6,
+                "branch_status": "evaluating", "branch_worker_status": "active",
+            },
+            "queue": {
+                "branch_status": "evaluating", "branch_worker_status": "active",
+                "priority": 0, "budget": 6, "best_guess": None,
+                "ceiling": None, "search_node_count": 1200,
+                "candidate_count": None, "completed_candidate_count": 0,
+                "bulk_completed_candidate_count": 0,
+                "one_level_erd_pruned_candidate_count": 0,
+                "two_level_erd_pruned_candidate_count": 0,
+            },
+            "cache": {
+                "cache_state": "missing", "best_guess": None,
+                "best_erd": None, "max_remaining_depth": None,
+            },
+            "workers": [],
+            "bundle_summary": {},
+            "candidate_eta": None,
+            "republished_candidates": [],
+            "claims": None,
+            "claim_summary": {"total_claim_count": 40, "evaluated_count": 25},
+            "recent_finalizations": [],
+            "finalization_total_count": 0,
+            "cut_reuse_misses": [],
+            "provenance_unknown": False,
+        }
+        output = render_report(report, width=100)
+        self.assertIn("25 evaluated", output)
+        for absent in ("unattributed", "in flight", "worker evals"):
+            with self.subTest(absent=absent):
+                self.assertNotIn(absent, output)
+
     def test_candidate_state_renders_bounded_claim_summary(self):
         report = overview_report()
         report["report_kind"] = "branch"
@@ -620,42 +659,95 @@ class OverviewRendererTest(unittest.TestCase):
             "queue": {
                 "branch_status": "evaluating", "branch_worker_status": "active",
                 "priority": 0, "budget": 6, "best_guess": None,
-                "ceiling": None, "search_node_count": 0,
-                "candidate_count": 3, "completed_candidate_count": 0,
+                "ceiling": None, "search_node_count": 1200,
+                "candidate_count": 3, "completed_candidate_count": 2,
                 "bulk_completed_candidate_count": 0,
-                "one_level_erd_pruned_candidate_count": 0,
-                "two_level_erd_pruned_candidate_count": 0,
+                "one_level_erd_pruned_candidate_count": 1,
+                "two_level_erd_pruned_candidate_count": 1,
             },
             "cache": {
                 "cache_state": "missing", "best_guess": None,
                 "best_erd": None, "max_remaining_depth": None,
             },
-            "workers": [],
-            "republished_candidates": [],
+            "workers": [{
+                **deepcopy(overview_report()["data"]["workers"][0]),
+                "candidate_index": 2, "worker_number": "0",
+            }],
+            "bundle_summary": {"wall_millis": 120000},
+            "candidate_eta": {
+                "state": "ready", "sample_duration_seconds": 180,
+                "sample_worker_count": 1, "current_worker_count": 2,
+                "worker_count_changed": True, "estimated_seconds": 90,
+                "remaining_inspection_count": 8,
+                "expected_full_evaluation_count": 3,
+            },
+            "republished_candidates": [{"republish_count": 2}],
             "claims": None,
             "claim_summary": {
                 "total_claim_count": 12972, "done_count": 12819,
                 "in_flight_count": 5, "evaluated_count": 11200,
                 "one_level_erd_pruned_count": 1500,
                 "two_level_erd_pruned_count": 119,
-                "provenance_unknown_count": 0,
+                "provenance_unknown_count": 3,
                 "worker_contributions": [
                     {"worker_id": "worker-0", "done_count": 6484},
                     {"worker_id": "worker-2", "done_count": 6335},
                 ],
             },
+            "recent_finalizations": [{
+                "spine": "RAISE -----", "outcome": "exact", "epoch": 2,
+                "search_node_count": 100, "evaluated_candidate_count": 2,
+                "one_level_erd_pruned_candidate_count": 1,
+                "two_level_erd_pruned_candidate_count": 0,
+            }],
+            "finalization_total_count": 2,
+            "cut_reuse_misses": [{"epoch": 2, "budget": 4,
+                                  "available_bound": 2.5, "answer_count": 2}],
             "provenance_unknown": False,
         }
         output = render_report(report, width=100)
         self.assertNotIn("12,819 done", output)
-        self.assertIn("candidates 0/3 =", output)
+        self.assertIn("candidates 2/3 =", output)
         self.assertNotIn("=  + evaluated", output)
         self.assertIn("evaluated 11,200", output)
-        self.assertNotIn("1,500 one-level ERD prunes", output)
-        self.assertNotIn("119 two-level ERD prunes", output)
+        self.assertIn("one-level ERD prunes 1", output)
+        self.assertIn("two-level ERD prunes 1", output)
         self.assertIn("in flight 5", output)
+        self.assertIn("wall-time=2m", output)
+        self.assertIn("+ unattributed 3", output)
+        self.assertIn("scaling 1→2 workers", output)
+        self.assertIn("1 re-queued (up to 2x each)", output)
         self.assertIn("worker evals w0:6,484 w2:6,335", output)
+        self.assertIn("and 1 more reaching this same answer set", output)
+        self.assertIn("cut reuse miss epoch=2 budget=4", output)
         self.assertNotIn("idx=", output)
+
+    def test_unqueued_branch_renders_claim_progress_and_answer_preview(self):
+        report = overview_report()
+        report["report_kind"] = "branch"
+        report["data"] = {
+            "branch": {
+                "branch_reference": "0123456789ab", "branch_key_hex": "010203",
+                "spine": [], "guess_depth": 0, "answer_count": 3, "budget": 6,
+                "branch_status": "unqueued", "branch_worker_status": None,
+                "answer_words": ["cigar", "rebut"],
+            },
+            "queue": None,
+            "cache": {"cache_state": "missing", "best_guess": None,
+                      "best_erd": None, "max_remaining_depth": None},
+            "workers": [], "republished_candidates": [], "claims": None,
+            "claim_summary": {
+                "total_claim_count": 4, "evaluated_count": 2,
+                "provenance_unknown_count": 1, "in_flight_count": 1,
+                "worker_contributions": [{"worker_id": "worker-3", "done_count": 2}],
+            },
+            "provenance_unknown": False,
+        }
+        output = render_report(report, width=100)
+        self.assertIn("answers: cigar rebut", output)
+        self.assertIn("2 evaluated", output)
+        self.assertIn("1 unattributed", output)
+        self.assertIn("worker evals w3:2", output)
 
     def test_selected_branch_detail_survives_parent_status_filter(self):
         report = overview_report()
@@ -1145,6 +1237,75 @@ class CollectionRendererTest(unittest.TestCase):
 
 
 class ViewSessionTest(unittest.TestCase):
+    def test_identity_rows_includes_one_branch_without_duplicate_identities(self):
+        report = {"data": {
+            "branches": [{"branch_key_hex": "one"}],
+            "rows": [{"branch_key_hex": "one"}, {"branch_key_hex": "two"}],
+            "branch": {"branch_key_hex": "three"},
+        }}
+        rows = WatchSession._identity_rows(report, "branch_key_hex")
+        self.assertEqual([row["branch_key_hex"] for row in rows], ["one", "two", "three"])
+
+    def test_navigation_section_lists_available_back_branch_and_worker_keys(self):
+        session = WatchSession(view_args(), FakeInput(), io.StringIO())
+        session.branch_hotkeys = {"a": "one"}
+        session.worker_hotkeys = {"2": "worker-2"}
+        session.navigation_stack.append(session.current_request)
+        session._width = Mock(return_value=100)
+        lines = session._navigation_section()[0][1]
+        rendered = "\n".join(lines)
+        self.assertIn("[a-z] branch", rendered)
+        self.assertIn("[0-9] worker", rendered)
+        self.assertIn("[esc] back", rendered)
+
+    def test_navigate_back_is_a_noop_at_the_root_and_resets_after_selection(self):
+        session = WatchSession(view_args(), FakeInput(), io.StringIO())
+        with patch.object(session, "_reset_navigation_display") as reset:
+            session._navigate_back()
+            reset.assert_not_called()
+            session.navigation_stack.append(session.current_request)
+            session._navigate_back()
+        self.assertEqual(len(session.navigation_stack), 1)
+
+    def test_terminal_error_lines_fall_back_when_ambiguity_rendering_fails(self):
+        session = WatchSession(view_args(), FakeInput(), io.StringIO())
+        error = ValueError("ambiguous")
+        error.candidates = []
+        with patch("report_terminal._ambiguous_reference_lines", side_effect=OSError("offline")):
+            self.assertEqual(session._error_lines(error), ["view: ambiguous"])
+
+    def test_jsonl_watch_emits_errors_and_keeps_polling(self):
+        output = io.StringIO()
+        errors = io.StringIO()
+        with (
+            patch("report_terminal.collect_report", side_effect=[ValueError("offline"), KeyboardInterrupt]),
+            patch("report_terminal.time.sleep", return_value=None),
+        ):
+            WatchSession(view_args(format="jsonl", watch=1.0), FakeInput(), output, errors).run()
+        self.assertIn("view: offline", errors.getvalue())
+
+    def test_branch_navigation_targets_use_spine_then_reference_fallback(self):
+        session = WatchSession(view_args(), FakeInput(), io.StringIO())
+        from_list = session._branch_target({
+            "spine": [{"word": "raise", "pattern": "-----"}],
+            "branch_key_hex": "01",
+        })
+        self.assertEqual(from_list.kind, "branch")
+        from_text = session._branch_target({
+            "spine": "RAISE -----", "branch_key_hex": "01",
+        })
+        self.assertEqual(from_text.kind, "branch")
+        fallback = session._branch_target({
+            "spine": "bad", "branch_key_hex": "0102",
+        })
+        self.assertEqual(fallback.kind, "branch_reference")
+        word_session = WatchSession(view_args(
+            branch_target=parse_report_branch_target("RAISE")), FakeInput(), io.StringIO())
+        pattern_target = word_session._branch_target({
+            "pattern": "-----", "branch_key_hex": "0102",
+        })
+        self.assertEqual(pattern_target.kind, "branch")
+
     def test_json_output_round_trips_exact_report(self):
         report = overview_report()
         output = io.StringIO()
@@ -2199,6 +2360,552 @@ class RootProgressRendererTest(unittest.TestCase):
         # for, unlike the cumulative total, which grows with every promotion.
         self.assertIn("524,184", output)
 
+class TerminalUtilityTest(unittest.TestCase):
+    def test_finalization_schedule_renderer_covers_rank_and_republish_evidence(self):
+        self.assertEqual(report_terminal._finalization_schedule_lines({}, 80), [])
+        lines = report_terminal._finalization_schedule_lines({
+            "winner_best_first_rank": 2,
+            "candidates_completed_before_winner": 5,
+            "weakest_best_first_rank_before_winner": 9,
+            "winner_republish_count": 2,
+            "republished_candidate_count": 3,
+            "max_candidate_republish_count": 4,
+        }, 120)
+        rendered = "\n".join(lines)
+        self.assertIn("winner ranked 2", rendered)
+        self.assertIn("5 candidates completed first", rendered)
+        self.assertIn("weakest of them ranked 9", rendered)
+        self.assertIn("winner republished 2x", rendered)
+        self.assertIn("3 candidates republished (up to 4x each)", rendered)
+
+    def test_terminal_labels_sweeps_and_change_highlighting_cover_edge_cases(self):
+        display_order = report_terminal.DisplayOrder()
+        display_order.hotkey_letters["key"] = "a"
+        self.assertEqual(report_terminal._hotkey_label(display_order, "key"), "[a]")
+        self.assertEqual(report_terminal._hotkey_label(display_order, "other"), "")
+        self.assertEqual(report_terminal._worker_number_label(None), "—")
+        self.assertEqual(report_terminal._worker_number_label("worker-alpha"), "worker-alpha")
+        self.assertEqual(report_terminal._worker_number_label("worker-12"), "w12")
+        self.assertEqual(report_terminal.candidate_sweep_bar(2, [-1, None, 0, 0], [(None, 1), (-1, 2)], 2), "█ ")
+        self.assertEqual(report_terminal.candidate_sweep_bar(1, [0], [(0, 1), (0, 2)], 1), "2")
+        self.assertEqual(report_terminal._highlight_changes("same", "same"), "same")
+        self.assertEqual(
+            report_terminal._highlight_changes("ab", "ax"),
+            "a" + report_terminal.RED + "b" + report_terminal.RESET,
+        )
+
+    def test_terminal_display_rows_render_optional_status_fields(self):
+        branch = {
+            "branch_key_hex": "key", "branch_status": "finalizing",
+            "best_guess": "raise", "best_guess_is_answer": True, "best_erd": 2.5,
+            "completed_candidate_count": 2, "candidate_count": 4,
+            "created_at": 10, "spine": [],
+        }
+        display_order = report_terminal.DisplayOrder()
+        self.assertEqual(report_terminal._display_done(branch), "2/4")
+        self.assertEqual(report_terminal._display_erd_prunes({}), "0/0")
+        self.assertEqual(report_terminal._display_best(branch), "RAISE*/2.500")
+        self.assertEqual(report_terminal._branch_display_row(branch, 20, display_order)["display_status"], "final")
+        worker = {
+            "worker_id": "worker-2", "updated_at": 10, "current_candidate": "raise",
+            "current_candidate_is_answer": True, "current_max_guess_depth": 3,
+            "nodes_per_second": 1200, "scheduling_role": "preferred",
+        }
+        row = report_terminal._worker_display_row(worker, 20, "finalizing")
+        self.assertEqual(row["display_state"], "final")
+        self.assertEqual(row["display_candidate"], "RAISE*")
+        self.assertEqual(report_terminal._display_best({}), "—")
+        self.assertEqual(report_terminal._display_best({"best_guess": "raise"}), "RAISE")
+        idle = report_terminal._worker_display_row(
+            {"worker_id": "worker-x", "updated_at": 30}, 20, "transitioning")
+        self.assertEqual(idle["display_state"], "trans")
+        self.assertEqual(idle["display_candidate"], "—")
+
+    def test_ambiguous_reference_renderer_lists_preview_and_spine(self):
+        report = {"data": {"candidates": [{
+            "branch_reference": "abcd", "answer_count": 2,
+            "answer_preview": ["cigar"],
+            "spine": [{"word": "raise", "pattern": "-----"}],
+        }]}}
+        with patch("report_terminal.collect_ambiguous_branch_reference_report", return_value=report):
+            lines = report_terminal._ambiguous_reference_lines(
+                ValueError("ambiguous"), object(), object())
+        self.assertIn("CIGAR…", lines[1])
+        self.assertIn("spine=RAISE -----", lines[2])
+
+    def test_overview_renderer_covers_empty_and_hint_summary_states(self):
+        report = overview_report()
+        report["data"]["branches"] = []
+        report["data"]["workers"] = []
+        report["sources"]["queue"].update({"epoch": 8, "label": "test", "git_sha": "deadbeef"})
+        totals = report["data"]["worker_totals"]
+        totals.update({
+            "hint_lookup_count": 4, "hint_hit_count": 2,
+            "hint_accepted_count": 1, "hint_inline_placement_count": 1,
+            "hint_inline_win_count": 1,
+        })
+        output = report_terminal.render_overview(report, width=120)
+        self.assertIn("sources ok", output)
+        self.assertIn("epoch=8 test revision=deadbeef", output)
+        self.assertIn("Hints (ordering only):", output)
+        self.assertIn("Branches (status=all)\n  none", output)
+
+    def test_formatters_and_change_rules_cover_boundary_values(self):
+        self.assertEqual(report_terminal._percentage(1, 0), "—")
+        self.assertEqual(report_terminal._format_metric_value("best_erd", 2.5), "2.500")
+        self.assertEqual(report_terminal._format_branch_erd(None, 2), "—")
+        self.assertEqual(report_terminal._abbreviate_number(None), "—")
+        self.assertEqual(report_terminal._abbreviate_number(1_200), "1.2k")
+        self.assertEqual(report_terminal._abbreviate_duration(-1), "—")
+        self.assertEqual(report_terminal._abbreviate_duration(90), "1m")
+        self.assertEqual(report_terminal._format_fill_eta(30), "0 min")
+        self.assertEqual(report_terminal._format_fill_eta(200000), "2.3 d")
+        row = {"count": 2, "best_erd": 2.0, "current_candidate": "raise"}
+        previous = {"count": 1, "best_erd": 3.0, "current_candidate": "slate"}
+        self.assertEqual(report_terminal._count_increase_rule("count")(row, previous), "green")
+        self.assertEqual(report_terminal._any_count_increase_rule("count")(row, previous), "green")
+        self.assertEqual(report_terminal._best_erd_improvement_rule(row, previous), "green")
+        self.assertEqual(report_terminal._candidate_advance_rule(row, previous), "green")
+        self.assertIsNone(report_terminal._count_increase_rule("count")(row, None))
+        self.assertIsNone(report_terminal._any_count_increase_rule("count")(row, None))
+        self.assertIsNone(report_terminal._best_erd_improvement_rule(row, None))
+        self.assertIsNone(report_terminal._candidate_advance_rule(row, None))
+        self.assertEqual(report_terminal._abbreviate_duration(7200), "2.0h")
+
+    def test_terminal_layout_helpers_handle_tight_widths(self):
+        column = report_terminal.TerminalColumn("word", "word", required=True,
+                                                truncation="tail")
+        self.assertEqual(report_terminal._fit("hello", 1), "h")
+        self.assertEqual(report_terminal._truncate_cell("hello", 3, "tail"), "…lo")
+        self.assertEqual(report_terminal._display_spine({"source_word": "raise", "source_pattern": "-----"}), "RAISE -----")
+        self.assertIsNone(report_terminal._table_layout([column], [{"word": "hello"}], 2))
+        stacked = report_terminal._render_table([column], [{"word": "hello"}], 2)
+        self.assertTrue(stacked)
+        self.assertEqual(report_terminal._wrap_fields(["long-field"], 4), ["  l…"])
+        self.assertEqual(report_terminal._wrap_fields(["ab", "cdef"], 5), ["  ab", "  cd…"])
+        columns = [
+            report_terminal.TerminalColumn("name", "name", required=True),
+            report_terminal.TerminalColumn("detail", "detail", truncation="tail"),
+        ]
+        stacked = report_terminal._render_stacked_rows(
+            columns, [{"name": "alpha", "detail": "long-value"}], 8, "", ["green"], False)
+        self.assertIn("detail:", stacked)
+        self.assertEqual(report_terminal._truncate_cell("hello", 1, "tail"), "h")
+        self.assertEqual(report_terminal._truncate_cell("hello", 3, None), "he…")
+
+    def test_disk_status_and_worker_state_cover_nonsteady_paths(self):
+        unavailable = report_terminal.render_disk_status({"used_fraction": None})
+        self.assertEqual(unavailable, "Disk: unavailable")
+        disk = {
+            "total_bytes": 10 * 2 ** 30, "used_bytes": 9 * 2 ** 30,
+            "available_bytes": 1 * 2 ** 30, "used_fraction": .9,
+            "warning_fraction": .8, "stop_fraction": .95,
+            "queue_wal_bytes": 0, "fill_rate_bytes_per_second": 20_000,
+        }
+        self.assertIn("filling", report_terminal.render_disk_status(disk, color=True))
+        disk["fill_rate_bytes_per_second"] = -20_000
+        self.assertIn("freeing", report_terminal.render_disk_status(disk))
+        stalled = {"is_live": True, "current_node_count": 1, "nodes_per_second": 0}
+        self.assertEqual(report_terminal._rate_stall_rule(stalled, None), "red")
+        self.assertEqual(report_terminal._semantic_worker_class(
+            {"is_live": False, "updated_at": 0}, None, 1), "red")
+
+    def test_tree_renderer_shows_context_unknown_and_unavailable_topologies(self):
+        report = overview_report()
+        report["report_kind"] = "queue"
+        report["tree"] = True
+        report["data"] = {
+            "tree_available": False, "unavailable_reason": "no queue",
+            "nodes": [],
+        }
+        self.assertIn("unavailable: no queue", report_terminal.render_report(report, width=100))
+        report["data"] = {
+            "tree_available": True,
+            "nodes": [
+                {"node_id": "raise", "parent_node_id": None,
+                 "step": {"word": "raise", "pattern": "-----"},
+                 "branch_key_hex": "key", "branch_reference": "abcdefgh",
+                 "branch_status": "evaluating", "branch_worker_status": "active",
+                 "answer_count": 2, "worker_count": 1, "is_context": True},
+                {"node_id": "unknown", "parent_node_id": "raise", "step": None,
+                 "branch_key_hex": None, "branch_reference": None,
+                 "branch_status": None, "branch_worker_status": None,
+                 "answer_count": None, "worker_count": 0, "is_context": False},
+            ],
+        }
+        output = report_terminal.render_report(report, width=100)
+        self.assertIn("RAISE  1 branch", output)
+        self.assertIn("[context]", output)
+        self.assertIn("unknown", output)
+
+    def test_source_erd_display_distinguishes_pending_and_infeasible(self):
+        self.assertEqual(report_terminal._display_source_erd(None), "—")
+        self.assertEqual(report_terminal._display_source_erd({
+            "state": "complete", "erd": 2.5,
+        }), "2.500")
+        self.assertEqual(report_terminal._display_source_erd({
+            "state": "infeasible",
+        }), "∞")
+        self.assertEqual(report_terminal._display_source_erd({
+            "state": "pending", "resolved_group_count": 2,
+            "response_group_count": 4,
+        }), "2/4")
+        self.assertEqual(report_terminal._timestamp_text(None), "—")
+        self.assertEqual(report_terminal._format_node_count(1_200), "1.2K")
+        self.assertEqual(report_terminal._format_node_count(2_000_000), "2.0M")
+        with self.assertRaisesRegex(ValueError, "unsupported report kind"):
+            report_terminal.render_report({"report_kind": "unknown", "data": {}})
+
+    def test_collection_renderers_include_queue_worker_cache_and_hotspot_rows(self):
+        report = overview_report()
+        report.update({"report_kind": "queue", "tree": False})
+        report["data"] = {
+            "summary": {"branch_count_by_status": {"evaluating": 1},
+                        "branch_count_by_worker_status": {"active": 1}},
+            "matched_rows": 1,
+            "rows": [{
+                "branch_key_hex": "key", "branch_reference": "abcdefgh",
+                "branch_status": "evaluating", "branch_worker_status": "active",
+                "answer_count": 2, "priority": 4, "worker_count": 1,
+                "spine": [{"word": "raise", "pattern": "-----"}],
+            }],
+        }
+        self.assertIn("spine=RAISE -----", report_terminal.render_report(report, width=100))
+        report["report_kind"] = "hotspots"
+        report["data"] = {
+            "field": "nodes", "population": "queue", "epoch": 1,
+            "since_seconds": 30, "sample_size": 2, "sampled_row_count": 1,
+            "sample_truncated": False,
+            "rows": [{"row_id": "bucket", "best_erd": 2.5,
+                      "spine": "RAISE -----"}],
+        }
+        output = report_terminal.render_report(report, width=100)
+        self.assertIn("bucket", output)
+        self.assertIn("best_erd=2.500", output)
+        report["report_kind"] = "cache"
+        report["data"] = {
+            "summary": {"exact_branch_count": 3, "loss_branch_count": 1,
+                        "recent_exact_branch_count": 2},
+            "distributions": {
+                "state_branch_counts": {"exact": 3},
+                "exact_branch_count_by_max_remaining_depth": {"3": 3},
+                "exact_branch_count_by_solve_budget": {"4": 3},
+                "exact_branch_count_by_taint": {"clean": 3},
+                "loss_branch_count_by_loss_budget": {"2": 1},
+            },
+        }
+        self.assertIn("max remaining depth: 3=3", report_terminal.render_report(report, width=100))
+
+    def test_cache_collection_renders_group_rows_and_a_single_branch(self):
+        report = overview_report()
+        report.update({"report_kind": "cache", "tree": False})
+        report["data"] = {"rows": [
+            {"branch_key_hex": "aa", "branch_reference": "abcdefgh",
+             "pattern": "-y---", "answer_count": 4, "cache_state": "missing"},
+            {"branch_key_hex": "bb", "branch_reference": "12345678",
+             "pattern": "g----", "answer_count": 2, "cache_state": "exact"},
+        ]}
+        rows_output = report_terminal.render_report(report, width=120)
+        self.assertIn("-y--- n=4 not cached", rows_output)
+        self.assertIn("g---- n=2 exact", rows_output)
+        report["data"] = {
+            "branch_reference": "abcdefgh",
+            "cache": {"cache_state": "missing"},
+        }
+        self.assertIn(
+            "not cached", report_terminal.render_report(report, width=120)
+        )
+
+    def test_opener_renderer_shows_paged_summary_and_shared_ownership(self):
+        report = overview_report()
+        report.update({"report_kind": "openers", "tree": False,
+                       "branch_target": {"trailing_word": "raise"}})
+        summary = {
+            "source_word": "raise", "request_count": 2,
+            "requested_priority": 7, "state": "active",
+            "erd_summary": {"state": "pending", "resolved_group_count": 1,
+                            "response_group_count": 2},
+            "direct_branch_count": 2, "branch_count": 3,
+            "open_branch_count": 2, "done_branch_count": 1,
+            "worker_count": 1, "requested_at": 900,
+        }
+        report["data"] = {
+            "summary": [summary], "total_source_word_count": 2,
+            "matched_rows": 1,
+            "rows": [{
+                "branch_key_hex": "key", "source_work_id": 4,
+                "source_word": "raise", "branch_reference": "abcdefgh",
+                "branch_status": "evaluating", "branch_worker_status": "active",
+                "requested_priority": 7, "branch_effective_priority": 9,
+                "is_shared": True, "owner_count": 2, "root_pattern": "-----",
+                "parent_branch_reference": "ijklmnop", "worker_count": 1,
+            }],
+        }
+        output = report_terminal.render_report(report, width=120)
+        self.assertIn("Openers: 1 of 2", output)
+        self.assertIn("Ownership:", output)
+        self.assertIn("shared, 2 owner(s)", output)
+
+    def test_root_progress_and_accuracy_renderers_show_estimates_and_raw_rows(self):
+        report = overview_report()
+        report.update({"report_kind": "root_progress", "tree": False})
+        report["data"] = {
+            "word": "raise", "word_is_answer": True, "epoch": 4,
+            "selected_telemetry_epoch": None, "telemetry_epochs": [2, 4],
+            "work_started_at": 100, "work_latest_at": 200,
+            "totals": {"requested_at": 90, "response_group_count": 4,
+                       "open_branch_count": 1, "search_node_count": 1200,
+                       "wall_millis": 90000,
+                       "state_counts": {"waiting": 1, "evaluating": 2}},
+            "estimate": {"provisional": True, "sample_duration_seconds": 60,
+                         "estimated_seconds": 120, "remaining_candidate_count": 3,
+                         "candidates_per_day": 10, "stalled_branch_count": 1,
+                         "stalled_remaining_candidate_count": 2},
+            "response_groups": [{"pattern": "-----", "state": "waiting",
+                                 "answer_count": 2, "started": False}],
+        }
+        output = report_terminal.render_report(report, width=120)
+        self.assertIn("estimate ~2m", output)
+        self.assertIn("excludes 1 waiting groups and 1 stalled branches", output)
+        report["report_kind"] = "accuracy"
+        report["data"] = {
+            "epoch": 2, "population_row_count": 4, "sampled_row_count": 2,
+            "requested_sample_size": 3, "erd_pruned_row_count": 1,
+            "non_erd_pruned_row_count": 1, "no_prediction_row_count": 0,
+            "calibration": {"row_count": 1, "actual_predicted_ratio": {"mean": 1.2}},
+            "largest_under_predicted": [{"candidate_word": "raise", "n_words": 3,
+                                           "budget": None, "predicted_work": None,
+                                           "actual_nodes": 20, "actual_predicted_ratio": None}],
+            "rows": [{"candidate_word": "raise", "idx": 2, "worker_id": None,
+                      "bundle_id": None, "outcome": None, "evaluation_millis": None,
+                      "republish_count": 1}], "raw_row_offset": 5,
+        }
+        output = report_terminal.render_report(report, width=120)
+        self.assertIn("Raw rows (offset 5)", output)
+        self.assertIn("RAISE idx=2", output)
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WatchSessionInputTest(unittest.TestCase):
+    """Keystroke handling in the interactive watch loop."""
+
+    def _session(self, text="", watch=1.0):
+        return WatchSession(
+            view_args(watch=watch), FakeInput(text, tty=True), io.StringIO()
+        )
+
+    def test_the_watch_interval_expiring_refreshes_without_a_keystroke(self):
+        session = self._session(watch=0)
+        self.assertTrue(session._wait_for_refresh())
+
+    def test_a_character_held_from_the_previous_read_is_consumed_first(self):
+        session = self._session()
+        session.pending_input_character = " "
+        self.assertTrue(session._wait_for_refresh())
+        self.assertIsNone(session.pending_input_character)
+
+    def test_an_idle_poll_keeps_waiting_until_a_keystroke_arrives(self):
+        session = self._session(" ")
+        polls = [([], [], []), ([session.input_stream], [], [])]
+        with patch("report_terminal.select.select", side_effect=polls):
+            self.assertTrue(session._wait_for_refresh())
+
+    def test_a_back_keystroke_navigates_back_and_refreshes(self):
+        for key in ("\x08", "\x7f", "\x1b"):
+            with self.subTest(key=key):
+                session = self._session(key)
+                session._navigate_back = Mock()
+                with patch(
+                    "report_terminal.select.select",
+                    return_value=([session.input_stream], [], []),
+                ):
+                    self.assertTrue(session._wait_for_refresh())
+                session._navigate_back.assert_called_once_with()
+
+    def test_a_digit_naming_no_worker_is_ignored_and_the_wait_resumes(self):
+        session = self._session("9")
+        session.worker_hotkeys = {}
+        with patch(
+            "report_terminal.select.select",
+            return_value=([session.input_stream], [], []),
+        ):
+            # "9" selects nothing, so the loop goes round and reads the empty
+            # stream, which ends the session rather than selecting a worker.
+            self.assertFalse(session._wait_for_refresh())
+        self.assertIsNone(session.current_request.worker_id)
+
+    def test_a_worker_number_stops_at_a_quiet_input_stream(self):
+        session = self._session()
+        session.worker_hotkeys = {"12": "worker-12"}
+        with patch("report_terminal.select.select", return_value=([], [], [])):
+            self.assertEqual(session._read_worker_number("1"), "1")
+
+    def test_a_worker_number_stops_at_a_non_digit_and_holds_it(self):
+        session = self._session("q")
+        session.worker_hotkeys = {"12": "worker-12"}
+        with patch(
+            "report_terminal.select.select",
+            return_value=([session.input_stream], [], []),
+        ):
+            self.assertEqual(session._read_worker_number("1"), "1")
+        self.assertEqual(session.pending_input_character, "q")
+
+    def test_an_interrupt_while_preparing_the_terminal_restores_it(self):
+        session = WatchSession(
+            view_args(watch=1.0), FakeInput(tty=True), FakeOutput(tty=True)
+        )
+        with (
+            patch("report_terminal.termios.tcgetattr", return_value=[0, 0, 0, 0]),
+            patch(
+                "report_terminal.termios.tcsetattr",
+                side_effect=[KeyboardInterrupt, None],
+            ) as set_attributes,
+        ):
+            session._run_tty_text()
+        # The cursor was never hidden, so it is not restored, but the saved
+        # terminal settings are put back either way.
+        self.assertFalse(session.cursor_hidden)
+        self.assertEqual(set_attributes.call_count, 2)
+
+
+class StackedRowRenderingTest(unittest.TestCase):
+    """The narrow-width fallback that stacks each field on its own line."""
+
+    def _columns(self):
+        return [
+            report_terminal.TerminalColumn(heading="word", value="word"),
+            report_terminal.TerminalColumn(
+                heading="spine", value="spine", truncation="tail",
+            ),
+        ]
+
+    def _render(self, rows, width):
+        return report_terminal._render_stacked_rows(
+            self._columns(), rows, width, "  ", None, False,
+        )
+
+    def test_a_field_that_fits_stays_on_one_line(self):
+        lines = self._render([{"word": "salet", "spine": "RAISE -----"}], 60)
+        self.assertIn("  word: salet", lines)
+        self.assertIn("  spine: RAISE -----", lines)
+
+    def test_a_truncatable_field_is_cut_to_the_room_left_by_its_heading(self):
+        lines = self._render(
+            [{"word": "salet", "spine": "RAISE ----- CRANE y----"}], 20
+        )
+        self.assertIn("  word: salet", lines)
+        self.assertTrue(any(line.startswith("  spine: ") and "…" in line
+                            for line in lines))
+
+    def test_consecutive_rows_are_separated_by_a_blank_line(self):
+        lines = self._render(
+            [{"word": "salet", "spine": "a"}, {"word": "crane", "spine": "b"}],
+            60,
+        )
+        self.assertIn("", lines)
+        self.assertLess(lines.index(""), lines.index("  word: crane"))
+
+
+class ChangeHighlightTest(unittest.TestCase):
+    def test_a_change_that_ends_mid_line_is_closed_before_the_tail(self):
+        highlighted = report_terminal._highlight_changes("abXde", "abcde")
+        self.assertIn(report_terminal.RED, highlighted)
+        self.assertIn(report_terminal.RESET, highlighted)
+        # The reset lands before the unchanged tail, not at end of line.
+        self.assertTrue(highlighted.endswith("de"))
+
+    def test_an_absent_erd_summary_reads_as_not_available(self):
+        for empty in (None, {}):
+            with self.subTest(empty=empty):
+                self.assertEqual(report_terminal._word_erd_line(empty), "ERD: n/a")
+
+
+class FinalizationScheduleLineTest(unittest.TestCase):
+    def test_a_winner_rank_alone_reports_only_what_it_supports(self):
+        # The two comparison facts are read against the winner's rank, so a
+        # finalization carrying only the rank reports neither.
+        lines = report_terminal._finalization_schedule_lines(
+            {"winner_best_first_rank": 1200}, 100
+        )
+        text = " ".join(lines)
+        self.assertIn("winner ranked 1,200", text)
+        self.assertNotIn("completed first", text)
+        self.assertNotIn("weakest", text)
+        self.assertNotIn("republished", text)
+
+
+class NavigationTargetTest(unittest.TestCase):
+    def _session(self):
+        return WatchSession(
+            view_args(watch=1.0), FakeInput(tty=True), io.StringIO()
+        )
+
+    def _report(self, branches=(), workers=()):
+        report = overview_report()
+        report["data"] = {"branches": list(branches), "workers": list(workers)}
+        return report
+
+    def test_branches_beyond_the_hotkey_alphabet_get_no_letter(self):
+        session = self._session()
+        branches = [
+            {"branch_key_hex": f"{index:04x}"}
+            for index in range(len(report_terminal.BRANCH_HOTKEYS) + 3)
+        ]
+        session._update_navigation_targets(self._report(branches=branches))
+        self.assertEqual(
+            len(session.branch_hotkeys), len(report_terminal.BRANCH_HOTKEYS)
+        )
+        self.assertLess(len(session.branch_hotkeys), len(branches))
+
+    def test_a_worker_without_a_numeric_number_gets_no_hotkey(self):
+        session = self._session()
+        workers = [
+            {"worker_id": "worker-a", "worker_number": None},
+            {"worker_id": "worker-1", "worker_number": "1"},
+        ]
+        session._update_navigation_targets(self._report(workers=workers))
+        self.assertEqual(session.worker_hotkeys, {"1": "worker-1"})
+
+    def test_a_row_whose_spine_names_no_branch_falls_back_to_its_digest(self):
+        session = self._session()
+        for spine in ([], "RAISE"):
+            with self.subTest(spine=spine):
+                target = session._branch_target(
+                    {"branch_key_hex": "0a0b", "spine": spine}
+                )
+                self.assertEqual(target.kind, "branch_reference")
+
+    def test_the_navigation_legend_omits_keys_that_select_nothing(self):
+        session = self._session()
+        session.branch_hotkeys = {}
+        session.worker_hotkeys = {}
+        legend = " ".join(
+            line for _, lines in session._navigation_section() for line in lines
+        )
+        self.assertNotIn("branch", legend)
+        self.assertNotIn("worker", legend)
+        self.assertIn("[q] quit", legend)
+
+
+class WordReportRenderingTest(unittest.TestCase):
+    def _word_report(self):
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "tests", "fixtures", "reports", "word.json",
+        )
+        with open(path) as handle:
+            return json.load(handle)
+
+    def test_a_changed_group_is_highlighted_and_answer_words_are_listed(self):
+        report = self._word_report()
+        previous = deepcopy(report)
+        previous["data"]["response_groups"][0]["answer_count"] = 99
+        report["data"]["response_groups"][0]["answer_words"] = ["salet", "crane"]
+        output = render_report(
+            report, previous, color=True, width=140,
+        )
+        self.assertIn(report_terminal.RED, output)
+        self.assertIn("salet crane", output)

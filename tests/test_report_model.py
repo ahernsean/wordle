@@ -7,7 +7,7 @@ import tempfile
 import time
 import unittest
 from dataclasses import replace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from cache_sqlite import ScoreCache
 from pattern_matrix import PatternMatrix
@@ -45,6 +45,511 @@ ANSWERS = ["salet", "crane", "nurdy", "khaki"]
 
 
 class ReportModelTest(unittest.TestCase):
+    def test_disk_fill_rate_uses_fresh_samples_and_rejects_flat_time(self):
+        self.assertIsNone(report_model.disk_fill_rate([(0, 100)], 0))
+        self.assertIsNone(report_model.disk_fill_rate([(0, 100), (0, 90)], 0))
+        self.assertEqual(
+            report_model.disk_fill_rate([(0, 100), (10, 80), (-1000, 1)], 10),
+            2.0,
+        )
+
+    def test_request_validation_rejects_invalid_operator_combinations(self):
+        root = parse_report_branch_target(None)
+        cases = (
+            (ReportRequest(report_kind="cache", tree=True), "cannot be used"),
+            (ReportRequest(tree_parent="RAISE -----"), "require tree"),
+            (ReportRequest(raw_row_offset=1), "requires an accuracy"),
+            (ReportRequest(report_kind="accuracy", raw_row_offset=-1), "cannot be negative"),
+            (ReportRequest(worker_id="w1"), "workers report"),
+            (ReportRequest(report_kind="root_progress", branch_target=root), "requires a target"),
+        )
+        for request, message in cases:
+            with self.subTest(request=request):
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_report_request(request)
+
+    def test_rich_spine_and_row_helpers_preserve_legacy_shapes(self):
+        self.assertEqual(parse_rich_spine(None), [])
+        parsed = parse_rich_spine("2:RAISE:-----/4→-y---/2")
+        self.assertEqual(parsed, [(2, "RAISE", "-----", "4"), (None, None, "-y---", "2")])
+        normalized = normalize_worker_descent(parsed, {"raise"})
+        self.assertTrue(normalized[0]["word_is_answer"])
+        self.assertFalse(normalized[1]["word_is_answer"])
+        self.assertEqual(report_model._row_value(None, "missing", "fallback"), "fallback")
+        self.assertEqual(report_model._row_value({}, "missing", "fallback"), "fallback")
+
+    def test_branch_target_parser_rejects_invalid_reference_and_word_tokens(self):
+        for target, message in (
+            ("@xyz", "expected @"),
+            ("toolong", "five-letter word"),
+            ("raise wrong", "response pattern"),
+        ):
+            with self.subTest(target=target):
+                with self.assertRaisesRegex(ValueError, message):
+                    parse_report_branch_target(target)
+
+    def test_request_validation_rejects_filter_scope_mismatches(self):
+        word = parse_report_branch_target("raise")
+        branch = parse_report_branch_target("raise -----")
+        cases = (
+            (ReportRequest(filters=ReportFilters(source_states=("queued",))), "opener_state"),
+            (ReportRequest(filters=ReportFilters(source_offset=0)), "source_offset"),
+            (ReportRequest(filters=ReportFilters(sort="word")), "requires an opener"),
+            (ReportRequest(branch_target=branch, filters=ReportFilters(branch_statuses=("unqueued",))), "unqueued"),
+            (ReportRequest(report_kind="hotspots", hotspot_field="coordination", branch_target=word), "coordination"),
+            (ReportRequest(report_kind="openers", branch_target=branch), "accepts only"),
+        )
+        for request, message in cases:
+            with self.subTest(request=request):
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_report_request(request)
+
+    def test_filter_and_lifecycle_helpers_cover_normalization_and_errors(self):
+        self.assertEqual(report_model.parse_branch_filter(" queued , done ", "status", ("queued", "done")), ("queued", "done"))
+        self.assertEqual(report_model.parse_branch_filter("all", "status", ("queued",)), ())
+        for value, message in (("", "comma"), ("all,queued", "combined"), ("nope", "unknown"), ("queued,queued", "duplicate")):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, message):
+                    report_model.parse_branch_filter(value, "status", ("queued",))
+        filters = ReportFilters(branch_statuses=("done",), branch_worker_statuses=("active",))
+        self.assertEqual(report_model.applied_branch_filters(filters).branch_worker_statuses, ())
+        active = report_model.applied_branch_filters(
+            replace(filters, branch_statuses=("evaluating",)))
+        self.assertEqual(active.branch_worker_statuses, ("active",))
+        self.assertEqual(report_model.branch_status_and_worker_status("pending", None, 0), ("queued", None))
+        self.assertEqual(report_model.branch_status_and_worker_status(None, "open", 1), ("evaluating", "active"))
+        self.assertEqual(report_model._response_group_key({}, "none"), (0, "all"))
+        self.assertEqual(report_model._root_progress_group_state(
+            {"answer_count": 3, "started": False},
+            {"best_erd": 2, "max_remaining_depth": 3, "cache_state": "exact"}, 2), "solved")
+        self.assertEqual(report_model._root_progress_group_state(
+            {"answer_count": 3, "started": False},
+            {"best_erd": None, "max_remaining_depth": None, "cache_state": "loss"}, 2), "loss")
+        self.assertEqual(report_model.branch_status_and_worker_status(None, "finalized", 0), ("finalizing", "waiting"))
+
+    def test_branch_reference_resolution_and_ambiguity_report(self):
+        key = ScoreCache.encode_subset(["salet", "crane"])
+        queue = Mock()
+        queue.branch_rows_for_reference_prefix.return_value = []
+        cache = Mock()
+        cache.branch_keys_for_reference_prefix.return_value = []
+        with self.assertRaisesRegex(ValueError, "No queued"):
+            resolve_branch_reference(queue, "abcd", cache)
+        cache.branch_keys_for_reference_prefix.return_value = [key, b"other"]
+        with self.assertRaisesRegex(ValueError, "ambiguous") as raised:
+            resolve_branch_reference(queue, "abcd", cache)
+        self.assertEqual(len(raised.exception.candidates), 2)
+
+        request = ReportRequest(branch_target=parse_report_branch_target("@abcd"))
+        error = ValueError("ambiguous")
+        error.candidates = [{"branch_reference": "abcd", "branch_key": key, "spine": None}]
+        base = {"sources": {"queue": {}, "cache": {}}}
+        with (
+            patch("report_model._decorative_answer_set", return_value={"salet", "crane"}),
+            patch("report_model._semantic_report", side_effect=lambda *_args: {
+                **base, "data": _args[4],
+            }),
+        ):
+            report = report_model.collect_ambiguous_branch_reference_report(
+                self.sources, request, error)
+        self.assertEqual(report["data"]["candidates"][0]["answer_count"], 2)
+        self.assertTrue(report["sources"]["queue"]["ok"])
+
+    def test_openers_filter_offsets_and_sort_validation(self):
+        for filters, message in (
+            (ReportFilters(source_offset=-1), "cannot be negative"),
+            (ReportFilters(branch_row_offset=-1), "cannot be negative"),
+            (ReportFilters(sort="nope"), "must be one"),
+        ):
+            with self.subTest(filters=filters):
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_report_request(ReportRequest(report_kind="openers", filters=filters))
+        allowed = ReportFilters(source_offset=0, branch_row_offset=0, sort="word")
+        validate_report_request(ReportRequest(report_kind="openers", filters=allowed))
+
+    def test_tree_layout_handles_empty_legacy_and_paged_topology(self):
+        request = ReportRequest(
+            report_kind="queue", tree=True,
+            filters=ReportFilters(limit=1),
+        )
+        self.assertFalse(report_model._tree_layout(
+            [], request, "", [], set())["tree_available"])
+        legacy_key = ScoreCache.encode_subset(["salet"])
+        rows = [
+            {
+                "branch_key": legacy_key, "branch_key_hex": legacy_key.hex(),
+                "budget": 4, "branch_status": "evaluating",
+                "branch_worker_status": "active", "answer_count": 1,
+                "worker_count": 2, "priority": 4,
+                "completed_candidate_count": 2, "candidate_count": 3,
+            },
+            {
+                "branch_key": ScoreCache.encode_subset(["crane"]),
+                "branch_key_hex": ScoreCache.encode_subset(["crane"]).hex(),
+                "spine": "RAISE ----- CRANE y----", "branch_status": "queued",
+                "branch_worker_status": None, "answer_count": 1,
+                "worker_count": 0, "priority": 2,
+                "completed_candidate_count": 0, "candidate_count": 3,
+            },
+        ]
+        layout = report_model._tree_layout(rows, request, "", rows, set(ANSWERS))
+        self.assertTrue(layout["tree_available"])
+        self.assertEqual(layout["paging"]["next_cursor"], "unknown:1:" + legacy_key.hex())
+        self.assertEqual(layout["nodes"][0]["guess_depth"], 1)
+        second_page = report_model._tree_layout(
+            rows, replace(request, tree_cursor=layout["paging"]["next_cursor"]),
+            "", rows, set(ANSWERS))
+        self.assertEqual(second_page["paging"]["returned_group_count"], 1)
+
+    def test_accuracy_report_normalizes_each_calibration_collection(self):
+        branch_key = ScoreCache.encode_subset(["salet"])
+        queue = Mock(epoch=9)
+        queue.report_candidate_accuracy.return_value = {
+            "rows": [{"branch_key": branch_key}],
+            "largest_under_predicted": [{"branch_key": branch_key}],
+            "largest_over_predicted": [{"branch_key": branch_key}],
+            "requested_sample_size": 2,
+        }
+        request = ReportRequest(report_kind="accuracy", sample_size=2)
+        with patch("report_model._open_report_queue", return_value=queue):
+            report = report_model.collect_accuracy_report(self.sources, request)
+        self.assertTrue(report["sources"]["queue"]["ok"])
+        self.assertEqual(report["data"]["rows"][0]["branch_key_hex"], branch_key.hex())
+        self.assertIn("branch_reference", report["data"]["largest_under_predicted"][0])
+        queue.close.assert_called_once()
+
+    def test_accuracy_and_historical_hotspot_reports_surface_queue_errors(self):
+        queue = Mock(epoch=9)
+        queue.report_candidate_accuracy.side_effect = sqlite3.OperationalError("offline")
+        with patch("report_model._open_report_queue", return_value=queue):
+            accuracy = report_model.collect_accuracy_report(
+                self.sources, ReportRequest(report_kind="accuracy"))
+        self.assertEqual(accuracy["sources"]["queue"]["error"], "offline")
+
+        branch_key = ScoreCache.encode_subset(["salet"])
+        queue = Mock(epoch=9)
+        queue.report_hotspots.return_value = {
+            "population": "candidate_claims", "epoch": 9, "since": 4,
+            "sample_size": 10, "sampled_row_count": 1, "sample_truncated": False,
+            "rows": [{"branch_key": branch_key, "best_guess": "salet"}],
+        }
+        request = ReportRequest(report_kind="hotspots", hotspot_field="cut-reuse")
+        with patch("report_model._open_report_queue", return_value=queue):
+            hotspots = report_model.collect_hotspot_report(self.sources, request)
+        self.assertEqual(hotspots["data"]["rows"][0]["branch_key_hex"], branch_key.hex())
+
+    def test_workers_report_filters_normalized_worker_rows(self):
+        queue = Mock()
+        queue.report_queue_rows.return_value = {"rows": [{
+            "branch_key_hex": "a", "branch_status": "evaluating",
+        }]}
+        queue.heartbeats_with_branch.return_value = [{"worker_id": "worker-2"}]
+        worker = {
+            "worker_id": "worker-2", "worker_number": "2",
+            "branch_key_hex": "a", "is_live": True, "updated_at": 1,
+        }
+        request = ReportRequest(report_kind="workers", worker_id="2")
+        with (
+            patch("report_model._open_report_queue", return_value=queue),
+            patch("report_model._normalize_worker", return_value=worker),
+            patch("report_model.worker_state", return_value="working"),
+            patch("report_model.load_word_list", return_value=ANSWERS),
+        ):
+            report = collect_workers_report(self.sources, request)
+        self.assertEqual(report["data"]["summary"]["worker_count"], 1)
+        self.assertEqual(report["data"]["rows"][0]["state"], "working")
+
+    def test_cache_report_collects_recent_cache_rows_without_a_live_queue(self):
+        branch_key = ScoreCache.encode_subset(["salet"])
+        cache = Mock()
+        cache.report_recent_rows.return_value = [{
+            "branch_key": branch_key, "best_guess": "salet",
+        }]
+        cache.erd_report_summary.return_value = {"exact_branch_count": 1}
+        cache.report_cache_distributions.return_value = {"answer_count": []}
+        with (
+            patch("report_model._open_report_queue", side_effect=sqlite3.OperationalError("queue offline")),
+            patch("report_model.ScoreCache", return_value=cache),
+            patch("report_model.load_word_list", return_value=ANSWERS),
+        ):
+            report = report_model.collect_cache_report(
+                self.sources, ReportRequest(report_kind="cache"))
+        self.assertEqual(report["sources"]["queue"]["error"], "queue offline")
+        self.assertTrue(report["sources"]["cache"]["ok"])
+        self.assertEqual(report["data"]["recent_rows"][0]["branch_reference"], branch_reference(branch_key))
+        cache.close.assert_called_once()
+
+    def test_cache_report_keeps_a_queue_report_when_cache_open_fails(self):
+        queue = Mock()
+        with (
+            patch("report_model._open_report_queue", return_value=queue),
+            patch("report_model.ScoreCache", side_effect=sqlite3.OperationalError("cache offline")),
+            patch("report_model.load_word_list", return_value=ANSWERS),
+        ):
+            report = report_model.collect_cache_report(
+                self.sources, ReportRequest(report_kind="cache"))
+        self.assertTrue(report["sources"]["queue"]["ok"])
+        self.assertEqual(report["sources"]["cache"]["error"], "cache offline")
+        queue.close.assert_called_once()
+
+    def test_cache_word_report_lists_response_group_cache_states(self):
+        report = report_model.collect_cache_report(
+            self.sources, ReportRequest(
+                report_kind="cache", branch_target=parse_report_branch_target("RAISE")))
+        self.assertTrue(report["sources"]["cache"]["ok"])
+        self.assertGreater(report["data"]["summary"]["response_group_count"], 0)
+        self.assertIn("branch_reference", report["data"]["rows"][0])
+
+    def test_cache_branch_report_uses_the_spine_budget(self):
+        report = report_model.collect_cache_report(
+            self.sources, ReportRequest(
+                report_kind="cache", branch_target=parse_report_branch_target("RAISE -----")))
+        self.assertIn("cache", report["data"])
+        self.assertIn("branch_reference", report["data"])
+
+    def test_branch_report_collects_an_unqueued_spine_without_creating_work(self):
+        request = ReportRequest(
+            report_kind="branch", branch_target=parse_report_branch_target("RAISE -----"),
+            include_answers=True,
+        )
+        report = report_model.collect_branch_report(self.sources, request)
+        self.assertIn(report["data"]["branch"]["branch_status"], ("done", "unqueued"))
+        self.assertIsNone(report["data"]["queue"])
+        self.assertTrue(report["sources"]["queue"]["ok"])
+
+    def test_branch_reference_report_falls_back_to_cache_when_queue_is_unavailable(self):
+        branch_key = ScoreCache.encode_subset(["salet"])
+        cache = Mock()
+        cache.report_branch_state.return_value = {
+            "cache_state": "exact", "best_guess": "salet",
+            "best_erd": 1.0, "max_remaining_depth": 1,
+        }
+        cache_class = Mock(return_value=cache)
+        cache_class.encode_subset = ScoreCache.encode_subset
+        cache_class.report_branch_state_without_rows.return_value = {
+            "cache_state": "missing", "best_guess": None,
+            "best_erd": None, "max_remaining_depth": None,
+        }
+        referenced_row = {"branch_key": branch_key}
+        request = ReportRequest(
+            report_kind="branch",
+            branch_target=parse_report_branch_target("@" + branch_reference(branch_key)),
+        )
+        with (
+            patch("report_model.ScoreCache", cache_class),
+            patch("report_model._open_report_queue", side_effect=sqlite3.OperationalError("offline")),
+            patch("report_model.resolve_branch_reference", return_value=referenced_row),
+        ):
+            report = report_model.collect_branch_report(self.sources, request)
+        self.assertEqual(report["sources"]["queue"]["error"], "offline")
+        self.assertEqual(report["data"]["cache"]["cache_state"], "exact")
+
+    def test_branch_report_preserves_queue_data_when_cache_read_fails(self):
+        request = ReportRequest(
+            report_kind="branch", branch_target=parse_report_branch_target("RAISE -----"),
+        )
+        cache = Mock()
+        cache.report_branch_state.side_effect = sqlite3.OperationalError("cache offline")
+        cache_class = Mock(return_value=cache)
+        cache_class.encode_subset = ScoreCache.encode_subset
+        cache_class.report_branch_state_without_rows.return_value = {
+            "cache_state": "missing", "best_guess": None,
+            "best_erd": None, "max_remaining_depth": None,
+        }
+        with patch("report_model.ScoreCache", cache_class):
+            report = report_model.collect_branch_report(self.sources, request)
+        self.assertTrue(report["sources"]["queue"]["ok"])
+        self.assertEqual(report["sources"]["cache"]["error"], "cache offline")
+
+    def test_root_progress_report_handles_an_opener_without_started_work(self):
+        report = report_model.collect_root_progress_report(
+            self.sources, ReportRequest(
+                report_kind="root_progress",
+                branch_target=parse_report_branch_target("RAISE")))
+        self.assertEqual(report["data"]["word"], "raise")
+        self.assertEqual(report["data"]["estimate"], None)
+
+    def test_opener_report_persists_missing_completed_timing(self):
+        queue = Mock()
+        queue.source_word_rows.return_value = [{"source_word": "raise", "state": "done"}]
+        queue.source_membership_rows.return_value = []
+        queue.completed_source_timing.return_value = {
+            "completed_at": 20, "first_created_at": 10,
+            "worker_millis": 4, "telemetry_epochs": "2,4",
+        }
+        queue.distinct_branch_count_for_words.return_value = 0
+        timing_cache = Mock()
+        timing_cache.completed_source_summary_map.return_value = {}
+        payload = {"source_word": "raise", "state": "complete", "branch_count": 0,
+                   "completed_at": 20, "requested_priority": 0}
+        with (
+            patch("report_model._open_report_queue", return_value=queue),
+            patch("report_model.ScoreCache", return_value=timing_cache),
+            patch("report_model.load_word_list", return_value=ANSWERS),
+            patch("report_model._source_rollups", return_value={"raise": {}}),
+            patch("report_model._source_summary_payload", return_value=payload),
+            patch("report_model._source_word_erd_summaries", return_value={}),
+        ):
+            report = collect_source_report(self.sources, ReportRequest(report_kind="openers"))
+        timing_cache.write_completed_source_summary.assert_called_once()
+        self.assertEqual(report["data"]["summary"], [payload])
+
+    def test_response_group_scale_skips_empty_and_unbuilt_matrices(self):
+        self.assertIsNone(report_model._maximum_response_group_count(
+            self.sources, ANSWERS, [], b"key", None))
+        with patch("report_model.PatternMatrix.load_if_built", return_value=None):
+            self.assertIsNone(report_model._maximum_response_group_count(
+               self.sources, ANSWERS, ANSWERS, b"other", None))
+
+    def test_source_summary_and_group_helpers_cover_active_and_empty_states(self):
+        row = {"source_word": "raise", "branch_count": 3,
+               "requested_priority": 4, "request_count": 1,
+               "direct_branch_count": 2, "direct_done_branch_count": 1,
+               "has_incomplete_request": 1, "has_active_request": 1,
+               "started_at": 10}
+        payload = report_model._source_summary_payload(
+            row, {"open_branch_count": 2, "worker_count": 1},
+            {"completed_at": None, "elapsed_millis": None, "worker_millis": None}, 20)
+        self.assertEqual(payload["state"], "active")
+        self.assertEqual(payload["elapsed_millis"], 10_000)
+        self.assertEqual(report_model._source_erd_sort_key({"source_word": "raise"})[0], 3)
+        self.assertEqual(report_model._duration_group_key(31 * 24 * 60 * 60 * 1000)[1], "[1 month, ∞)")
+        self.assertEqual(report_model._source_word_group_key(
+            {"worker_count": 0}, "worker_presence", 0), (1, "no workers"))
+        self.assertEqual(report_model._completed_at_group_key(None, 0), (5, "not completed"))
+        self.assertEqual(report_model._source_word_group_key(
+            {"elapsed_millis": None}, "elapsed", 0), (5, "not completed"))
+
+    def test_source_rollups_and_membership_payload_preserve_shared_branch_context(self):
+        branch_key = ScoreCache.encode_subset(["salet"])
+        parent_key = ScoreCache.encode_subset(["crane"])
+        row = {
+            "branch_id": 3, "branch_key": branch_key, "parent_branch_key": parent_key,
+            "source_work_id": 7, "source_word": "raise", "requested_priority": 4,
+            "source_state": "active", "root_pattern": 0,
+            "pending_status": "in_progress", "active_status": "open", "worker_count": 2,
+            "branch_effective_priority": 6,
+        }
+        rollup = report_model._source_rollups([row, row])["raise"]
+        self.assertEqual(rollup["open_branch_count"], 1)
+        payload = report_model._source_membership_payload(row, 2)
+        self.assertTrue(payload["is_shared"])
+        self.assertEqual(payload["parent_branch_reference"], branch_reference(parent_key))
+
+    def test_source_erd_summary_reuses_the_current_cache_generation(self):
+        branch_key = ScoreCache.encode_subset(["salet"])
+        cache = Mock(answer_list_id="answers")
+        cache.report_branch_states.return_value = {
+            branch_key: {"best_erd": 1.0, "max_remaining_depth": 1, "cache_state": "exact"},
+        }
+        response_cache = Mock()
+        response_cache.group_words.return_value = {0: ["salet"]}
+        report_model._SOURCE_ERD_SUMMARY_CACHE = {}
+        report = {"sources": {"cache": {"ok": False, "error": None}}}
+        with (
+            patch("report_model.ResponseCache", return_value=response_cache),
+            patch("report_model._score_cache_file_signature", return_value=((1, 1), None)),
+        ):
+            first = report_model._source_word_erd_summaries(
+                self.sources, ["raise"], report, cache, ANSWERS)
+            second = report_model._source_word_erd_summaries(
+                self.sources, ["raise"], report, cache, ANSWERS)
+        self.assertTrue(report["sources"]["cache"]["ok"])
+        self.assertEqual(first, second)
+        self.assertEqual(response_cache.group_words.call_count, 1)
+
+    def test_queue_and_current_hotspot_reports_normalize_rows(self):
+        branch_key = ScoreCache.encode_subset(["salet"])
+        queue = Mock(epoch=12)
+        queue.report_queue_rows.return_value = {"rows": [{
+            "branch_key": branch_key, "branch_status": "evaluating",
+            "branch_worker_status": "active", "spine": "RAISE -----",
+            "best_guess": "salet",
+        }]}
+        with patch("report_model._open_report_queue", return_value=queue):
+            queue_report = report_model.collect_queue_report(
+                self.sources, ReportRequest(report_kind="queue"))
+        row = queue_report["data"]["rows"][0]
+        self.assertEqual(row["branch_reference"], branch_reference(branch_key))
+        self.assertTrue(row["best_guess_is_answer"])
+
+        queue = Mock(epoch=12)
+        queue.report_queue_rows.return_value = {"rows": [{
+            "branch_key": branch_key, "branch_key_hex": branch_key.hex(),
+            "branch_status": "evaluating", "branch_worker_status": "active",
+            "spine": "RAISE -----", "best_guess": "salet",
+        }]}
+        with patch("report_model._open_report_queue", return_value=queue):
+            hotspots = report_model.collect_hotspot_report(
+                self.sources, ReportRequest(report_kind="hotspots", hotspot_field="nodes"))
+        self.assertEqual(hotspots["data"]["population"], "current_queue_branches")
+        self.assertEqual(len(hotspots["data"]["rows"]), 1)
+
+    def test_tree_report_limits_rows_to_the_selected_worker(self):
+        selected_key = ScoreCache.encode_subset(["salet"])
+        other_key = ScoreCache.encode_subset(["crane"])
+        queue = Mock()
+        queue.report_queue_rows.return_value = {"rows": [
+            {"branch_key_hex": selected_key.hex()},
+            {"branch_key_hex": other_key.hex()},
+        ]}
+        queue.heartbeats_with_branch.return_value = [{
+            "worker_id": "worker-2", "current_branch_key": selected_key,
+        }]
+        layout = {"tree_available": True, "nodes": ["selected"]}
+        request = ReportRequest(report_kind="queue", tree=True, worker_id="2")
+        with (
+            patch("report_model._open_report_queue", return_value=queue),
+            patch("report_model._tree_layout", return_value=layout) as tree_layout,
+        ):
+            report = report_model.collect_tree_report(self.sources, request)
+        self.assertEqual(report["data"]["nodes"], ["selected"])
+        self.assertEqual(len(tree_layout.call_args.args[0]), 1)
+
+    def test_branch_target_queue_scopes_and_row_matching_cover_each_target_kind(self):
+        branch_key = ScoreCache.encode_subset(["salet"])
+        queue = Mock()
+        queue.branch_rows_for_reference_prefix.return_value = [{
+            "branch_key": branch_key, "spine": "RAISE -----",
+        }]
+        reference_target = parse_report_branch_target("@" + branch_reference(branch_key))
+        scope, prefix = report_model._branch_target_queue_scope(reference_target, queue)
+        self.assertEqual(scope["branch_key"], branch_key)
+        self.assertEqual(prefix, "RAISE -----")
+        word_target = parse_report_branch_target("RAISE")
+        scope, prefix = report_model._branch_target_queue_scope(word_target)
+        self.assertEqual(scope["source_word"], "raise")
+        self.assertEqual(prefix, "RAISE")
+        self.assertTrue(report_model._row_matches_branch_target(
+            {"spine": "RAISE ----- CRANE y----"}, word_target, prefix))
+        branch_target = parse_report_branch_target("RAISE -----")
+        self.assertTrue(report_model._row_matches_branch_target(
+            {"spine": "RAISE ----- CRANE y----"}, branch_target, "RAISE -----"))
+        self.assertTrue(report_model._row_matches_branch_target(
+            {"branch_key": branch_key}, reference_target, ""))
+
+    def test_report_dispatches_each_explicit_collection_kind(self):
+        request = ReportRequest(report_kind="queue")
+        with patch("report_model.collect_queue_report", return_value={"kind": "queue"}):
+            self.assertEqual(collect_report(self.sources, request), {"kind": "queue"})
+        for kind, function_name in (
+            ("workers", "collect_workers_report"), ("cache", "collect_cache_report"),
+            ("hotspots", "collect_hotspot_report"), ("accuracy", "collect_accuracy_report"),
+            ("leaderboard", "collect_leaderboard_report"), ("openers", "collect_source_report"),
+            ("root_progress", "collect_root_progress_report"),
+        ):
+            with self.subTest(kind=kind), patch("report_model." + function_name,
+                                                return_value={"kind": kind}):
+                self.assertEqual(collect_report(
+                    self.sources, ReportRequest(report_kind=kind)), {"kind": kind})
+        with self.assertRaisesRegex(ValueError, "tree layout"):
+            collect_report(self.sources, ReportRequest(report_kind="cache", tree=True))
+        with patch("report_model.collect_overview_report", return_value={"kind": "overview"}):
+            self.assertEqual(collect_report(self.sources, ReportRequest()), {"kind": "overview"})
+        with patch("report_model.collect_word_report", return_value={"kind": "word"}):
+            self.assertEqual(collect_report(self.sources, ReportRequest(
+                branch_target=parse_report_branch_target("RAISE"))), {"kind": "word"})
+
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         directory = self.temporary_directory.name
@@ -91,6 +596,53 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(eta["remaining_inspection_count"], 600)
         self.assertEqual(eta["expected_full_evaluation_count"], 150)
         self.assertEqual(eta["estimated_seconds"], 105)
+
+    def test_candidate_eta_withholds_an_estimate_it_cannot_support(self):
+        base = {
+            "best_updated_at": 900, "window_started_at": 900,
+            "inspected_candidate_count": 200, "pruned_candidate_count": 150,
+            "inspection_worker_millis": 20_000,
+            "evaluated_candidate_count": 50,
+            "evaluation_worker_millis": 50_000,
+        }
+        work = {"candidate_count": 1_000, "completed_candidate_count": 400}
+
+        def eta(payload=None, **sample):
+            return _candidate_eta(
+                payload or work, {**base, **sample},
+                live_worker_count=2, now=1_600,
+            )
+
+        # Nothing left to evaluate is not a slow estimate, it is no estimate.
+        self.assertIsNone(
+            eta({"candidate_count": 400, "completed_candidate_count": 400})
+        )
+        # A timing the sample never observed would divide by zero, so the
+        # estimate is withheld instead.
+        for sample in (
+            {"inspection_worker_millis": 0},
+            {"evaluated_candidate_count": 0},
+            {"inspected_candidate_count": 0, "pruned_candidate_count": 0,
+             "evaluated_candidate_count": 0},
+        ):
+            with self.subTest(sample=sample):
+                self.assertNotEqual(eta(**sample)["state"], "ready")
+
+    def test_candidate_eta_expects_no_evaluations_when_every_check_prunes(self):
+        eta = _candidate_eta(
+            {"candidate_count": 1_000, "completed_candidate_count": 400},
+            {
+                "best_updated_at": 900, "window_started_at": 900,
+                "inspected_candidate_count": 200,
+                "pruned_candidate_count": 200,
+                "inspection_worker_millis": 20_000,
+                "evaluated_candidate_count": 50,
+                "evaluation_worker_millis": 50_000,
+            },
+            live_worker_count=2, now=1_600,
+        )
+        self.assertEqual(eta["expected_full_evaluation_count"], 0)
+        self.assertEqual(eta["state"], "ready")
 
     def test_candidate_eta_learns_after_a_new_best_erd(self):
         eta = _candidate_eta(
@@ -553,6 +1105,274 @@ class ReportModelTest(unittest.TestCase):
             sum(group["rollup"]["answer_count"] for group in groups),
             summary["answer_count"],
         )
+
+    def test_word_and_root_progress_reports_need_a_target_ending_in_a_word(self):
+        branch = parse_report_branch_target("salet -----")
+        with self.assertRaisesRegex(ValueError, "ending in a word"):
+            report_model.collect_word_report(
+                self.sources, ReportRequest(branch_target=branch)
+            )
+        with self.assertRaisesRegex(ValueError, "ending in a word"):
+            report_model.collect_root_progress_report(
+                self.sources,
+                ReportRequest(report_kind="root_progress", branch_target=branch),
+            )
+
+    def test_root_progress_report_degrades_when_a_store_is_unavailable(self):
+        request = ReportRequest(
+            report_kind="root_progress",
+            branch_target=parse_report_branch_target("salet"),
+        )
+        with patch.object(report_model, "_open_report_queue",
+                          side_effect=sqlite3.OperationalError("queue locked")):
+            report = collect_report(self.sources, request)
+        self.assertFalse(report["sources"]["queue"]["ok"])
+        with patch.object(report_model, "ScoreCache",
+                          side_effect=sqlite3.OperationalError("cache locked")):
+            report = collect_report(self.sources, request)
+        self.assertFalse(report["sources"]["cache"]["ok"])
+
+    def test_a_root_progress_group_is_working_only_while_a_worker_holds_it(self):
+        row = {"answer_count": 5, "pattern": "-y---", "started": 1}
+        self.assertEqual(
+            report_model._root_progress_group_state(row, None, 4), "working"
+        )
+        self.assertEqual(
+            report_model._root_progress_group_state({**row, "started": 0},
+                                                    None, 4),
+            "waiting",
+        )
+
+    def test_parsing_helpers_cover_their_degenerate_inputs(self):
+        # A trailing descent token carrying no answer count is kept as text.
+        self.assertEqual(
+            parse_rich_spine("RAISE:-----/4\u2192pending")[-1],
+            (None, None, None, "pending"),
+        )
+        # A row that cannot be subscripted at all yields the default.
+        self.assertEqual(
+            report_model._row_value([], "missing", "fallback"), "fallback"
+        )
+        # A worker whose number is not a digit sorts after the numbered ones.
+        self.assertEqual(
+            report_model._worker_sort_key(
+                {"worker_number": "x", "worker_id": "worker-x"}
+            ),
+            (1, "worker-x"),
+        )
+
+    def test_root_progress_is_not_a_tree_and_a_reference_needs_the_queue(self):
+        with self.assertRaisesRegex(ValueError, "tree cannot be used"):
+            validate_report_request(
+                ReportRequest(report_kind="root_progress", tree=True)
+            )
+        with self.assertRaisesRegex(ValueError, "requires queue resolution"):
+            report_model.resolve_branch_target(
+                parse_report_branch_target("@abcdef12"), ANSWERS
+            )
+
+    def test_opener_sort_orders_complete_pending_infeasible_then_unknown(self):
+        def rank(state, erd=None):
+            summary = None if state is None else {"state": state, "erd": erd}
+            return report_model._source_erd_sort_key(
+                {"source_word": "salet", "erd_summary": summary}
+            )[0]
+
+        self.assertEqual(
+            [rank("complete", 3.5), rank("pending"),
+             rank("infeasible"), rank(None)],
+            [0, 1, 2, 3],
+        )
+
+    def test_a_cache_file_that_is_not_there_has_no_signature(self):
+        missing = os.path.join(self.temporary_directory.name, "absent.sqlite3")
+        self.assertEqual(
+            report_model._score_cache_file_signature(missing), (None, None)
+        )
+
+    def test_hotspot_and_accuracy_reports_scope_and_survive_queue_errors(self):
+        requests = (
+            ReportRequest(report_kind="hotspots", hotspot_field="nodes"),
+            ReportRequest(
+                report_kind="accuracy",
+                branch_target=parse_report_branch_target("salet -----"),
+            ),
+            ReportRequest(
+                report_kind="accuracy",
+                branch_target=parse_report_branch_target("salet"),
+            ),
+        )
+        for request in requests:
+            with self.subTest(kind=request.report_kind,
+                              target=request.branch_target.kind):
+                self.assertTrue(
+                    collect_report(self.sources, request)["sources"]["queue"]["ok"]
+                )
+        with patch.object(report_model, "_open_report_queue",
+                          side_effect=sqlite3.OperationalError("queue locked")):
+            report = collect_report(self.sources, requests[0])
+        self.assertFalse(report["sources"]["queue"]["ok"])
+
+    def test_tree_report_reads_a_reference_as_a_branch_and_survives_errors(self):
+        request = ReportRequest(
+            report_kind="auto", tree=True,
+            branch_target=parse_report_branch_target("@abcdef12"),
+        )
+        with patch.object(report_model, "_open_report_queue",
+                          side_effect=sqlite3.OperationalError("queue locked")):
+            report = collect_report(self.sources, request)
+        self.assertEqual(report["report_kind"], "branch")
+        self.assertFalse(report["sources"]["queue"]["ok"])
+
+    def test_workers_report_scopes_to_a_branch_and_survives_a_queue_error(self):
+        request = ReportRequest(
+            report_kind="workers",
+            branch_target=parse_report_branch_target("salet -----"),
+        )
+        scoped = collect_report(self.sources, request)
+        self.assertTrue(scoped["sources"]["queue"]["ok"])
+        with patch.object(report_model, "_open_report_queue",
+                          side_effect=sqlite3.OperationalError("queue locked")):
+            report = collect_report(self.sources, request)
+        self.assertFalse(report["sources"]["queue"]["ok"])
+
+    def test_branch_target_scoping_and_row_matching_cover_each_kind(self):
+        root = parse_report_branch_target("")
+        reference = parse_report_branch_target("@abcdef12")
+        word = parse_report_branch_target("salet")
+        branch = parse_report_branch_target("salet -----")
+
+        # A reference names a branch only the queue can resolve, so without one
+        # it scopes nothing rather than guessing.
+        self.assertEqual(
+            report_model._branch_target_queue_scope(reference, None), ({}, "")
+        )
+        # A resolved reference whose row carries no spine scopes by key alone.
+        with patch.object(
+            report_model, "resolve_branch_reference",
+            return_value={"branch_key": b"salet", "spine": None},
+        ):
+            scope, prefix = report_model._branch_target_queue_scope(
+                reference, Mock()
+            )
+        self.assertEqual(prefix, "")
+        self.assertNotIn("spine_prefix", scope)
+
+        self.assertTrue(report_model._row_matches_branch_target({}, root, ""))
+        self.assertTrue(report_model._row_matches_branch_target(
+            {"spine": None, "source_word": "SALET"}, word, "SALET"
+        ))
+        self.assertFalse(report_model._row_matches_branch_target(
+            {"spine": None, "source_word": "crane"}, word, "SALET"
+        ))
+        # A spine-scoped target cannot match a row that has no spine.
+        self.assertFalse(report_model._row_matches_branch_target(
+            {"spine": None}, branch, ""
+        ))
+
+    def test_queue_report_scopes_to_a_tree_parent_and_survives_a_queue_error(self):
+        tree_request = ReportRequest(
+            report_kind="queue", tree=True, tree_parent="SALET -----",
+        )
+        collect_report(self.sources, tree_request)
+        flat_request = ReportRequest(report_kind="queue")
+        collect_report(self.sources, flat_request)
+        with patch.object(report_model, "_open_report_queue",
+                          side_effect=sqlite3.OperationalError("queue locked")):
+            for request in (tree_request, flat_request):
+                with self.subTest(tree=request.tree):
+                    report = collect_report(self.sources, request)
+                    self.assertFalse(report["sources"]["queue"]["ok"])
+
+    def test_branch_report_survives_a_cache_that_will_not_open(self):
+        request = ReportRequest(
+            branch_target=parse_report_branch_target("salet -----")
+        )
+        with patch.object(
+            report_model, "ScoreCache",
+            side_effect=sqlite3.OperationalError("cache locked"),
+        ):
+            report = collect_report(self.sources, request)
+        self.assertFalse(report["sources"]["cache"]["ok"])
+
+    def test_branch_report_pages_finalizations_in_both_directions(self):
+        for direction in ("after", "before"):
+            with self.subTest(direction=direction):
+                request = ReportRequest(
+                    branch_target=parse_report_branch_target("salet -----"),
+                    filters=ReportFilters(
+                        finalization_cursor_direction=direction,
+                        finalization_cursor_recorded_at=1_700_000_000,
+                        finalization_cursor_id=42,
+                    ),
+                )
+                collect_report(self.sources, request)
+
+    def test_a_branch_reference_needs_a_queue_or_a_cache_to_resolve(self):
+        request = ReportRequest(
+            branch_target=parse_report_branch_target("@abcdef12")
+        )
+        with (
+            patch.object(report_model, "ScoreCache",
+                         side_effect=sqlite3.OperationalError("cache locked")),
+            patch.object(report_model, "_open_report_queue",
+                         side_effect=sqlite3.OperationalError("queue locked")),
+        ):
+            with self.assertRaises(sqlite3.OperationalError):
+                collect_report(self.sources, request)
+
+    def test_a_branch_report_resolves_from_the_answer_list_without_a_queue(self):
+        request = ReportRequest(
+            branch_target=parse_report_branch_target("salet -----")
+        )
+        with patch.object(report_model, "_open_report_queue",
+                          side_effect=sqlite3.OperationalError("queue locked")):
+            report = collect_report(self.sources, request)
+        self.assertFalse(report["sources"]["queue"]["ok"])
+
+    def test_word_report_filters_and_sorts_its_response_groups(self):
+        target = parse_report_branch_target("salet")
+
+        def groups(**filter_values):
+            request = ReportRequest(
+                branch_target=target, filters=ReportFilters(**filter_values)
+            )
+            return collect_report(
+                self.sources, request
+            )["data"]["response_groups"]
+
+        everything = groups()
+        self.assertTrue(everything)
+        self.assertLessEqual(
+            len(groups(branch_statuses=("evaluating",))), len(everything)
+        )
+        self.assertLessEqual(
+            len(groups(branch_worker_statuses=("active",))), len(everything)
+        )
+        self.assertTrue(all(
+            row["answer_count"] <= 1 for row in groups(maximum_answer_count=1)
+        ))
+        self.assertTrue(all(
+            row["priority"] == 4 for row in groups(priority=4)
+        ))
+        # A budget other than the one these groups are solved at matches none.
+        self.assertEqual(groups(budget=2), [])
+        for sort, rank in (
+            ("size", lambda row: -row["answer_count"]),
+            ("workers", lambda row: -row["worker_count"]),
+            ("priority", lambda row: -(row["priority"] or 0)),
+        ):
+            with self.subTest(sort=sort):
+                ranks = [rank(row) for row in groups(sort=sort)]
+                self.assertEqual(ranks, sorted(ranks))
+
+    def test_word_report_includes_answer_words_on_request(self):
+        request = ReportRequest(
+            branch_target=parse_report_branch_target("salet"),
+            include_answers=True,
+        )
+        groups = collect_report(self.sources, request)["data"]["response_groups"]
+        self.assertTrue(any("answer_words" in row for row in groups))
 
     def test_collect_word_report_omits_groups_when_ungrouped(self):
         request = ReportRequest(branch_target=parse_report_branch_target("salet"))
