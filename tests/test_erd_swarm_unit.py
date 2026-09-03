@@ -3372,7 +3372,7 @@ class TestCompletedOpenerSnapshots(unittest.TestCase):
 
         worker._snapshot_completed_openers(["SALET"])
 
-        worker.score_cache.write_completed_source_summary.assert_called_once_with(
+        worker.score_cache.write_completed_opener_summary.assert_called_once_with(
             "SALET", erd_swarm.ERD_ALL, 160, 60_000, 2_000, (3,))
 
     def test_snapshot_failure_does_not_abort_the_worker(self):
@@ -3386,7 +3386,7 @@ class TestCompletedOpenerSnapshots(unittest.TestCase):
         with self.assertLogs("wordle", level="ERROR"):
             worker._snapshot_completed_openers(["salet", "crane"])
 
-        worker.score_cache.write_completed_source_summary.assert_called_once_with(
+        worker.score_cache.write_completed_opener_summary.assert_called_once_with(
             "crane", erd_swarm.ERD_ALL, 160, 60_000, 2_000, (3,))
 
 

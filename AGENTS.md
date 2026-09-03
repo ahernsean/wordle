@@ -314,21 +314,24 @@ requested it; the guess at the root of *that* branch appears only in the spine.
 
 **Legacy naming.** Tier B (#280) renamed the Linux-only queue identifiers and
 schema — `erd_queue.py`, `erd_swarm.py`, `erd_search.py`, `report_model.py`,
-`report_terminal.py`, and their tests — from `source_*` to `opener_*`. Two
-`source_*` spellings remain deliberately:
-
-1. The phone-shared cache (`runtime/wordle_cache.sqlite3`) is Tier C (#281,
-   still open): `cache_sqlite.py`'s `completed_source_summaries` and
-   `root_response_group_summaries` tables, and their `source_word` columns,
-   are untouched by Tier B and stay `source_word` until that tier lands.
-2. `report_model.py`'s branch/membership JSON output keeps the wire key
-   `"root_pattern"` even though the field is read internally from the
-   renamed `opener_pattern` column — `report_client.html` reads that exact
-   key and is outside Tier B's rename scope, so the key name is a deliberate
-   compatibility exception, not a leftover.
+`report_terminal.py`, and their tests — from `source_*` to `opener_*`. Tier C
+(#281) did the same for the phone-shared cache: `cache_sqlite.py`'s
+`completed_source_summaries` and `root_response_group_summaries` tables,
+their `source_word` columns, and every caller now read `opener`/
+`completed_opener_summaries`/`opener_response_group_summaries`. The rename is
+a migration (`ScoreCache._rename_source_summaries_to_opener`), not a
+find/replace: it runs once per database, guarded by `schema_migrations`, and
+fails loudly if it ever finds both an old- and new-named table present at
+once (a half-applied prior run) rather than guessing which copy holds the
+good rows. One `source_*` spelling remains deliberately: `report_model.py`'s
+branch/membership JSON output keeps the wire key `"root_pattern"` even though
+the field is read internally from the renamed `opener_pattern` column —
+`report_client.html` reads that exact key and is outside Tier B's rename
+scope, so the key name is a deliberate compatibility exception, not a
+leftover.
 
 Do not introduce new `source_*` names anywhere else; read every other
-`source_*` spelling you encounter as a Tier C carryover or a bug.
+`source_*` spelling you encounter as a bug.
 
 The phase boundary between candidate and guess is explicit in the code:
 ```python
