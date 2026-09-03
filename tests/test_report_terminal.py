@@ -2507,6 +2507,44 @@ class TerminalUtilityTest(unittest.TestCase):
         self.assertIn("Ownership:", output)
         self.assertIn("shared, 2 owner(s)", output)
 
+    def test_root_progress_and_accuracy_renderers_show_estimates_and_raw_rows(self):
+        report = overview_report()
+        report.update({"report_kind": "root_progress", "tree": False})
+        report["data"] = {
+            "word": "raise", "word_is_answer": True, "epoch": 4,
+            "selected_telemetry_epoch": None, "telemetry_epochs": [2, 4],
+            "work_started_at": 100, "work_latest_at": 200,
+            "totals": {"requested_at": 90, "response_group_count": 4,
+                       "open_branch_count": 1, "search_node_count": 1200,
+                       "wall_millis": 90000,
+                       "state_counts": {"waiting": 1, "evaluating": 2}},
+            "estimate": {"provisional": True, "sample_duration_seconds": 60,
+                         "estimated_seconds": 120, "remaining_candidate_count": 3,
+                         "candidates_per_day": 10, "stalled_branch_count": 1,
+                         "stalled_remaining_candidate_count": 2},
+            "response_groups": [{"pattern": "-----", "state": "waiting",
+                                 "answer_count": 2, "started": False}],
+        }
+        output = report_terminal.render_report(report, width=120)
+        self.assertIn("estimate ~2m", output)
+        self.assertIn("excludes 1 waiting groups and 1 stalled branches", output)
+        report["report_kind"] = "accuracy"
+        report["data"] = {
+            "epoch": 2, "population_row_count": 4, "sampled_row_count": 2,
+            "requested_sample_size": 3, "erd_pruned_row_count": 1,
+            "non_erd_pruned_row_count": 1, "no_prediction_row_count": 0,
+            "calibration": {"row_count": 1, "actual_predicted_ratio": {"mean": 1.2}},
+            "largest_under_predicted": [{"candidate_word": "raise", "n_words": 3,
+                                           "budget": None, "predicted_work": None,
+                                           "actual_nodes": 20, "actual_predicted_ratio": None}],
+            "rows": [{"candidate_word": "raise", "idx": 2, "worker_id": None,
+                      "bundle_id": None, "outcome": None, "evaluation_millis": None,
+                      "republish_count": 1}], "raw_row_offset": 5,
+        }
+        output = report_terminal.render_report(report, width=120)
+        self.assertIn("Raw rows (offset 5)", output)
+        self.assertIn("RAISE idx=2", output)
+
 
 if __name__ == "__main__":
     unittest.main()
