@@ -285,6 +285,33 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(report["sources"]["cache"]["error"], "cache offline")
         queue.close.assert_called_once()
 
+    def test_queue_and_current_hotspot_reports_normalize_rows(self):
+        branch_key = ScoreCache.encode_subset(["salet"])
+        queue = Mock(epoch=12)
+        queue.report_queue_rows.return_value = {"rows": [{
+            "branch_key": branch_key, "branch_status": "evaluating",
+            "branch_worker_status": "active", "spine": "RAISE -----",
+            "best_guess": "salet",
+        }]}
+        with patch("report_model._open_report_queue", return_value=queue):
+            queue_report = report_model.collect_queue_report(
+                self.sources, ReportRequest(report_kind="queue"))
+        row = queue_report["data"]["rows"][0]
+        self.assertEqual(row["branch_reference"], branch_reference(branch_key))
+        self.assertTrue(row["best_guess_is_answer"])
+
+        queue = Mock(epoch=12)
+        queue.report_queue_rows.return_value = {"rows": [{
+            "branch_key": branch_key, "branch_key_hex": branch_key.hex(),
+            "branch_status": "evaluating", "branch_worker_status": "active",
+            "spine": "RAISE -----", "best_guess": "salet",
+        }]}
+        with patch("report_model._open_report_queue", return_value=queue):
+            hotspots = report_model.collect_hotspot_report(
+                self.sources, ReportRequest(report_kind="hotspots", hotspot_field="nodes"))
+        self.assertEqual(hotspots["data"]["population"], "current_queue_branches")
+        self.assertEqual(len(hotspots["data"]["rows"]), 1)
+
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         directory = self.temporary_directory.name
