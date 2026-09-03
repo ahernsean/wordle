@@ -321,7 +321,7 @@ class TestBranchSpinePersistence(unittest.TestCase):
             CREATE TABLE active_branches (
                 branch_key BLOB PRIMARY KEY, n_words INTEGER NOT NULL,
                 n_candidates INTEGER NOT NULL, priority INTEGER NOT NULL DEFAULT 0,
-                source_word TEXT, source_pattern INTEGER, best_erd REAL,
+                opener TEXT, opener_pattern INTEGER, best_erd REAL,
                 best_guess TEXT, status TEXT NOT NULL DEFAULT 'open',
                 created_at INTEGER, finalized_at INTEGER, budget INTEGER,
                 best_max_depth INTEGER, tainted INTEGER NOT NULL DEFAULT 0,

@@ -23,12 +23,12 @@ from unittest import mock
 import erd_queue
 from cache_sqlite import ScoreCache
 from erd_queue import (
-    SOURCE_PRIORITY_MAX,
-    SOURCE_PRIORITY_MIN,
+    OPENER_PRIORITY_MAX,
+    OPENER_PRIORITY_MIN,
     ERDQueue as ProductionERDQueue,
     cost_size_bucket,
 )
-from tests.queue_invariants import SourceWorkInvariantCheckMixin
+from tests.queue_invariants import OpenerWorkInvariantCheckMixin
 
 WORDS = ["crane", "slate", "trace", "stale", "tales"]
 N_CANDIDATES = 20
@@ -46,7 +46,7 @@ _IDENTITY_ORDER = list(range(N_CANDIDATES))
 _ZERO_LOWER_BOUND = [0.0] * N_CANDIDATES
 
 
-class InvariantCheckedERDQueue(SourceWorkInvariantCheckMixin,
+class InvariantCheckedERDQueue(OpenerWorkInvariantCheckMixin,
                                ProductionERDQueue):
     pass
 
@@ -64,16 +64,16 @@ class _TmpQueue(unittest.TestCase):
         self.key = ScoreCache.encode_subset(WORDS)
 
     def _claim_one_idx(self, branch_key, worker_id="worker-0",
-                       expected_source_work_id=None,
-                       expected_source_priority=None):
+                       expected_opener_work_id=None,
+                       expected_opener_priority=None):
         """claim_next_bundle(small_count=1, count_cap=1) unwrapped to a bare
         idx (or None) — the old claim_candidate single-index contract, for
         tests exercising something other than the packer itself."""
         claim = self.q.claim_next_bundle(
             branch_key, worker_id, N_CANDIDATES, _IDENTITY_ORDER,
             _ZERO_LOWER_BOUND, small_count=1, count_cap=1,
-            expected_source_work_id=expected_source_work_id,
-            expected_source_priority=expected_source_priority)
+            expected_opener_work_id=expected_opener_work_id,
+            expected_opener_priority=expected_opener_priority)
         return claim[1][0] if claim is not None else None
 
 
@@ -86,7 +86,7 @@ class TestLegacyPriorityMigration(unittest.TestCase):
             pending_key = ScoreCache.encode_subset(WORDS[:4])
             done_key = ScoreCache.encode_subset(WORDS[:3])
             queue.create_branch(active_key, len(WORDS), N_CANDIDATES,
-                                priority=0, source_word='crane')
+                                priority=0, opener='crane')
             queue.add_pending_many([
                 (pending_key, 4, 0, 'slate', 0),
                 (done_key, 3, 0, 'trace', 0),
@@ -101,13 +101,13 @@ class TestLegacyPriorityMigration(unittest.TestCase):
                 "UPDATE pending_branches SET status = 'done' WHERE branch_id = ?",
                 (queue._intern_branch(done_key),))
             queue._conn.execute("""
-                UPDATE source_work SET state = 'complete'
-                WHERE source_work_id = (
-                    SELECT source_work_id FROM branch_source_work WHERE branch_id = ?
+                UPDATE opener_work SET state = 'complete'
+                WHERE opener_work_id = (
+                    SELECT opener_work_id FROM branch_opener_work WHERE branch_id = ?
                 )
             """, (queue._intern_branch(done_key),))
             queue._conn.execute(
-                "UPDATE branch_source_work SET resolved_at = 1 WHERE branch_id = ?",
+                "UPDATE branch_opener_work SET resolved_at = 1 WHERE branch_id = ?",
                 (queue._intern_branch(done_key),))
             queue._conn.execute(
                 "DELETE FROM schema_migrations "
@@ -121,7 +121,7 @@ class TestLegacyPriorityMigration(unittest.TestCase):
             self.assertEqual(
                 queue.get_pending_branch(done_key)['priority'],
                 erd_queue.LEGACY_PROMOTED_PRIORITY_MIN + 1)
-            self.assertEqual(queue.check_source_work_invariants(), [])
+            self.assertEqual(queue.check_opener_work_invariants(), [])
             self.assertEqual(queue._conn.execute(
                 "SELECT COUNT(*) FROM schema_migrations "
                 "WHERE name = 'neutralize_legacy_promoted_priorities'").fetchone()[0],
@@ -139,114 +139,114 @@ class TestBranchLifecycle(_TmpQueue):
     def test_create_branch_commits_active_row_and_ownership_together(self):
         other_key = ScoreCache.encode_subset(WORDS[:4])
         self.q.add_pending_many([(other_key, 4, 1, "crane", 42)])
-        source_work_id = self.q.source_work_rows()[0]["source_work_id"]
+        opener_work_id = self.q.opener_work_rows()[0]["opener_work_id"]
         statements = []
         self.q._conn.set_trace_callback(statements.append)
         try:
             self.assertTrue(self.q.create_branch(
                 self.key, len(WORDS), N_CANDIDATES, budget=5,
-                source_word="crane", source_pattern=42,
-                source_work_id=source_work_id))
+                opener="crane", opener_pattern=42,
+                opener_work_id=opener_work_id))
         finally:
             self.q._conn.set_trace_callback(None)
         transaction = "\n".join(statements)
         self.assertLess(transaction.index("BEGIN IMMEDIATE"),
                         transaction.index("INSERT OR IGNORE INTO active_branches"))
         self.assertLess(transaction.index("INSERT OR IGNORE INTO active_branches"),
-                        transaction.index("INSERT INTO branch_source_work"))
-        self.assertLess(transaction.index("INSERT INTO branch_source_work"),
+                        transaction.index("INSERT INTO branch_opener_work"))
+        self.assertLess(transaction.index("INSERT INTO branch_opener_work"),
                         transaction.index("COMMIT"))
 
-    def test_losing_create_does_not_attach_incompatible_source_work(self):
+    def test_losing_create_does_not_attach_incompatible_opener_work(self):
         self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 0)])
-        source_a = self.q.source_work_rows()[0]["source_work_id"]
+        opener_a = self.q.opener_work_rows()[0]["opener_work_id"]
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES,
-                             budget=4, source_work_id=source_a)
+                             budget=4, opener_work_id=opener_a)
         other_key = ScoreCache.encode_subset(WORDS[:4])
         self.q.add_pending_many([(other_key, 4, 1, "slate", 42)])
-        source_b = max(row["source_work_id"] for row in self.q.source_work_rows())
+        opener_b = max(row["opener_work_id"] for row in self.q.opener_work_rows())
 
         self.assertFalse(self.q.create_branch(
             self.key, len(WORDS), N_CANDIDATES,
-            budget=5, source_work_id=source_b))
-        self.assertEqual(self.q.branches_in_progress(source_b), [])
+            budget=5, opener_work_id=opener_b))
+        self.assertEqual(self.q.branches_in_progress(opener_b), [])
 
-    def test_attach_source_work_rejects_replaced_incompatible_branch(self):
+    def test_attach_opener_work_rejects_replaced_incompatible_branch(self):
         other_key = ScoreCache.encode_subset(WORDS[:4])
         self.q.add_pending_many([(other_key, 4, 1, "crane", 0)])
-        source_work_id = self.q.source_work_rows()[0]["source_work_id"]
+        opener_work_id = self.q.opener_work_rows()[0]["opener_work_id"]
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
 
-        self.assertFalse(self.q.attach_branch_source_work(
-            self.key, source_work_id, budget=4, ceiling=None,
-            n_words=len(WORDS), source_pattern=0))
-        self.assertEqual(self.q.branches_in_progress(source_work_id), [])
+        self.assertFalse(self.q.attach_branch_opener_work(
+            self.key, opener_work_id, budget=4, ceiling=None,
+            n_words=len(WORDS), opener_pattern=0))
+        self.assertEqual(self.q.branches_in_progress(opener_work_id), [])
 
-    def test_attach_source_work_accepts_compatible_branch(self):
+    def test_attach_opener_work_accepts_compatible_branch(self):
         other_key = ScoreCache.encode_subset(WORDS[:4])
         self.q.add_pending_many([(other_key, 4, 1, "crane", 0)])
-        source_work_id = self.q.source_work_rows()[0]["source_work_id"]
+        opener_work_id = self.q.opener_work_rows()[0]["opener_work_id"]
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
 
-        self.assertTrue(self.q.attach_branch_source_work(
-            self.key, source_work_id, budget=5, ceiling=None,
-            n_words=len(WORDS), source_pattern=0))
-        self.assertEqual(len(self.q.branches_in_progress(source_work_id)), 1)
+        self.assertTrue(self.q.attach_branch_opener_work(
+            self.key, opener_work_id, budget=5, ceiling=None,
+            n_words=len(WORDS), opener_pattern=0))
+        self.assertEqual(len(self.q.branches_in_progress(opener_work_id)), 1)
 
-    def test_attach_source_work_rejects_completed_source(self):
+    def test_attach_opener_work_rejects_completed_opener(self):
         other_key = ScoreCache.encode_subset(WORDS[:4])
         self.q.add_pending_many([(other_key, 4, 1, "crane", 0)])
-        source_work_id = self.q.source_work_rows()[0]["source_work_id"]
+        opener_work_id = self.q.opener_work_rows()[0]["opener_work_id"]
         self.assertTrue(self.q.remove_pending(other_key))
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
 
-        self.assertFalse(self.q.attach_branch_source_work(
-            self.key, source_work_id, budget=5, ceiling=None,
-            n_words=len(WORDS), source_pattern=0))
+        self.assertFalse(self.q.attach_branch_opener_work(
+            self.key, opener_work_id, budget=5, ceiling=None,
+            n_words=len(WORDS), opener_pattern=0))
         self.assertEqual(len(self.q.direct_branches_in_progress()), 1)
 
-    def test_attach_source_work_compares_compatible_lattice_ceilings(self):
+    def test_attach_opener_work_compares_compatible_lattice_ceilings(self):
         other_key = ScoreCache.encode_subset(WORDS[:4])
         self.q.add_pending_many([(other_key, 4, 1, "crane", 0)])
-        source_work_id = self.q.source_work_rows()[0]["source_work_id"]
+        opener_work_id = self.q.opener_work_rows()[0]["opener_work_id"]
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES,
                              budget=5, ceiling=2.0)
 
-        self.assertTrue(self.q.attach_branch_source_work(
-            self.key, source_work_id, budget=5, ceiling=1.8,
-            n_words=len(WORDS), source_pattern=0))
+        self.assertTrue(self.q.attach_branch_opener_work(
+            self.key, opener_work_id, budget=5, ceiling=1.8,
+            n_words=len(WORDS), opener_pattern=0))
 
-    def test_attach_source_work_compares_off_lattice_ceilings(self):
+    def test_attach_opener_work_compares_off_lattice_ceilings(self):
         other_key = ScoreCache.encode_subset(WORDS[:4])
         self.q.add_pending_many([(other_key, 4, 1, "crane", 0)])
-        source_work_id = self.q.source_work_rows()[0]["source_work_id"]
+        opener_work_id = self.q.opener_work_rows()[0]["opener_work_id"]
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES,
                              budget=5, ceiling=2.01)
 
-        self.assertTrue(self.q.attach_branch_source_work(
-            self.key, source_work_id, budget=5, ceiling=1.99,
-            n_words=len(WORDS), source_pattern=0))
+        self.assertTrue(self.q.attach_branch_opener_work(
+            self.key, opener_work_id, budget=5, ceiling=1.99,
+            n_words=len(WORDS), opener_pattern=0))
 
     def test_direct_claim_rejects_newly_owned_branch(self):
         other_key = ScoreCache.encode_subset(WORDS[:4])
         self.q.add_pending_many([(other_key, 4, 1, "crane", 0)])
-        source_work_id = self.q.source_work_rows()[0]["source_work_id"]
+        opener_work_id = self.q.opener_work_rows()[0]["opener_work_id"]
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
-        self.assertTrue(self.q.attach_branch_source_work(
-            self.key, source_work_id, budget=5, ceiling=None,
-            n_words=len(WORDS), source_pattern=0))
+        self.assertTrue(self.q.attach_branch_opener_work(
+            self.key, opener_work_id, budget=5, ceiling=None,
+            n_words=len(WORDS), opener_pattern=0))
 
         self.assertIsNone(self.q.claim_next_bundle(
             self.key, "worker-0", N_CANDIDATES, _IDENTITY_ORDER,
             _ZERO_LOWER_BOUND, small_count=1, count_cap=1,
-            expected_source_work_id=None))
+            expected_opener_work_id=None))
 
     def test_claim_rejects_resolved_expected_owner(self):
         self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 7)])
-        source_work_id = self.q.source_work_rows()[0]["source_work_id"]
+        opener_work_id = self.q.opener_work_rows()[0]["opener_work_id"]
         self.q.create_branch(
             self.key, len(WORDS), N_CANDIDATES, budget=5,
-            source_work_id=source_work_id, source_pattern=7)
+            opener_work_id=opener_work_id, opener_pattern=7)
         self.q.mark_done(self.key)
         self.q.delete_branch(self.key)
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
@@ -254,22 +254,22 @@ class TestBranchLifecycle(_TmpQueue):
         self.assertIsNone(self.q.claim_next_bundle(
             self.key, "worker-0", N_CANDIDATES, _IDENTITY_ORDER,
             _ZERO_LOWER_BOUND, small_count=1, count_cap=1,
-            expected_source_work_id=source_work_id,
-            expected_source_priority=1))
+            expected_opener_work_id=opener_work_id,
+            expected_opener_priority=1))
 
-    def test_claim_rejects_stale_expected_source_priority(self):
+    def test_claim_rejects_stale_expected_opener_priority(self):
         self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 7)])
-        source_work_id = self.q.source_work_rows()[0]["source_work_id"]
+        opener_work_id = self.q.opener_work_rows()[0]["opener_work_id"]
         self.q.create_branch(
             self.key, len(WORDS), N_CANDIDATES, budget=5,
-            source_work_id=source_work_id, source_pattern=7)
-        self.q.set_source_work_priority(source_work_id, 9)
+            opener_work_id=opener_work_id, opener_pattern=7)
+        self.q.set_opener_work_priority(opener_work_id, 9)
 
         self.assertIsNone(self.q.claim_next_bundle(
             self.key, "worker-0", N_CANDIDATES, _IDENTITY_ORDER,
             _ZERO_LOWER_BOUND, small_count=1, count_cap=1,
-            expected_source_work_id=source_work_id,
-            expected_source_priority=1))
+            expected_opener_work_id=opener_work_id,
+            expected_opener_priority=1))
         self.assertEqual(self.q.claims_for_branch(self.key), [])
 
     def test_exact_direct_root_retires_only_its_descendants(self):
@@ -279,15 +279,15 @@ class TestBranchLifecycle(_TmpQueue):
             (self.key, len(WORDS), 1, "crane", 7),
             (other_root_key, 4, 1, "crane", 42),
         ])
-        source_work_id = self.q.source_work_rows()[0]["source_work_id"]
+        opener_work_id = self.q.opener_work_rows()[0]["opener_work_id"]
         self.q.create_branch(
             self.key, len(WORDS), N_CANDIDATES, budget=5,
-            source_work_id=source_work_id, source_pattern=7)
+            opener_work_id=opener_work_id, opener_pattern=7)
         self.q.create_branch(
             descendant_key, 3, N_CANDIDATES, budget=4,
-            source_work_id=source_work_id, source_pattern=7,
+            opener_work_id=opener_work_id, opener_pattern=7,
             parent_branch_key=self.key)
-        self._claim_one_idx(descendant_key, expected_source_work_id=source_work_id)
+        self._claim_one_idx(descendant_key, expected_opener_work_id=opener_work_id)
 
         self.q.try_finalize_branch(self.key)
         self.q.mark_done(self.key)
@@ -296,13 +296,13 @@ class TestBranchLifecycle(_TmpQueue):
         self.assertEqual(self.q.claims_for_branch(descendant_key), [])
         self.assertFalse(self.q.create_branch(
             descendant_key, 3, N_CANDIDATES, budget=4,
-            source_work_id=source_work_id, source_pattern=7,
+            opener_work_id=opener_work_id, opener_pattern=7,
             parent_branch_key=self.key))
         other_root = self.q.get_pending_branch(other_root_key)
         self.assertEqual(other_root["status"], "pending")
-        live_memberships = self.q.source_membership_rows(source_work_id)
+        live_memberships = self.q.opener_membership_rows(opener_work_id)
         self.assertEqual(
-            [(row["branch_id"], row["root_pattern"])
+            [(row["branch_id"], row["opener_pattern"])
              for row in live_memberships],
             [(self.q._intern_branch(other_root_key), 42)])
 
@@ -313,30 +313,30 @@ class TestBranchLifecycle(_TmpQueue):
             (self.key, len(WORDS), 1, "crane", 7),
             (other_root_key, 4, 1, "slate", 42),
         ])
-        sources = {row["source_word"]: row
-                   for row in self.q.source_work_rows()}
+        openers = {row["opener"]: row
+                   for row in self.q.opener_work_rows()}
         self.q.create_branch(
             self.key, len(WORDS), N_CANDIDATES, budget=5,
-            source_work_id=sources["crane"]["source_work_id"], source_pattern=7)
+            opener_work_id=openers["crane"]["opener_work_id"], opener_pattern=7)
         self.q.create_branch(
             descendant_key, 3, N_CANDIDATES, budget=4,
-            source_work_id=sources["crane"]["source_work_id"], source_pattern=7,
+            opener_work_id=openers["crane"]["opener_work_id"], opener_pattern=7,
             parent_branch_key=self.key)
-        self.assertTrue(self.q.attach_branch_source_work(
-            descendant_key, sources["slate"]["source_work_id"], budget=4,
-            ceiling=None, n_words=3, source_pattern=42,
+        self.assertTrue(self.q.attach_branch_opener_work(
+            descendant_key, openers["slate"]["opener_work_id"], budget=4,
+            ceiling=None, n_words=3, opener_pattern=42,
             parent_branch_key=other_root_key))
 
         self.q.try_finalize_branch(self.key)
         self.q.mark_done(self.key)
 
         self.assertIsNotNone(self.q.get_active_branch(descendant_key))
-        live_memberships = self.q.source_membership_rows()
+        live_memberships = self.q.opener_membership_rows()
         descendant_memberships = [row for row in live_memberships
                                   if row["branch_id"]
                                   == self.q._intern_branch(descendant_key)]
         self.assertEqual(len(descendant_memberships), 1)
-        self.assertEqual(descendant_memberships[0]["source_word"], "slate")
+        self.assertEqual(descendant_memberships[0]["opener"], "slate")
 
     def test_malformed_pending_schema_reports_schema_drift(self):
         self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 0)])
@@ -349,16 +349,16 @@ class TestBranchLifecycle(_TmpQueue):
                     branch_id INTEGER PRIMARY KEY,
                     n_words INTEGER NOT NULL,
                     priority INTEGER NOT NULL DEFAULT 0,
-                    source_word TEXT,
+                    opener TEXT,
                     status TEXT NOT NULL DEFAULT 'pending',
                     claimed_by TEXT,
                     claimed_at INTEGER,
                     completed_at INTEGER
                 );
                 INSERT INTO pending_branches_without_pattern
-                    (branch_id, n_words, priority, source_word, status,
+                    (branch_id, n_words, priority, opener, status,
                      claimed_by, claimed_at, completed_at)
-                    SELECT branch_id, n_words, priority, source_word, status,
+                    SELECT branch_id, n_words, priority, opener, status,
                            claimed_by, claimed_at, completed_at
                     FROM pending_branches;
                 DROP TABLE pending_branches;
@@ -373,38 +373,190 @@ class TestBranchLifecycle(_TmpQueue):
                                     "pending_branches is missing column"):
             ERDQueue(queue_path)
 
-    def test_source_work_migration_preserves_root_pattern_idempotently(self):
+    def test_opener_work_migration_preserves_opener_pattern_idempotently(self):
         self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 42)])
-        self.q._conn.execute("DELETE FROM branch_source_work")
-        self.q._conn.execute("DELETE FROM source_work")
+        self.q._conn.execute("DELETE FROM branch_opener_work")
+        self.q._conn.execute("DELETE FROM opener_work")
         self.q.close()
 
         migrated = ERDQueue(self.queue_path)
         try:
             claimed = migrated.claim_next("worker-0")
-            self.assertEqual(claimed["source_pattern"], 42)
-            self.assertEqual(claimed["source_word"], "crane")
+            self.assertEqual(claimed["opener_pattern"], 42)
+            self.assertEqual(claimed["opener"], "crane")
             self.assertLessEqual(
-                migrated.source_work_rows()[0]["requested_at"], int(time.time()))
+                migrated.opener_work_rows()[0]["requested_at"], int(time.time()))
         finally:
             migrated.close()
 
         reopened = ERDQueue(self.queue_path)
         try:
-            self.assertEqual(len(reopened.source_work_rows()), 1)
-            self.assertEqual(reopened.source_work_rows()[0]["root_count"], 1)
+            self.assertEqual(len(reopened.opener_work_rows()), 1)
+            self.assertEqual(reopened.opener_work_rows()[0]["root_count"], 1)
         finally:
             reopened.close()
 
-    def test_first_claim_records_source_work_start_time(self):
+    def _revert_to_pre_opener_schema(self):
+        """Rewrite the queue file at self.queue_path into the pre-Tier-B
+        source_work/branch_source_work/source_word/source_pattern shape,
+        starting from whatever opener_* rows the current test has already
+        populated through self.q.  Used to prove rename_source_to_opener
+        migrates a real legacy database rather than only a synthetic one.
+
+        ALTER TABLE ... RENAME TO does not rename a table's indexes -- a
+        real pre-Tier-B database carries idx_source_work_priority_order and
+        idx_branch_source_work_source under those exact names, from when
+        they were first created against source_work/branch_source_work, not
+        under the new names with the old ones dropped.  So the old-named
+        indexes are recreated here (before the column/table renames below,
+        so RENAME COLUMN carries their definitions forward the same way it
+        does for the views) rather than simply removing the new ones."""
+        self.q.close()
+        conn = sqlite3.connect(self.queue_path)
+        try:
+            conn.executescript("""
+                DROP VIEW IF EXISTS active_branch_owner_rows;
+                DROP VIEW IF EXISTS live_branch_opener_rows;
+                DROP INDEX IF EXISTS idx_opener_work_priority_order;
+                CREATE INDEX idx_source_work_priority_order
+                    ON opener_work(requested_priority DESC, opener_work_id);
+                DROP INDEX IF EXISTS idx_branch_opener_work_opener;
+                CREATE INDEX idx_branch_source_work_source
+                    ON branch_opener_work(opener_work_id, branch_id);
+                ALTER TABLE opener_work RENAME COLUMN opener TO source_word;
+                ALTER TABLE opener_work
+                    RENAME COLUMN opener_work_id TO source_work_id;
+                ALTER TABLE opener_work RENAME TO source_work;
+                ALTER TABLE branch_opener_work
+                    RENAME COLUMN opener_pattern TO root_pattern;
+                ALTER TABLE branch_opener_work
+                    RENAME COLUMN opener_work_id TO source_work_id;
+                ALTER TABLE branch_opener_work RENAME TO branch_source_work;
+                ALTER TABLE pending_branches RENAME COLUMN opener TO source_word;
+                ALTER TABLE pending_branches
+                    RENAME COLUMN opener_pattern TO source_pattern;
+                ALTER TABLE active_branches RENAME COLUMN opener TO source_word;
+                ALTER TABLE active_branches
+                    RENAME COLUMN opener_pattern TO source_pattern;
+                ALTER TABLE active_branches RENAME COLUMN
+                    requires_opener_membership TO requires_source_membership;
+                ALTER TABLE worker_heartbeat
+                    RENAME COLUMN opener_work_id TO source_work_id;
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+        telemetry_conn = sqlite3.connect(erd_queue.derive_telemetry_path(self.queue_path))
+        try:
+            telemetry_conn.execute(
+                "ALTER TABLE candidate_accuracy RENAME COLUMN opener TO source_word")
+            telemetry_conn.commit()
+        finally:
+            telemetry_conn.close()
+
+    def test_rename_source_to_opener_migration_preserves_data_on_a_legacy_database(self):
+        pending_key = ScoreCache.encode_subset(WORDS[:4])
+        self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 42)])
+        self.q.add_pending_many([(pending_key, 4, 1, "slate", 7)])
+        claimed = self.q.claim_next("worker-0")
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES,
+                             priority=claimed["priority"],
+                             opener_work_id=claimed["opener_work_id"],
+                             opener="crane", opener_pattern=42)
+        self.q.add_candidate_accuracy(
+            self.key, len(WORDS), 5, 1.0, 1.0, 1.0, False, 3,
+            group_sizes="1-2", opener="crane")
+
+        self._revert_to_pre_opener_schema()
+
+        migrated = ERDQueue(self.queue_path)
+        try:
+            table_names = {row["name"] for row in migrated._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'")}
+            self.assertIn("opener_work", table_names)
+            self.assertIn("branch_opener_work", table_names)
+            self.assertNotIn("source_work", table_names)
+            self.assertNotIn("branch_source_work", table_names)
+
+            # ALTER TABLE ... RENAME TO does not rename a table's indexes, so
+            # the legacy-named indexes (still attached to opener_work/
+            # branch_opener_work after the table rename above) must be
+            # dropped explicitly rather than left to coexist as duplicates
+            # alongside the newly created ones.
+            index_names = {row["name"] for row in migrated._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'")}
+            self.assertNotIn("idx_source_work_priority_order", index_names)
+            self.assertNotIn("idx_branch_source_work_source", index_names)
+            self.assertIn("idx_opener_work_priority_order", index_names)
+            self.assertIn("idx_branch_opener_work_opener", index_names)
+
+            opener_rows = {row["opener"]: row
+                          for row in migrated.opener_work_rows()}
+            self.assertEqual(set(opener_rows), {"crane", "slate"})
+            pending_row = migrated._conn.execute(
+                "SELECT opener, opener_pattern FROM pending_branches "
+                "WHERE opener = 'slate'").fetchone()
+            self.assertEqual(pending_row["opener"], "slate")
+            self.assertEqual(pending_row["opener_pattern"], 7)
+            active_row = migrated._conn.execute(
+                "SELECT opener, opener_pattern, requires_opener_membership "
+                "FROM active_branches WHERE opener = 'crane'").fetchone()
+            self.assertEqual(active_row["opener"], "crane")
+            self.assertEqual(active_row["opener_pattern"], 42)
+
+            membership_row = migrated._conn.execute(
+                "SELECT opener_pattern FROM branch_opener_work "
+                "LIMIT 1").fetchone()
+            self.assertEqual(membership_row["opener_pattern"], 42)
+
+            accuracy_row = migrated._conn.execute(
+                "SELECT opener FROM telemetry.candidate_accuracy "
+                "LIMIT 1").fetchone()
+            self.assertEqual(accuracy_row["opener"], "crane")
+
+            # The migrated schema must still validate against current code's
+            # expectations, and the pre-opener-aware backfill (which fires
+            # only when opener_work is empty) must not have run a second
+            # time against data the rename already carried over.
+            migrated._assert_schema()
+            self.assertEqual(len(migrated.opener_work_rows()), 2)
+            self.assertEqual(migrated.check_opener_work_invariants(), [])
+        finally:
+            migrated.close()
+
+        # Idempotent: reopening an already-migrated database applies no
+        # further ALTER TABLE and leaves the data exactly as it was.
+        reopened = ERDQueue(self.queue_path)
+        try:
+            self.assertEqual(len(reopened.opener_work_rows()), 2)
+            reopened._assert_schema()
+        finally:
+            reopened.close()
+
+    def test_rename_source_to_opener_migration_is_a_noop_on_a_fresh_database(self):
+        # A fresh database is created directly under the new opener_* names
+        # (the schema script already spells them that way), so the rename
+        # migration must find nothing to rename rather than raising on a
+        # missing source_work/branch_source_work table.
+        self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 42)])
+        self.q.close()
+
+        reopened = ERDQueue(self.queue_path)
+        try:
+            self.assertEqual(len(reopened.opener_work_rows()), 1)
+            self.assertEqual(reopened.opener_work_rows()[0]["opener"], "crane")
+        finally:
+            reopened.close()
+
+    def test_first_claim_records_opener_work_start_time(self):
         self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 42)])
 
         claimed = self.q.claim_next("worker-0")
 
-        source = self.q.source_work_rows()[0]
-        self.assertEqual(source["source_work_id"], claimed["source_work_id"])
-        self.assertEqual(source["state"], "active")
-        self.assertIsNotNone(source["started_at"])
+        opener_row = self.q.opener_work_rows()[0]
+        self.assertEqual(opener_row["opener_work_id"], claimed["opener_work_id"])
+        self.assertEqual(opener_row["state"], "active")
+        self.assertIsNotNone(opener_row["started_at"])
 
     def test_view_migration_rebuilds_drifted_views_without_rewriting_current_views(self):
         expected_views = {
@@ -412,16 +564,16 @@ class TestBranchLifecycle(_TmpQueue):
             for row in self.q._conn.execute("""
                 SELECT name, sql FROM sqlite_master
                 WHERE type = 'view'
-                  AND name IN ('live_branch_source_rows',
+                  AND name IN ('live_branch_opener_rows',
                                'active_branch_owner_rows')
             """)
         }
         self.q.close()
         conn = sqlite3.connect(self.queue_path)
         try:
-            conn.execute("DROP VIEW live_branch_source_rows")
+            conn.execute("DROP VIEW live_branch_opener_rows")
             conn.execute(
-                "CREATE VIEW live_branch_source_rows AS SELECT 0 AS branch_id")
+                "CREATE VIEW live_branch_opener_rows AS SELECT 0 AS branch_id")
             conn.commit()
         finally:
             conn.close()
@@ -433,7 +585,7 @@ class TestBranchLifecycle(_TmpQueue):
                 for row in rebuilt._conn.execute("""
                     SELECT name, sql FROM sqlite_master
                     WHERE type = 'view'
-                      AND name IN ('live_branch_source_rows',
+                      AND name IN ('live_branch_opener_rows',
                                    'active_branch_owner_rows')
                 """)
             }
@@ -458,16 +610,16 @@ class TestBranchLifecycle(_TmpQueue):
             for statement in statements
         ))
 
-    def test_source_work_migration_marks_terminal_roots_complete(self):
+    def test_opener_work_migration_marks_terminal_roots_complete(self):
         self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 42)])
         self.q.mark_done(self.key)
-        self.q._conn.execute("DELETE FROM branch_source_work")
-        self.q._conn.execute("DELETE FROM source_work")
+        self.q._conn.execute("DELETE FROM branch_opener_work")
+        self.q._conn.execute("DELETE FROM opener_work")
         self.q.close()
 
         migrated = ERDQueue(self.queue_path)
         try:
-            rows = migrated.source_work_rows()
+            rows = migrated.opener_work_rows()
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["state"], "complete")
         finally:
@@ -475,7 +627,7 @@ class TestBranchLifecycle(_TmpQueue):
 
         reopened = ERDQueue(self.queue_path)
         try:
-            self.assertEqual(reopened.source_work_rows()[0]["state"], "complete")
+            self.assertEqual(reopened.opener_work_rows()[0]["state"], "complete")
         finally:
             reopened.close()
 
@@ -695,10 +847,10 @@ class TestStartupRecovery(_TmpQueue):
     def test_recover_active_branches_frees_in_flight_claims_only(self):
         # A user-queued branch is identified by its pending_branches row.
         self.q.add_pending_many([(self.key, len(WORDS), 0, None, None)])
-        source_work_id = self.q.source_work_rows()[0]["source_work_id"]
+        opener_work_id = self.q.opener_work_rows()[0]["opener_work_id"]
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES)
         self._claim_one_idx(
-            self.key, "worker-0", source_work_id, 0)
+            self.key, "worker-0", opener_work_id, 0)
         n_b, n_c = self.q.recover_active_branches()
         self.assertEqual(n_b, 1)
         self.assertEqual(n_c, 1)
@@ -735,10 +887,10 @@ class TestStartupRecovery(_TmpQueue):
         # User-queued branch: has a pending_branches row.
         d0_key = self.key
         self.q.add_pending_many([(d0_key, len(WORDS), 0, None, None)])
-        source_work_id = self.q.source_work_rows()[0]["source_work_id"]
+        opener_work_id = self.q.opener_work_rows()[0]["opener_work_id"]
         self.q.create_branch(d0_key, len(WORDS), N_CANDIDATES)
         idx_done = self._claim_one_idx(
-            d0_key, "worker-0", source_work_id, 0)
+            d0_key, "worker-0", opener_work_id, 0)
         self.q.complete_candidate(d0_key, idx_done)
 
         # Cooperative branch: no pending_branches row.
@@ -887,7 +1039,7 @@ class TestClaimNext(_TmpQueue):
     def test_legacy_priority_is_clamped_but_still_claimable(self):
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES,
                              priority=erd_queue.LEGACY_PROMOTED_PRIORITY_MIN,
-                             source_word='crane')
+                             opener='crane')
 
         owner = self.q.owner_row_for_branch(self.key)
         self.assertEqual(owner['owner_priority'], 0)
@@ -901,12 +1053,12 @@ class TestClaimNext(_TmpQueue):
             'UPDATE active_branches SET priority = 0 WHERE branch_id = ?',
             (self.q._intern_branch(self.key),))
 
-    def test_invariant_reports_legacy_priority_with_source_and_membership(self):
+    def test_invariant_reports_legacy_priority_with_opener_and_membership(self):
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES,
                              priority=erd_queue.LEGACY_PROMOTED_PRIORITY_MIN,
-                             source_word='crane')
+                             opener='crane')
 
-        violations = self.q.check_source_work_invariants()
+        violations = self.q.check_opener_work_invariants()
 
         self.assertIn(
             '1 open branch(es) at or above legacy priority 1,000,000: crane '
@@ -915,57 +1067,57 @@ class TestClaimNext(_TmpQueue):
             'UPDATE active_branches SET priority = 0 WHERE branch_id = ?',
             (self.q._intern_branch(self.key),))
 
-    def test_source_work_invariant_checker_reports_each_violation(self):
+    def test_opener_work_invariant_checker_reports_each_violation(self):
         other_key = ScoreCache.encode_subset(WORDS[:4])
         direct_key = ScoreCache.encode_subset(WORDS[:3])
         self.q.add_pending_many([
             (self.key, len(WORDS), 1, "crane", 7),
             (other_key, 4, 2, "slate", 42),
         ])
-        sources = {row["source_word"]: row for row in self.q.source_work_rows()}
+        openers = {row["opener"]: row for row in self.q.opener_work_rows()}
         claimed = self.q.claim_next(
-            "worker-0", sources["crane"]["source_work_id"])
+            "worker-0", openers["crane"]["opener_work_id"])
         self.q.create_branch(
             self.key, len(WORDS), N_CANDIDATES,
-            priority=claimed["priority"], source_work_id=claimed["source_work_id"])
+            priority=claimed["priority"], opener_work_id=claimed["opener_work_id"])
         self.q.create_branch(
-            direct_key, 3, N_CANDIDATES, priority=SOURCE_PRIORITY_MIN - 1)
+            direct_key, 3, N_CANDIDATES, priority=OPENER_PRIORITY_MIN - 1)
         self.q._conn.execute(
-            "DELETE FROM branch_source_work WHERE source_work_id = ?",
-            (sources["crane"]["source_work_id"],))
+            "DELETE FROM branch_opener_work WHERE opener_work_id = ?",
+            (openers["crane"]["opener_work_id"],))
         self.q._conn.execute(
             "DELETE FROM pending_branches WHERE branch_id = ?",
             (self.q._intern_branch(other_key),))
         self.q._conn.execute(
-            "UPDATE source_work SET requested_priority = -1 "
-            "WHERE source_work_id = ?",
-            (sources["crane"]["source_work_id"],))
+            "UPDATE opener_work SET requested_priority = -1 "
+            "WHERE opener_work_id = ?",
+            (openers["crane"]["opener_work_id"],))
         self.q._conn.execute(
-            "UPDATE source_work SET state = 'complete' "
-            "WHERE source_work_id = ?",
-            (sources["slate"]["source_work_id"],))
+            "UPDATE opener_work SET state = 'complete' "
+            "WHERE opener_work_id = ?",
+            (openers["slate"]["opener_work_id"],))
         self.q._conn.execute(
-            "UPDATE branch_source_work SET parent_branch_id = ? "
-            "WHERE source_work_id = ?",
+            "UPDATE branch_opener_work SET parent_branch_id = ? "
+            "WHERE opener_work_id = ?",
             (self.q._intern_branch(direct_key),
-             sources["slate"]["source_work_id"])
+             openers["slate"]["opener_work_id"])
         )
 
-        violations = self.q.check_source_work_invariants()
+        violations = self.q.check_opener_work_invariants()
         joined = "\n".join(violations)
         self.assertIn("has neither pending/in-progress work", joined)
-        self.assertIn("complete source_work_id", joined)
-        self.assertIn("unfinished source_work_id", joined)
-        self.assertIn("source-owned open branch_id", joined)
+        self.assertIn("complete opener_work_id", joined)
+        self.assertIn("unfinished opener_work_id", joined)
+        self.assertIn("opener-owned open branch_id", joined)
         self.assertIn(
             f"requested priority -1 outside "
-            f"{SOURCE_PRIORITY_MIN}..{SOURCE_PRIORITY_MAX}", joined)
-        # Below the range rather than above it: SOURCE_PRIORITY_MAX + 1 is
+            f"{OPENER_PRIORITY_MIN}..{OPENER_PRIORITY_MAX}", joined)
+        # Below the range rather than above it: OPENER_PRIORITY_MAX + 1 is
         # exactly LEGACY_PROMOTED_PRIORITY_MIN, which the legacy-band check
         # claims first.
         self.assertIn(
-            f"effective priority {SOURCE_PRIORITY_MIN - 1} outside "
-            f"{SOURCE_PRIORITY_MIN}..{SOURCE_PRIORITY_MAX}", joined)
+            f"effective priority {OPENER_PRIORITY_MIN - 1} outside "
+            f"{OPENER_PRIORITY_MIN}..{OPENER_PRIORITY_MAX}", joined)
         self.assertIn("that the same request does not own", joined)
         self.assertNotIn(
             self.key,
@@ -985,24 +1137,24 @@ class TestClaimNext(_TmpQueue):
         crane = self.q.claim_next("worker-0")
         self.q.create_branch(
             self.key, len(WORDS), N_CANDIDATES, budget=5,
-            priority=crane["priority"], source_word=crane["source_word"],
-            source_pattern=crane["source_pattern"],
-            source_work_id=crane["source_work_id"])
+            priority=crane["priority"], opener=crane["opener"],
+            opener_pattern=crane["opener_pattern"],
+            opener_work_id=crane["opener_work_id"])
         branch_id = self.q._intern_branch(self.key)
         # This is the branch's only membership, so retracting it must also
         # retire the request itself -- exactly what _complete_finished_
-        # source_work does once nothing live references it -- to keep the
+        # opener_work does once nothing live references it -- to keep the
         # rest of the database internally consistent while isolating the
         # one violation under test.
         self.q._conn.execute(
-            "DELETE FROM branch_source_work WHERE branch_id = ?", (branch_id,))
+            "DELETE FROM branch_opener_work WHERE branch_id = ?", (branch_id,))
         self.q._conn.execute(
-            "UPDATE source_work SET state = 'complete' "
-            "WHERE source_work_id = ?", (crane["source_work_id"],))
+            "UPDATE opener_work SET state = 'complete' "
+            "WHERE opener_work_id = ?", (crane["opener_work_id"],))
 
-        violations = self.q.check_source_work_invariants()
+        violations = self.q.check_opener_work_invariants()
         self.assertEqual(violations,
-                         [f"source-owned open branch_id {branch_id} has no "
+                         [f"opener-owned open branch_id {branch_id} has no "
                           "live membership"])
         self.assertEqual(self.q.direct_branches_in_progress(), [])
 
@@ -1010,8 +1162,8 @@ class TestClaimNext(_TmpQueue):
 
         self.assertEqual(demoted, [branch_id])
         self.assertEqual(
-            self.q.get_active_branch(self.key)["requires_source_membership"], 0)
-        self.assertEqual(self.q.check_source_work_invariants(), [])
+            self.q.get_active_branch(self.key)["requires_opener_membership"], 0)
+        self.assertEqual(self.q.check_opener_work_invariants(), [])
         self.assertEqual(
             [bytes(row["branch_key"])
              for row in self.q.direct_branches_in_progress()],
@@ -1028,16 +1180,16 @@ class TestClaimNext(_TmpQueue):
         crane = self.q.claim_next("worker-0")
         self.q.create_branch(
             self.key, len(WORDS), N_CANDIDATES, budget=5,
-            priority=crane["priority"], source_word=crane["source_word"],
-            source_pattern=crane["source_pattern"],
-            source_work_id=crane["source_work_id"])
+            priority=crane["priority"], opener=crane["opener"],
+            opener_pattern=crane["opener_pattern"],
+            opener_work_id=crane["opener_work_id"])
 
         self.assertEqual(self.q.reconcile_orphaned_branch_ownership(), [])
         self.assertEqual(
-            self.q.get_active_branch(self.key)["requires_source_membership"], 1)
+            self.q.get_active_branch(self.key)["requires_opener_membership"], 1)
 
     def test_resolve_branch_memberships_self_heals_orphaned_sibling(self):
-        # Two branches promoted under the same source-work request: the root
+        # Two branches promoted under the same opener-work request: the root
         # (self.key) finalizes normally while its sibling (other_key) was
         # already orphaned by a one-level ERD-prune race and never touched
         # again.  Finalizing the root must not silently strand the sibling
@@ -1048,30 +1200,30 @@ class TestClaimNext(_TmpQueue):
             (self.key, len(WORDS), 9, "crane", 7),
             (other_key, 4, 9, "crane", 8),
         ])
-        source_work_id = self.q.source_work_rows()[0]["source_work_id"]
-        root = self.q.claim_next("worker-0", source_work_id)
+        opener_work_id = self.q.opener_work_rows()[0]["opener_work_id"]
+        root = self.q.claim_next("worker-0", opener_work_id)
         self.q.create_branch(
             self.key, len(WORDS), N_CANDIDATES, budget=5,
-            priority=root["priority"], source_word=root["source_word"],
-            source_pattern=root["source_pattern"],
-            source_work_id=root["source_work_id"])
-        sibling = self.q.claim_next("worker-0", source_work_id)
+            priority=root["priority"], opener=root["opener"],
+            opener_pattern=root["opener_pattern"],
+            opener_work_id=root["opener_work_id"])
+        sibling = self.q.claim_next("worker-0", opener_work_id)
         self.q.create_branch(
             other_key, 4, N_CANDIDATES, budget=5,
-            priority=sibling["priority"], source_word=sibling["source_word"],
-            source_pattern=sibling["source_pattern"],
-            source_work_id=sibling["source_work_id"])
+            priority=sibling["priority"], opener=sibling["opener"],
+            opener_pattern=sibling["opener_pattern"],
+            opener_work_id=sibling["opener_work_id"])
         other_branch_id = self.q._intern_branch(other_key)
         self.q._conn.execute(
-            "DELETE FROM branch_source_work WHERE branch_id = ?",
+            "DELETE FROM branch_opener_work WHERE branch_id = ?",
             (other_branch_id,))
 
         self.q.mark_done(self.key)
         self.q.delete_branch(self.key)
 
         self.assertEqual(
-            self.q.get_active_branch(other_key)["requires_source_membership"], 0)
-        self.assertEqual(self.q.check_source_work_invariants(), [])
+            self.q.get_active_branch(other_key)["requires_opener_membership"], 0)
+        self.assertEqual(self.q.check_opener_work_invariants(), [])
         self.assertEqual(
             [bytes(row["branch_key"])
              for row in self.q.direct_branches_in_progress()],
@@ -1102,7 +1254,7 @@ class TestClaimNext(_TmpQueue):
         self.q.claim_next("worker-0")       # claims the only pending branch
         self.assertIsNone(self.q.claim_next("worker-1"))  # nothing left
 
-    def test_equal_priority_source_work_keeps_started_source_admitted(self):
+    def test_equal_priority_opener_work_keeps_started_opener_admitted(self):
         later_key = ScoreCache.encode_subset(WORDS[:3])
         earlier_second_key = ScoreCache.encode_subset(WORDS[1:])
         self.q.add_pending_many([
@@ -1112,107 +1264,107 @@ class TestClaimNext(_TmpQueue):
         self.q.add_pending_many([(later_key, 3, 5, "slate", 0)])
 
         first = self.q.claim_next("worker-0")
-        self.assertEqual(first["source_word"], "crane")
+        self.assertEqual(first["opener"], "crane")
         second = self.q.claim_next("worker-1")
-        self.assertEqual(second["source_word"], "crane")
+        self.assertEqual(second["opener"], "crane")
 
-    def test_source_priority_updates_active_and_pending_membership(self):
-        self.assertFalse(self.q.has_source_work())
+    def test_opener_priority_updates_active_and_pending_membership(self):
+        self.assertFalse(self.q.has_opener_work())
         self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 0)])
-        self.assertTrue(self.q.has_source_work())
+        self.assertTrue(self.q.has_opener_work())
         claimed = self.q.claim_next("worker-0")
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES,
                              priority=claimed["priority"],
-                             source_work_id=claimed["source_work_id"])
-        self.assertTrue(self.q.set_source_work_priority(
-            claimed["source_work_id"], 9))
+                             opener_work_id=claimed["opener_work_id"])
+        self.assertTrue(self.q.set_opener_work_priority(
+            claimed["opener_work_id"], 9))
         self.assertEqual(self.q.get_branch(self.key)["priority"], 9)
-        self.assertEqual(self.q.source_work_candidates()[0]["requested_priority"], 9)
-        rows = self.q.source_work_rows()
+        self.assertEqual(self.q.opener_work_candidates()[0]["requested_priority"], 9)
+        rows = self.q.opener_work_rows()
         self.assertEqual(rows[0]["root_count"], 1)
         self.assertEqual(rows[0]["branch_count"], 1)
         self.assertIsNotNone(self.q.claim_next_bundle(
             self.key, "worker-1", N_CANDIDATES, _IDENTITY_ORDER,
             _ZERO_LOWER_BOUND, small_count=1, count_cap=1,
-            expected_source_work_id=claimed["source_work_id"]))
+            expected_opener_work_id=claimed["opener_work_id"]))
 
-    def test_source_priority_rejects_invalid_and_completed_requests(self):
+    def test_opener_priority_rejects_invalid_and_completed_requests(self):
         self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 0)])
-        source_work_id = self.q.source_work_rows()[0]["source_work_id"]
-        for priority in (-1, SOURCE_PRIORITY_MAX + 1):
+        opener_work_id = self.q.opener_work_rows()[0]["opener_work_id"]
+        for priority in (-1, OPENER_PRIORITY_MAX + 1):
             with self.assertRaisesRegex(
                     ValueError,
-                    f"between {SOURCE_PRIORITY_MIN} and {SOURCE_PRIORITY_MAX}"):
-                self.q.set_source_work_priority(source_work_id, priority)
+                    f"between {OPENER_PRIORITY_MIN} and {OPENER_PRIORITY_MAX}"):
+                self.q.set_opener_work_priority(opener_work_id, priority)
         self.assertEqual(
-            self.q.source_work_rows()[0]["requested_priority"], 1)
+            self.q.opener_work_rows()[0]["requested_priority"], 1)
 
-        self.q.claim_next("worker-0", source_work_id)
+        self.q.claim_next("worker-0", opener_work_id)
         self.q.mark_done(self.key)
-        self.assertFalse(self.q.set_source_work_priority(source_work_id, 2))
+        self.assertFalse(self.q.set_opener_work_priority(opener_work_id, 2))
         self.assertEqual(
-            self.q.source_work_rows()[0]["requested_priority"], 1)
+            self.q.opener_work_rows()[0]["requested_priority"], 1)
 
     def test_add_pending_many_rejects_priority_outside_range(self):
         other_key = ScoreCache.encode_subset(WORDS[:4])
-        for priority in (-1, SOURCE_PRIORITY_MAX + 1):
+        for priority in (-1, OPENER_PRIORITY_MAX + 1):
             with self.assertRaisesRegex(
                     ValueError,
-                    f"between {SOURCE_PRIORITY_MIN} and {SOURCE_PRIORITY_MAX}"):
+                    f"between {OPENER_PRIORITY_MIN} and {OPENER_PRIORITY_MAX}"):
                 self.q.add_pending_many([
                     (self.key, len(WORDS), 1, "crane", 0),
                     (other_key, 4, priority, "slate", 0),
                 ])
         # The whole batch is rejected before any write, so neither the
         # out-of-range row nor the valid row it travelled with is queued.
-        self.assertEqual(self.q.source_work_rows(), [])
+        self.assertEqual(self.q.opener_work_rows(), [])
         self.assertFalse(self.q.has_pending_row(self.key))
         self.assertFalse(self.q.has_pending_row(other_key))
-        self.assertEqual(self.q.check_source_work_invariants(), [])
+        self.assertEqual(self.q.check_opener_work_invariants(), [])
 
-    def test_owner_row_for_branch_has_canonical_direct_and_source_columns(self):
+    def test_owner_row_for_branch_has_canonical_direct_and_opener_columns(self):
         direct_key = ScoreCache.encode_subset(WORDS[:3])
         self.q.create_branch(direct_key, 3, N_CANDIDATES, priority=3)
         direct_row = self.q.owner_row_for_branch(direct_key)
         direct_list_row = self.q.direct_branches_in_progress()[0]
         self.assertEqual(set(direct_row.keys()), set(direct_list_row.keys()))
-        self.assertIsNone(direct_row["source_work_id"])
+        self.assertIsNone(direct_row["opener_work_id"])
         self.assertEqual(direct_row["owner_priority"], 3)
 
         self.q.add_pending_many([(self.key, len(WORDS), 7, "crane", 42)])
         claimed = self.q.claim_next("worker-0")
         self.q.create_branch(
             self.key, len(WORDS), N_CANDIDATES, priority=claimed["priority"],
-            source_work_id=claimed["source_work_id"], source_pattern=42)
-        source_row = self.q.owner_row_for_branch(self.key)
-        source_list_row = self.q.branches_in_progress(
-            claimed["source_work_id"])[0]
-        self.assertEqual(set(source_row.keys()), set(source_list_row.keys()))
-        self.assertEqual(source_row["source_work_id"], claimed["source_work_id"])
+            opener_work_id=claimed["opener_work_id"], opener_pattern=42)
+        opener_row = self.q.owner_row_for_branch(self.key)
+        opener_list_row = self.q.branches_in_progress(
+            claimed["opener_work_id"])[0]
+        self.assertEqual(set(opener_row.keys()), set(opener_list_row.keys()))
+        self.assertEqual(opener_row["opener_work_id"], claimed["opener_work_id"])
 
     def test_shared_root_claim_uses_selected_owner_pattern(self):
         self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 7)])
         self.q.add_pending_many([(self.key, len(WORDS), 9, "slate", 42)])
-        slate = next(row for row in self.q.source_work_rows()
-                     if row["source_word"] == "slate")
-        claimed = self.q.claim_next("worker-0", slate["source_work_id"])
-        self.assertEqual(claimed["source_word"], "slate")
-        self.assertEqual(claimed["source_pattern"], 42)
+        slate = next(row for row in self.q.opener_work_rows()
+                     if row["opener"] == "slate")
+        claimed = self.q.claim_next("worker-0", slate["opener_work_id"])
+        self.assertEqual(claimed["opener"], "slate")
+        self.assertEqual(claimed["opener_pattern"], 42)
 
     def test_active_shared_root_uses_selected_owner_metadata(self):
         self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 7)])
         self.q.add_pending_many([(self.key, len(WORDS), 9, "slate", 42)])
-        rows = {row["source_word"]: row for row in self.q.source_work_rows()}
-        crane = self.q.claim_next("worker-0", rows["crane"]["source_work_id"])
+        rows = {row["opener"]: row for row in self.q.opener_work_rows()}
+        crane = self.q.claim_next("worker-0", rows["crane"]["opener_work_id"])
         self.q.create_branch(
             self.key, len(WORDS), N_CANDIDATES, priority=crane["priority"],
-            source_word=crane["source_word"],
-            source_pattern=crane["source_pattern"],
-            source_work_id=crane["source_work_id"])
+            opener=crane["opener"],
+            opener_pattern=crane["opener_pattern"],
+            opener_work_id=crane["opener_work_id"])
 
-        active = self.q.branches_in_progress(rows["slate"]["source_work_id"])[0]
-        self.assertEqual(active["owner_source_word"], "slate")
-        self.assertEqual(active["owner_root_pattern"], 42)
+        active = self.q.branches_in_progress(rows["slate"]["opener_work_id"])[0]
+        self.assertEqual(active["owner_opener"], "slate")
+        self.assertEqual(active["owner_opener_pattern"], 42)
         self.assertEqual(active["owner_priority"], 9)
 
     def test_completed_owner_stays_resolved_when_branch_is_reactivated(self):
@@ -1220,32 +1372,32 @@ class TestClaimNext(_TmpQueue):
         crane = self.q.claim_next("worker-0")
         self.q.create_branch(
             self.key, len(WORDS), N_CANDIDATES, budget=5,
-            priority=crane["priority"], source_word=crane["source_word"],
-            source_pattern=crane["source_pattern"],
-            source_work_id=crane["source_work_id"])
+            priority=crane["priority"], opener=crane["opener"],
+            opener_pattern=crane["opener_pattern"],
+            opener_work_id=crane["opener_work_id"])
         self.q.mark_done(self.key)
         self.q.delete_branch(self.key)
 
         self.q.add_pending_many([(self.key, len(WORDS), 1, "slate", 42)])
-        slate = next(row for row in self.q.source_work_rows()
-                     if row["source_word"] == "slate")
+        slate = next(row for row in self.q.opener_work_rows()
+                     if row["opener"] == "slate")
         self.q.create_branch(
             self.key, len(WORDS), N_CANDIDATES, budget=4,
-            priority=1, source_word="slate", source_pattern=42,
-            source_work_id=slate["source_work_id"])
+            priority=1, opener="slate", opener_pattern=42,
+            opener_work_id=slate["opener_work_id"])
 
-        candidates = self.q.source_work_candidates()
-        self.assertEqual([row["source_word"] for row in candidates], ["slate"])
+        candidates = self.q.opener_work_candidates()
+        self.assertEqual([row["opener"] for row in candidates], ["slate"])
         provenance = self.q._conn.execute("""
-            SELECT source.source_word, membership.resolved_at
-            FROM branch_source_work AS membership
-            JOIN source_work AS source USING (source_work_id)
+            SELECT opener.opener, membership.resolved_at
+            FROM branch_opener_work AS membership
+            JOIN opener_work AS opener USING (opener_work_id)
             WHERE membership.branch_id = ?
-            ORDER BY source.source_work_id
+            ORDER BY opener.opener_work_id
         """, (self.q._intern_branch(self.key),)).fetchall()
-        self.assertEqual(provenance[0]["source_word"], "crane")
+        self.assertEqual(provenance[0]["opener"], "crane")
         self.assertIsNotNone(provenance[0]["resolved_at"])
-        self.assertEqual(provenance[1]["source_word"], "slate")
+        self.assertEqual(provenance[1]["opener"], "slate")
         self.assertIsNone(provenance[1]["resolved_at"])
 
     def test_cut_branch_keeps_live_membership_for_pending_exact_work(self):
@@ -1253,71 +1405,71 @@ class TestClaimNext(_TmpQueue):
         crane = self.q.claim_next("worker-0")
         self.q.create_branch(
             self.key, len(WORDS), N_CANDIDATES, budget=5,
-            priority=crane["priority"], source_word=crane["source_word"],
-            source_pattern=crane["source_pattern"],
-            source_work_id=crane["source_work_id"])
+            priority=crane["priority"], opener=crane["opener"],
+            opener_pattern=crane["opener_pattern"],
+            opener_work_id=crane["opener_work_id"])
         self.q.requeue_pending(self.key)
         self.q.delete_branch(self.key)
 
-        candidates = self.q.source_work_candidates()
-        self.assertEqual([row["source_word"] for row in candidates], ["crane"])
+        candidates = self.q.opener_work_candidates()
+        self.assertEqual([row["opener"] for row in candidates], ["crane"])
         membership = self.q._conn.execute("""
-            SELECT resolved_at FROM branch_source_work
-            WHERE branch_id = ? AND source_work_id = ?
+            SELECT resolved_at FROM branch_opener_work
+            WHERE branch_id = ? AND opener_work_id = ?
         """, (self.q._intern_branch(self.key),
-              crane["source_work_id"])).fetchone()
+              crane["opener_work_id"])).fetchone()
         self.assertIsNone(membership["resolved_at"])
 
-    def test_clear_removes_source_work_before_readding_shared_root(self):
+    def test_clear_removes_opener_work_before_readding_shared_root(self):
         self.q.add_pending_many([(self.key, len(WORDS), 999, "audio", 0)])
         self.q.clear()
         self.q.add_pending_many([(self.key, len(WORDS), 1, "scope", 0)])
         claimed = self.q.claim_next("worker-0")
-        self.assertEqual(claimed["source_word"], "scope")
+        self.assertEqual(claimed["opener"], "scope")
         self.assertEqual(claimed["priority"], 1)
 
-    def test_remove_pending_removes_source_work_membership(self):
+    def test_remove_pending_removes_opener_work_membership(self):
         self.q.add_pending_many([(self.key, len(WORDS), 9, "crane", 0)])
         branch_id = self.q._intern_branch(self.key)
 
         self.assertTrue(self.q.remove_pending(self.key))
         self.assertEqual(self.q._conn.execute(
-            "SELECT COUNT(*) FROM branch_source_work WHERE branch_id = ?",
+            "SELECT COUNT(*) FROM branch_opener_work WHERE branch_id = ?",
             (branch_id,)).fetchone()[0], 0)
 
         self.q.add_pending_many([(self.key, len(WORDS), 1, "slate", 42)])
         claimed = self.q.claim_next("worker-0")
-        self.assertEqual(claimed["source_word"], "slate")
+        self.assertEqual(claimed["opener"], "slate")
         self.assertEqual(claimed["priority"], 1)
 
-    def test_forced_active_removal_removes_source_work_membership(self):
+    def test_forced_active_removal_removes_opener_work_membership(self):
         self.q.add_pending_many([(self.key, len(WORDS), 9, "crane", 0)])
         claimed = self.q.claim_next("worker-0")
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES,
                              priority=claimed["priority"],
-                             source_work_id=claimed["source_work_id"])
+                             opener_work_id=claimed["opener_work_id"])
         branch_id = self.q._intern_branch(self.key)
 
         self.q.cancel_active_branch(self.key, remove_from_queue=True)
         self.assertEqual(self.q._conn.execute(
-            "SELECT COUNT(*) FROM branch_source_work WHERE branch_id = ?",
+            "SELECT COUNT(*) FROM branch_opener_work WHERE branch_id = ?",
             (branch_id,)).fetchone()[0], 0)
 
         self.q.add_pending_many([(self.key, len(WORDS), 1, "slate", 42)])
         claimed = self.q.claim_next("worker-1")
-        self.assertEqual(claimed["source_word"], "slate")
+        self.assertEqual(claimed["opener"], "slate")
         self.assertEqual(claimed["priority"], 1)
 
-    def test_source_membership_rows_reports_multiple_owners_with_effective_priority(self):
-        # Two requests own the same root: one row per (source_work_id,
+    def test_opener_membership_rows_reports_multiple_owners_with_effective_priority(self):
+        # Two requests own the same root: one row per (opener_work_id,
         # branch_id) membership, each keeping its own requested priority
         # while the branch's effective priority is the MAX across both.
         self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 7)])
         self.q.add_pending_many([(self.key, len(WORDS), 9, "slate", 42)])
 
-        rows = self.q.source_membership_rows()
+        rows = self.q.opener_membership_rows()
         self.assertEqual(len(rows), 2)
-        by_word = {row["source_word"]: row for row in rows}
+        by_word = {row["opener"]: row for row in rows}
         self.assertEqual(set(by_word), {"crane", "slate"})
         self.assertEqual(by_word["crane"]["requested_priority"], 1)
         self.assertEqual(by_word["slate"]["requested_priority"], 9)
@@ -1330,10 +1482,10 @@ class TestClaimNext(_TmpQueue):
         self.assertEqual(by_word["crane"]["pending_status"], "pending")
         self.assertIsNone(by_word["crane"]["active_status"])
 
-        filtered = self.q.source_membership_rows(source_word="slate")
-        self.assertEqual([row["source_word"] for row in filtered], ["slate"])
+        filtered = self.q.opener_membership_rows(opener="slate")
+        self.assertEqual([row["opener"] for row in filtered], ["slate"])
 
-    def test_source_membership_rows_worker_count_ignores_stale_heartbeat(self):
+    def test_opener_membership_rows_worker_count_ignores_stale_heartbeat(self):
         # A heartbeat row survives a crashed worker (only unregister_worker/
         # clear remove it), so worker_count must be fenced by liveness like
         # worker_counts_by_branch() and report_queue_rows()'s workers CTE —
@@ -1348,11 +1500,11 @@ class TestClaimNext(_TmpQueue):
             VALUES ('dead-worker', 1, ?, ?)
         """, (branch_id, stale_at))
 
-        self.assertEqual(self.q.source_membership_rows()[0]["worker_count"], 0)
+        self.assertEqual(self.q.opener_membership_rows()[0]["worker_count"], 0)
         self.q._conn.execute(
             "DELETE FROM worker_heartbeat WHERE worker_id = 'dead-worker'")
 
-    def test_source_membership_rows_excludes_resolved_by_default(self):
+    def test_opener_membership_rows_excludes_resolved_by_default(self):
         # A pending root discovered to already be cache-reusable is marked
         # done without ever being promoted to an active branch (the
         # claim_one() cache-reuse path) — mark_done resolves its membership
@@ -1360,8 +1512,8 @@ class TestClaimNext(_TmpQueue):
         self.q.add_pending_many([(self.key, len(WORDS), 9, "crane", 7)])
         self.q.mark_done(self.key)
 
-        self.assertEqual(self.q.source_membership_rows(), [])
-        resolved_rows = self.q.source_membership_rows(include_resolved=True)
+        self.assertEqual(self.q.opener_membership_rows(), [])
+        resolved_rows = self.q.opener_membership_rows(include_resolved=True)
         self.assertEqual(len(resolved_rows), 1)
         self.assertIsNotNone(resolved_rows[0]["resolved_at"])
 
@@ -1373,41 +1525,41 @@ class TestClaimNext(_TmpQueue):
     def test_heartbeats_with_branch_prefers_workers_own_selected_owner(self):
         # A branch shared by two requests (both own the same root): the
         # worker recorded against the *other* owner must not display this
-        # branch's own source label — heartbeats_with_branch must key off the
-        # worker's own source_work_id, not an arbitrary branch-level column.
+        # branch's own opener label — heartbeats_with_branch must key off the
+        # worker's own opener_work_id, not an arbitrary branch-level column.
         self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 7)])
         self.q.add_pending_many([(self.key, len(WORDS), 9, "slate", 42)])
-        rows = {row["source_word"]: row for row in self.q.source_work_rows()}
-        claimed = self.q.claim_next("worker-0", rows["crane"]["source_work_id"])
+        rows = {row["opener"]: row for row in self.q.opener_work_rows()}
+        claimed = self.q.claim_next("worker-0", rows["crane"]["opener_work_id"])
         self.q.create_branch(
             self.key, len(WORDS), N_CANDIDATES, priority=claimed["priority"],
-            source_word=claimed["source_word"],
-            source_pattern=claimed["source_pattern"],
-            source_work_id=claimed["source_work_id"])
+            opener=claimed["opener"],
+            opener_pattern=claimed["opener_pattern"],
+            opener_work_id=claimed["opener_work_id"])
 
         self.q.heartbeat("worker-0", 1, self.key, len(WORDS), 0, 0,
-                         source_work_id=rows["slate"]["source_work_id"],
+                         opener_work_id=rows["slate"]["opener_work_id"],
                          scheduling_role="preferred")
         heartbeat_row = self.q.heartbeats_with_branch()[0]
-        self.assertEqual(heartbeat_row["source_word"], "slate")
-        self.assertEqual(heartbeat_row["source_pattern"], 42)
+        self.assertEqual(heartbeat_row["opener"], "slate")
+        self.assertEqual(heartbeat_row["opener_pattern"], 42)
         self.assertEqual(heartbeat_row["priority"], 9)
         self.assertEqual(heartbeat_row["scheduling_role"], "preferred")
 
-    def test_invariant_checker_flags_scheduling_role_source_mismatch(self):
+    def test_invariant_checker_flags_scheduling_role_opener_mismatch(self):
         self.q.heartbeat("worker-0", 1, None, None, 0, 0)
         self.q._conn.execute(
-            "UPDATE worker_heartbeat SET source_work_id = 999, "
+            "UPDATE worker_heartbeat SET opener_work_id = 999, "
             "scheduling_role = NULL WHERE worker_id = 'worker-0'")
-        violations = self.q.check_source_work_invariants()
+        violations = self.q.check_opener_work_invariants()
         self.assertTrue(any("worker worker-0" in violation
                             for violation in violations))
         self.q._conn.execute(
             "DELETE FROM worker_heartbeat WHERE worker_id = 'worker-0'")
 
 
-class TestSourceWorkConcurrency(_TmpQueue):
-    def test_interleaved_source_lifecycle_preserves_invariants(self):
+class TestOpenerWorkConcurrency(_TmpQueue):
+    def test_interleaved_opener_lifecycle_preserves_invariants(self):
         worker_count = 4
         for batch in range(3):
             ready_to_help = threading.Barrier(worker_count)
@@ -1419,42 +1571,42 @@ class TestSourceWorkConcurrency(_TmpQueue):
             def run_worker(worker_index):
                 queue = ProductionERDQueue(self.queue_path)
                 try:
-                    source_word = f"s{batch}{worker_index}aa"
-                    branch_key = ScoreCache.encode_subset([source_word])
+                    opener = f"s{batch}{worker_index}aa"
+                    branch_key = ScoreCache.encode_subset([opener])
                     priority = (batch + worker_index) % 10
                     queue.add_pending_many([
-                        (branch_key, 1, priority, source_word, worker_index),
+                        (branch_key, 1, priority, opener, worker_index),
                     ])
-                    source_work_id = next(
-                        row["source_work_id"] for row in queue.source_work_rows()
-                        if row["source_word"] == source_word
+                    opener_work_id = next(
+                        row["opener_work_id"] for row in queue.opener_work_rows()
+                        if row["opener"] == opener
                     )
                     claimed = queue.claim_next(
-                        f"owner-{batch}-{worker_index}", source_work_id)
+                        f"owner-{batch}-{worker_index}", opener_work_id)
                     self.assertIsNotNone(claimed)
                     self.assertTrue(queue.create_branch(
                         branch_key, 1, 1, priority=priority,
-                        source_word=source_word, source_pattern=worker_index,
-                        budget=5, source_work_id=source_work_id))
+                        opener=opener, opener_pattern=worker_index,
+                        budget=5, opener_work_id=opener_work_id))
                     effective_priority = (priority + 1) % 10
-                    self.assertTrue(queue.set_source_work_priority(
-                        source_work_id, effective_priority))
+                    self.assertTrue(queue.set_opener_work_priority(
+                        opener_work_id, effective_priority))
                     ownership[worker_index] = (
-                        branch_key, source_work_id, effective_priority)
+                        branch_key, opener_work_id, effective_priority)
                     ready_to_help.wait()
 
                     helped_index = (worker_index + 1) % worker_count
-                    helped_key, helped_source_work_id, helped_priority = (
+                    helped_key, helped_opener_work_id, helped_priority = (
                         ownership[helped_index]
                     )
                     active = queue.branches_in_progress(
-                        helped_source_work_id)
+                        helped_opener_work_id)
                     self.assertEqual(len(active), 1)
                     bundle = queue.claim_next_bundle(
                         helped_key, f"helper-{batch}-{worker_index}", 1,
                         [0], [0.0], small_count=1, count_cap=1,
-                        expected_source_work_id=helped_source_work_id,
-                        expected_source_priority=helped_priority)
+                        expected_opener_work_id=helped_opener_work_id,
+                        expected_opener_priority=helped_priority)
                     self.assertIsNotNone(bundle)
                     queue.complete_candidate(helped_key, bundle[1][0])
                     helped.wait()
@@ -1488,10 +1640,10 @@ class TestSourceWorkConcurrency(_TmpQueue):
                 thread.join(timeout=20)
             self.assertFalse(
                 [thread for thread in threads if thread.is_alive()],
-                "source lifecycle stress threads did not finish")
+                "opener lifecycle stress threads did not finish")
             if failures:
                 raise failures[0]
-            self.assertEqual(self.q.check_source_work_invariants(), [])
+            self.assertEqual(self.q.check_opener_work_invariants(), [])
 
 
 class TestCostModel(_TmpQueue):
@@ -1831,9 +1983,9 @@ class TestCeilingTelemetry(_TmpQueue):
         self.assertEqual(row["infeasible_candidates"], 2)
         self.assertEqual(row["infeasible_nodes"], 1_200)
 
-    def test_completed_source_timing_uses_the_spine_opener(self):
+    def test_completed_opener_timing_uses_the_spine_opener(self):
         old_branch_key = ScoreCache.encode_subset(["crane", "slate"])
-        source_branch_key = ScoreCache.encode_subset(["trace", "stale"])
+        new_branch_key = ScoreCache.encode_subset(["trace", "stale"])
         self.q.add_pending_many([
             (old_branch_key, 2, 0, "trace", "-----"),
         ])
@@ -1841,16 +1993,16 @@ class TestCeilingTelemetry(_TmpQueue):
             old_branch_key, "SALET -----", 2, 4, 100, 200, 10, 1,
             total_bundle_wall_millis=1_000)
         self.q.add_branch_finalize_log(
-            source_branch_key, "TRACE -----", 2, 4, 120, 180, 10, 1,
+            new_branch_key, "TRACE -----", 2, 4, 120, 180, 10, 1,
             total_bundle_wall_millis=2_000)
 
-        timing = self.q.completed_source_timing("trace")
+        timing = self.q.completed_opener_timing("trace")
 
         self.assertEqual(timing["first_created_at"], 120)
         self.assertEqual(timing["completed_at"], 180)
         self.assertEqual(timing["worker_millis"], 2_000)
 
-    def test_completed_source_timing_includes_every_epoch(self):
+    def test_completed_opener_timing_includes_every_epoch(self):
         self.q.add_branch_finalize_log(
             self.key, "TRACE -----", 2, 4, 10, 20, 10, 1,
             total_bundle_wall_millis=1_000)
@@ -1859,7 +2011,7 @@ class TestCeilingTelemetry(_TmpQueue):
             self.key, "TRACE -----", 2, 4, 100, 160, 10, 1,
             total_bundle_wall_millis=2_000)
 
-        timing = self.q.completed_source_timing("trace")
+        timing = self.q.completed_opener_timing("trace")
 
         self.assertEqual(timing["first_created_at"], 10)
         self.assertEqual(timing["completed_at"], 160)

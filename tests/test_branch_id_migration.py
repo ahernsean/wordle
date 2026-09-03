@@ -40,8 +40,8 @@ CREATE TABLE active_branches (
     n_words        INTEGER NOT NULL,
     n_candidates   INTEGER NOT NULL,
     priority       INTEGER NOT NULL DEFAULT 0,
-    source_word    TEXT,
-    source_pattern INTEGER,
+    opener    TEXT,
+    opener_pattern INTEGER,
     best_erd       REAL,
     best_guess     TEXT,
     status         TEXT    NOT NULL DEFAULT 'open',
@@ -62,8 +62,8 @@ CREATE TABLE pending_branches (
     branch_key     BLOB    NOT NULL,
     n_words        INTEGER NOT NULL,
     priority       INTEGER NOT NULL DEFAULT 0,
-    source_word    TEXT,
-    source_pattern INTEGER,
+    opener    TEXT,
+    opener_pattern INTEGER,
     status         TEXT    NOT NULL DEFAULT 'pending',
     claimed_by     TEXT,
     claimed_at     INTEGER,
@@ -125,7 +125,7 @@ class TestBranchIdMigration(unittest.TestCase):
             (self.key_a,))
         con.execute(
             "INSERT INTO pending_branches (branch_key, n_words, priority, "
-            "source_word) VALUES (?, 4, 1, 'salet')", (self.key_b,))
+            "opener) VALUES (?, 4, 1, 'salet')", (self.key_b,))
         con.execute(
             "INSERT INTO worker_heartbeat "
             "(worker_id, pid, current_branch_key, updated_at) "

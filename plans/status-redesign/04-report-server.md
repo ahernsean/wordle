@@ -86,7 +86,7 @@ shared across simultaneously running servers.
 
 Configuration contains:
 
-    ReportSources
+    ReportOpeners
     client_path
     fixture_directory
 

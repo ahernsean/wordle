@@ -26,7 +26,7 @@ from erd_queue import ERDQueue
 from report_model import (
     ReportFilters,
     ReportRequest,
-    ReportSources,
+    ReportOpeners,
     collect_overview_report,
     collect_report,
     parse_report_branch_target,
@@ -53,7 +53,7 @@ class ReportPipelineTest(unittest.TestCase):
             answer_file.write("\n".join(ANSWERS) + "\n")
         with open(self.candidate_list_path, "w") as candidate_file:
             candidate_file.write("\n".join(ANSWERS) + "\n")
-        self.sources = ReportSources(
+        self.sources = ReportOpeners(
             queue_path=self.queue_path,
             cache_path=self.cache_path,
             answer_list_path=self.answer_list_path,
@@ -69,8 +69,8 @@ class ReportPipelineTest(unittest.TestCase):
         # A real two-step spine and a best_guess that is itself an answer
         # word -- the two fields whose shape broke report_terminal.py.
         queue.create_branch(
-            self.branch_key, 3, 10, priority=9, source_word="salet",
-            source_pattern=0, budget=4, spine="salet ----- crane y----",
+            self.branch_key, 3, 10, priority=9, opener="salet",
+            opener_pattern=0, budget=4, spine="salet ----- crane y----",
         )
         queue._conn.execute(
             "UPDATE active_branches SET bulk_done_candidates = 1, "

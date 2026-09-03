@@ -17,11 +17,11 @@ import report_model
 from report_model import (
     ReportFilters,
     ReportRequest,
-    ReportSources,
+    ReportOpeners,
     WORKER_LIVENESS_SECONDS,
     _candidate_erd_summary,
     _candidate_eta,
-    _source_word_group_key,
+    _opener_group_key,
     _grouped_response_groups,
     _response_group_is_solved,
     _response_group_key,
@@ -31,7 +31,7 @@ from report_model import (
     branch_reference,
     collect_overview_report,
     collect_report,
-    collect_source_report,
+    collect_opener_report,
     collect_workers_report,
     normalize_worker_descent,
     parse_rich_spine,
@@ -92,8 +92,8 @@ class ReportModelTest(unittest.TestCase):
         word = parse_report_branch_target("raise")
         branch = parse_report_branch_target("raise -----")
         cases = (
-            (ReportRequest(filters=ReportFilters(source_states=("queued",))), "opener_state"),
-            (ReportRequest(filters=ReportFilters(source_offset=0)), "source_offset"),
+            (ReportRequest(filters=ReportFilters(opener_states=("queued",))), "opener_state"),
+            (ReportRequest(filters=ReportFilters(opener_offset=0)), "opener_offset"),
             (ReportRequest(filters=ReportFilters(sort="word")), "requires an opener"),
             (ReportRequest(branch_target=branch, filters=ReportFilters(branch_statuses=("unqueued",))), "unqueued"),
             (ReportRequest(report_kind="hotspots", hotspot_field="coordination", branch_target=word), "coordination"),
@@ -157,14 +157,14 @@ class ReportModelTest(unittest.TestCase):
 
     def test_openers_filter_offsets_and_sort_validation(self):
         for filters, message in (
-            (ReportFilters(source_offset=-1), "cannot be negative"),
+            (ReportFilters(opener_offset=-1), "cannot be negative"),
             (ReportFilters(branch_row_offset=-1), "cannot be negative"),
             (ReportFilters(sort="nope"), "must be one"),
         ):
             with self.subTest(filters=filters):
                 with self.assertRaisesRegex(ValueError, message):
                     validate_report_request(ReportRequest(report_kind="openers", filters=filters))
-        allowed = ReportFilters(source_offset=0, branch_row_offset=0, sort="word")
+        allowed = ReportFilters(opener_offset=0, branch_row_offset=0, sort="word")
         validate_report_request(ReportRequest(report_kind="openers", filters=allowed))
 
     def test_tree_layout_handles_empty_legacy_and_paged_topology(self):
@@ -371,26 +371,26 @@ class ReportModelTest(unittest.TestCase):
 
     def test_opener_report_persists_missing_completed_timing(self):
         queue = Mock()
-        queue.source_word_rows.return_value = [{"source_word": "raise", "state": "done"}]
-        queue.source_membership_rows.return_value = []
-        queue.completed_source_timing.return_value = {
+        queue.opener_rows.return_value = [{"opener": "raise", "state": "done"}]
+        queue.opener_membership_rows.return_value = []
+        queue.completed_opener_timing.return_value = {
             "completed_at": 20, "first_created_at": 10,
             "worker_millis": 4, "telemetry_epochs": "2,4",
         }
         queue.distinct_branch_count_for_words.return_value = 0
         timing_cache = Mock()
         timing_cache.completed_source_summary_map.return_value = {}
-        payload = {"source_word": "raise", "state": "complete", "branch_count": 0,
+        payload = {"opener": "raise", "state": "complete", "branch_count": 0,
                    "completed_at": 20, "requested_priority": 0}
         with (
             patch("report_model._open_report_queue", return_value=queue),
             patch("report_model.ScoreCache", return_value=timing_cache),
             patch("report_model.load_word_list", return_value=ANSWERS),
-            patch("report_model._source_rollups", return_value={"raise": {}}),
-            patch("report_model._source_summary_payload", return_value=payload),
-            patch("report_model._source_word_erd_summaries", return_value={}),
+            patch("report_model._opener_rollups", return_value={"raise": {}}),
+            patch("report_model._opener_summary_payload", return_value=payload),
+            patch("report_model._opener_erd_summaries", return_value={}),
         ):
-            report = collect_source_report(self.sources, ReportRequest(report_kind="openers"))
+            report = collect_opener_report(self.sources, ReportRequest(report_kind="openers"))
         timing_cache.write_completed_source_summary.assert_called_once()
         self.assertEqual(report["data"]["summary"], [payload])
 
@@ -401,42 +401,42 @@ class ReportModelTest(unittest.TestCase):
             self.assertIsNone(report_model._maximum_response_group_count(
                self.sources, ANSWERS, ANSWERS, b"other", None))
 
-    def test_source_summary_and_group_helpers_cover_active_and_empty_states(self):
-        row = {"source_word": "raise", "branch_count": 3,
+    def test_opener_summary_and_group_helpers_cover_active_and_empty_states(self):
+        row = {"opener": "raise", "branch_count": 3,
                "requested_priority": 4, "request_count": 1,
                "direct_branch_count": 2, "direct_done_branch_count": 1,
                "has_incomplete_request": 1, "has_active_request": 1,
                "started_at": 10}
-        payload = report_model._source_summary_payload(
+        payload = report_model._opener_summary_payload(
             row, {"open_branch_count": 2, "worker_count": 1},
             {"completed_at": None, "elapsed_millis": None, "worker_millis": None}, 20)
         self.assertEqual(payload["state"], "active")
         self.assertEqual(payload["elapsed_millis"], 10_000)
-        self.assertEqual(report_model._source_erd_sort_key({"source_word": "raise"})[0], 3)
+        self.assertEqual(report_model._opener_erd_sort_key({"opener": "raise"})[0], 3)
         self.assertEqual(report_model._duration_group_key(31 * 24 * 60 * 60 * 1000)[1], "[1 month, ∞)")
-        self.assertEqual(report_model._source_word_group_key(
+        self.assertEqual(report_model._opener_group_key(
             {"worker_count": 0}, "worker_presence", 0), (1, "no workers"))
         self.assertEqual(report_model._completed_at_group_key(None, 0), (5, "not completed"))
-        self.assertEqual(report_model._source_word_group_key(
+        self.assertEqual(report_model._opener_group_key(
             {"elapsed_millis": None}, "elapsed", 0), (5, "not completed"))
 
-    def test_source_rollups_and_membership_payload_preserve_shared_branch_context(self):
+    def test_opener_rollups_and_membership_payload_preserve_shared_branch_context(self):
         branch_key = ScoreCache.encode_subset(["salet"])
         parent_key = ScoreCache.encode_subset(["crane"])
         row = {
             "branch_id": 3, "branch_key": branch_key, "parent_branch_key": parent_key,
-            "source_work_id": 7, "source_word": "raise", "requested_priority": 4,
-            "source_state": "active", "root_pattern": 0,
+            "opener_work_id": 7, "opener": "raise", "requested_priority": 4,
+            "opener_state": "active", "opener_pattern": 0,
             "pending_status": "in_progress", "active_status": "open", "worker_count": 2,
             "branch_effective_priority": 6,
         }
-        rollup = report_model._source_rollups([row, row])["raise"]
+        rollup = report_model._opener_rollups([row, row])["raise"]
         self.assertEqual(rollup["open_branch_count"], 1)
-        payload = report_model._source_membership_payload(row, 2)
+        payload = report_model._opener_membership_payload(row, 2)
         self.assertTrue(payload["is_shared"])
         self.assertEqual(payload["parent_branch_reference"], branch_reference(parent_key))
 
-    def test_source_erd_summary_reuses_the_current_cache_generation(self):
+    def test_opener_erd_summary_reuses_the_current_cache_generation(self):
         branch_key = ScoreCache.encode_subset(["salet"])
         cache = Mock(answer_list_id="answers")
         cache.report_branch_states.return_value = {
@@ -444,15 +444,15 @@ class ReportModelTest(unittest.TestCase):
         }
         response_cache = Mock()
         response_cache.group_words.return_value = {0: ["salet"]}
-        report_model._SOURCE_ERD_SUMMARY_CACHE = {}
+        report_model._OPENER_ERD_SUMMARY_CACHE = {}
         report = {"sources": {"cache": {"ok": False, "error": None}}}
         with (
             patch("report_model.ResponseCache", return_value=response_cache),
             patch("report_model._score_cache_file_signature", return_value=((1, 1), None)),
         ):
-            first = report_model._source_word_erd_summaries(
+            first = report_model._opener_erd_summaries(
                 self.sources, ["raise"], report, cache, ANSWERS)
-            second = report_model._source_word_erd_summaries(
+            second = report_model._opener_erd_summaries(
                 self.sources, ["raise"], report, cache, ANSWERS)
         self.assertTrue(report["sources"]["cache"]["ok"])
         self.assertEqual(first, second)
@@ -518,7 +518,7 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(prefix, "RAISE -----")
         word_target = parse_report_branch_target("RAISE")
         scope, prefix = report_model._branch_target_queue_scope(word_target)
-        self.assertEqual(scope["source_word"], "raise")
+        self.assertEqual(scope["opener"], "raise")
         self.assertEqual(prefix, "RAISE")
         self.assertTrue(report_model._row_matches_branch_target(
             {"spine": "RAISE ----- CRANE y----"}, word_target, prefix))
@@ -535,7 +535,7 @@ class ReportModelTest(unittest.TestCase):
         for kind, function_name in (
             ("workers", "collect_workers_report"), ("cache", "collect_cache_report"),
             ("hotspots", "collect_hotspot_report"), ("accuracy", "collect_accuracy_report"),
-            ("leaderboard", "collect_leaderboard_report"), ("openers", "collect_source_report"),
+            ("leaderboard", "collect_leaderboard_report"), ("openers", "collect_opener_report"),
             ("root_progress", "collect_root_progress_report"),
         ):
             with self.subTest(kind=kind), patch("report_model." + function_name,
@@ -562,7 +562,7 @@ class ReportModelTest(unittest.TestCase):
             answer_file.write("\n".join(ANSWERS) + "\n")
         with open(self.candidate_list_path, "w") as candidate_file:
             candidate_file.write("\n".join(ANSWERS + ["raise"]) + "\n")
-        self.sources = ReportSources(
+        self.sources = ReportOpeners(
             queue_path=self.queue_path,
             cache_path=self.cache_path,
             answer_list_path=self.answer_list_path,
@@ -951,8 +951,8 @@ class ReportModelTest(unittest.TestCase):
         claimed = queue.claim_next("worker-0")
         queue.create_branch(
             branch_key, len(branch_words), 5, priority=1_000_001,
-            source_word="salet", source_pattern=pattern,
-            source_work_id=claimed["source_work_id"],
+            opener="salet", opener_pattern=pattern,
+            opener_work_id=claimed["opener_work_id"],
         )
         queue.close()
 
@@ -1174,8 +1174,8 @@ class ReportModelTest(unittest.TestCase):
     def test_opener_sort_orders_complete_pending_infeasible_then_unknown(self):
         def rank(state, erd=None):
             summary = None if state is None else {"state": state, "erd": erd}
-            return report_model._source_erd_sort_key(
-                {"source_word": "salet", "erd_summary": summary}
+            return report_model._opener_erd_sort_key(
+                {"opener": "salet", "erd_summary": summary}
             )[0]
 
         self.assertEqual(
@@ -1260,10 +1260,10 @@ class ReportModelTest(unittest.TestCase):
 
         self.assertTrue(report_model._row_matches_branch_target({}, root, ""))
         self.assertTrue(report_model._row_matches_branch_target(
-            {"spine": None, "source_word": "SALET"}, word, "SALET"
+            {"spine": None, "opener": "SALET"}, word, "SALET"
         ))
         self.assertFalse(report_model._row_matches_branch_target(
-            {"spine": None, "source_word": "crane"}, word, "SALET"
+            {"spine": None, "opener": "crane"}, word, "SALET"
         ))
         # A spine-scoped target cannot match a row that has no spine.
         self.assertFalse(report_model._row_matches_branch_target(
@@ -1739,7 +1739,7 @@ class ReportModelTest(unittest.TestCase):
             answer_file.write("\n".join(answers) + "\n")
         with open(candidate_path, "w") as candidate_file:
             candidate_file.write("\n".join(candidates) + "\n")
-        return ReportSources(
+        return ReportOpeners(
             queue_path=self.queue_path,
             cache_path=self.cache_path,
             answer_list_path=answer_path,
@@ -1875,7 +1875,7 @@ class ReportModelTest(unittest.TestCase):
 
     def test_queue_and_cache_fail_independently(self):
         missing_directory = os.path.join(self.temporary_directory.name, "missing")
-        unavailable_queue = ReportSources(
+        unavailable_queue = ReportOpeners(
             queue_path=os.path.join(missing_directory, "queue.sqlite3"),
             cache_path=self.cache_path,
             answer_list_path=self.answer_list_path,
@@ -1887,7 +1887,7 @@ class ReportModelTest(unittest.TestCase):
         self.assertFalse(report["sources"]["telemetry"]["ok"])
         self.assertTrue(report["sources"]["cache"]["ok"])
 
-        unavailable_cache = ReportSources(
+        unavailable_cache = ReportOpeners(
             queue_path=self.queue_path,
             cache_path=os.path.join(missing_directory, "cache.sqlite3"),
             answer_list_path=self.answer_list_path,
@@ -1898,14 +1898,14 @@ class ReportModelTest(unittest.TestCase):
         self.assertTrue(report["sources"]["queue"]["ok"])
         self.assertFalse(report["sources"]["cache"]["ok"])
 
-    def test_missing_queue_source_does_not_create_database_files(self):
+    def test_missing_queue_opener_does_not_create_database_files(self):
         missing_queue_path = os.path.join(
             self.temporary_directory.name, "missing-queue.sqlite3"
         )
         missing_telemetry_path = os.path.join(
             self.temporary_directory.name, "missing-telemetry.sqlite3"
         )
-        unavailable_queue = ReportSources(
+        unavailable_queue = ReportOpeners(
             queue_path=missing_queue_path,
             cache_path=self.cache_path,
             answer_list_path=self.answer_list_path,
@@ -1943,7 +1943,7 @@ class ReportModelTest(unittest.TestCase):
         branch_key = ScoreCache.encode_subset(ANSWERS[:3])
         queue = self._open_queue()
         queue.create_branch(
-            branch_key, 3, 5, source_word="salet", source_pattern=0,
+            branch_key, 3, 5, opener="salet", opener_pattern=0,
             budget=4, spine="salet ----- crane y----",
         )
         queue._conn.execute(
@@ -1993,7 +1993,7 @@ class ReportModelTest(unittest.TestCase):
             with self.assertRaises(KeyError):
                 collect_overview_report(self.sources)
 
-    def test_epoch_metadata_is_queue_source_metadata(self):
+    def test_epoch_metadata_is_queue_opener_metadata(self):
         queue = self._open_queue()
         queue.set_epoch(7, label="bounded-claims", git_sha="abcdef12")
         queue.close()
@@ -2021,8 +2021,8 @@ class ReportModelTest(unittest.TestCase):
         queue.add_pending_many([(branch_key, 3, 9, "SALET", 0)])
         queue.claim_next("worker-2")
         queue.create_branch(
-            branch_key, 3, 10, priority=9, source_word="SALET",
-            source_pattern=0, budget=4, spine="SALET ----- CRANE y----",
+            branch_key, 3, 10, priority=9, opener="SALET",
+            opener_pattern=0, budget=4, spine="SALET ----- CRANE y----",
         )
         queue._conn.execute(
             "INSERT INTO candidate_claims "
@@ -2058,7 +2058,7 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(branch["raw_status"], "in_progress")
         self.assertFalse(branch["is_cooperative"])
         self.assertEqual(branch["guess_depth"], 2)
-        self.assertEqual(branch["source_pattern"], "-----")
+        self.assertEqual(branch["opener_pattern"], "-----")
         self.assertEqual(branch["completed_candidate_count"], 1)
         self.assertEqual(branch["bulk_completed_candidate_count"], 2)
         self.assertEqual(branch["one_level_erd_pruned_candidate_count"], 1)
@@ -2081,7 +2081,7 @@ class ReportModelTest(unittest.TestCase):
         branch_key = b"legacy-gray"
         queue = self._open_queue()
         queue.create_branch(
-            branch_key, 2, 4, source_word="SALET", source_pattern=0
+            branch_key, 2, 4, opener="SALET", opener_pattern=0
         )
         queue.close()
         report = collect_overview_report(self.sources)
@@ -2179,10 +2179,10 @@ class ReportModelTest(unittest.TestCase):
         child_key = b"child-branch"
         queue = self._open_queue()
         queue.create_branch(
-            parent_key, 3, 10, source_word="SALET", source_pattern=0, budget=5
+            parent_key, 3, 10, opener="SALET", opener_pattern=0, budget=5
         )
         queue.create_branch(
-            child_key, 2, 10, source_word="SALET", source_pattern=6, budget=4
+            child_key, 2, 10, opener="SALET", opener_pattern=6, budget=4
         )
         parent_id = queue._intern_branch(parent_key)
         queue._conn.execute(
@@ -2498,17 +2498,17 @@ class ReportModelTest(unittest.TestCase):
         cache.close()
 
 
-class SourceReportTest(unittest.TestCase):
+class OpenerReportTest(unittest.TestCase):
     setUp = ReportModelTest.setUp
     tearDown = ReportModelTest.tearDown
     _open_queue = ReportModelTest._open_queue
 
-    def _source_rows_for(self, word):
+    def _opener_rows_for(self, word):
         report = collect_report(self.sources, ReportRequest(
             report_kind="openers",
             branch_target=parse_report_branch_target([word]),
         ))
-        return {row["source_word"]: row for row in report["data"]["rows"]}
+        return {row["opener"]: row for row in report["data"]["rows"]}
 
     def test_collapsed_report_is_one_row_per_request_whatever_the_branch_count(self):
         # The report's unit is the request: a root that spawned a hundred
@@ -2534,13 +2534,13 @@ class SourceReportTest(unittest.TestCase):
         self.assertEqual(len(data["summary"]), 2)
         self.assertEqual(data["rows"], [])
         self.assertEqual(data["matched_rows"], 0)
-        rollups = {row["source_word"]: row for row in data["summary"]}
+        rollups = {row["opener"]: row for row in data["summary"]}
         self.assertEqual(rollups["salet"]["branch_count"], 40)
         self.assertEqual(rollups["salet"]["open_branch_count"], 40)
         self.assertEqual(rollups["salet"]["done_branch_count"], 0)
         self.assertEqual(rollups["crane"]["branch_count"], 15)
         # Naming one request is what opens its branches.
-        self.assertEqual(len(self._source_rows_for("crane")), 1)
+        self.assertEqual(len(self._opener_rows_for("crane")), 1)
 
     def _queue_words(self, *rows):
         queue = self._open_queue()
@@ -2553,12 +2553,12 @@ class SourceReportTest(unittest.TestCase):
             ])
         queue.close()
 
-    def _source_words(self, **filters):
+    def _openers(self, **filters):
         report = collect_report(self.sources, ReportRequest(
             report_kind="openers", filters=ReportFilters(**filters)))
         return report["data"]
 
-    def test_source_state_filter_narrows_and_reports_what_it_hid(self):
+    def test_opener_state_filter_narrows_and_reports_what_it_hid(self):
         self._queue_words(("salet", 5, 3), ("crane", 1, 2))
         queue = self._open_queue()
         # CRANE's branches all finish, which resolves its memberships and
@@ -2568,25 +2568,25 @@ class SourceReportTest(unittest.TestCase):
                 ScoreCache.encode_subset(ANSWERS[:2] + [f"crane{item:04d}"]))
         queue.close()
 
-        every = self._source_words()
-        self.assertEqual(every["total_source_word_count"], 2)
-        complete = self._source_words(source_states=("complete",))
+        every = self._openers()
+        self.assertEqual(every["total_opener_count"], 2)
+        complete = self._openers(opener_states=("complete",))
         self.assertEqual(
-            [row["source_word"] for row in complete["summary"]], ["crane"])
-        queued = self._source_words(source_states=("queued",))
+            [row["opener"] for row in complete["summary"]], ["crane"])
+        queued = self._openers(opener_states=("queued",))
         self.assertEqual(
-            [row["source_word"] for row in queued["summary"]], ["salet"])
+            [row["opener"] for row in queued["summary"]], ["salet"])
         # The total is the unfiltered count, so a filtered report can say how
         # much it is hiding rather than looking like the whole queue.
-        self.assertEqual(complete["total_source_word_count"], 2)
+        self.assertEqual(complete["total_opener_count"], 2)
         self.assertEqual(
-            complete["matched_source_word_count"], len(complete["summary"]))
+            complete["matched_opener_count"], len(complete["summary"]))
 
-    def test_source_sorts_order_by_the_column_named(self):
+    def test_opener_sorts_order_by_the_column_named(self):
         self._queue_words(("salet", 5, 3), ("crane", 9, 1), ("nurdy", 1, 7))
         queue = self._open_queue()
         queue._conn.execute(
-            "UPDATE source_work SET requested_at = CASE source_word "
+            "UPDATE opener_work SET requested_at = CASE opener "
             "WHEN 'salet' THEN 100 WHEN 'crane' THEN 300 "
             "WHEN 'nurdy' THEN 200 END"
         )
@@ -2596,36 +2596,36 @@ class SourceReportTest(unittest.TestCase):
         # The default shows the newest completed work first.  With no
         # completed sources, its word tie-breaker gives a stable order.
         self.assertEqual(
-            [row["source_word"] for row in
-             self._source_words(sort="default")["summary"]],
-            [row["source_word"] for row in
-             self._source_words(sort="erd")["summary"]])
+            [row["opener"] for row in
+             self._openers(sort="default")["summary"]],
+            [row["opener"] for row in
+             self._openers(sort="erd")["summary"]])
         self.assertEqual(
-            [row["source_word"] for row in
-             self._source_words(sort="priority")["summary"]],
+            [row["opener"] for row in
+             self._openers(sort="priority")["summary"]],
             ["crane", "salet", "nurdy"])
         self.assertEqual(
-            [row["source_word"] for row in
-             self._source_words(sort="word")["summary"]],
+            [row["opener"] for row in
+             self._openers(sort="word")["summary"]],
             ["crane", "nurdy", "salet"])
         self.assertEqual(
-            [row["source_word"] for row in
-             self._source_words(sort="branches")["summary"]],
+            [row["opener"] for row in
+             self._openers(sort="branches")["summary"]],
             ["nurdy", "salet", "crane"])
         self.assertEqual(
-            [row["source_word"] for row in
-             self._source_words(sort="open")["summary"]],
+            [row["opener"] for row in
+             self._openers(sort="open")["summary"]],
             ["nurdy", "salet", "crane"])
         self.assertEqual(
-            [row["source_word"] for row in
-             self._source_words(sort="requested")["summary"]],
+            [row["opener"] for row in
+             self._openers(sort="requested")["summary"]],
             ["crane", "nurdy", "salet"])
         self.assertEqual(
-            [row["source_word"] for row in
-             self._source_words(sort="age")["summary"]],
+            [row["opener"] for row in
+             self._openers(sort="age")["summary"]],
             ["salet", "nurdy", "crane"])
 
-    def test_source_timing_fields_and_sorts_roll_up_finalized_branches(self):
+    def test_opener_timing_fields_and_sorts_roll_up_finalized_branches(self):
         self._queue_words(("salet", 5, 1), ("crane", 3, 1), ("nurdy", 1, 1))
         queue = self._open_queue()
         salet_key = ScoreCache.encode_subset(ANSWERS[:2] + ["salet0000"])
@@ -2646,7 +2646,7 @@ class SourceReportTest(unittest.TestCase):
         cache.write_completed_source_summary("crane", ERD_ALL, 30, 10_000, 5_000)
         cache.close()
 
-        rows = {row["source_word"]: row for row in self._source_words()["summary"]}
+        rows = {row["opener"]: row for row in self._openers()["summary"]}
         self.assertEqual(rows["salet"]["elapsed_millis"], 30_000)
         self.assertEqual(rows["salet"]["worker_millis"], 2_000)
         self.assertEqual(rows["crane"]["elapsed_millis"], 10_000)
@@ -2655,44 +2655,44 @@ class SourceReportTest(unittest.TestCase):
         self.assertIsNone(rows["nurdy"]["elapsed_millis"])
         self.assertIsNone(rows["nurdy"]["worker_millis"])
         self.assertEqual(
-            [row["source_word"] for row in
-             self._source_words(sort="elapsed")["summary"]],
+            [row["opener"] for row in
+             self._openers(sort="elapsed")["summary"]],
             ["salet", "crane", "nurdy"],
         )
         self.assertEqual(
-            [row["source_word"] for row in
-             self._source_words(sort="worker_time")["summary"]],
+            [row["opener"] for row in
+             self._openers(sort="worker_time")["summary"]],
             ["crane", "salet", "nurdy"],
         )
         self.assertEqual(
-            [row["source_word"] for row in self._source_words()["summary"]],
+            [row["opener"] for row in self._openers()["summary"]],
             ["salet", "crane", "nurdy"],
         )
 
-    def test_active_source_elapsed_time_starts_when_work_is_claimed(self):
+    def test_active_opener_elapsed_time_starts_when_work_is_claimed(self):
         self._queue_words(("salet", 5, 1))
         queue = self._open_queue()
         queue._conn.execute(
-            "UPDATE source_work SET state = 'active', started_at = 100 "
-            "WHERE source_word = 'salet'"
+            "UPDATE opener_work SET state = 'active', started_at = 100 "
+            "WHERE opener = 'salet'"
         )
         queue._conn.commit()
         queue.close()
 
         with patch("report_model.time.time", return_value=130):
-            row = self._source_words()["summary"][0]
+            row = self._openers()["summary"][0]
 
         self.assertEqual(row["started_at"], 100)
         self.assertEqual(row["elapsed_millis"], 30_000)
         self.assertIsNone(row["worker_millis"])
 
-    def test_source_report_keeps_erd_summary_shape_when_cache_unavailable(self):
+    def test_opener_report_keeps_erd_summary_shape_when_cache_unavailable(self):
         self._queue_words(("salet", 5, 1))
         unavailable_sources = replace(
             self.sources, answer_list_path="unused-answers"
         )
 
-        report = collect_source_report(
+        report = collect_opener_report(
             unavailable_sources, ReportRequest(report_kind="openers")
         )
 
@@ -2700,23 +2700,23 @@ class SourceReportTest(unittest.TestCase):
         self.assertIn("erd_summary", report["data"]["summary"][0])
         self.assertIsNone(report["data"]["summary"][0]["erd_summary"])
 
-    def test_requeued_source_hides_completed_run_timing(self):
+    def test_requeued_opener_hides_completed_run_timing(self):
         self._queue_words(("salet", 5, 1))
         cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
         cache.write_completed_source_summary("salet", ERD_ALL, 160, 60_000, 2_000)
         cache.close()
 
-        row = self._source_words()["summary"][0]
+        row = self._openers()["summary"][0]
 
         self.assertEqual(row["state"], "queued")
         self.assertIsNone(row["completed_at"])
         self.assertIsNone(row["elapsed_millis"])
         self.assertIsNone(row["worker_millis"])
 
-    def test_source_erd_summary_cache_invalidates_for_wal_writes(self):
-        self.addCleanup(report_model._SOURCE_ERD_SUMMARY_CACHE.clear)
+    def test_opener_erd_summary_cache_invalidates_for_wal_writes(self):
+        self.addCleanup(report_model._OPENER_ERD_SUMMARY_CACHE.clear)
         self._queue_words(("nurdy", 5, 1))
-        first = self._source_words()["summary"][0]["erd_summary"]
+        first = self._openers()["summary"][0]["erd_summary"]
         self.assertEqual(first["state"], "pending")
 
         cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
@@ -2730,13 +2730,13 @@ class SourceReportTest(unittest.TestCase):
                 )
         cache._conn.commit()
 
-        second = self._source_words()["summary"][0]["erd_summary"]
+        second = self._openers()["summary"][0]["erd_summary"]
 
         self.assertEqual(second["state"], "complete")
         self.assertNotEqual(first, second)
         cache.close()
 
-    def test_each_source_word_carries_its_own_erd(self):
+    def test_each_opener_carries_its_own_erd(self):
         # A word's ERD is why it was queued.  It is derived from the word's
         # cached response groups on every read.  NURDY is the one of these that
         # leaves a two-answer group, so it is the one whose ERD needs the
@@ -2761,8 +2761,8 @@ class SourceReportTest(unittest.TestCase):
         cache._conn.commit()
         cache.close()
 
-        rows = {row["source_word"]: row
-                for row in self._source_words()["summary"]}
+        rows = {row["opener"]: row
+                for row in self._openers()["summary"]}
 
         # Every group of CRANE is solved, so its ERD is exact: the guess
         # itself, plus the mean of its groups -- and the all-green group costs
@@ -2803,40 +2803,40 @@ class SourceReportTest(unittest.TestCase):
                                 (solo_key, 2, 3, "crane", 1)])
         queue.close()
 
-        data = self._source_words()
+        data = self._openers()
 
         self.assertEqual(
             sum(row["branch_count"] for row in data["summary"]), 3)
         self.assertEqual(data["matched_branch_count"], 2)
         self.assertEqual(data["matched_open_branch_count"], 2)
         # The totals follow the filter, so they describe the words on screen.
-        narrowed = self._source_words(source_states=("complete",))
+        narrowed = self._openers(opener_states=("complete",))
         self.assertEqual(narrowed["matched_branch_count"], 0)
         self.assertEqual(narrowed["matched_open_branch_count"], 0)
 
-    def test_source_offset_pages_through_the_words(self):
+    def test_opener_offset_pages_through_the_words(self):
         self._queue_words(*[(word, 5, 1) for word in
                             ("salet", "crane", "nurdy", "khaki", "scope")])
 
         pages = [
-            self._source_words(sort="word", limit=2, source_offset=offset)
+            self._openers(sort="word", limit=2, opener_offset=offset)
             for offset in (0, 2, 4, 6)
         ]
 
         self.assertEqual(
-            [[row["source_word"] for row in page["summary"]] for page in pages],
+            [[row["opener"] for row in page["summary"]] for page in pages],
             [["crane", "khaki"], ["nurdy", "salet"], ["scope"], []],
         )
         # Every page reports the same matched total and its own start, which
         # is what lets a client know it has more to page through.
         for offset, page in zip((0, 2, 4, 6), pages):
-            self.assertEqual(page["matched_source_word_count"], 5)
-            self.assertEqual(page["source_word_offset"], offset)
+            self.assertEqual(page["matched_opener_count"], 5)
+            self.assertEqual(page["opener_offset"], offset)
         # Paging is over the matched words, so a state filter repaginates
         # rather than leaving holes where the filtered-out words were.
-        filtered = self._source_words(
-            sort="word", limit=2, source_offset=0, source_states=("queued",))
-        self.assertEqual(filtered["matched_source_word_count"], 5)
+        filtered = self._openers(
+            sort="word", limit=2, opener_offset=0, opener_states=("queued",))
+        self.assertEqual(filtered["matched_opener_count"], 5)
 
     def test_group_rollups_count_a_shared_branch_once(self):
         # Same defect as the report's own totals, one level down: two words in
@@ -2849,10 +2849,10 @@ class SourceReportTest(unittest.TestCase):
                                 (solo_key, 2, 5, "crane", 1)])
         queue.close()
 
-        data = self._source_words(group_by="state")
+        data = self._openers(group_by="state")
 
         group = data["summary_groups"][0]
-        self.assertEqual(group["rollup"]["source_word_count"], 2)
+        self.assertEqual(group["rollup"]["opener_count"], 2)
         self.assertEqual(
             sum(row["branch_count"] for row in group["rows"]), 3)
         self.assertEqual(group["rollup"]["branch_count"], 2)
@@ -2888,36 +2888,36 @@ class SourceReportTest(unittest.TestCase):
         self.assertEqual(len(seen), len(set(seen)))
         self.assertEqual(len(seen), 5)
 
-    def test_source_grouping_buckets_words_with_their_own_rollup(self):
+    def test_opener_grouping_buckets_words_with_their_own_rollup(self):
         self._queue_words(("salet", 5, 3), ("crane", 5, 1), ("nurdy", 1, 7))
 
-        groups = self._source_words(group_by="priority")["summary_groups"]
+        groups = self._openers(group_by="priority")["summary_groups"]
 
         self.assertEqual([group["label"] for group in groups],
                          ["priority 5", "priority 1"])
-        self.assertEqual(groups[0]["rollup"]["source_word_count"], 2)
+        self.assertEqual(groups[0]["rollup"]["opener_count"], 2)
         # The rollup sums the group's rows, so a collapsed group still says
         # how much work it holds.
         self.assertEqual(groups[0]["rollup"]["branch_count"], 4)
         self.assertEqual(groups[0]["rollup"]["open_branch_count"], 4)
         self.assertEqual(groups[1]["rollup"]["branch_count"], 7)
         self.assertEqual(
-            [row["source_word"] for row in groups[1]["rows"]], ["nurdy"])
+            [row["opener"] for row in groups[1]["rows"]], ["nurdy"])
         # Every word lands in exactly one group.
         self.assertEqual(
             sum(len(group["rows"]) for group in groups),
-            len(self._source_words()["summary"]))
+            len(self._openers()["summary"]))
 
-    def test_source_time_grouping_boundaries(self):
+    def test_opener_time_grouping_boundaries(self):
         generated_at = 1_787_270_400  # 21 Aug 2026 00:00 UTC (Friday)
         base_row = {"state": "complete", "worker_count": 0,
                     "requested_priority": 0, "completed_at": generated_at,
                     "elapsed_millis": 0, "worker_millis": 0,
                     "requested_at": generated_at}
-        completed = lambda seconds_ago: _source_word_group_key(
+        completed = lambda seconds_ago: _opener_group_key(
             {**base_row, "completed_at": generated_at - seconds_ago},
             "completed", generated_at)[1]
-        duration = lambda field, millis: _source_word_group_key(
+        duration = lambda field, millis: _opener_group_key(
             {**base_row, field: millis},
             "elapsed" if field == "elapsed_millis" else "worker_time",
             generated_at)[1]
@@ -2935,23 +2935,23 @@ class SourceReportTest(unittest.TestCase):
              "[1 week, 1 month)", "[1 month, ∞)"],
         )
         self.assertEqual(
-            _source_word_group_key(
+            _opener_group_key(
                 {**base_row, "requested_at": generated_at - 24 * 60 * 60},
                 "requested", generated_at)[1],
             "[1 day, 1 week)",
         )
         self.assertEqual(
-            _source_word_group_key(
+            _opener_group_key(
                 {**base_row, "completed_at": None, "elapsed_millis": None,
                  "worker_millis": None},
                 "completed", generated_at)[1],
             "not completed",
         )
 
-    def test_source_only_filters_and_sorts_are_rejected_elsewhere(self):
+    def test_opener_only_filters_and_sorts_are_rejected_elsewhere(self):
         for filters, message in (
-            ({"source_states": ("queued",)}, "opener_state requires"),
-            ({"source_offset": 2}, "source_offset requires"),
+            ({"opener_states": ("queued",)}, "opener_state requires"),
+            ({"opener_offset": 2}, "opener_offset requires"),
             ({"sort": "branches"}, "requires an opener report"),
         ):
             with self.subTest(filters=filters):
@@ -2973,7 +2973,7 @@ class SourceReportTest(unittest.TestCase):
                 filters=ReportFilters(group_by="cache_state")))
 
     def test_one_word_queued_twice_merges_into_one_row(self):
-        # Source work is keyed by (word, priority), so the same word queued at
+        # Opener work is keyed by (word, priority), so the same word queued at
         # a second priority is a second request.  The report is per word: the
         # two fold into one row, the branch they both own is counted once, and
         # the priority reported is the one that actually schedules.
@@ -2990,14 +2990,14 @@ class SourceReportTest(unittest.TestCase):
 
         self.assertEqual(len(report["data"]["summary"]), 1)
         row = report["data"]["summary"][0]
-        self.assertEqual(row["source_word"], "salet")
+        self.assertEqual(row["opener"], "salet")
         self.assertEqual(row["request_count"], 2)
         self.assertEqual(row["requested_priority"], 7)
         self.assertEqual(row["branch_count"], 2)
         self.assertEqual(row["open_branch_count"], 2)
         self.assertEqual(row["worker_count"], 0)
 
-    def test_source_report_exposes_multiple_owners_with_requested_and_effective_priority(self):
+    def test_opener_report_exposes_multiple_owners_with_requested_and_effective_priority(self):
         branch_key = ScoreCache.encode_subset(ANSWERS[:2])
         queue = self._open_queue()
         queue.add_pending_many([(branch_key, 2, 1, "salet", 0)])
@@ -3011,7 +3011,7 @@ class SourceReportTest(unittest.TestCase):
         self.assertEqual(len(report["data"]["summary"]), 2)
         # Each owner's own row comes from naming that owner's word; the shared
         # branch is still never reduced to one owner's claim.
-        rows = {**self._source_rows_for("salet"), **self._source_rows_for("crane")}
+        rows = {**self._opener_rows_for("salet"), **self._opener_rows_for("crane")}
         self.assertEqual(set(rows), {"salet", "crane"})
         self.assertEqual(rows["salet"]["requested_priority"], 1)
         self.assertEqual(rows["crane"]["requested_priority"], 9)
@@ -3025,7 +3025,7 @@ class SourceReportTest(unittest.TestCase):
         self.assertEqual(rows["salet"]["branch_status"], "queued")
         self.assertIsNone(rows["salet"]["branch_worker_status"])
 
-    def test_source_report_filters_by_word_but_keeps_global_shared_detection(self):
+    def test_opener_report_filters_by_word_but_keeps_global_shared_detection(self):
         branch_key = ScoreCache.encode_subset(ANSWERS[:2])
         solo_key = ScoreCache.encode_subset(ANSWERS[2:4])
         queue = self._open_queue()
@@ -3034,7 +3034,7 @@ class SourceReportTest(unittest.TestCase):
         queue.add_pending_many([(solo_key, 2, 1, "salet", 2)])
         queue.close()
 
-        report = collect_source_report(
+        report = collect_opener_report(
             self.sources,
             ReportRequest(
                 report_kind="openers",
@@ -3043,7 +3043,7 @@ class SourceReportTest(unittest.TestCase):
         )
 
         rows = report["data"]["rows"]
-        self.assertEqual({row["source_word"] for row in rows}, {"salet"})
+        self.assertEqual({row["opener"] for row in rows}, {"salet"})
         shared_row = next(r for r in rows
                           if bytes.fromhex(r["branch_key_hex"]) == branch_key)
         # The word filter drops crane's own row, but shared detection still
@@ -3085,14 +3085,14 @@ class SourceReportTest(unittest.TestCase):
         self.assertEqual(limited["data"]["matched_rows"], 2)
         self.assertEqual(limited["data"]["shared_branch_count"], 1)
 
-    def test_workers_report_exposes_scheduling_role_and_source_work_id(self):
+    def test_workers_report_exposes_scheduling_role_and_opener_work_id(self):
         branch_key = ScoreCache.encode_subset(ANSWERS[:2])
         queue = self._open_queue()
         queue.add_pending_many([(branch_key, 2, 1, "salet", 0)])
-        source_work_id = queue.source_work_rows()[0]["source_work_id"]
+        opener_work_id = queue.opener_work_rows()[0]["opener_work_id"]
         now = int(time.time())
         queue.heartbeat("worker-1", 1, branch_key, 2, now, 0,
-                        source_work_id=source_work_id,
+                        opener_work_id=opener_work_id,
                         scheduling_role="preferred")
         queue.close()
 
@@ -3101,7 +3101,7 @@ class SourceReportTest(unittest.TestCase):
 
         worker = report["data"]["rows"][0]
         self.assertEqual(worker["answer_count"], 2)
-        self.assertEqual(worker["source_work_id"], source_work_id)
+        self.assertEqual(worker["opener_work_id"], opener_work_id)
         self.assertEqual(worker["scheduling_role"], "preferred")
 
 
@@ -3126,7 +3126,7 @@ class RootProgressReportTest(unittest.TestCase):
                      answer_slice=slice(0, 2)):
         queue.create_branch(
             ScoreCache.encode_subset(ANSWERS[answer_slice]), n_words, 5,
-            source_word="salet", spine=spine)
+            opener="salet", spine=spine)
         queue._conn.execute(
             "UPDATE active_branches SET created_at = ? WHERE spine = ?",
             (created_at, spine))
@@ -3263,7 +3263,7 @@ class RootProgressReportTest(unittest.TestCase):
         branch_key = ScoreCache.encode_subset(ANSWERS[:2])
         queue = self._open_queue()
         queue.add_pending_many([(branch_key, 2, 1, "salet", 0)])
-        requested_at = queue.source_work_rows()[0]["requested_at"]
+        requested_at = queue.opener_work_rows()[0]["requested_at"]
         # Work opens well after the request: the root waits behind others.
         self._finalize(queue, "SALET -y---", 1, 100, 10,
                        requested_at + 86_400, requested_at + 90_000)
@@ -3277,14 +3277,14 @@ class RootProgressReportTest(unittest.TestCase):
                             data["totals"]["requested_at"])
 
     def test_request_time_stamped_after_the_work_it_asked_for_is_dropped(self):
-        # A queue rebuild restamps every source_work row with its own clock
+        # A queue rebuild restamps every opener_work row with its own clock
         # while the branches keep their true creation times, which leaves the
         # request looking later than the work.  Reporting that stamp would
         # claim the swarm started before the word was asked for.
         branch_key = ScoreCache.encode_subset(ANSWERS[:2])
         queue = self._open_queue()
         queue.add_pending_many([(branch_key, 2, 1, "salet", 0)])
-        requested_at = queue.source_work_rows()[0]["requested_at"]
+        requested_at = queue.opener_work_rows()[0]["requested_at"]
         self._finalize(queue, "SALET -y---", 1, 100, 10,
                        requested_at - 86_400, requested_at - 80_000)
         queue.close()

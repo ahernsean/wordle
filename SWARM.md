@@ -175,7 +175,7 @@ counted, so a root whose work began before the current epoch shows a start time
 older than any of its costs.
 
 A request time appears only when the queue holds one that precedes the work it
-asked for. Rebuilding the queue's `source_work` rows restamps every one of them
+asked for. Rebuilding the queue's `opener_work` rows restamps every one of them
 with the rebuild's clock while the branches keep their true creation times,
 which leaves the recorded request later than the work; that stamp is dropped
 rather than displayed.

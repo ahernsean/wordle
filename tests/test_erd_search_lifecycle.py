@@ -409,14 +409,14 @@ class OperatorHelperTest(unittest.TestCase):
             erd_search._dump_worker_stacks({2: (live_process, 0), 3: (dead_process, 0)})
         kill.assert_called_once_with(12, erd_search.signal.SIGUSR1)
 
-    def test_source_work_invariant_check_accepts_empty_and_logs_rows(self):
+    def test_opener_work_invariant_check_accepts_empty_and_logs_rows(self):
         queue = Mock()
-        queue.check_source_work_invariants.return_value = []
-        erd_search._check_source_work_invariants(queue)
+        queue.check_opener_work_invariants.return_value = []
+        erd_search._check_opener_work_invariants(queue)
 
-        queue.check_source_work_invariants.return_value = ['branch 17 has no owner']
+        queue.check_opener_work_invariants.return_value = ['branch 17 has no owner']
         with self.assertLogs(erd_search.logger, 'WARNING') as logs:
-            erd_search._check_source_work_invariants(queue)
+            erd_search._check_opener_work_invariants(queue)
         self.assertIn('branch 17 has no owner', logs.output[-1])
 
 
@@ -453,7 +453,7 @@ class QueueOperatorCommandTest(unittest.TestCase):
             (["view", "NOTAWORD"], "five-letter word"),
             (["view", "--since-seconds", "30"],
              "require --hotspots or --accuracy"),
-            (["view", "--source-word", "raise"], "requires --accuracy"),
+            (["view", "--opener", "raise"], "requires --accuracy"),
             (["view", "--accuracy", "--accuracy-offset", "-1"],
              "cannot be negative"),
             (["view", "--hotspots", "--since-seconds", "0"],
@@ -789,34 +789,34 @@ class QueueOperatorCommandTest(unittest.TestCase):
             queue="queue.sqlite3", word="raise", priority=5, opener_work_id=None,
         )
         queue = Mock()
-        with patch.object(erd_search, "check_source_priority_range", side_effect=ValueError("out of range")):
-            erd_search.cmd_queue_source_priority(arguments)
+        with patch.object(erd_search, "check_opener_priority_range", side_effect=ValueError("out of range")):
+            erd_search.cmd_queue_opener_priority(arguments)
 
-        queue.source_work_rows.return_value = []
-        queue.source_work_candidates.return_value = []
+        queue.opener_work_rows.return_value = []
+        queue.opener_work_candidates.return_value = []
         with patch.object(erd_search, "ERDQueue", return_value=queue):
-            erd_search.cmd_queue_source_priority(arguments)
+            erd_search.cmd_queue_opener_priority(arguments)
 
         rows = [
-            {"source_work_id": 2, "source_word": "raise", "requested_at": 0,
+            {"opener_work_id": 2, "opener": "raise", "requested_at": 0,
              "requested_priority": 1, "state": "queued", "root_count": 1, "branch_count": 2},
-            {"source_work_id": 3, "source_word": "raise", "requested_at": 0,
+            {"opener_work_id": 3, "opener": "raise", "requested_at": 0,
              "requested_priority": 2, "state": "queued", "root_count": 1, "branch_count": 2},
         ]
         queue.reset_mock()
-        queue.source_work_rows.return_value = rows
-        queue.source_work_candidates.return_value = rows
+        queue.opener_work_rows.return_value = rows
+        queue.opener_work_candidates.return_value = rows
         with patch.object(erd_search, "ERDQueue", return_value=queue):
-            erd_search.cmd_queue_source_priority(arguments)
-        queue.set_source_work_priority.assert_not_called()
+            erd_search.cmd_queue_opener_priority(arguments)
+        queue.set_opener_work_priority.assert_not_called()
 
         queue.reset_mock()
-        queue.source_work_rows.return_value = rows[:1]
-        queue.source_work_candidates.return_value = rows[:1]
-        queue.set_source_work_priority.return_value = True
+        queue.opener_work_rows.return_value = rows[:1]
+        queue.opener_work_candidates.return_value = rows[:1]
+        queue.set_opener_work_priority.return_value = True
         with patch.object(erd_search, "ERDQueue", return_value=queue):
-            erd_search.cmd_queue_source_priority(arguments)
-        queue.set_source_work_priority.assert_called_once_with(2, 5)
+            erd_search.cmd_queue_opener_priority(arguments)
+        queue.set_opener_work_priority.assert_called_once_with(2, 5)
 if __name__ == '__main__':
     unittest.main()
 
@@ -880,7 +880,7 @@ class SupervisorLoopTest(unittest.TestCase):
                 erd_search.erd_swarm, "CHECKPOINT_SECONDS", -1))
             stack.enter_context(patch.object(erd_search, "_supervisor_checkpoint"))
             stack.enter_context(patch.object(
-                erd_search, "_check_source_work_invariants",
+                erd_search, "_check_opener_work_invariants",
                 side_effect=invariants))
         if spawn is not None:
             stack.enter_context(patch.object(
@@ -1106,7 +1106,7 @@ class QueueAddReportingTest(unittest.TestCase):
 
     def setUp(self):
         self.queue = Mock()
-        self.queue.lowest_unfinished_source_priority.return_value = None
+        self.queue.lowest_unfinished_opener_priority.return_value = None
         self.queue.total_branches.return_value = 0
         self.queue.status_by_branch_keys.return_value = {}
         self.queue.add_pending_many.return_value = 0

@@ -130,7 +130,7 @@ Add presentation-neutral resolver functions to `report_model.py`:
 normalized complete spine, and an optional trailing word.
 
 For a semantic spine, start with all answers loaded from
-`ReportSources.answer_list_path` and apply each guess/pattern response group
+`ReportOpeners.answer_list_path` and apply each guess/pattern response group
 in order through `ResponseCache(all_answers, score_cache=None)`. Use the pure
 reference path so branch_target resolution never reads or writes persistent cache
 state. Produce the encoded branch key with the static

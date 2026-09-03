@@ -15,7 +15,7 @@ from threading import Event, Thread
 import unittest
 from urllib.parse import unquote
 
-from report_model import ReportSources
+from report_model import ReportOpeners
 from report_server import ServerConfiguration, load_fixtures, make_handler
 from tests.webkit_container import WebKitContainerUnavailable, start_webkit_server
 
@@ -185,7 +185,7 @@ class ReportClientStaticTest(unittest.TestCase):
 @contextmanager
 def fixture_server():
     configuration = ServerConfiguration(
-        ReportSources("unused", "unused", "unused", "unused"),
+        ReportOpeners("unused", "unused", "unused", "unused"),
         CLIENT_PATH,
         FIXTURE_DIRECTORY,
         load_fixtures(FIXTURE_DIRECTORY),
@@ -719,7 +719,7 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def test_root_progress_omits_a_request_time_the_queue_cannot_vouch_for(self):
         # The fixture carries no request time: the queue rebuild that restamped
-        # source_work destroyed it.  Rendering a placeholder would read as a
+        # opener_work destroyed it.  Rendering a placeholder would read as a
         # measurement.
         self.apply_branch_target("SALET")
         self.page.wait_for_selector("table.root-progress")
@@ -4097,9 +4097,9 @@ class ReportClientBrowserTest(unittest.TestCase):
         def apply_page(offset, shown):
             self.page.evaluate("""async ([offset, shown]) => {
               const report = await (await fetch('/api/view/openers')).json();
-              report.data.matched_source_word_count = 12;
-              report.data.total_source_word_count = 12;
-              report.data.source_word_offset = offset;
+              report.data.matched_opener_count = 12;
+              report.data.total_opener_count = 12;
+              report.data.opener_offset = offset;
               report.data.summary = report.data.summary.slice(0, shown);
               applyReport(report, null,
                 parsePageState({search:'?kind=openers&limit=3'}));
@@ -4155,7 +4155,7 @@ class ReportClientBrowserTest(unittest.TestCase):
           const rows = report.data.summary;
           const bucket = state => rows.filter(row => row.state === state);
           const rollup = group => ({
-            source_word_count: group.length,
+            opener_count: group.length,
             branch_count: group.reduce((total, row) => total + row.branch_count, 0),
             open_branch_count: group.reduce((total, row) => total + row.open_branch_count, 0),
             done_branch_count: group.reduce((total, row) => total + row.done_branch_count, 0),

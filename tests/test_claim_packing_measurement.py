@@ -349,13 +349,13 @@ class TestCandidateAccuracyGroupSizes(_TmpQueue):
             "SELECT group_sizes FROM candidate_accuracy").fetchone()
         self.assertIsNone(row["group_sizes"])
 
-    def test_source_word_persisted_for_per_opener_segmentation(self):
+    def test_opener_persisted_for_per_opener_segmentation(self):
         self.q.add_candidate_accuracy(
             b"k", 30, 4, 820.0, 3.41, 2.9, erd_lower_bound_pruned=False,
-            actual_nodes=771, group_sizes="12-8-5", source_word="salet")
+            actual_nodes=771, group_sizes="12-8-5", opener="salet")
         row = self.q._conn.execute(
-            "SELECT source_word FROM candidate_accuracy").fetchone()
-        self.assertEqual(row["source_word"], "salet")
+            "SELECT opener FROM candidate_accuracy").fetchone()
+        self.assertEqual(row["opener"], "salet")
 
     def test_identity_lifecycle_fields_join_to_claim_telemetry(self):
         branch_key = b"accuracy-branch"
@@ -404,7 +404,7 @@ class TestCandidateAccuracyMigration(unittest.TestCase):
                     erd_lower_bound_pruned INTEGER NOT NULL,
                     actual_nodes INTEGER NOT NULL,
                     group_sizes TEXT,
-                    source_word TEXT,
+                    opener TEXT,
                     epoch INTEGER NOT NULL DEFAULT 0,
                     recorded_at INTEGER NOT NULL
                 )

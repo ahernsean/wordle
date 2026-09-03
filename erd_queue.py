@@ -80,28 +80,28 @@ DEFAULT_COUNT_CAP = 500
 # (other bundle members happened to be heavy too) to resolve itself without
 # letting a genuinely pathological candidate thrash the pool indefinitely.
 DEFAULT_REPUBLISH_LIMIT = 3
-# The inclusive range a caller-supplied source-work priority may occupy.  Every
-# writer of source_work.requested_priority enforces it and
-# check_source_work_invariants reports a row outside it as a violation, so a
+# The inclusive range a caller-supplied opener-work priority may occupy.  Every
+# writer of opener_work.requested_priority enforces it and
+# check_opener_work_invariants reports a row outside it as a violation, so a
 # priority a queue can hold is exactly a priority a caller may ask for.
 #
-# The range seats one rung per source word: every candidate word laddered at a
+# The range seats one rung per opener word: every candidate word laddered at a
 # distinct priority, with room left to append further batches beneath and to
 # insert above.  The full candidate list is ~15,000 words, so it runs to just
 # below LEGACY_PROMOTED_PRIORITY_MIN rather than stopping at a round hundred.
-SOURCE_PRIORITY_MIN = 0
-SOURCE_PRIORITY_MAX = 999_999
+OPENER_PRIORITY_MIN = 0
+OPENER_PRIORITY_MAX = 999_999
 
 # Priorities at or above this bound are never allowed to preempt requested work.
 LEGACY_PROMOTED_PRIORITY_MIN = 1_000_000
 
 # A worker's scheduling role, recorded alongside its heartbeat so a report can
 # explain why the worker is running the branch it is on: PREFERRED is a
-# highest-requested-priority eligible source at the claim boundary that
+# highest-requested-priority eligible opener at the claim boundary that
 # selected it (ties at the top priority all count as preferred — none of them
 # was skipped in favor of another), FALLBACK is a strictly-lower-priority
-# eligible source claimed because every higher-priority source had no
-# claimable bundle, and DIRECT is a branch with no live source-work ownership
+# eligible opener claimed because every higher-priority opener had no
+# claimable bundle, and DIRECT is a branch with no live opener-work ownership
 # (legacy provenance).  Role is a function of ownership and admission order
 # alone, never of how a branch was reached — a branch with a live owner is
 # always PREFERRED or FALLBACK, one without is always DIRECT.
@@ -235,8 +235,8 @@ CREATE TABLE IF NOT EXISTS pending_branches (
     branch_id      INTEGER PRIMARY KEY,   -- references branches(branch_id)
     n_words        INTEGER NOT NULL,
     priority       INTEGER NOT NULL DEFAULT 0,
-    source_word    TEXT,
-    source_pattern INTEGER,
+    opener    TEXT,
+    opener_pattern INTEGER,
     status         TEXT    NOT NULL DEFAULT 'pending',
     claimed_by     TEXT,
     claimed_at     INTEGER,
@@ -248,33 +248,33 @@ CREATE TABLE IF NOT EXISTS pending_branches (
 CREATE INDEX IF NOT EXISTS idx_pending_status_pri_n
     ON pending_branches(status, priority DESC, n_words DESC);
 
--- A user request to precache the response branches of one source guess.  A
+-- A user request to precache the response branches of one opener guess.  A
 -- request remains distinct even when it shares roots with an earlier request.
-CREATE TABLE IF NOT EXISTS source_work (
-    source_work_id     INTEGER PRIMARY KEY,
-    source_word        TEXT,
+CREATE TABLE IF NOT EXISTS opener_work (
+    opener_work_id     INTEGER PRIMARY KEY,
+    opener        TEXT,
     requested_priority INTEGER NOT NULL,
     requested_at       INTEGER NOT NULL,
     started_at         INTEGER,
     state              TEXT    NOT NULL DEFAULT 'queued'
 );
 
-CREATE INDEX IF NOT EXISTS idx_source_work_priority_order
-    ON source_work(requested_priority DESC, source_work_id);
+CREATE INDEX IF NOT EXISTS idx_opener_work_priority_order
+    ON opener_work(requested_priority DESC, opener_work_id);
 
--- Every source-work request that owns a branch.  parent_branch_id records the
--- source-local promotion lineage; NULL identifies a requested root.
-CREATE TABLE IF NOT EXISTS branch_source_work (
+-- Every opener-work request that owns a branch.  parent_branch_id records the
+-- opener-local promotion lineage; NULL identifies a requested root.
+CREATE TABLE IF NOT EXISTS branch_opener_work (
     branch_id      INTEGER NOT NULL REFERENCES branches(branch_id),
-    source_work_id INTEGER NOT NULL REFERENCES source_work(source_work_id),
+    opener_work_id INTEGER NOT NULL REFERENCES opener_work(opener_work_id),
     parent_branch_id INTEGER REFERENCES branches(branch_id),
-    root_pattern   INTEGER,
+    opener_pattern INTEGER,
     resolved_at    INTEGER,
-    PRIMARY KEY (branch_id, source_work_id)
+    PRIMARY KEY (branch_id, opener_work_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_branch_source_work_source
-    ON branch_source_work(source_work_id, branch_id);
+CREATE INDEX IF NOT EXISTS idx_branch_opener_work_opener
+    ON branch_opener_work(opener_work_id, branch_id);
 
 -- One row per worker, overwritten each heartbeat.  In the swarm model a
 -- worker is a fungible contributor: it reports which branch and claim it is
@@ -309,9 +309,9 @@ CREATE TABLE IF NOT EXISTS worker_heartbeat (
     node_rate          REAL,        -- nodes/sec since last heartbeat
     cur_path           TEXT,        -- live recursion spine: subset sizes by depth
     cur_help_depth     INTEGER NOT NULL DEFAULT 0,  -- _help_other_branch nesting depth
-    source_work_id     INTEGER,     -- source_work(source_work_id) selected at the
+    opener_work_id     INTEGER,     -- opener_work(opener_work_id) selected at the
                                     -- last claim boundary; NULL if none was selected
-    scheduling_role    TEXT,        -- one of SCHEDULING_ROLES; NULL if source_work_id
+    scheduling_role    TEXT,        -- one of SCHEDULING_ROLES; NULL if opener_work_id
                                     -- is NULL
     -- Hint-artifact accounting for the run (hint_cache.py).  All NULL when the
     -- swarm was started without --hint-cache, which is not the same fact as a
@@ -354,9 +354,9 @@ CREATE TABLE IF NOT EXISTS active_branches (
     n_words        INTEGER NOT NULL,
     n_candidates   INTEGER NOT NULL,
     priority       INTEGER NOT NULL DEFAULT 0,
-    requires_source_membership INTEGER NOT NULL DEFAULT 0,
-    source_word    TEXT,
-    source_pattern INTEGER,
+    requires_opener_membership INTEGER NOT NULL DEFAULT 0,
+    opener    TEXT,
+    opener_pattern INTEGER,
     best_erd       REAL,
     best_guess     TEXT,
     status         TEXT    NOT NULL DEFAULT 'open',
@@ -636,7 +636,7 @@ CREATE TABLE IF NOT EXISTS telemetry.cost_samples (
 -- coordination_millis's claim-handout portion into the scan/write phase and
 -- the COMMIT itself; busy_wait_millis is the write-lock wait across the claim
 -- paths taken while coordinating; scheduling_millis is the work-selection scan
--- that chose this branch (source-work ordering, pending promotion, joining an
+-- that chose this branch (opener-work ordering, pending promotion, joining an
 -- in-progress branch) excluding the phases already counted; idle_millis is
 -- what is left over.  Those five partition coordination_millis exactly, and
 -- idle_millis means genuinely unaccounted wait -- scheduling work is called
@@ -799,7 +799,7 @@ CREATE TABLE IF NOT EXISTS telemetry.candidate_accuracy (
     erd_lower_bound_pruned     INTEGER NOT NULL,
     actual_nodes               INTEGER NOT NULL,
     group_sizes                TEXT,
-    source_word                TEXT,
+    opener                TEXT,
     -- started_at is the beginning of evaluation; recorded_at remains the
     -- completion time so existing readers retain their timestamp contract.
     started_at                 INTEGER,
@@ -860,12 +860,12 @@ def best_first_rank(best_first_position):
     return None if best_first_position is None else best_first_position + 1
 
 
-def check_source_priority_range(priority: int) -> None:
-    """Raise ValueError unless priority is within the source-work range."""
-    if not SOURCE_PRIORITY_MIN <= priority <= SOURCE_PRIORITY_MAX:
+def check_opener_priority_range(priority: int) -> None:
+    """Raise ValueError unless priority is within the opener-work range."""
+    if not OPENER_PRIORITY_MIN <= priority <= OPENER_PRIORITY_MAX:
         raise ValueError(
             "opener-work priority must be between "
-            f"{SOURCE_PRIORITY_MIN} and {SOURCE_PRIORITY_MAX}")
+            f"{OPENER_PRIORITY_MIN} and {OPENER_PRIORITY_MAX}")
 
 
 def read_only_database_uri(db_path: str) -> str:
@@ -1021,9 +1021,129 @@ class ERDQueue:
                     f"queue file (rename it) and start a fresh queue; "
                     f"telemetry now lives in {self.telemetry_path!r}.")
 
+    def _rename_source_to_opener(self):
+        """Rename the pre-opener-vocabulary source_* schema to opener_* naming.
+
+        Runs first in _migrate(), before any other step reads or writes the
+        renamed tables/columns by their new names.  A fresh database never
+        held the old names (the schema script above already creates
+        opener_work/branch_opener_work directly), so every step here is
+        conditioned on the old name actually being present rather than on
+        the schema_migrations guard alone: CREATE TABLE IF NOT EXISTS runs
+        before _migrate() and would otherwise have already created an empty
+        opener_work/branch_opener_work table alongside an old database's
+        source_work/branch_source_work, which a bare ALTER TABLE ... RENAME
+        TO would then refuse (the destination name already exists).
+        """
+        migration_name = "rename_source_to_opener"
+        already_applied = self._conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE name = ?",
+            (migration_name,)).fetchone() is not None
+        existing_tables = {r["name"] for r in self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        pending_columns = {r["name"] for r in
+                           self._conn.execute("PRAGMA table_info(pending_branches)")}
+        active_columns = {r["name"] for r in
+                          self._conn.execute("PRAGMA table_info(active_branches)")}
+        renaming_anything = (
+            "source_work" in existing_tables
+            or "branch_source_work" in existing_tables
+            or "source_word" in pending_columns
+            or "source_pattern" in pending_columns
+            or "source_word" in active_columns
+            or "source_pattern" in active_columns
+            or "requires_source_membership" in active_columns
+        )
+        if renaming_anything:
+            # Both queue views read columns this migration renames below, and
+            # SQLite's RENAME COLUMN tries to rewrite any view that references
+            # the renamed column in place -- which fails on a definition still
+            # shaped around the old table or column.  Drop both before any
+            # rename runs; _rebuild_queue_views recreates them from current
+            # code once every renamed column exists under its new name.
+            self._conn.execute("DROP VIEW IF EXISTS active_branch_owner_rows")
+            self._conn.execute("DROP VIEW IF EXISTS live_branch_source_rows")
+            self._conn.execute("DROP VIEW IF EXISTS live_branch_opener_rows")
+        if "source_work" in existing_tables:
+            # ALTER TABLE ... RENAME TO renames the table but leaves any index
+            # on it under its old name -- idx_source_work_priority_order does
+            # not become idx_opener_work_priority_order, it stays exactly as
+            # named and simply now points at opener_work.  Dropping only the
+            # new name here is therefore a no-op on a real old-schema database
+            # (that name has never existed yet) and leaves the genuinely old
+            # one behind, duplicating the index CREATE INDEX below adds.  Both
+            # names must be dropped; which happens before or after the rename
+            # makes no difference, since DROP INDEX addresses the index by its
+            # own name regardless of which table it is currently attached to.
+            self._conn.execute("DROP INDEX IF EXISTS idx_source_work_priority_order")
+            self._conn.execute("DROP INDEX IF EXISTS idx_opener_work_priority_order")
+            self._conn.execute("DROP TABLE IF EXISTS opener_work")
+            self._conn.execute("ALTER TABLE source_work RENAME TO opener_work")
+            self._conn.execute(
+                "ALTER TABLE opener_work RENAME COLUMN source_word TO opener")
+            self._conn.execute(
+                "ALTER TABLE opener_work RENAME COLUMN source_work_id "
+                "TO opener_work_id")
+            self._conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_opener_work_priority_order
+                    ON opener_work(requested_priority DESC, opener_work_id)
+            """)
+        if "branch_source_work" in existing_tables:
+            # Same index-survives-the-rename hazard as opener_work above.
+            self._conn.execute("DROP INDEX IF EXISTS idx_branch_source_work_source")
+            self._conn.execute("DROP INDEX IF EXISTS idx_branch_opener_work_opener")
+            self._conn.execute("DROP TABLE IF EXISTS branch_opener_work")
+            self._conn.execute(
+                "ALTER TABLE branch_source_work RENAME TO branch_opener_work")
+            self._conn.execute(
+                "ALTER TABLE branch_opener_work RENAME COLUMN root_pattern "
+                "TO opener_pattern")
+            self._conn.execute(
+                "ALTER TABLE branch_opener_work RENAME COLUMN source_work_id "
+                "TO opener_work_id")
+            self._conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_branch_opener_work_opener
+                    ON branch_opener_work(opener_work_id, branch_id)
+            """)
+        if "source_word" in pending_columns:
+            self._conn.execute(
+                "ALTER TABLE pending_branches RENAME COLUMN source_word TO opener")
+        if "source_pattern" in pending_columns:
+            self._conn.execute(
+                "ALTER TABLE pending_branches RENAME COLUMN source_pattern "
+                "TO opener_pattern")
+        if "source_word" in active_columns:
+            self._conn.execute(
+                "ALTER TABLE active_branches RENAME COLUMN source_word TO opener")
+        if "source_pattern" in active_columns:
+            self._conn.execute(
+                "ALTER TABLE active_branches RENAME COLUMN source_pattern "
+                "TO opener_pattern")
+        if "requires_source_membership" in active_columns:
+            self._conn.execute(
+                "ALTER TABLE active_branches RENAME COLUMN "
+                "requires_source_membership TO requires_opener_membership")
+        heartbeat_columns = {r["name"] for r in
+                             self._conn.execute("PRAGMA table_info(worker_heartbeat)")}
+        if "source_work_id" in heartbeat_columns:
+            self._conn.execute(
+                "ALTER TABLE worker_heartbeat RENAME COLUMN "
+                "source_work_id TO opener_work_id")
+        telemetry_columns = {r["name"] for r in self._conn.execute(
+            "PRAGMA telemetry.table_info(candidate_accuracy)")}
+        if "source_word" in telemetry_columns:
+            self._conn.execute(
+                "ALTER TABLE telemetry.candidate_accuracy "
+                "RENAME COLUMN source_word TO opener")
+        if not already_applied:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (name, completed_at) "
+                "VALUES (?, ?)", (migration_name, int(time.time())))
+
     def _migrate(self):
+        self._rename_source_to_opener()
         # active_branches.spine: additive, nullable, no backfill.  Existing rows
-        # keep NULL (display falls back to the source word) until re-promoted.
+        # keep NULL (display falls back to the opener word) until re-promoted.
         cols = {r["name"] for r in
                 self._conn.execute("PRAGMA table_info(active_branches)")}
         if "spine" not in cols:
@@ -1041,8 +1161,8 @@ class ERDQueue:
                     n_words        INTEGER NOT NULL,
                     n_candidates   INTEGER NOT NULL,
                     priority       INTEGER NOT NULL DEFAULT 0,
-                    source_word    TEXT,
-                    source_pattern INTEGER,
+                    opener    TEXT,
+                    opener_pattern INTEGER,
                     best_erd       REAL,
                     best_guess     TEXT,
                     status         TEXT    NOT NULL DEFAULT 'open',
@@ -1056,7 +1176,7 @@ class ERDQueue:
                 );
                 INSERT INTO active_branches_new
                     SELECT branch_key, n_words, n_candidates, priority,
-                           source_word, source_pattern, best_erd, best_guess,
+                           opener, opener_pattern, best_erd, best_guess,
                            status, created_at, finalized_at, budget,
                            best_max_depth, tainted, nodes_spent, spine
                     FROM active_branches;
@@ -1357,7 +1477,7 @@ class ERDQueue:
             """)
         if _rebuildable("active_branches", {
                 "branch_key", "n_words", "n_candidates", "priority",
-                "source_word", "source_pattern", "best_erd", "best_guess",
+                "opener", "opener_pattern", "best_erd", "best_guess",
                 "status", "created_at", "finalized_at", "budget",
                 "best_max_depth", "tainted", "nodes_spent", "spine", "ceiling",
                 "cut_occurred", "bulk_done_candidates", "bulk_done_bound",
@@ -1368,8 +1488,8 @@ class ERDQueue:
                     n_words        INTEGER NOT NULL,
                     n_candidates   INTEGER NOT NULL,
                     priority       INTEGER NOT NULL DEFAULT 0,
-                    source_word    TEXT,
-                    source_pattern INTEGER,
+                    opener    TEXT,
+                    opener_pattern INTEGER,
                     best_erd       REAL,
                     best_guess     TEXT,
                     status         TEXT    NOT NULL DEFAULT 'open',
@@ -1391,7 +1511,7 @@ class ERDQueue:
                 );
                 INSERT INTO active_branches_norm
                     SELECT b.branch_id, a.n_words, a.n_candidates, a.priority,
-                           a.source_word, a.source_pattern, a.best_erd,
+                           a.opener, a.opener_pattern, a.best_erd,
                            a.best_guess, a.status, a.created_at, a.finalized_at,
                            a.budget, a.best_max_depth, a.tainted, a.nodes_spent,
                            a.spine, a.ceiling, a.cut_occurred,
@@ -1409,24 +1529,24 @@ class ERDQueue:
                     ON active_branches(status, priority DESC, n_words DESC);
             """)
         if _rebuildable("pending_branches", {
-                "branch_key", "n_words", "priority", "source_word",
-                "source_pattern", "status", "claimed_by", "claimed_at",
+                "branch_key", "n_words", "priority", "opener",
+                "opener_pattern", "status", "claimed_by", "claimed_at",
                 "completed_at"}):
             self._conn.executescript("""
                 CREATE TABLE pending_branches_norm (
                     branch_id      INTEGER PRIMARY KEY,
                     n_words        INTEGER NOT NULL,
                     priority       INTEGER NOT NULL DEFAULT 0,
-                    source_word    TEXT,
-                    source_pattern INTEGER,
+                    opener    TEXT,
+                    opener_pattern INTEGER,
                     status         TEXT    NOT NULL DEFAULT 'pending',
                     claimed_by     TEXT,
                     claimed_at     INTEGER,
                     completed_at   INTEGER
                 );
                 INSERT INTO pending_branches_norm
-                    SELECT b.branch_id, p.n_words, p.priority, p.source_word,
-                           p.source_pattern, p.status, p.claimed_by,
+                    SELECT b.branch_id, p.n_words, p.priority, p.opener,
+                           p.opener_pattern, p.status, p.claimed_by,
                            p.claimed_at, p.completed_at
                     FROM pending_branches p
                     JOIN branches b ON b.branch_key = p.branch_key;
@@ -1445,16 +1565,16 @@ class ERDQueue:
                 "ALTER TABLE worker_heartbeat "
                 "RENAME COLUMN current_branch_key TO current_branch_id")
 
-        # Pre-source-aware queues recorded only a display label on each root.
-        # Preserve each surviving root as independently schedulable source work;
+        # Pre-opener-aware queues recorded only a display label on each root.
+        # Preserve each surviving root as independently schedulable opener work;
         # its original request grouping cannot be recovered from those labels.
         pending_columns = {row["name"] for row in self._conn.execute(
             "PRAGMA table_info(pending_branches)")}
-        if (self._conn.execute("SELECT COUNT(*) FROM source_work").fetchone()[0] == 0
-                and {"branch_id", "source_word", "priority", "status"}
+        if (self._conn.execute("SELECT COUNT(*) FROM opener_work").fetchone()[0] == 0
+                and {"branch_id", "opener", "priority", "status"}
                 <= pending_columns):
             legacy_roots = self._conn.execute("""
-                SELECT branch_id, source_word, priority, status
+                SELECT branch_id, opener, priority, status
                 FROM pending_branches
                 ORDER BY branch_id
             """).fetchall()
@@ -1463,37 +1583,37 @@ class ERDQueue:
                 state = ({"done": "complete", "in_progress": "active"}
                          .get(row["status"], "queued"))
                 cur = self._conn.execute("""
-                    INSERT INTO source_work
-                        (source_word, requested_priority, requested_at, state)
+                    INSERT INTO opener_work
+                        (opener, requested_priority, requested_at, state)
                     VALUES (?, ?, ?, ?)
-                """, (row["source_word"], row["priority"], now, state))
+                """, (row["opener"], row["priority"], now, state))
                 self._conn.execute("""
-                    INSERT OR IGNORE INTO branch_source_work
-                        (branch_id, source_work_id, parent_branch_id)
+                    INSERT OR IGNORE INTO branch_opener_work
+                        (branch_id, opener_work_id, parent_branch_id)
                     VALUES (?, ?, NULL)
                 """, (row["branch_id"], cur.lastrowid))
 
-        self._add_columns("branch_source_work", {
-            "root_pattern": "INTEGER",
+        self._add_columns("branch_opener_work", {
+            "opener_pattern": "INTEGER",
             "resolved_at": "INTEGER",
         })
-        self._add_columns("source_work", {"started_at": "INTEGER"})
+        self._add_columns("opener_work", {"started_at": "INTEGER"})
         if "claimed_at" in pending_columns:
             self._conn.execute("""
-                UPDATE source_work AS source
+                UPDATE opener_work AS opener
                 SET started_at = (
                     SELECT MIN(pending.claimed_at)
-                    FROM branch_source_work AS membership
+                    FROM branch_opener_work AS membership
                     JOIN pending_branches AS pending
                       ON pending.branch_id = membership.branch_id
-                    WHERE membership.source_work_id = source.source_work_id
+                    WHERE membership.opener_work_id = opener.opener_work_id
                       AND membership.resolved_at IS NULL
                       AND pending.claimed_at IS NOT NULL
                 )
-                WHERE source.state = 'active' AND source.started_at IS NULL
+                WHERE opener.state = 'active' AND opener.started_at IS NULL
             """)
         self._add_columns("active_branches", {
-            "requires_source_membership": "INTEGER NOT NULL DEFAULT 0",
+            "requires_opener_membership": "INTEGER NOT NULL DEFAULT 0",
             "infeasible_candidates": "INTEGER NOT NULL DEFAULT 0",
             "infeasible_nodes": "INTEGER NOT NULL DEFAULT 0",
         })
@@ -1501,34 +1621,34 @@ class ERDQueue:
         # backfill for existing rows is needed, they are overwritten on the next
         # heartbeat.
         self._add_columns("worker_heartbeat", {
-            "source_work_id": "INTEGER",
+            "opener_work_id": "INTEGER",
             "scheduling_role": "TEXT",
         })
         self._conn.execute("""
             UPDATE active_branches
-            SET requires_source_membership = 1
+            SET requires_opener_membership = 1
             WHERE branch_id IN (
-                SELECT branch_id FROM branch_source_work
+                SELECT branch_id FROM branch_opener_work
                 WHERE resolved_at IS NULL
             )
         """)
-        if {"branch_id", "source_pattern"} <= pending_columns:
+        if {"branch_id", "opener_pattern"} <= pending_columns:
             self._conn.execute("""
-                UPDATE branch_source_work
-                SET root_pattern = (
-                    SELECT source_pattern FROM pending_branches
-                    WHERE pending_branches.branch_id = branch_source_work.branch_id
+                UPDATE branch_opener_work
+                SET opener_pattern = (
+                    SELECT opener_pattern FROM pending_branches
+                    WHERE pending_branches.branch_id = branch_opener_work.branch_id
                 )
-                WHERE parent_branch_id IS NULL AND root_pattern IS NULL
+                WHERE parent_branch_id IS NULL AND opener_pattern IS NULL
             """)
         self._conn.execute("""
-            UPDATE branch_source_work AS membership
+            UPDATE branch_opener_work AS membership
             SET resolved_at = ?
             WHERE resolved_at IS NULL
               AND EXISTS (
-                  SELECT 1 FROM source_work AS source
-                  WHERE source.source_work_id = membership.source_work_id
-                    AND source.state = 'complete'
+                  SELECT 1 FROM opener_work AS opener
+                  WHERE opener.opener_work_id = membership.opener_work_id
+                    AND opener.state = 'complete'
               )
         """, (int(time.time()),))
         self._apply_queue_migration(
@@ -1680,28 +1800,28 @@ class ERDQueue:
     def _rebuild_queue_views(self):
         """Restore queue views when their stored definition differs from code."""
         view_definitions = {
-            "live_branch_source_rows": """
-                CREATE VIEW live_branch_source_rows AS
+            "live_branch_opener_rows": """
+                CREATE VIEW live_branch_opener_rows AS
                 SELECT membership.branch_id,
-                       source.source_work_id,
-                       source.source_word AS owner_source_word,
-                       membership.root_pattern AS owner_root_pattern,
-                       source.requested_priority AS owner_priority
-                FROM branch_source_work AS membership
-                JOIN source_work AS source
-                  ON source.source_work_id = membership.source_work_id
+                       opener.opener_work_id,
+                       opener.opener AS owner_opener,
+                       membership.opener_pattern AS owner_opener_pattern,
+                       opener.requested_priority AS owner_priority
+                FROM branch_opener_work AS membership
+                JOIN opener_work AS opener
+                  ON opener.opener_work_id = membership.opener_work_id
                 WHERE membership.resolved_at IS NULL
-                  AND source.state != 'complete'
+                  AND opener.state != 'complete'
             """,
             "active_branch_owner_rows": f"""
                 CREATE VIEW active_branch_owner_rows AS
                 SELECT active.*,
                        branch.branch_key,
-                       owner.source_work_id,
-                       COALESCE(owner.owner_source_word, active.source_word)
-                           AS owner_source_word,
-                       COALESCE(owner.owner_root_pattern, active.source_pattern)
-                           AS owner_root_pattern,
+                       owner.opener_work_id,
+                       COALESCE(owner.owner_opener, active.opener)
+                           AS owner_opener,
+                       COALESCE(owner.owner_opener_pattern, active.opener_pattern)
+                           AS owner_opener_pattern,
                        COALESCE(
                            owner.owner_priority,
                            CASE WHEN active.priority >= {LEGACY_PROMOTED_PRIORITY_MIN}
@@ -1710,10 +1830,10 @@ class ERDQueue:
                            AS owner_priority
                 FROM active_branches AS active
                 JOIN branches AS branch USING (branch_id)
-                LEFT JOIN live_branch_source_rows AS owner USING (branch_id)
+                LEFT JOIN live_branch_opener_rows AS owner USING (branch_id)
                 WHERE active.status = 'open'
-                  AND (owner.source_work_id IS NOT NULL
-                       OR active.requires_source_membership = 0)
+                  AND (owner.opener_work_id IS NOT NULL
+                       OR active.requires_opener_membership = 0)
             """,
         }
         stored_definitions = {
@@ -1881,7 +2001,7 @@ class ERDQueue:
         return row[0]
 
     def add_pending_many(self, rows):
-        """Insert (branch_key, n_words, priority, source_word, source_pattern) rows.
+        """Insert (branch_key, n_words, priority, opener, opener_pattern) rows.
 
         Uses an UPSERT so that:
         - A row inserted for the first time is added as 'pending'.
@@ -1889,15 +2009,15 @@ class ERDQueue:
           e.g. a branch first inserted at priority=0 by an earlier opener
           is correctly promoted to priority=1 when a VIP word (SALET) is
           queued later.
-        - source_word / source_pattern record the first opener whose branch
+        - opener / opener_pattern record the first opener whose branch
           produced this entry (kept for display in `status`).
 
         Raises ValueError, before writing anything, if any row's priority lies
-        outside the source-work range.
+        outside the opener-work range.
         """
         rows = list(rows)
         for row in rows:
-            check_source_priority_range(row[2])
+            check_opener_priority_range(row[2])
         # Intern before the transaction: the branches registry is append-only,
         # so committing ids up front is safe even if the pending insert fails,
         # and keeps the id cache consistent with the database on a rollback.
@@ -1906,35 +2026,35 @@ class ERDQueue:
         self._conn.execute("BEGIN")
         try:
             now = int(time.time())
-            source_work_ids = {}
-            for _branch_id, _n_words, priority, source_word, _source_pattern in prepared:
-                key = (source_word, priority)
-                if key not in source_work_ids:
+            opener_work_ids = {}
+            for _branch_id, _n_words, priority, opener, _opener_pattern in prepared:
+                key = (opener, priority)
+                if key not in opener_work_ids:
                     cur = self._conn.execute("""
-                        INSERT INTO source_work
-                            (source_word, requested_priority, requested_at, state)
+                        INSERT INTO opener_work
+                            (opener, requested_priority, requested_at, state)
                         VALUES (?, ?, ?, 'queued')
-                    """, (source_word, priority, now))
-                    source_work_ids[key] = cur.lastrowid
+                    """, (opener, priority, now))
+                    opener_work_ids[key] = cur.lastrowid
             self._conn.executemany("""
                 INSERT INTO pending_branches
-                    (branch_id, n_words, priority, source_word, source_pattern, status)
+                    (branch_id, n_words, priority, opener, opener_pattern, status)
                 VALUES (?, ?, ?, ?, ?, 'pending')
                 ON CONFLICT(branch_id) DO UPDATE SET
                     priority       = MAX(priority, excluded.priority),
-                    source_word    = COALESCE(source_word, excluded.source_word),
-                    source_pattern = COALESCE(source_pattern, excluded.source_pattern)
+                    opener    = COALESCE(opener, excluded.opener),
+                    opener_pattern = COALESCE(opener_pattern, excluded.opener_pattern)
             """, prepared)
             self._conn.executemany("""
-                INSERT INTO branch_source_work
-                    (branch_id, source_work_id, parent_branch_id, root_pattern)
+                INSERT INTO branch_opener_work
+                    (branch_id, opener_work_id, parent_branch_id, opener_pattern)
                 VALUES (?, ?, NULL, ?)
-                ON CONFLICT(branch_id, source_work_id) DO UPDATE SET
+                ON CONFLICT(branch_id, opener_work_id) DO UPDATE SET
                     parent_branch_id = NULL,
-                    root_pattern = excluded.root_pattern,
+                    opener_pattern = excluded.opener_pattern,
                     resolved_at = NULL
-            """, [(branch_id, source_work_ids[(source_word, priority)], source_pattern)
-                  for branch_id, _n_words, priority, source_word, source_pattern
+            """, [(branch_id, opener_work_ids[(opener, priority)], opener_pattern)
+                  for branch_id, _n_words, priority, opener, opener_pattern
                   in prepared])
             self._conn.execute("COMMIT")
             self._tally_wal_traffic(
@@ -1948,30 +2068,30 @@ class ERDQueue:
     # Worker claim loop
     # ------------------------------------------------------------------
 
-    def source_work_candidates(self):
-        """Return unfinished source work in source-first admission order."""
+    def opener_work_candidates(self):
+        """Return unfinished opener work in opener-first admission order."""
         return self._conn.execute("""
-            SELECT s.* FROM source_work s
+            SELECT s.* FROM opener_work s
             WHERE s.state != 'complete'
               AND EXISTS (
-                SELECT 1 FROM branch_source_work m
+                SELECT 1 FROM branch_opener_work m
                 LEFT JOIN pending_branches p ON p.branch_id = m.branch_id
                 LEFT JOIN active_branches a ON a.branch_id = m.branch_id
-                WHERE m.source_work_id = s.source_work_id
+                WHERE m.opener_work_id = s.opener_work_id
                   AND m.resolved_at IS NULL
                   AND (p.status IN ('pending', 'in_progress') OR a.status = 'open')
             )
             ORDER BY s.requested_priority DESC,
                      CASE s.state WHEN 'active' THEN 0 ELSE 1 END,
-                     s.source_work_id
+                     s.opener_work_id
         """).fetchall()
 
-    def has_source_work(self) -> bool:
-        """Whether this queue has source-aware scheduling provenance."""
+    def has_opener_work(self) -> bool:
+        """Whether this queue has opener-aware scheduling provenance."""
         return self._conn.execute(
-            "SELECT EXISTS(SELECT 1 FROM source_work)").fetchone()[0] == 1
+            "SELECT EXISTS(SELECT 1 FROM opener_work)").fetchone()[0] == 1
 
-    def lowest_unfinished_source_priority(self):
+    def lowest_unfinished_opener_priority(self):
         """The lowest requested priority still owed work, or None if none is.
 
         A request that has not completed is still owed work whether or not it
@@ -1979,41 +2099,41 @@ class ERDQueue:
         ranks it below this.
         """
         return self._conn.execute("""
-            SELECT MIN(requested_priority) FROM source_work
+            SELECT MIN(requested_priority) FROM opener_work
             WHERE state != 'complete'
         """).fetchone()[0]
 
-    def _source_response_group_is_live(self, source_work_id, root_pattern):
-        """Whether a source request still needs work below one direct response group."""
-        if root_pattern is None:
+    def _opener_response_group_is_live(self, opener_work_id, opener_pattern):
+        """Whether an opener request still needs work below one direct response group."""
+        if opener_pattern is None:
             return self._conn.execute("""
                 SELECT EXISTS(
-                    SELECT 1 FROM source_work
-                    WHERE source_work_id = ? AND state != 'complete'
+                    SELECT 1 FROM opener_work
+                    WHERE opener_work_id = ? AND state != 'complete'
                 )
-            """, (source_work_id,)).fetchone()[0] == 1
+            """, (opener_work_id,)).fetchone()[0] == 1
         return self._conn.execute("""
             SELECT EXISTS(
                 SELECT 1
-                FROM branch_source_work AS membership
-                JOIN source_work AS source
-                  ON source.source_work_id = membership.source_work_id
-                WHERE membership.source_work_id = ?
-                  AND membership.root_pattern = ?
+                FROM branch_opener_work AS membership
+                JOIN opener_work AS opener
+                  ON opener.opener_work_id = membership.opener_work_id
+                WHERE membership.opener_work_id = ?
+                  AND membership.opener_pattern = ?
                   AND membership.parent_branch_id IS NULL
                   AND membership.resolved_at IS NULL
-                  AND source.state != 'complete'
+                  AND opener.state != 'complete'
             )
-        """, (source_work_id, root_pattern)).fetchone()[0] == 1
+        """, (opener_work_id, opener_pattern)).fetchone()[0] == 1
 
-    def claim_next(self, worker_id: str, source_work_id: int = None):
+    def claim_next(self, worker_id: str, opener_work_id: int = None):
         """Atomically claim the highest-priority / largest pending branch.
 
-        Returns a dict {branch_key, n_words, priority, source_word,
-        source_pattern} or None if the queue is empty.  In the swarm model the
+        Returns a dict {branch_key, n_words, priority, opener,
+        opener_pattern} or None if the queue is empty.  In the swarm model the
         claiming worker uses this to PROMOTE a queued branch into an
         active_branches row that other workers can then join; the branch's
-        priority and source word/pattern are carried over for display.
+        priority and opener word/pattern are carried over for display.
 
         Uses BEGIN IMMEDIATE to acquire the write lock before the SELECT,
         eliminating the TOCTOU race where two workers could both read the same
@@ -2022,25 +2142,25 @@ class ERDQueue:
         """
         self._begin_immediate_timed()
         try:
-            if source_work_id is None:
-                source_rows = self.source_work_candidates()
-                source_work_id = (source_rows[0]["source_work_id"]
-                                  if source_rows else None)
-            if source_work_id is None:
+            if opener_work_id is None:
+                opener_work_rows = self.opener_work_candidates()
+                opener_work_id = (opener_work_rows[0]["opener_work_id"]
+                                  if opener_work_rows else None)
+            if opener_work_id is None:
                 self._conn.execute("COMMIT")
                 return None
             row = self._conn.execute("""
                 SELECT branch.branch_key, pending.branch_id, pending.n_words,
-                       owner.owner_priority, owner.owner_source_word,
-                       owner.owner_root_pattern, owner.source_work_id
+                       owner.owner_priority, owner.owner_opener,
+                       owner.owner_opener_pattern, owner.opener_work_id
                 FROM pending_branches AS pending
                 JOIN branches AS branch USING (branch_id)
-                JOIN live_branch_source_rows AS owner USING (branch_id)
+                JOIN live_branch_opener_rows AS owner USING (branch_id)
                 WHERE pending.status = 'pending'
-                  AND owner.source_work_id = ?
+                  AND owner.opener_work_id = ?
                 ORDER BY pending.n_words DESC
                 LIMIT 1
-            """, (source_work_id,)).fetchone()
+            """, (opener_work_id,)).fetchone()
             if row is None:
                 self._conn.execute("COMMIT")
                 return None
@@ -2051,18 +2171,18 @@ class ERDQueue:
                 WHERE branch_id = ?
             """, (worker_id, now, row["branch_id"]))
             self._conn.execute("""
-                UPDATE source_work
+                UPDATE opener_work
                 SET state = 'active', started_at = COALESCE(started_at, ?)
-                WHERE source_work_id = ?
-            """, (now, source_work_id))
+                WHERE opener_work_id = ?
+            """, (now, opener_work_id))
             self._conn.execute("COMMIT")
             return {
                 'branch_key': bytes(row["branch_key"]),
                 'n_words': row["n_words"],
                 'priority': row["owner_priority"],
-                'source_word': row["owner_source_word"],
-                'source_pattern': row["owner_root_pattern"],
-                'source_work_id': row["source_work_id"],
+                'opener': row["owner_opener"],
+                'opener_pattern': row["owner_opener_pattern"],
+                'opener_work_id': row["opener_work_id"],
             }
         except Exception:  # pragma: no cover
             self._conn.execute("ROLLBACK")
@@ -2093,30 +2213,30 @@ class ERDQueue:
             self._conn.execute("ROLLBACK")
             raise
 
-    def _complete_finished_source_work(self):
-        """Mark source requests terminal once every owned branch is complete."""
+    def _complete_finished_opener_work(self):
+        """Mark opener requests terminal once every owned branch is complete."""
         completion_predicate = """
             state != 'complete'
               AND NOT EXISTS (
-                  SELECT 1 FROM branch_source_work m
+                  SELECT 1 FROM branch_opener_work m
                   LEFT JOIN pending_branches p ON p.branch_id = m.branch_id
                   LEFT JOIN active_branches a ON a.branch_id = m.branch_id
-                  WHERE m.source_work_id = s.source_work_id
+                  WHERE m.opener_work_id = s.opener_work_id
                     AND m.resolved_at IS NULL
                     AND (p.status IN ('pending', 'in_progress') OR a.status = 'open')
               )
         """
         completed_rows = self._conn.execute(
-            "SELECT source_word FROM source_work AS s WHERE "
+            "SELECT opener FROM opener_work AS s WHERE "
             + completion_predicate
         ).fetchall()
         if not completed_rows:
             return []
         self._conn.execute(
-            "UPDATE source_work AS s SET state = 'complete' WHERE "
+            "UPDATE opener_work AS s SET state = 'complete' WHERE "
             + completion_predicate
         )
-        return list({row["source_word"] for row in completed_rows})
+        return list({row["opener"] for row in completed_rows})
 
     def _resolve_branch_memberships(self, branch_id: int = None,
                                     withdraw: bool = False):
@@ -2125,36 +2245,36 @@ class ERDQueue:
         parameters = () if branch_id is None else (branch_id,)
         if withdraw:
             if branch_id is None:
-                self._conn.execute("DELETE FROM branch_source_work")
+                self._conn.execute("DELETE FROM branch_opener_work")
             else:
                 self._conn.execute(
-                    "DELETE FROM branch_source_work "
+                    "DELETE FROM branch_opener_work "
                     "WHERE resolved_at IS NULL AND branch_id = ?", parameters)
         else:
             self._conn.execute(
-                "UPDATE branch_source_work SET resolved_at = ? "
+                "UPDATE branch_opener_work SET resolved_at = ? "
                 "WHERE resolved_at IS NULL" + branch_condition,
                 (int(time.time()), *parameters))
-        completed_words = self._complete_finished_source_work()
+        completed_words = self._complete_finished_opener_work()
         self._demote_orphaned_owned_branches()
         return completed_words
 
     def _retire_exact_direct_response_groups(self, branch_id: int) -> list[str]:
         """Retire work below direct response groups whose exact result is done.
 
-        A source request needs each direct response group once.  Once one of
+        A opener request needs each direct response group once.  Once one of
         those roots has an exact result, descendant candidate searches under
         that same root cannot change it.  Other direct response groups, and
         branches still owned by another live request, remain runnable.
 
         The caller holds the queue transaction.  Removing exclusive active
-        rows before resolving their source memberships prevents the normal
+        rows before resolving their opener memberships prevents the normal
         orphan reconciliation from reclassifying cancelled descendant work as
         direct work.
         """
         direct_groups = self._conn.execute("""
-            SELECT source_work_id, root_pattern
-            FROM branch_source_work
+            SELECT opener_work_id, opener_pattern
+            FROM branch_opener_work
             WHERE branch_id = ?
               AND parent_branch_id IS NULL
               AND resolved_at IS NULL
@@ -2166,21 +2286,21 @@ class ERDQueue:
         for group in direct_groups:
             target_branch_ids.update(row[0] for row in self._conn.execute("""
                 SELECT branch_id
-                FROM branch_source_work
-                WHERE source_work_id = ?
-                  AND root_pattern IS ?
+                FROM branch_opener_work
+                WHERE opener_work_id = ?
+                  AND opener_pattern IS ?
                   AND resolved_at IS NULL
-            """, (group["source_work_id"], group["root_pattern"])))
+            """, (group["opener_work_id"], group["opener_pattern"])))
 
         now = int(time.time())
         for group in direct_groups:
             self._conn.execute("""
-                UPDATE branch_source_work
+                UPDATE branch_opener_work
                 SET resolved_at = ?
-                WHERE source_work_id = ?
-                  AND root_pattern IS ?
+                WHERE opener_work_id = ?
+                  AND opener_pattern IS ?
                   AND resolved_at IS NULL
-            """, (now, group["source_work_id"], group["root_pattern"]))
+            """, (now, group["opener_work_id"], group["opener_pattern"]))
 
         descendant_ids = sorted(target_branch_ids - {branch_id})
         if descendant_ids:
@@ -2192,7 +2312,7 @@ class ERDQueue:
                 WHERE active.status = 'open'
                   AND active.branch_id IN ({placeholders})
                   AND NOT EXISTS (
-                      SELECT 1 FROM live_branch_source_rows AS owner
+                      SELECT 1 FROM live_branch_opener_rows AS owner
                       WHERE owner.branch_id = active.branch_id
                   )
             """, descendant_ids).fetchall()
@@ -2215,14 +2335,14 @@ class ERDQueue:
                     f"DELETE FROM active_branches WHERE branch_id IN ({active_placeholders})",
                     active_ids)
 
-        return self._complete_finished_source_work()
+        return self._complete_finished_opener_work()
 
-    def completed_source_timing(self, source_word):
-        """Return durable-source timing from every telemetry epoch.
+    def completed_opener_timing(self, opener):
+        """Return durable-opener timing from every telemetry epoch.
 
-        Source ownership can attach a request to an already-existing branch.
+        Opener ownership can attach a request to an already-existing branch.
         Its finalization record predates that request, so ownership joins are
-        not a source timing boundary.  The opener in each recorded spine is.
+        not an opener timing boundary.  The opener in each recorded spine is.
         """
         return self._conn.execute("""
             SELECT MIN(log.created_at) AS first_created_at,
@@ -2233,12 +2353,12 @@ class ERDQueue:
             WHERE lower(substr(log.spine, 1, 5)) = lower(?)
               AND log.created_at IS NOT NULL
               AND log.finalized_at IS NOT NULL
-        """, (source_word,)).fetchone()
+        """, (opener,)).fetchone()
 
     def _demote_orphaned_owned_branches(self) -> list[int]:
-        """Demote open branches whose only source ownership has been lost.
+        """Demote open branches whose only opener ownership has been lost.
 
-        A branch promoted under a source-work request (requires_source_
+        A branch promoted under an opener-work request (requires_opener_
         membership = 1) can outlive every membership that justified the
         requirement, in either of two shapes:
 
@@ -2247,32 +2367,32 @@ class ERDQueue:
           bound tightens past it, and the branch's own membership resolves
           along with the rest of the (now-finished) request while the
           branch itself stays open;
-        - create_branch attaches a source_work_id without checking the
-          request is still live (unlike attach_branch_source_work, which
-          gates on source.state != 'complete'), so a worker's in-flight
+        - create_branch attaches an opener_work_id without checking the
+          request is still live (unlike attach_branch_opener_work, which
+          gates on opener.state != 'complete'), so a worker's in-flight
           create_branch call can land an unresolved membership against a
           request that finished moments earlier.
 
         Neither is an error -- both are routine consequences of alpha-beta
         pruning racing a shared bound -- so the branch is never cancelled
         here (its answer set may still be reachable from another spine).
-        Instead it is demoted to requires_source_membership = 0, the state a
+        Instead it is demoted to requires_opener_membership = 0, the state a
         directly dispatched branch already has, so active_branch_owner_rows
         admits it without a live membership and any worker can pick it up
         again.
 
         The query mirrors active_branch_owner_rows' own visibility test
-        (via live_branch_source_rows) exactly, rather than only the
+        (via live_branch_opener_rows) exactly, rather than only the
         resolved_at half of it, so both shapes above are caught. Any
         leftover unresolved membership rows for a demoted branch are also
         resolved here: claim_next_bundle's direct-claim guard requires both
-        requires_source_membership = 0 and the absence of any resolved_at
+        requires_opener_membership = 0 and the absence of any resolved_at
         IS NULL row, so flipping the flag alone would leave the branch
         visible but still unclaimable.
 
         Must run inside the caller's transaction (see _resolve_branch_
         memberships): the condition it looks for is only ever created by a
-        membership resolution, a source-work completion, or a create_branch
+        membership resolution, an opener-work completion, or a create_branch
         call, all of which already hold the write lock here. Returns the
         demoted branch_ids.
         """
@@ -2280,9 +2400,9 @@ class ERDQueue:
             SELECT active.branch_id
             FROM active_branches AS active
             WHERE active.status = 'open'
-              AND active.requires_source_membership = 1
+              AND active.requires_opener_membership = 1
               AND NOT EXISTS (
-                  SELECT 1 FROM live_branch_source_rows AS owner
+                  SELECT 1 FROM live_branch_opener_rows AS owner
                   WHERE owner.branch_id = active.branch_id
               )
         """).fetchall()
@@ -2291,11 +2411,11 @@ class ERDQueue:
             now = int(time.time())
             placeholders = ",".join("?" for _ in branch_ids)
             self._conn.execute(
-                "UPDATE branch_source_work SET resolved_at = ? "
+                "UPDATE branch_opener_work SET resolved_at = ? "
                 f"WHERE resolved_at IS NULL AND branch_id IN ({placeholders})",
                 (now, *branch_ids))
             self._conn.executemany(
-                "UPDATE active_branches SET requires_source_membership = 0 "
+                "UPDATE active_branches SET requires_opener_membership = 0 "
                 "WHERE branch_id = ?",
                 [(branch_id,) for branch_id in branch_ids])
         return branch_ids
@@ -2342,7 +2462,7 @@ class ERDQueue:
                   best_guess=None, best_erd=None, bound_erd=None,
                   cur_candidate=None, cand_n_seen=None, claim_total=None,
                   cur_max_depth=None, cur_nodes=None, node_rate=None,
-                  cur_path=None, cur_help_depth=0, source_work_id=None,
+                  cur_path=None, cur_help_depth=0, opener_work_id=None,
                   scheduling_role=None,
                   hint_lookups=None, hint_hits=None, hint_accepted=None,
                   hint_rejected=None, hint_inline_placements=None,
@@ -2360,7 +2480,7 @@ class ERDQueue:
                  cand_rate, cache_hits, cache_misses, n_cutoff, n_pruned, n_ok,
                  best_guess, best_erd, bound_erd, cur_candidate, cand_n_seen, claim_total,
                  cur_max_depth, cur_nodes, node_rate, cur_path, cur_help_depth,
-                 source_work_id, scheduling_role,
+                 opener_work_id, scheduling_role,
                  hint_lookups, hint_hits, hint_accepted, hint_rejected,
                  hint_inline_placements, hint_inline_wins)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
@@ -2370,7 +2490,7 @@ class ERDQueue:
               cand_rate, cache_hits, cache_misses, n_cutoff, n_pruned, n_ok,
               best_guess, best_erd, bound_erd, cur_candidate, cand_n_seen, claim_total,
               cur_max_depth, cur_nodes, node_rate, cur_path, cur_help_depth,
-              source_work_id, scheduling_role,
+              opener_work_id, scheduling_role,
               hint_lookups, hint_hits, hint_accepted, hint_rejected,
               hint_inline_placements, hint_inline_wins))
         # Attributed so a heartbeat write storm is visible in the WAL report: an
@@ -2451,10 +2571,10 @@ class ERDQueue:
     def heartbeats_with_branch(self):
         """Heartbeat rows joined to the branch each worker is contributing to.
 
-        source_word/pattern/priority prefer the OWNER the worker itself selected
-        at its last claim boundary (h.source_work_id, via live_branch_source_rows)
+        opener/pattern/priority prefer the OWNER the worker itself selected
+        at its last claim boundary (h.opener_work_id, via live_branch_opener_rows)
         and fall back to active_branches' own fields for a direct branch with no
-        live source-work ownership — so a shared branch's display reflects each
+        live opener-work ownership — so a shared branch's display reflects each
         worker's actual selected owner rather than one arbitrary label for every
         worker on the branch.  on_active_branch is 1 when that branch still has
         an active row and 0 once it has been finalized and removed, so a display
@@ -2465,17 +2585,17 @@ class ERDQueue:
                    bk.branch_key AS current_branch_key,
                    COALESCE(owner.owner_priority, b.priority) AS priority,
                    b.spine,
-                   COALESCE(owner.owner_source_word, b.source_word) AS source_word,
-                   COALESCE(owner.owner_root_pattern, b.source_pattern) AS source_pattern,
+                   COALESCE(owner.owner_opener, b.opener) AS opener,
+                   COALESCE(owner.owner_opener_pattern, b.opener_pattern) AS opener_pattern,
                    b.branch_id IS NOT NULL AS on_active_branch
             FROM worker_heartbeat h
             LEFT JOIN active_branches b
                    ON h.current_branch_id = b.branch_id
             LEFT JOIN branches bk
                    ON h.current_branch_id = bk.branch_id
-            LEFT JOIN live_branch_source_rows owner
+            LEFT JOIN live_branch_opener_rows owner
                    ON owner.branch_id = h.current_branch_id
-                  AND owner.source_work_id = h.source_work_id
+                  AND owner.opener_work_id = h.opener_work_id
             ORDER BY h.worker_id
         """).fetchall()
 
@@ -2484,9 +2604,9 @@ class ERDQueue:
     # ------------------------------------------------------------------
 
     def create_branch(self, branch_key, n_words, n_candidates,
-                      priority=0, source_word=None, source_pattern=None,
+                      priority=0, opener=None, opener_pattern=None,
                       budget=None, spine=None, root_budget=None,
-                      ceiling=None, source_work_id=None,
+                      ceiling=None, opener_work_id=None,
                       parent_branch_key=None) -> bool:
         """Register a branch as in-progress (status 'open'), if not present.
 
@@ -2496,7 +2616,7 @@ class ERDQueue:
         total claim slot count (one slot per candidate in the policy-canonical
         list).  budget is the guess budget for depth-limited ERD.  spine is the
         guesses played from the root to this branch (see the active_branches.spine
-        column); None leaves the display to fall back to the source word.
+        column); None leaves the display to fall back to the opener word.
 
         ceiling is the alpha-beta ceiling the branch is solved under (NULL =
         exact).  Immutable once set: a racing creator whose ceiling differs
@@ -2519,45 +2639,45 @@ class ERDQueue:
         branch_id = self._intern_branch(branch_key, create=True)
         self._conn.execute("BEGIN IMMEDIATE")
         try:
-            if (source_work_id is not None
-                    and not self._source_response_group_is_live(
-                        source_work_id, source_pattern)):
+            if (opener_work_id is not None
+                    and not self._opener_response_group_is_live(
+                        opener_work_id, opener_pattern)):
                 self._conn.execute("COMMIT")
                 return False
             cur = self._conn.execute("""
                 INSERT OR IGNORE INTO active_branches
                     (branch_id, n_words, n_candidates,
-                     priority, requires_source_membership,
-                     source_word, source_pattern, status, created_at,
+                     priority, requires_opener_membership,
+                     opener, opener_pattern, status, created_at,
                      budget, spine, ceiling)
                 VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
             """, (branch_id, n_words, n_candidates,
-                  priority, int(source_work_id is not None), source_word,
-                  source_pattern, now, budget, spine, ceiling))
+                  priority, int(opener_work_id is not None), opener,
+                  opener_pattern, now, budget, spine, ceiling))
             created = cur.rowcount == 1
-            if source_work_id is not None and created:
+            if opener_work_id is not None and created:
                 parent_branch_id = (self._intern_branch(parent_branch_key)
                                     if parent_branch_key is not None else None)
                 self._conn.execute("""
-                    INSERT INTO branch_source_work
-                        (branch_id, source_work_id, parent_branch_id, root_pattern)
+                    INSERT INTO branch_opener_work
+                        (branch_id, opener_work_id, parent_branch_id, opener_pattern)
                     VALUES (?, ?, ?, ?)
-                    ON CONFLICT(branch_id, source_work_id) DO UPDATE SET
+                    ON CONFLICT(branch_id, opener_work_id) DO UPDATE SET
                         parent_branch_id = excluded.parent_branch_id,
-                        root_pattern = excluded.root_pattern,
+                        opener_pattern = excluded.opener_pattern,
                         resolved_at = NULL
-                """, (branch_id, source_work_id, parent_branch_id,
-                      source_pattern))
+                """, (branch_id, opener_work_id, parent_branch_id,
+                      opener_pattern))
             self._conn.execute("COMMIT")
             return created
         except Exception:  # pragma: no cover
             self._conn.execute("ROLLBACK")
             raise
 
-    def attach_branch_source_work(self, branch_key, source_work_id, budget,
-                                  ceiling, n_words, source_pattern,
+    def attach_branch_opener_work(self, branch_key, opener_work_id, budget,
+                                  ceiling, n_words, opener_pattern,
                                   parent_branch_key=None) -> bool:
-        """Attach source ownership when the surviving branch is joinable."""
+        """Attach opener ownership when the surviving branch is joinable."""
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             branch_id = self._intern_branch(branch_key)
@@ -2565,9 +2685,9 @@ class ERDQueue:
                 "SELECT budget, ceiling FROM active_branches "
                 "WHERE branch_id = ? AND status = 'open'",
                 (branch_id,)).fetchone()
-            source_response_group_is_live = self._source_response_group_is_live(
-                source_work_id, source_pattern)
-            if (not active or not source_response_group_is_live
+            opener_response_group_is_live = self._opener_response_group_is_live(
+                opener_work_id, opener_pattern)
+            if (not active or not opener_response_group_is_live
                     or active["budget"] != budget
                     or (active["ceiling"] is not None
                         and (ceiling is None
@@ -2577,17 +2697,17 @@ class ERDQueue:
             parent_branch_id = (self._intern_branch(parent_branch_key)
                                 if parent_branch_key is not None else None)
             self._conn.execute("""
-                INSERT INTO branch_source_work
-                    (branch_id, source_work_id, parent_branch_id, root_pattern)
+                INSERT INTO branch_opener_work
+                    (branch_id, opener_work_id, parent_branch_id, opener_pattern)
                 VALUES (?, ?, ?, ?)
-                ON CONFLICT(branch_id, source_work_id) DO UPDATE SET
+                ON CONFLICT(branch_id, opener_work_id) DO UPDATE SET
                     parent_branch_id = excluded.parent_branch_id,
-                    root_pattern = excluded.root_pattern,
+                    opener_pattern = excluded.opener_pattern,
                     resolved_at = NULL
-            """, (branch_id, source_work_id, parent_branch_id, source_pattern))
+            """, (branch_id, opener_work_id, parent_branch_id, opener_pattern))
             self._conn.execute("""
                 UPDATE active_branches
-                SET requires_source_membership = 1
+                SET requires_opener_membership = 1
                 WHERE branch_id = ?
             """, (branch_id,))
             self._conn.execute("COMMIT")
@@ -2616,7 +2736,7 @@ class ERDQueue:
 
         Only for locks taken while the worker is coordinating between
         candidates.  A lock taken during candidate evaluation (sub-branch
-        promotion, e.g. attach_branch_source_work) must NOT use this: that
+        promotion, e.g. attach_branch_opener_work) must NOT use this: that
         time sits inside the evaluation span which evaluate_claim subtracts
         from coordination_millis, so counting it would push the phase parts
         above the whole they are supposed to partition.
@@ -2782,8 +2902,8 @@ class ERDQueue:
                           small_count=DEFAULT_SMALL_COUNT,
                           count_cap=DEFAULT_COUNT_CAP,
                           republish_limit=DEFAULT_REPUBLISH_LIMIT,
-                          expected_source_work_id=None,
-                          expected_source_priority=None,
+                          expected_opener_work_id=None,
+                          expected_opener_priority=None,
                           max_other_workers=None):
         """Atomically complete one-level ERD prunes and claim survivors.
 
@@ -2883,30 +3003,30 @@ class ERDQueue:
             branch_id = self._intern_branch(branch_key)
             br = None if branch_id is None else self._conn.execute(
                 "SELECT status, best_erd, pack_cursor, ceiling, bulk_done_bound, "
-                "requires_source_membership "
+                "requires_opener_membership "
                 "FROM active_branches "
                 "WHERE branch_id = ?", (branch_id,)).fetchone()
             if br is None or br["status"] != "open":
                 self._commit_claim_transaction(_txn_t0)
                 return None
-            if expected_source_work_id is None:
-                owner_matches = (not br["requires_source_membership"] and
+            if expected_opener_work_id is None:
+                owner_matches = (not br["requires_opener_membership"] and
                     self._conn.execute("""
-                    SELECT 1 FROM branch_source_work
+                    SELECT 1 FROM branch_opener_work
                     WHERE branch_id = ? AND resolved_at IS NULL
                 """, (branch_id,)).fetchone() is None)
             else:
                 owner_matches = self._conn.execute("""
-                    SELECT 1 FROM live_branch_source_rows
-                    WHERE branch_id = ? AND source_work_id = ?
-                """, (branch_id, expected_source_work_id)).fetchone() is not None
-                if owner_matches and expected_source_priority is not None:
+                    SELECT 1 FROM live_branch_opener_rows
+                    WHERE branch_id = ? AND opener_work_id = ?
+                """, (branch_id, expected_opener_work_id)).fetchone() is not None
+                if owner_matches and expected_opener_priority is not None:
                     owner_matches = self._conn.execute("""
-                        SELECT 1 FROM live_branch_source_rows
-                        WHERE branch_id = ? AND source_work_id = ?
+                        SELECT 1 FROM live_branch_opener_rows
+                        WHERE branch_id = ? AND opener_work_id = ?
                           AND owner_priority = ?
-                    """, (branch_id, expected_source_work_id,
-                          expected_source_priority)).fetchone() is not None
+                    """, (branch_id, expected_opener_work_id,
+                          expected_opener_priority)).fetchone() is not None
             if not owner_matches:
                 self._commit_claim_transaction(_txn_t0)
                 return None
@@ -3464,7 +3584,7 @@ class ERDQueue:
     def complete_pending_for_loss(self, branch_key, loss_budget, root_budget) -> bool:
         """Atomically retire only pending work covered by a branch loss.
 
-        A queued branch is reached through its single source-word response, so
+        A queued branch is reached through its single opener-word response, so
         its remaining budget is root_budget minus one when that spine is known.
         Returns True when no queued row needs further work, False when a queued
         request is left pending because the loss budget does not cover it.
@@ -3475,14 +3595,14 @@ class ERDQueue:
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             row = self._conn.execute("""
-                SELECT source_word, source_pattern FROM pending_branches
+                SELECT opener, opener_pattern FROM pending_branches
                 WHERE branch_id = ?
             """, (branch_id,)).fetchone()
             if row is None:
                 self._conn.execute("COMMIT")
                 return True
             pending_budget = root_budget - (
-                1 if row["source_word"] and row["source_pattern"] is not None
+                1 if row["opener"] and row["opener_pattern"] is not None
                 else 0)
             if loss_budget is not None and loss_budget >= pending_budget:
                 self._conn.execute("""
@@ -3716,28 +3836,28 @@ class ERDQueue:
             'candidate_holes/reclaim-worker',
             'candidate_claims/reclaim-worker')
 
-    def branches_in_progress(self, source_work_id=None):
+    def branches_in_progress(self, opener_work_id=None):
         """Open branches ordered by effective priority then answer count."""
-        if source_work_id is None:
+        if opener_work_id is None:
             return self._conn.execute("""
                 SELECT row.* FROM active_branch_owner_rows AS row
-                WHERE row.source_work_id IS NULL
-                   OR row.source_work_id = (
-                       SELECT selected.source_work_id
+                WHERE row.opener_work_id IS NULL
+                   OR row.opener_work_id = (
+                       SELECT selected.opener_work_id
                        FROM active_branch_owner_rows AS selected
                        WHERE selected.branch_id = row.branch_id
-                         AND selected.source_work_id IS NOT NULL
+                         AND selected.opener_work_id IS NOT NULL
                        ORDER BY selected.owner_priority DESC,
-                                selected.source_work_id
+                                selected.opener_work_id
                        LIMIT 1
                    )
                 ORDER BY row.owner_priority DESC, row.n_words DESC
             """).fetchall()
         return self._conn.execute("""
             SELECT * FROM active_branch_owner_rows
-            WHERE source_work_id = ?
+            WHERE opener_work_id = ?
             ORDER BY owner_priority DESC, n_words DESC
-        """, (source_work_id,)).fetchall()
+        """, (opener_work_id,)).fetchall()
 
     def owner_row_for_branch(self, branch_key):
         """Return the canonical owner row selected for one open branch."""
@@ -3747,24 +3867,24 @@ class ERDQueue:
         return self._conn.execute("""
             SELECT row.* FROM active_branch_owner_rows AS row
             WHERE row.branch_id = ?
-              AND (row.source_work_id IS NULL
-                   OR row.source_work_id = (
-                       SELECT selected.source_work_id
+              AND (row.opener_work_id IS NULL
+                   OR row.opener_work_id = (
+                       SELECT selected.opener_work_id
                        FROM active_branch_owner_rows AS selected
                        WHERE selected.branch_id = row.branch_id
-                         AND selected.source_work_id IS NOT NULL
+                         AND selected.opener_work_id IS NOT NULL
                        ORDER BY selected.owner_priority DESC,
-                                selected.source_work_id
+                                selected.opener_work_id
                        LIMIT 1
                    ))
             LIMIT 1
         """, (branch_id,)).fetchone()
 
     def direct_branches_in_progress(self):
-        """Open branches that have no source-work ownership."""
+        """Open branches that have no opener-work ownership."""
         return self._conn.execute("""
             SELECT * FROM active_branch_owner_rows
-            WHERE source_work_id IS NULL
+            WHERE opener_work_id IS NULL
             ORDER BY owner_priority DESC, n_words DESC
         """).fetchall()
 
@@ -3898,16 +4018,16 @@ class ERDQueue:
             "best_erd": a["best_erd"] if a is not None else None,
             "best_max_depth": a["best_max_depth"] if a is not None else None,
             "tainted": bool(a["tainted"]) if a is not None else False,
-            "source_word": ((a["source_word"] if a is not None else None)
-                            or (p["source_word"] if p is not None else None)),
-            "source_pattern": ((a["source_pattern"] if a is not None else None)
-                               if a is not None and a["source_pattern"] is not None
-                               else (p["source_pattern"] if p is not None else None)),
-            "source_pattern_text": (
-                fmt_pattern(a["source_pattern"])
-                if a is not None and a["source_pattern"] is not None
-                else (fmt_pattern(p["source_pattern"])
-                      if p is not None and p["source_pattern"] is not None
+            "opener": ((a["opener"] if a is not None else None)
+                            or (p["opener"] if p is not None else None)),
+            "opener_pattern": ((a["opener_pattern"] if a is not None else None)
+                               if a is not None and a["opener_pattern"] is not None
+                               else (p["opener_pattern"] if p is not None else None)),
+            "opener_pattern_text": (
+                fmt_pattern(a["opener_pattern"])
+                if a is not None and a["opener_pattern"] is not None
+                else (fmt_pattern(p["opener_pattern"])
+                      if p is not None and p["opener_pattern"] is not None
                       else None)),
             "spine": a["spine"] if a is not None else None,
             "created_at": a["created_at"] if a is not None else None,
@@ -3933,7 +4053,7 @@ class ERDQueue:
                 f"""SELECT a.*, b.branch_key,
                            CASE WHEN a.status = 'open' THEN COALESCE(
                                (SELECT MAX(owner_priority)
-                                FROM live_branch_source_rows
+                                FROM live_branch_opener_rows
                                 WHERE branch_id = a.branch_id),
                                CASE WHEN a.priority >= {LEGACY_PROMOTED_PRIORITY_MIN}
                                     THEN 0 ELSE a.priority END
@@ -3956,8 +4076,8 @@ class ERDQueue:
                 return False
             if filters.get("priority") is not None and row["priority"] != filters["priority"]:
                 return False
-            if filters.get("source_word"):
-                if (row["source_word"] or "").lower() != filters["source_word"].lower():
+            if filters.get("opener"):
+                if (row["opener"] or "").lower() != filters["opener"].lower():
                     return False
             prefix = filters.get("prefix")
             if prefix and not self._row_matches_spine_prefix(row, prefix):
@@ -3997,7 +4117,7 @@ class ERDQueue:
         budget = self._report_filter_value(filters, "budget")
         priority = self._report_filter_value(filters, "priority")
         spine_prefix = self._report_filter_value(filters, "spine_prefix")
-        source_word = self._report_filter_value(filters, "source_word")
+        opener = self._report_filter_value(filters, "opener")
         branch_key = self._report_filter_value(filters, "branch_key")
         branch_status_expression = """CASE
             WHEN pending_status = 'done' THEN 'done'
@@ -4041,24 +4161,24 @@ class ERDQueue:
             completed AS (
                 {completed_query}
             ),
-            source_rows AS (
+            joined_rows AS (
                 SELECT registry.branch_key,
                        pending.status AS pending_status,
                        active.status AS active_status,
                        pending.priority AS pending_priority,
                        CASE WHEN active.status = 'open' THEN COALESCE(
                            (SELECT MAX(owner_priority)
-                            FROM live_branch_source_rows
+                            FROM live_branch_opener_rows
                             WHERE branch_id = active.branch_id),
                            CASE WHEN active.priority >= {LEGACY_PROMOTED_PRIORITY_MIN}
                                 THEN 0 ELSE active.priority END
                        ) ELSE active.priority END AS active_priority,
                        pending.n_words AS pending_answer_count,
                        active.n_words AS active_answer_count,
-                       pending.source_word AS pending_source_word,
-                       active.source_word AS active_source_word,
-                       pending.source_pattern AS pending_source_pattern,
-                       active.source_pattern AS active_source_pattern,
+                       pending.opener AS pending_opener,
+                       active.opener AS active_opener,
+                       pending.opener_pattern AS pending_opener_pattern,
+                       active.opener_pattern AS active_opener_pattern,
                        pending.claimed_at,
                        pending.completed_at,
                        active.n_candidates AS candidate_count,
@@ -4089,9 +4209,9 @@ class ERDQueue:
                        {branch_worker_status_expression} AS branch_worker_status,
                        COALESCE(active_priority, pending_priority, 0) AS priority,
                        COALESCE(active_answer_count, pending_answer_count) AS answer_count,
-                       COALESCE(active_source_word, pending_source_word) AS source_word,
-                       COALESCE(active_source_pattern, pending_source_pattern) AS source_pattern
-                FROM source_rows
+                       COALESCE(active_opener, pending_opener) AS opener,
+                       COALESCE(active_opener_pattern, pending_opener_pattern) AS opener_pattern
+                FROM joined_rows
             )
         """
         conditions = []
@@ -4124,11 +4244,11 @@ class ERDQueue:
         if spine_prefix:
             scope_conditions.append("(spine = ? OR spine LIKE ?)")
             scope_parameters.extend((spine_prefix, spine_prefix + " %"))
-        if source_word:
+        if opener:
             scope_conditions.append(
-                "(spine IS NULL AND LOWER(source_word) = ?)"
+                "(spine IS NULL AND LOWER(opener) = ?)"
             )
-            scope_parameters.append(source_word.lower())
+            scope_parameters.append(opener.lower())
         if branch_key is not None:
             scope_conditions.append("branch_key = ?")
             scope_parameters.append(bytes(branch_key))
@@ -4177,10 +4297,10 @@ class ERDQueue:
         if effective_limit is not None:
             row_query += " LIMIT ?"
             row_parameters.append(effective_limit)
-        source_rows = self._conn.execute(row_query, row_parameters).fetchall()
+        joined_rows = self._conn.execute(row_query, row_parameters).fetchall()
         returned_rows = []
-        for row in source_rows:
-            source_pattern = row["source_pattern"]
+        for row in joined_rows:
+            opener_pattern = row["opener_pattern"]
             returned_rows.append({
                 "branch_key": bytes(row["branch_key"]),
                 "branch_key_hex": bytes(row["branch_key"]).hex(),
@@ -4204,9 +4324,9 @@ class ERDQueue:
                 "best_guess": row["best_guess"],
                 "best_erd": row["best_erd"],
                 "best_max_remaining_depth": row["best_max_depth"],
-                "source_word": row["source_word"],
-                "source_pattern": (
-                    fmt_pattern(source_pattern) if source_pattern is not None else None
+                "opener": row["opener"],
+                "opener_pattern": (
+                    fmt_pattern(opener_pattern) if opener_pattern is not None else None
                 ),
                 "spine": row["spine"],
                 "created_at": row["created_at"],
@@ -4268,8 +4388,8 @@ class ERDQueue:
         """Return the most specific recorded spine text for a queue row."""
         if row.get("spine"):
             return row["spine"]
-        if row.get("source_word") and row.get("source_pattern_text"):
-            return f'{row["source_word"].upper()} {row["source_pattern_text"]}'
+        if row.get("opener") and row.get("opener_pattern_text"):
+            return f'{row["opener"].upper()} {row["opener_pattern_text"]}'
         return ""
 
     def _row_matches_spine_prefix(self, row, prefix):
@@ -4277,10 +4397,10 @@ class ERDQueue:
         if spine == prefix or spine.startswith(prefix + " "):
             return True
         fallback = ""
-        if row.get("source_word") and row.get("source_pattern_text"):
-            fallback = f'{row["source_word"].upper()} {row["source_pattern_text"]}'
-        elif row.get("source_word"):
-            fallback = row["source_word"].upper()
+        if row.get("opener") and row.get("opener_pattern_text"):
+            fallback = f'{row["opener"].upper()} {row["opener_pattern_text"]}'
+        elif row.get("opener"):
+            fallback = row["opener"].upper()
         return fallback == prefix or fallback.startswith(prefix + " ")
 
     def queue_dashboard(self, limit=8):
@@ -4303,8 +4423,8 @@ class ERDQueue:
         if max_depth is not None:
             rows = [r for r in rows
                     if guess_depth_from_spine(r["spine"]) <= max_depth
-                    or (not r["spine"] and r["source_word"])]
-        rows.sort(key=lambda r: (r["spine"] or r["source_word"] or "",
+                    or (not r["spine"] and r["opener"])]
+        rows.sort(key=lambda r: (r["spine"] or r["opener"] or "",
                                  r["branch_key_hex"]))
         if limit is not None:
             rows = rows[:limit]
@@ -4667,8 +4787,8 @@ class ERDQueue:
         (branch_finalize_log carries no spine index), so callers should treat
         it as a seconds-scale query.
 
-        Branches are selected by spine prefix alone rather than by source word.
-        A source word identifies the root a branch was requested under, which
+        Branches are selected by spine prefix alone rather than by opener word.
+        A opener word identifies the root a branch was requested under, which
         for a deeper spine is still the root -- selecting on it would scope the
         open branches to the wrong subtree.  active_branches holds thousands of
         rows, not millions, so scanning it costs single-digit milliseconds.
@@ -4817,23 +4937,23 @@ class ERDQueue:
             "telemetry_epochs": sorted(telemetry_epochs),
         }
 
-    def source_work_requests_for_word(self, word) -> list:
-        """Every source-work request naming `word`, oldest request first.
+    def opener_work_requests_for_word(self, word) -> list:
+        """Every opener-work request naming `word`, oldest request first.
 
         The request time is when the word was *asked for*, which is not when
         the swarm began working it: a request sits behind higher-priority
         roots until workers reach it.
         """
         rows = self._conn.execute("""
-            SELECT source.source_work_id, source.requested_priority,
-                   source.requested_at, source.state,
+            SELECT opener.opener_work_id, opener.requested_priority,
+                   opener.requested_at, opener.state,
                    MAX(membership.resolved_at) AS completed_at
-            FROM source_work AS source
-            LEFT JOIN branch_source_work AS membership
-              ON membership.source_work_id = source.source_work_id
-            WHERE source.source_word = ?
-            GROUP BY source.source_work_id
-            ORDER BY source.requested_at, source.source_work_id
+            FROM opener_work AS opener
+            LEFT JOIN branch_opener_work AS membership
+              ON membership.opener_work_id = opener.opener_work_id
+            WHERE opener.opener = ?
+            GROUP BY opener.opener_work_id
+            ORDER BY opener.requested_at, opener.opener_work_id
         """, (word.lower(),)).fetchall()
         return [dict(row) for row in rows]
 
@@ -5143,7 +5263,7 @@ class ERDQueue:
             self._conn.execute("DELETE FROM active_branches")
             self._conn.execute("DELETE FROM pending_branches")
             self._resolve_branch_memberships(withdraw=True)
-            self._conn.execute("DELETE FROM source_work")
+            self._conn.execute("DELETE FROM opener_work")
             self._conn.execute("DELETE FROM worker_heartbeat")
             self._conn.execute("DELETE FROM run_meta")
             self._conn.execute("COMMIT")
@@ -5198,7 +5318,7 @@ class ERDQueue:
             f"""SELECT a.*, b.branch_key,
                        CASE WHEN a.status = 'open' THEN COALESCE(
                            (SELECT MAX(owner_priority)
-                            FROM live_branch_source_rows
+                            FROM live_branch_opener_rows
                             WHERE branch_id = a.branch_id),
                            CASE WHEN a.priority >= {LEGACY_PROMOTED_PRIORITY_MIN}
                                 THEN 0 ELSE a.priority END
@@ -5224,7 +5344,7 @@ class ERDQueue:
             f"""SELECT a.*, b.branch_key,
                        CASE WHEN a.status = 'open' THEN COALESCE(
                            (SELECT MAX(owner_priority)
-                            FROM live_branch_source_rows
+                            FROM live_branch_opener_rows
                             WHERE branch_id = a.branch_id),
                            CASE WHEN a.priority >= {LEGACY_PROMOTED_PRIORITY_MIN}
                                 THEN 0 ELSE a.priority END
@@ -5315,7 +5435,7 @@ class ERDQueue:
           other.
 
         Membership is left to the caller: this clears the branch's work state
-        but does not revive branch_source_work, because reviving it blindly
+        but does not revive branch_opener_work, because reviving it blindly
         would attach live membership to requests that have since completed.
         add_pending_many's UPSERT re-establishes membership for the request
         being queued, and is what makes the reset branch claimable again.
@@ -5377,76 +5497,76 @@ class ERDQueue:
             (priority, branch_id))
         return self._conn.execute("SELECT changes()").fetchone()[0] > 0
 
-    def set_ownerless_active_priority(self, source_word: str, priority: int) -> int:
-        """Set priority on open, ownerless branches attributed to source_word."""
-        check_source_priority_range(priority)
+    def set_ownerless_active_priority(self, opener: str, priority: int) -> int:
+        """Set priority on open, ownerless branches attributed to opener."""
+        check_opener_priority_range(priority)
         cur = self._conn.execute("""
             UPDATE active_branches AS active
             SET priority = ?
             WHERE active.status = 'open'
-              AND lower(active.source_word) = lower(?)
+              AND lower(active.opener) = lower(?)
               AND NOT EXISTS (
-                  SELECT 1 FROM live_branch_source_rows AS owner
+                  SELECT 1 FROM live_branch_opener_rows AS owner
                   WHERE owner.branch_id = active.branch_id
               )
-        """, (priority, source_word))
+        """, (priority, opener))
         return cur.rowcount
 
-    def set_source_work_priority(self, source_work_id: int, priority: int) -> bool:
-        """Atomically change a source request and every owned branch priority."""
-        check_source_priority_range(priority)
+    def set_opener_work_priority(self, opener_work_id: int, priority: int) -> bool:
+        """Atomically change an opener request and every owned branch priority."""
+        check_opener_priority_range(priority)
         self._conn.execute("BEGIN")
         try:
             cur = self._conn.execute("""
-                UPDATE source_work SET requested_priority = ?
-                WHERE source_work_id = ? AND state != 'complete'
-            """, (priority, source_work_id))
+                UPDATE opener_work SET requested_priority = ?
+                WHERE opener_work_id = ? AND state != 'complete'
+            """, (priority, opener_work_id))
             if cur.rowcount:
                 self._conn.execute("""
                     UPDATE pending_branches
                     SET priority = (
                         SELECT MAX(owner_priority)
-                        FROM live_branch_source_rows
+                        FROM live_branch_opener_rows
                         WHERE branch_id = pending_branches.branch_id
                     )
                     WHERE branch_id IN (
-                        SELECT branch_id FROM live_branch_source_rows
-                        WHERE source_work_id = ?
+                        SELECT branch_id FROM live_branch_opener_rows
+                        WHERE opener_work_id = ?
                     )
-                """, (source_work_id,))
+                """, (opener_work_id,))
                 self._conn.execute("""
                     UPDATE active_branches
                     SET priority = (
                         SELECT MAX(owner_priority)
-                        FROM live_branch_source_rows
+                        FROM live_branch_opener_rows
                         WHERE branch_id = active_branches.branch_id
                     )
                     WHERE branch_id IN (
-                        SELECT branch_id FROM live_branch_source_rows
-                        WHERE source_work_id = ?
+                        SELECT branch_id FROM live_branch_opener_rows
+                        WHERE opener_work_id = ?
                     )
-                """, (source_work_id,))
+                """, (opener_work_id,))
             self._conn.execute("COMMIT")
             return cur.rowcount == 1
         except Exception:  # pragma: no cover
             self._conn.execute("ROLLBACK")
             raise
 
-    def source_work_rows(self):
-        """Return source requests with their roots and descendants count."""
+    def opener_work_rows(self):
+        """Return opener requests with their roots and descendants count."""
         return self._conn.execute("""
             SELECT s.*, SUM(m.parent_branch_id IS NULL) AS root_count,
                    COUNT(m.branch_id) AS branch_count
-            FROM source_work s
-            LEFT JOIN branch_source_work m ON m.source_work_id = s.source_work_id
-            GROUP BY s.source_work_id
-            ORDER BY s.requested_priority DESC, s.source_work_id
+            FROM opener_work s
+            LEFT JOIN branch_opener_work m ON m.opener_work_id = s.opener_work_id
+            GROUP BY s.opener_work_id
+            ORDER BY s.requested_priority DESC, s.opener_work_id
         """).fetchall()
 
-    def source_word_rows(self):
-        """Return one row per source word, merging that word's requests.
+    def opener_rows(self):
+        """Return one row per opener word, merging that word's requests.
 
-        Source work is keyed by (word, priority), so one word can hold several
+        Opener work is keyed by (word, priority), so one word can hold several
         requests, and two of them can own the same branch.  Branches are
         therefore counted distinctly rather than summed across requests, which
         would report a shared branch once per owning request.
@@ -5455,21 +5575,21 @@ class ERDQueue:
         directly; a branch acquired later by promotion carries a
         parent_branch_id and is counted only in branch_count.
         """
-        source_columns = {
+        opener_work_columns = {
             row["name"] for row in self._conn.execute(
-                "PRAGMA table_info(source_work)")
+                "PRAGMA table_info(opener_work)")
         }
         started_at = (
             "MIN(CASE WHEN s.state != 'complete' THEN s.started_at END)"
-            if "started_at" in source_columns else "NULL"
+            if "started_at" in opener_work_columns else "NULL"
         )
         return self._conn.execute(f"""
-            SELECT s.source_word,
+            SELECT s.opener,
                    MIN(s.requested_at) AS requested_at,
                    {started_at} AS started_at,
                    MAX(s.requested_priority) AS requested_priority,
                    MAX(m.resolved_at) AS completed_at,
-                   COUNT(DISTINCT s.source_work_id) AS request_count,
+                   COUNT(DISTINCT s.opener_work_id) AS request_count,
                    MAX(s.state = 'active') AS has_active_request,
                    MAX(s.state != 'complete') AS has_incomplete_request,
                    COUNT(DISTINCT m.branch_id) AS branch_count,
@@ -5480,46 +5600,46 @@ class ERDQueue:
                        WHEN m.parent_branch_id IS NULL
                         AND p.status = 'done'
                        THEN m.branch_id END) AS direct_done_branch_count
-            FROM source_work s
-            LEFT JOIN branch_source_work m
-              ON m.source_work_id = s.source_work_id
+            FROM opener_work s
+            LEFT JOIN branch_opener_work m
+              ON m.opener_work_id = s.opener_work_id
             LEFT JOIN pending_branches p ON p.branch_id = m.branch_id
-            GROUP BY s.source_word
-            ORDER BY MAX(s.requested_priority) DESC, s.source_word
+            GROUP BY s.opener
+            ORDER BY MAX(s.requested_priority) DESC, s.opener
         """).fetchall()
 
-    def distinct_branch_count_for_words(self, source_words):
-        """Count the branches owned by these source words, each branch once.
+    def distinct_branch_count_for_words(self, openers):
+        """Count the branches owned by these opener words, each branch once.
 
         Two words can own the same branch, so summing their branch counts
         double-counts exactly the shared ownership the opener report exists to
         show.  Counted over every membership, resolved or not, to match the
-        per-word branch_count in source_word_rows().
+        per-word branch_count in opener_rows().
         """
-        words = [word for word in source_words if word is not None]
+        words = [word for word in openers if word is not None]
         if not words:
             return 0
         placeholders = ",".join("?" for _ in words)
         return self._conn.execute(f"""
             SELECT COUNT(DISTINCT m.branch_id)
-            FROM branch_source_work AS m
-            JOIN source_work AS s ON s.source_work_id = m.source_work_id
-            WHERE s.source_word IN ({placeholders})
+            FROM branch_opener_work AS m
+            JOIN opener_work AS s ON s.opener_work_id = m.opener_work_id
+            WHERE s.opener IN ({placeholders})
         """, words).fetchone()[0]
 
-    def source_membership_rows(self, source_work_id=None, source_word=None,
+    def opener_membership_rows(self, opener_work_id=None, opener=None,
                                include_resolved=False):
-        """Return one row per (source_work_id, branch_id) membership.
+        """Return one row per (opener_work_id, branch_id) membership.
 
-        This is the canonical detail query behind `view --sources`: every
+        This is the canonical detail query behind `view --openers`: every
         request that owns a branch, its recorded requested priority, the
         branch's effective priority (MAX(owner_priority) across every live
-        owner, computed the same way set_source_work_priority materializes it
+        owner, computed the same way set_opener_work_priority materializes it
         onto active_branches/pending_branches — computed directly here rather
         than trusted from that materialization, so a shared branch never
         reports one owner's request as though it were exclusive even when a
         second owner attached without a priority change to re-materialize
-        it), and the promotion lineage (root_pattern traces back to the root
+        it), and the promotion lineage (opener_pattern traces back to the root
         (word, pattern) this membership descends from; parent_branch_key is
         the immediate parent).
 
@@ -5528,37 +5648,37 @@ class ERDQueue:
         resolved memberships, so a completed request's ownership history
         remains queryable even though it is no longer schedulable.
 
-        source_work_id/source_word filter to one request or one word's
+        opener_work_id/opener filter to one request or one word's
         requests (a word may have more than one request; see
-        set_source_work_priority's word-to-request ambiguity).
+        set_opener_work_priority's word-to-request ambiguity).
         """
         clauses = []
         params = []
         if not include_resolved:
             clauses.append("membership.resolved_at IS NULL")
-        if source_work_id is not None:
-            clauses.append("membership.source_work_id = ?")
-            params.append(source_work_id)
-        if source_word is not None:
-            clauses.append("source.source_word = ?")
-            params.append(source_word)
+        if opener_work_id is not None:
+            clauses.append("membership.opener_work_id = ?")
+            params.append(opener_work_id)
+        if opener is not None:
+            clauses.append("opener.opener = ?")
+            params.append(opener)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         live_since = int(time.time()) - WORKER_LIVENESS_SECONDS
         return self._conn.execute(f"""
-            SELECT membership.source_work_id,
-                   source.source_word,
-                   source.requested_priority,
-                   source.state AS source_state,
+            SELECT membership.opener_work_id,
+                   opener.opener,
+                   opener.requested_priority,
+                   opener.state AS opener_state,
                    membership.branch_id,
                    branch.branch_key,
-                   membership.root_pattern,
+                   membership.opener_pattern,
                    membership.parent_branch_id,
                    parent_branch.branch_key AS parent_branch_key,
                    membership.resolved_at,
                    pending.status AS pending_status,
                    active.status AS active_status,
                    COALESCE(
-                       (SELECT MAX(owner_priority) FROM live_branch_source_rows
+                       (SELECT MAX(owner_priority) FROM live_branch_opener_rows
                          WHERE branch_id = membership.branch_id),
                        active.priority, pending.priority
                    ) AS branch_priority,
@@ -5570,9 +5690,9 @@ class ERDQueue:
                    (SELECT COUNT(*) FROM worker_heartbeat h
                      WHERE h.current_branch_id = membership.branch_id
                        AND h.updated_at >= ?) AS worker_count
-            FROM branch_source_work AS membership
-            JOIN source_work AS source
-              ON source.source_work_id = membership.source_work_id
+            FROM branch_opener_work AS membership
+            JOIN opener_work AS opener
+              ON opener.opener_work_id = membership.opener_work_id
             JOIN branches AS branch ON branch.branch_id = membership.branch_id
             LEFT JOIN branches AS parent_branch
                    ON parent_branch.branch_id = membership.parent_branch_id
@@ -5581,17 +5701,17 @@ class ERDQueue:
             LEFT JOIN active_branches AS active
                    ON active.branch_id = membership.branch_id
             {where}
-            ORDER BY source.requested_priority DESC, membership.source_work_id,
+            ORDER BY opener.requested_priority DESC, membership.opener_work_id,
                      membership.branch_id
         """, [live_since, *params]).fetchall()
 
-    def check_source_work_invariants(self) -> list[str]:
-        """Return human-readable violations of source scheduling invariants."""
+    def check_opener_work_invariants(self) -> list[str]:
+        """Return human-readable violations of opener scheduling invariants."""
         violations = []
 
         unresolved_without_work = self._conn.execute("""
-            SELECT membership.branch_id, membership.source_work_id
-            FROM branch_source_work AS membership
+            SELECT membership.branch_id, membership.opener_work_id
+            FROM branch_opener_work AS membership
             LEFT JOIN pending_branches AS pending
               ON pending.branch_id = membership.branch_id
              AND pending.status IN ('pending', 'in_progress')
@@ -5601,36 +5721,36 @@ class ERDQueue:
             WHERE membership.resolved_at IS NULL
               AND pending.branch_id IS NULL
               AND active.branch_id IS NULL
-            ORDER BY membership.source_work_id, membership.branch_id
+            ORDER BY membership.opener_work_id, membership.branch_id
         """).fetchall()
         for row in unresolved_without_work:
             violations.append(
-                "live membership source_work_id "
-                f"{row['source_work_id']} branch_id {row['branch_id']} "
+                "live membership opener_work_id "
+                f"{row['opener_work_id']} branch_id {row['branch_id']} "
                 "has neither pending/in-progress work nor an open active branch"
             )
 
-        source_rows = self._conn.execute("""
-            SELECT source.source_work_id, source.state,
+        opener_work_rows = self._conn.execute("""
+            SELECT opener.opener_work_id, opener.state,
                    EXISTS (
-                       SELECT 1 FROM branch_source_work AS membership
-                       WHERE membership.source_work_id = source.source_work_id
+                       SELECT 1 FROM branch_opener_work AS membership
+                       WHERE membership.opener_work_id = opener.opener_work_id
                          AND membership.resolved_at IS NULL
                    ) AS has_live_membership
-            FROM source_work AS source
-            ORDER BY source.source_work_id
+            FROM opener_work AS opener
+            ORDER BY opener.opener_work_id
         """).fetchall()
-        for row in source_rows:
+        for row in opener_work_rows:
             is_complete = row["state"] == "complete"
             has_live_membership = bool(row["has_live_membership"])
             if is_complete and has_live_membership:
                 violations.append(
-                    f"complete source_work_id {row['source_work_id']} has a "
+                    f"complete opener_work_id {row['opener_work_id']} has a "
                     "live membership"
                 )
             elif not is_complete and not has_live_membership:
                 violations.append(
-                    f"unfinished source_work_id {row['source_work_id']} has no "
+                    f"unfinished opener_work_id {row['opener_work_id']} has no "
                     "live membership"
                 )
 
@@ -5638,9 +5758,9 @@ class ERDQueue:
             SELECT active.branch_id
             FROM active_branches AS active
             WHERE active.status = 'open'
-              AND active.requires_source_membership = 1
+              AND active.requires_opener_membership = 1
               AND NOT EXISTS (
-                  SELECT 1 FROM branch_source_work AS membership
+                  SELECT 1 FROM branch_opener_work AS membership
                   WHERE membership.branch_id = active.branch_id
                     AND membership.resolved_at IS NULL
               )
@@ -5648,7 +5768,7 @@ class ERDQueue:
         """).fetchall()
         for row in owners_without_membership:
             violations.append(
-                f"source-owned open branch_id {row['branch_id']} has no live "
+                f"opener-owned open branch_id {row['branch_id']} has no live "
                 "membership"
             )
 
@@ -5659,93 +5779,93 @@ class ERDQueue:
         # that lineage is covered by
         # test_nested_cooperative_branch_records_immediate_parent.
         invalid_lineage = self._conn.execute("""
-            SELECT child.source_work_id, child.branch_id, child.parent_branch_id
-            FROM branch_source_work AS child
+            SELECT child.opener_work_id, child.branch_id, child.parent_branch_id
+            FROM branch_opener_work AS child
             WHERE child.parent_branch_id IS NOT NULL
               AND NOT EXISTS (
-                  SELECT 1 FROM branch_source_work AS parent
-                  WHERE parent.source_work_id = child.source_work_id
+                  SELECT 1 FROM branch_opener_work AS parent
+                  WHERE parent.opener_work_id = child.opener_work_id
                     AND parent.branch_id = child.parent_branch_id
               )
-            ORDER BY child.source_work_id, child.branch_id
+            ORDER BY child.opener_work_id, child.branch_id
         """).fetchall()
         for row in invalid_lineage:
             violations.append(
-                f"membership source_work_id {row['source_work_id']} branch_id "
+                f"membership opener_work_id {row['opener_work_id']} branch_id "
                 f"{row['branch_id']} has parent_branch_id "
                 f"{row['parent_branch_id']} that the same request does not own"
             )
 
-        priority_range = (SOURCE_PRIORITY_MIN, SOURCE_PRIORITY_MAX)
+        priority_range = (OPENER_PRIORITY_MIN, OPENER_PRIORITY_MAX)
         invalid_requested_priorities = self._conn.execute("""
-            SELECT source_work_id, requested_priority
-            FROM source_work
+            SELECT opener_work_id, requested_priority
+            FROM opener_work
             WHERE requested_priority NOT BETWEEN ? AND ?
-            ORDER BY source_work_id
+            ORDER BY opener_work_id
         """, priority_range).fetchall()
         for row in invalid_requested_priorities:
             violations.append(
-                f"source_work_id {row['source_work_id']} has requested priority "
+                f"opener_work_id {row['opener_work_id']} has requested priority "
                 f"{row['requested_priority']} outside "
-                f"{SOURCE_PRIORITY_MIN}..{SOURCE_PRIORITY_MAX}"
+                f"{OPENER_PRIORITY_MIN}..{OPENER_PRIORITY_MAX}"
             )
 
         legacy_active_priorities = self._conn.execute("""
-            SELECT active.source_word,
+            SELECT active.opener,
                    EXISTS (
-                       SELECT 1 FROM live_branch_source_rows AS owner
+                       SELECT 1 FROM live_branch_opener_rows AS owner
                        WHERE owner.branch_id = active.branch_id
                    ) AS has_live_membership,
                    COUNT(*) AS branch_count
             FROM active_branches AS active
             WHERE active.status = 'open'
               AND active.priority >= ?
-            GROUP BY active.source_word, has_live_membership
-            ORDER BY has_live_membership, active.source_word
+            GROUP BY active.opener, has_live_membership
+            ORDER BY has_live_membership, active.opener
         """, (LEGACY_PROMOTED_PRIORITY_MIN,)).fetchall()
         for row in legacy_active_priorities:
-            source_word = row["source_word"] or "(none)"
+            opener = row["opener"] or "(none)"
             membership = ("with live membership" if row["has_live_membership"]
                           else "without live membership")
             violations.append(
                 f"{row['branch_count']} open branch(es) at or above legacy "
-                f"priority {LEGACY_PROMOTED_PRIORITY_MIN:,}: {source_word} "
+                f"priority {LEGACY_PROMOTED_PRIORITY_MIN:,}: {opener} "
                 f"{membership}"
             )
 
         invalid_effective_priorities = self._conn.execute("""
-            SELECT branch_id, source_work_id, owner_priority
+            SELECT branch_id, opener_work_id, owner_priority
             FROM active_branch_owner_rows
             WHERE owner_priority NOT BETWEEN ? AND ?
-            ORDER BY branch_id, source_work_id
+            ORDER BY branch_id, opener_work_id
         """, priority_range).fetchall()
         for row in invalid_effective_priorities:
-            owner = ("direct" if row["source_work_id"] is None else
-                     f"source_work_id {row['source_work_id']}")
+            owner = ("direct" if row["opener_work_id"] is None else
+                     f"opener_work_id {row['opener_work_id']}")
             violations.append(
                 f"open branch_id {row['branch_id']} owner {owner} has effective "
                 f"priority {row['owner_priority']} outside "
-                f"{SOURCE_PRIORITY_MIN}..{SOURCE_PRIORITY_MAX}"
+                f"{OPENER_PRIORITY_MIN}..{OPENER_PRIORITY_MAX}"
             )
 
         role_placeholders = ",".join("?" for _ in SCHEDULING_ROLES)
         invalid_scheduling_roles = self._conn.execute(f"""
-            SELECT worker_id, source_work_id, scheduling_role
+            SELECT worker_id, opener_work_id, scheduling_role
             FROM worker_heartbeat
             WHERE (scheduling_role IS NOT NULL
                    AND scheduling_role NOT IN ({role_placeholders}))
-               OR (source_work_id IS NOT NULL
+               OR (opener_work_id IS NOT NULL
                    AND (scheduling_role IS NULL
                         OR scheduling_role NOT IN (?, ?)))
-               OR (source_work_id IS NULL AND scheduling_role IN (?, ?))
+               OR (opener_work_id IS NULL AND scheduling_role IN (?, ?))
             ORDER BY worker_id
         """, (*SCHEDULING_ROLES,
               SCHEDULING_ROLE_PREFERRED, SCHEDULING_ROLE_FALLBACK,
               SCHEDULING_ROLE_PREFERRED, SCHEDULING_ROLE_FALLBACK)).fetchall()
         for row in invalid_scheduling_roles:
             violations.append(
-                f"worker {row['worker_id']} has source_work_id "
-                f"{row['source_work_id']} with scheduling_role "
+                f"worker {row['worker_id']} has opener_work_id "
+                f"{row['opener_work_id']} with scheduling_role "
                 f"{row['scheduling_role']!r}"
             )
 
@@ -6004,7 +6124,7 @@ class ERDQueue:
         candidates.
 
         scheduling_millis is the caller's work-selection scan for this claim
-        (source-work ordering, pending promotion, joining an in-progress
+        (opener-work ordering, pending promotion, joining an in-progress
         branch), already net of any lock wait and claim transaction it
         contained so the phases stay disjoint.  idle_millis is
         coordination_millis minus every other timed phase, so those five
@@ -6250,7 +6370,7 @@ class ERDQueue:
     def add_candidate_accuracy(self, branch_key, n_words, budget, predicted_work,
                                bound_erd, candidate_cost_lower_bound,
                                erd_lower_bound_pruned, actual_nodes,
-                               group_sizes=None, source_word=None,
+                               group_sizes=None, opener=None,
                                candidate_word=None, worker_id=None,
                                bundle_id=None, idx=None, started_at=None,
                                evaluation_millis=None, outcome=None,
@@ -6260,7 +6380,7 @@ class ERDQueue:
         Under single-candidate claiming a claim is exactly one candidate, so
         actual_nodes is that candidate's true cost.  group_sizes ('-'-joined
         response-group sizes) is the sufficient statistic for recomputing any work
-        metric offline; logged only for non-ERD-pruned rows.  source_word is the
+        metric offline; logged only for non-ERD-pruned rows.  opener is the
         root opener of the branch's spine, so a multi-day corpus can be
         segmented per opener (different openers reach differently-shaped
         answer sets).  The claim identity fields match claim_telemetry, while
@@ -6280,13 +6400,13 @@ class ERDQueue:
                 (branch_key, branch_id, candidate_word, worker_id, bundle_id, idx,
                  n_words, budget, predicted_work, bound_erd,
                  candidate_cost_lower_bound, erd_lower_bound_pruned,
-                 actual_nodes, group_sizes, source_word, started_at,
+                 actual_nodes, group_sizes, opener, started_at,
                  evaluation_millis, outcome, republish_count, epoch, recorded_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (branch_key, branch_id, candidate_word, worker_id, bundle_id, idx,
               n_words, budget, predicted_work, bound_erd,
               candidate_cost_lower_bound, 1 if erd_lower_bound_pruned else 0,
-              actual_nodes, group_sizes, source_word, started_at,
+              actual_nodes, group_sizes, opener, started_at,
               evaluation_millis, outcome, republish_count, self.epoch, now))
 
     @staticmethod
@@ -6303,7 +6423,7 @@ class ERDQueue:
 
     def report_candidate_accuracy(self, epoch=None, budget=None,
                                   minimum_answer_count=None,
-                                  maximum_answer_count=None, source_word=None,
+                                  maximum_answer_count=None, opener=None,
                                   branch_key=None, since=None, limit=None,
                                   sample_size=50_000, raw_row_offset=0):
         """Return a bounded candidate-level calibration sample.
@@ -6321,7 +6441,7 @@ class ERDQueue:
                 ("budget = ?", budget),
                 ("n_words >= ?", minimum_answer_count),
                 ("n_words <= ?", maximum_answer_count),
-                ("source_word = ?", source_word),
+                ("opener = ?", opener),
                 ("branch_key = ?", branch_key),
                 ("recorded_at >= ?", since)):
             if value is not None:

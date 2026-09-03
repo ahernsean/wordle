@@ -96,8 +96,8 @@ from report_model import (
     OVERVIEW_BRANCH_WORKER_STATUSES,
     applied_branch_filters,
     is_overview_request,
-    SOURCE_SORT_FIELDS,
-    SOURCE_STATES,
+    OPENER_SORT_FIELDS,
+    OPENER_STATES,
     ReportFilters,
     ReportRequest,
     WORKER_LIVENESS_SECONDS,
@@ -119,9 +119,9 @@ from erd_queue import (
     DISK_STOP_FRACTION,
     ERDQueue,
     QUEUE_WAL_HARD_CEILING_BYTES,
-    SOURCE_PRIORITY_MAX,
-    SOURCE_PRIORITY_MIN,
-    check_source_priority_range,
+    OPENER_PRIORITY_MAX,
+    OPENER_PRIORITY_MIN,
+    check_opener_priority_range,
     disk_stats,
     encode_subset,
 )
@@ -157,8 +157,8 @@ def _branch_worker_status_filter(value):
     return _comma_separated_filter(value, "branch worker status", BRANCH_WORKER_STATUSES)
 
 
-def _source_state_filter(value):
-    return _comma_separated_filter(value, "opener state", SOURCE_STATES)
+def _opener_state_filter(value):
+    return _comma_separated_filter(value, "opener state", OPENER_STATES)
 
 
 def cmd_view(args):
@@ -175,7 +175,7 @@ DEFAULT_PRIORITY_STEP = 5
 
 
 def priority_ladder(words, top_priority, step):
-    """Map words to descending source priorities, first word highest.
+    """Map words to descending opener priorities, first word highest.
 
     Words tied at one priority are all eligible to start at once, so a
     blocked worker widens the batch by starting whichever of them has no
@@ -188,14 +188,14 @@ def priority_ladder(words, top_priority, step):
     disturbing its neighbours.  A step of 0 puts every word on
     `top_priority`.
 
-    Rungs below SOURCE_PRIORITY_MIN clamp onto it, so a list too long to seat
+    Rungs below OPENER_PRIORITY_MIN clamp onto it, so a list too long to seat
     on distinct rungs gives them to the leading words and ties the remainder
     on the minimum.  The tail is undifferentiated but still ranks below every
     seated word.
     """
     if step <= 0:
         return {word: top_priority for word in words}
-    return {word: max(SOURCE_PRIORITY_MIN, top_priority - step * index)
+    return {word: max(OPENER_PRIORITY_MIN, top_priority - step * index)
             for index, word in enumerate(words)}
 
 
@@ -219,17 +219,17 @@ def ladder_top_priority(lowest_queued, explicit_priority, step, n_words):
     """
     if explicit_priority is not None:
         top_priority = explicit_priority + step * max(0, n_words - 1)
-        if top_priority > SOURCE_PRIORITY_MAX:
+        if top_priority > OPENER_PRIORITY_MAX:
             raise ValueError(
                 f'--priority {explicit_priority:,} needs a ladder reaching '
                 f'{top_priority:,} for {n_words:,} words at step {step:,}, '
-                f'above the maximum {SOURCE_PRIORITY_MAX:,}.  Lower '
+                f'above the maximum {OPENER_PRIORITY_MAX:,}.  Lower '
                 f'--priority, use a smaller --priority-step, or add fewer '
                 f'words at a time.')
         return top_priority
     if lowest_queued is None:
-        return SOURCE_PRIORITY_MAX
-    return max(SOURCE_PRIORITY_MIN, lowest_queued - 1)
+        return OPENER_PRIORITY_MAX
+    return max(OPENER_PRIORITY_MIN, lowest_queued - 1)
 
 
 def invalidate_branches_for_recompute(queue, score_cache, branch_keys):
@@ -329,9 +329,9 @@ def cmd_queue_add(args):
               'ignoring it.  Use --priority directly with --word.')
         priority_words = set()
 
-    base_priority = (SOURCE_PRIORITY_MIN if args.priority is None
+    base_priority = (OPENER_PRIORITY_MIN if args.priority is None
                      else args.priority)
-    check_source_priority_range(base_priority)
+    check_opener_priority_range(base_priority)
     if args.priority_step < 0:
         raise ValueError('--priority-step must not be negative')
 
@@ -346,7 +346,7 @@ def cmd_queue_add(args):
 
     laddered_words = [word for word in words_to_process
                       if not priority_words or word in priority_words]
-    lowest_queued = queue.lowest_unfinished_source_priority()
+    lowest_queued = queue.lowest_unfinished_opener_priority()
     top_priority = ladder_top_priority(
         lowest_queued, args.priority, args.priority_step, len(laddered_words))
     ladder = priority_ladder(laddered_words, top_priority, args.priority_step)
@@ -372,7 +372,7 @@ def cmd_queue_add(args):
         on_floor = sum(1 for word in laddered_words if ladder[word] == floor)
         if args.priority_step and on_floor > 1:
             # Distinct rungs only collide once the ladder clamps, so a tie here
-            # always sits on SOURCE_PRIORITY_MIN with nothing beneath it.  A
+            # always sits on OPENER_PRIORITY_MIN with nothing beneath it.  A
             # smaller step cannot divide headroom that does not exist; raising
             # the incumbent or naming a priority is what actually works.
             print(f'Warning: {len(laddered_words):,} words do not fit on a '
@@ -393,7 +393,7 @@ def cmd_queue_add(args):
     n_busy = 0
     try:
         for word in words_to_process:
-            priority = ladder.get(word, SOURCE_PRIORITY_MIN)
+            priority = ladder.get(word, OPENER_PRIORITY_MIN)
             if args.pattern:
                 code = parse_pattern(args.pattern)
                 groups = rcache.group_words(word, all_answers)
@@ -672,12 +672,12 @@ def cmd_queue_priority(args):
 # queue opener-priority
 # ---------------------------------------------------------------------------
 
-def cmd_queue_source_priority(args):
+def cmd_queue_opener_priority(args):
     """Set the requested priority of an opener-work request, by word.
 
-    Resolves the word to an open (non-complete) source_work_id via
-    ERDQueue.source_work_candidates() and defers to
-    ERDQueue.set_source_work_priority(), which applies the change to both the
+    Resolves the word to an open (non-complete) opener_work_id via
+    ERDQueue.opener_work_candidates() and defers to
+    ERDQueue.set_opener_work_priority(), which applies the change to both the
     request's pending roots and its active/promoted descendants in one
     transaction.  A branch owned by more than one live request keeps the
     higher of their requested priorities (MAX(owner_priority) at the branch
@@ -692,27 +692,27 @@ def cmd_queue_source_priority(args):
     word = args.word.strip().lower()
 
     try:
-        check_source_priority_range(args.priority)
+        check_opener_priority_range(args.priority)
     except ValueError as error:
         print(error)
         return
 
     queue = ERDQueue(args.queue)
     try:
-        all_rows = {row['source_work_id']: row
-                    for row in queue.source_work_rows()
-                    if row['source_word'] == word}
+        all_rows = {row['opener_work_id']: row
+                    for row in queue.opener_work_rows()
+                    if row['opener'] == word}
 
         if args.opener_work_id is not None:
             if args.opener_work_id not in all_rows:
                 print(f'{word.upper()}: no opener-work request with id '
                       f'{args.opener_work_id}.')
                 return
-            source_work_id = args.opener_work_id
+            opener_work_id = args.opener_work_id
         else:
-            open_ids = [row['source_work_id']
-                        for row in queue.source_work_candidates()
-                        if row['source_word'] == word]
+            open_ids = [row['opener_work_id']
+                        for row in queue.opener_work_candidates()
+                        if row['opener'] == word]
             if not open_ids:
                 if all_rows:
                     print(f'{word.upper()}: all {len(all_rows)} '
@@ -734,17 +734,17 @@ def cmd_queue_source_priority(args):
                           f'{row["branch_count"]} branch(es)  '
                           f'requested {requested_at}')
                 return
-            source_work_id = open_ids[0]
+            opener_work_id = open_ids[0]
 
-        updated = queue.set_source_work_priority(source_work_id, args.priority)
+        updated = queue.set_opener_work_priority(opener_work_id, args.priority)
     finally:
         queue.close()
 
     if updated:
-        print(f'{word.upper()} (id {source_work_id}): '
+        print(f'{word.upper()} (id {opener_work_id}): '
               f'requested priority set to {args.priority}.')
     else:
-        print(f'{word.upper()} (id {source_work_id}): '
+        print(f'{word.upper()} (id {opener_work_id}): '
               f'request is complete, cannot reprioritize.')
 
 
@@ -903,7 +903,7 @@ def _checkpoint_cache_on_start(cache_path):
 
 
 DISK_SAMPLE_SECONDS = 30
-# Cadence for the supervisor's check_source_work_invariants() sweep.  The
+# Cadence for the supervisor's check_opener_work_invariants() sweep.  The
 # reconciliation in _resolve_branch_memberships already demotes routine
 # pruning residue on every membership resolution, so a violation surviving
 # to this sweep is a genuine anomaly worth logging rather than the expected
@@ -950,9 +950,9 @@ def _supervisor_checkpoint(queue):
     queue.checkpoint('PASSIVE')
 
 
-def _check_source_work_invariants(queue):
-    """Log any check_source_work_invariants() violations found right now."""
-    violations = queue.check_source_work_invariants()
+def _check_opener_work_invariants(queue):
+    """Log any check_opener_work_invariants() violations found right now."""
+    violations = queue.check_opener_work_invariants()
     if violations:
         logger.warning('Opener-work invariant check found %d violation(s):',
                        len(violations))
@@ -1143,7 +1143,7 @@ def cmd_run(args):
                 # fail-stop handler below, which is for the load-bearing
                 # writes elsewhere in this loop.
                 try:
-                    _check_source_work_invariants(q)
+                    _check_opener_work_invariants(q)
                 except sqlite3.OperationalError as exc:
                     logger.warning('Opener-work invariant check skipped: %s',
                                    exc)
@@ -1477,7 +1477,7 @@ def main():
         help='Comma-separated active,waiting, or all (meaningful only for '
              'evaluating/finalizing branches)')
     p_view.add_argument(
-        '--opener-state', type=_source_state_filter, metavar='STATES',
+        '--opener-state', type=_opener_state_filter, metavar='STATES',
         help='Comma-separated queued,active,complete, or all (--openers only)')
     p_view.add_argument('--minimum-answer-count', type=int, metavar='N')
     p_view.add_argument('--maximum-answer-count', type=int, metavar='N')
@@ -1486,7 +1486,7 @@ def main():
     p_view.add_argument('--sort',
                         choices=tuple(sorted(
                             {'default', 'age', 'size', 'workers', 'priority',
-                             'nodes', 'slowest', *SOURCE_SORT_FIELDS})))
+                             'nodes', 'slowest', *OPENER_SORT_FIELDS})))
     p_view.add_argument('--limit', type=int, metavar='N')
     p_view.add_argument(
         '--by', choices=(
@@ -1495,7 +1495,7 @@ def main():
             'two-level-erd-prunes',
             'cut-reuse', 'coordination'))
     p_view.add_argument('--epoch', type=int, metavar='N')
-    p_view.add_argument('--source-word', metavar='WORD',
+    p_view.add_argument('--opener', metavar='WORD',
                         help='Restrict --accuracy to one opener')
     p_view.add_argument('--accuracy-offset', type=int, default=0, metavar='N',
                         help='Skip N raw --accuracy rows before --limit')
@@ -1713,8 +1713,8 @@ def main():
         if args.epoch is not None and not (args.hotspots or args.root_progress
                                            or args.accuracy):
             parser.error('--epoch requires --hotspots, --accuracy, or --root-progress')
-        if args.source_word is not None and not args.accuracy:
-            parser.error('--source-word requires --accuracy')
+        if args.opener is not None and not args.accuracy:
+            parser.error('--opener requires --accuracy')
         if args.accuracy_offset and not args.accuracy:
             parser.error('--accuracy-offset requires --accuracy')
         if args.accuracy_offset < 0:
@@ -1747,7 +1747,7 @@ def main():
             budget=args.budget,
             priority=args.priority,
             sort=args.sort,
-            source_states=args.opener_state or (),
+            opener_states=args.opener_state or (),
             limit=args.limit,
         ))
         args.hotspot_field = hotspot_field if args.hotspots else None
@@ -1780,7 +1780,7 @@ def main():
             'clear': cmd_queue_clear,
             'remove': cmd_queue_remove,
             'priority': cmd_queue_priority,
-            'opener-priority': cmd_queue_source_priority,
+            'opener-priority': cmd_queue_opener_priority,
             'reset-stale': cmd_reset_stale,
             'reconcile-orphaned-ownership': cmd_queue_reconcile_orphaned_ownership,
             'clear-disk-stop': cmd_queue_clear_disk_stop,

@@ -36,7 +36,7 @@ q = sqlite3.connect(DEFAULT_QUEUE_PATH, timeout=10); q.row_factory = sqlite3.Row
 branches = []
 for sz in BRANCH_SIZES:
     row = q.execute("""SELECT branch_key, n_words FROM pending_branches
-                       WHERE source_word='salet' AND n_words>=? AND n_words<>238
+                       WHERE opener='salet' AND n_words>=? AND n_words<>238
                        ORDER BY n_words ASC LIMIT 1""", (sz,)).fetchone()
     if row:
         branches.append((row['branch_key'], row['n_words']))

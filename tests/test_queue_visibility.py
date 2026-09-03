@@ -29,7 +29,7 @@ class QueueVisibilityTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["kind"], "user")
         self.assertEqual(rows[0]["status"], "pending")
-        self.assertEqual(rows[0]["source_pattern_text"], "----y")
+        self.assertEqual(rows[0]["opener_pattern_text"], "----y")
 
     def test_report_telemetry_indexes_exist_and_are_idempotent(self):
         expected = {
@@ -71,17 +71,17 @@ class QueueVisibilityTests(unittest.TestCase):
     def test_candidate_accuracy_report_calibrates_and_filters_raw_rows(self):
         self.q.add_candidate_accuracy(
             self.user_key, 25, 4, 10.0, 3.0, 2.0, False, 40,
-            source_word="salet", candidate_word="crane", idx=7,
+            opener="salet", candidate_word="crane", idx=7,
             bundle_id="w1:1", worker_id="worker-1", outcome="solved",
             evaluation_millis=12, republish_count=2)
         self.q.add_candidate_accuracy(
             self.user_key, 25, 4, 0.0, 3.0, 3.5, True, 0,
-            source_word="salet", candidate_word="slate", idx=8)
+            opener="salet", candidate_word="slate", idx=8)
         self.q.add_candidate_accuracy(
             self.user_key, 25, 4, 0.0, 3.0, 2.0, False, 5,
-            source_word="salet", candidate_word="trace", idx=9)
+            opener="salet", candidate_word="trace", idx=9)
         report = self.q.report_candidate_accuracy(
-            epoch=0, source_word="salet", limit=1)
+            epoch=0, opener="salet", limit=1)
         self.assertEqual(report["requested_sample_size"], 50_000)
         self.assertEqual(report["erd_pruned_row_count"], 1)
         self.assertEqual(report["non_erd_pruned_row_count"], 2)
@@ -104,14 +104,14 @@ class QueueVisibilityTests(unittest.TestCase):
         for idx, candidate_word in enumerate(("crane", "slate")):
             self.q.add_candidate_accuracy(
                 self.user_key, 25, 4, 10.0, 3.0, 2.0, False, 20,
-                source_word="salet", candidate_word=candidate_word, idx=idx)
+                opener="salet", candidate_word=candidate_word, idx=idx)
         filtered = self.q.report_candidate_accuracy(
             epoch=0, budget=4, minimum_answer_count=20,
-            maximum_answer_count=30, source_word="salet",
+            maximum_answer_count=30, opener="salet",
             branch_key=self.user_key, limit=1, raw_row_offset=1)
         self.assertEqual(filtered["rows"][0]["candidate_word"], "crane")
         self.assertEqual(filtered["raw_row_offset"], 1)
-        empty = self.q.report_candidate_accuracy(epoch=0, source_word="none")
+        empty = self.q.report_candidate_accuracy(epoch=0, opener="none")
         self.assertEqual(empty["sampled_row_count"], 0)
         self.assertIsNone(
             empty["calibration"]["actual_predicted_ratio"]["p99"])
@@ -119,7 +119,7 @@ class QueueVisibilityTests(unittest.TestCase):
     def test_candidate_accuracy_report_honors_since_without_counting_filter(self):
         self.q.add_candidate_accuracy(
             self.user_key, 25, 4, 10.0, 3.0, 2.0, False, 20,
-            source_word="salet", candidate_word="crane")
+            opener="salet", candidate_word="crane")
         self.q._conn.execute(
             "UPDATE telemetry.candidate_accuracy SET recorded_at = 100")
         self.assertEqual(
@@ -655,7 +655,7 @@ class QueueVisibilityTests(unittest.TestCase):
         self.q.claim_next("worker-0")
         self.q.create_branch(
             self.user_key, len(WORDS), 20, priority=5,
-            source_word="crane", source_pattern=1,
+            opener="crane", opener_pattern=1,
             budget=5, spine="CRANE ----y")
         rows = self.q.list_queue_rows()
         self.assertEqual(len(rows), 1)
@@ -667,7 +667,7 @@ class QueueVisibilityTests(unittest.TestCase):
     def test_cooperative_active_branch_has_no_pending_membership(self):
         self.q.create_branch(
             self.coop_key, 3, 10, priority=1_000_000,
-            source_word="alibi", source_pattern=42,
+            opener="alibi", opener_pattern=42,
             spine="CRANE -y--g ALIBI g-g--")
         rows = self.q.list_queue_rows()
         self.assertEqual(rows[0]["kind"], "coop")
@@ -703,7 +703,7 @@ class QueueVisibilityTests(unittest.TestCase):
         self.q.add_pending_many([(self.user_key, len(WORDS), 7, "crane", 1)])
         self.q.create_branch(
             self.user_key, len(WORDS), 20, priority=7,
-            source_word="crane", source_pattern=1, budget=4,
+            opener="crane", opener_pattern=1, budget=4,
             spine="CRANE ----y")
 
         self.assertEqual(self.q.list_queue_rows({"status": "done"}), [])
@@ -711,7 +711,7 @@ class QueueVisibilityTests(unittest.TestCase):
         self.assertEqual(self.q.list_queue_rows({"max_words": 4}), [])
         self.assertEqual(self.q.list_queue_rows({"budget": 3}), [])
         self.assertEqual(self.q.list_queue_rows({"priority": 8}), [])
-        self.assertEqual(self.q.list_queue_rows({"source_word": "slate"}), [])
+        self.assertEqual(self.q.list_queue_rows({"opener": "slate"}), [])
         self.assertEqual(self.q.list_queue_rows({"prefix": "SLATE -----"}), [])
         self.assertEqual(
             len(self.q.list_queue_rows({
@@ -720,7 +720,7 @@ class QueueVisibilityTests(unittest.TestCase):
                 "max_words": 5,
                 "budget": 4,
                 "priority": 7,
-                "source_word": "crane",
+                "opener": "crane",
                 "prefix": "CRANE ----y",
             })),
             1)
@@ -761,7 +761,7 @@ class QueueVisibilityTests(unittest.TestCase):
         ])
         self.q.create_branch(
             small_key, 3, 10, priority=1_000_000,
-            source_word="alibi", source_pattern=42, budget=2,
+            opener="alibi", opener_pattern=42, budget=2,
             spine="CRANE -y--g ALIBI g-g--")
         self.q.add_nodes_spent(small_key, 123)
         self.q.update_branch_best(small_key, "crane", 1.25, max_depth=3)
@@ -824,8 +824,8 @@ class QueueVisibilityTests(unittest.TestCase):
             "CRANE -----")
         self.assertEqual(
             self.q.row_spine_text({
-                "source_word": "crane",
-                "source_pattern_text": "-----",
+                "opener": "crane",
+                "opener_pattern_text": "-----",
             }),
             "CRANE -----")
         self.assertEqual(self.q.row_spine_text({}), "")

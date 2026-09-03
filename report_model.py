@@ -49,9 +49,9 @@ BRANCH_ETA_STABLE_SAMPLE_SECONDS = 10 * 60
 BRANCH_ETA_SPEEDUP = {1: 1.0, 2: 1.64, 3: 1.97, 4: 1.97}
 OVERVIEW_COMPLETION_DISPLAY_SECONDS = 5
 
-# Source ERD summaries are immutable until the score cache changes.  The
-# Sources view polls frequently, so retain the completed folds between polls.
-_SOURCE_ERD_SUMMARY_CACHE = {}
+# Opener ERD summaries are immutable until the score cache changes.  The
+# Openers view polls frequently, so retain the completed folds between polls.
+_OPENER_ERD_SUMMARY_CACHE = {}
 
 RichSpineStep = Tuple[Optional[int], Optional[str], Optional[str], str]
 
@@ -129,8 +129,8 @@ class ReportFilters:
     finalization_cursor_recorded_at: int | None = None
     finalization_cursor_id: int | None = None
     group_by: str | None = None
-    source_states: tuple[str, ...] = ()
-    source_offset: int | None = None
+    opener_states: tuple[str, ...] = ()
+    opener_offset: int | None = None
     branch_row_offset: int | None = None
 
 
@@ -142,28 +142,28 @@ BRANCH_WORKER_STATUSES = ("active", "waiting")
 # neither can select a branch the other has nothing to say about.
 OVERVIEW_BRANCH_STATUSES = ("evaluating", "finalizing")
 OVERVIEW_BRANCH_WORKER_STATUSES = ("active",)
-# A source word's lifecycle is its own: it is queued until a worker picks one
+# An opener's lifecycle is its own: it is queued until a worker picks one
 # of its requests up, and complete only once every request behind it is.  These
 # are deliberately not the branch statuses, which describe a single branch.
-SOURCE_STATES = ("queued", "active", "complete")
+OPENER_STATES = ("queued", "active", "complete")
 GROUP_BY_STRATEGIES = (
     "none", "status", "answer_count", "cache_state", "worker_presence", "priority",
 )
-SOURCE_GROUP_BY_STRATEGIES = (
+OPENER_GROUP_BY_STRATEGIES = (
     "none", "state", "worker_presence", "priority", "completed", "elapsed",
     "worker_time", "requested",
 )
-SOURCE_SORT_FIELDS = (
+OPENER_SORT_FIELDS = (
     "default", "age", "word", "priority", "branches", "open", "done", "workers",
     "completed", "erd", "requested", "elapsed", "worker_time",
 )
 # Sorts that only an opener report can serve, so another report asking for one
 # is rejected rather than quietly sorted some other way.
-SOURCE_ONLY_SORT_FIELDS = (
+OPENER_ONLY_SORT_FIELDS = (
     "word", "branches", "open", "done", "completed", "erd", "requested",
     "elapsed", "worker_time",
 )
-_SOURCE_STATE_GROUP_ORDER = {"active": 0, "queued": 1, "complete": 2}
+_OPENER_STATE_GROUP_ORDER = {"active": 0, "queued": 1, "complete": 2}
 _STATUS_GROUP_ORDER = {status: index for index, status in enumerate(BRANCH_STATUSES)}
 _ANSWER_COUNT_GROUP_BOUNDARIES = ((1, "1"), (9, "2–9"), (29, "10–29"), (99, "30–99"))
 _CACHE_STATE_GROUP_ORDER = {"missing": 0, "loss": 1, "exact": 2, "not_applicable": 3}
@@ -249,7 +249,7 @@ class ReportRequest:
     tree_cursor: str | None = None
     since_seconds: int | None = None
     sample_size: int | None = None
-    source_word: str | None = None
+    opener: str | None = None
     raw_row_offset: int = 0
 
 
@@ -289,10 +289,10 @@ def validate_report_request(request: ReportRequest) -> None:
             "--sort for word reports must be default, size, workers, or priority"
         )
     if request.filters.group_by is not None and report_kind == "openers":
-        if request.filters.group_by not in SOURCE_GROUP_BY_STRATEGIES:
+        if request.filters.group_by not in OPENER_GROUP_BY_STRATEGIES:
             raise ValueError(
                 "group_by for opener reports must be one of "
-                + ", ".join(SOURCE_GROUP_BY_STRATEGIES)
+                + ", ".join(OPENER_GROUP_BY_STRATEGIES)
             )
     elif request.filters.group_by is not None and (
         report_kind != "auto"
@@ -303,9 +303,9 @@ def validate_report_request(request: ReportRequest) -> None:
             "group_by requires a word or opener report and must be one of "
             + ", ".join(GROUP_BY_STRATEGIES)
         )
-    if request.filters.source_states and report_kind != "openers":
+    if request.filters.opener_states and report_kind != "openers":
         raise ValueError("opener_state requires an opener report")
-    for name in ("source_offset", "branch_row_offset"):
+    for name in ("opener_offset", "branch_row_offset"):
         offset = getattr(request.filters, name)
         if offset is None:
             continue
@@ -315,12 +315,12 @@ def validate_report_request(request: ReportRequest) -> None:
             raise ValueError(f"{name} cannot be negative")
     if request.filters.sort is not None:
         if report_kind == "openers":
-            if request.filters.sort not in SOURCE_SORT_FIELDS:
+            if request.filters.sort not in OPENER_SORT_FIELDS:
                 raise ValueError(
                     "--sort for opener reports must be one of "
-                    + ", ".join(SOURCE_SORT_FIELDS)
+                    + ", ".join(OPENER_SORT_FIELDS)
                 )
-        elif request.filters.sort in SOURCE_ONLY_SORT_FIELDS:
+        elif request.filters.sort in OPENER_ONLY_SORT_FIELDS:
             raise ValueError(
                 f"--sort {request.filters.sort} requires an opener report"
             )
@@ -366,7 +366,7 @@ def validate_report_request(request: ReportRequest) -> None:
 
 
 @dataclass(frozen=True)
-class ReportSources:
+class ReportOpeners:
     queue_path: str
     cache_path: str
     answer_list_path: str
@@ -374,7 +374,7 @@ class ReportSources:
     telemetry_path: str | None = None
 
     @classmethod
-    def defaults(cls) -> "ReportSources":
+    def defaults(cls) -> "ReportOpeners":
         return cls(
             queue_path=DEFAULT_QUEUE_PATH,
             cache_path=DEFAULT_CACHE_PATH,
@@ -571,13 +571,13 @@ def _normalized_branch_spine(row, answer_set):
             }
             for index in range(0, len(tokens) - 1, 2)
         ]
-    source_word = _row_value(row, "source_word")
-    source_pattern = _row_value(row, "source_pattern")
-    if source_word and source_pattern is not None:
-        normalized_word = source_word.lower()
+    opener = _row_value(row, "opener")
+    opener_pattern = _row_value(row, "opener_pattern")
+    if opener and opener_pattern is not None:
+        normalized_word = opener.lower()
         return [{
             "word": normalized_word,
-            "pattern": _normalized_pattern(source_pattern),
+            "pattern": _normalized_pattern(opener_pattern),
             "word_is_answer": normalized_word in answer_set,
         }]
     return []
@@ -589,7 +589,7 @@ def _normalize_branch(
     branch_key = bytes(row["branch_key"])
     spine = _normalized_branch_spine(row, answer_set)
     best_guess = _row_value(row, "best_guess")
-    source_word = _row_value(row, "source_word")
+    opener = _row_value(row, "opener")
     return {
         "branch_reference": branch_reference(branch_key),
         "branch_key_hex": branch_key.hex(),
@@ -611,8 +611,8 @@ def _normalize_branch(
         ),
         "priority": row["priority"],
         "is_cooperative": not bool(_row_value(row, "is_user_queued", False)),
-        "source_word": source_word.lower() if source_word else None,
-        "source_pattern": _normalized_pattern(_row_value(row, "source_pattern")),
+        "opener": opener.lower() if opener else None,
+        "opener_pattern": _normalized_pattern(_row_value(row, "opener_pattern")),
         "best_guess": best_guess.lower() if best_guess else None,
         "best_guess_is_answer": _is_answer(best_guess, answer_set),
         "best_erd": _row_value(row, "best_erd"),
@@ -732,7 +732,7 @@ def _normalize_worker(row, generated_at, answer_set):
         ),
         "best_erd": _row_value(row, "best_erd"),
         "bound_erd": _row_value(row, "bound_erd"),
-        "source_work_id": _row_value(row, "source_work_id"),
+        "opener_work_id": _row_value(row, "opener_work_id"),
         "scheduling_role": _row_value(row, "scheduling_role"),
         "scheduling_role_reason": scheduling_role_reason(
             _row_value(row, "scheduling_role")
@@ -901,8 +901,8 @@ def _queue_overview(sources, generated_at, answer_set, report):
                 "n_words": row["answer_count"],
                 "n_candidates": row["candidate_count"],
                 "priority": row["priority"],
-                "source_word": row["source_word"],
-                "source_pattern": row["source_pattern"],
+                "opener": row["opener"],
+                "opener_pattern": row["opener_pattern"],
                 "best_guess": row["best_guess"],
                 "best_erd": row["best_erd"],
                 "best_max_depth": row["best_max_remaining_depth"],
@@ -1152,12 +1152,12 @@ def _with_best_guess_is_answer(cache_state, answer_set):
     }
 
 
-def _mark_queue_source_ok(report):
+def _mark_queue_opener_ok(report):
     report["sources"]["queue"]["ok"] = True
     report["sources"]["telemetry"]["ok"] = True
 
 
-def _mark_queue_source_error(report, error):
+def _mark_queue_opener_error(report, error):
     message = str(error)
     report["sources"]["queue"]["error"] = message
     report["sources"]["telemetry"]["error"] = message
@@ -1187,7 +1187,7 @@ def _response_group_is_solved(group, group_budget):
 def _candidate_erd_summary(response_groups, group_budget):
     """Fold a candidate's response groups into its own ERD and worst-case line.
 
-    The single place every caller (word report, leaderboard, sources view) gets
+    The single place every caller (word report, leaderboard, openers view) gets
     a candidate's own ERD, and it is derived on every read from the response
     groups the caller has already materialized — never memoised.  A stored fold
     would state that every group behind it is an exact branch result, and
@@ -1381,7 +1381,7 @@ def _maximum_response_group_count(sources, all_answers, branch_words,
     return maximum
 
 
-def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
+def collect_word_report(sources: ReportOpeners, request: ReportRequest) -> dict:
     generated_at = int(time.time())
     all_answers = load_word_list(sources.answer_list_path)
     answer_set = set(all_answers)
@@ -1426,9 +1426,9 @@ def collect_word_report(sources: ReportSources, request: ReportRequest) -> dict:
         pending_rows = queue.status_by_branch_keys(branch_keys)
         active_rows = queue.active_branches_by_keys(branch_keys)
         worker_counts = queue.worker_counts_by_branch(WORKER_LIVENESS_SECONDS)
-        _mark_queue_source_ok(report)
+        _mark_queue_opener_ok(report)
     except (sqlite3.Error, OSError) as error:
-        _mark_queue_source_error(report, error)
+        _mark_queue_opener_error(report, error)
     finally:
         if queue is not None:
             queue.close()
@@ -1701,7 +1701,7 @@ def _root_progress_group_state(row, cache_state, group_budget):
     return "working" if row["started"] else "waiting"
 
 
-def collect_root_progress_report(sources: ReportSources,
+def collect_root_progress_report(sources: ReportOpeners,
                                  request: ReportRequest) -> dict:
     """Work totals and a completion estimate for one opener.
 
@@ -1761,11 +1761,11 @@ def collect_root_progress_report(sources: ReportSources,
             now=generated_at)
         # Work under a deeper spine is still requested under its root, so the
         # request time is the root's however deep the target sits.
-        requests = queue.source_work_requests_for_word(
+        requests = queue.opener_work_requests_for_word(
             resolved.steps[0].word if resolved.steps else word)
-        _mark_queue_source_ok(report)
+        _mark_queue_opener_ok(report)
     except (sqlite3.Error, OSError) as error:
-        _mark_queue_source_error(report, error)
+        _mark_queue_opener_error(report, error)
         return report
     finally:
         if queue is not None:
@@ -1866,7 +1866,7 @@ def collect_root_progress_report(sources: ReportSources,
         progress["recent_window_seconds"], generated_at)
     data["active_branches"] = progress["active_branches"]
     # A request time later than the work it asked for is not a request time.
-    # Rebuilding the queue's source_work rows stamps every one of them with the
+    # Rebuilding the queue's opener_work rows stamps every one of them with the
     # rebuild's own clock, discarding whatever the original request time was,
     # while the branches themselves keep their true creation times.  Reporting
     # the stamp would place the request after the work it requested, so it is
@@ -1909,10 +1909,10 @@ def _spine_steps(spine):
 def _steps_from_queue_row(row):
     if row.get("spine"):
         return _spine_steps(row["spine"])
-    source_word = row.get("source_word")
-    source_pattern = row.get("source_pattern")
-    if source_word and source_pattern is not None:
-        return (SpineStep(source_word.lower(), _normalized_pattern(source_pattern)),)
+    opener = row.get("opener")
+    opener_pattern = row.get("opener_pattern")
+    if opener and opener_pattern is not None:
+        return (SpineStep(opener.lower(), _normalized_pattern(opener_pattern)),)
     return ()
 
 
@@ -2115,7 +2115,7 @@ def _normalize_claim(row, republish_count):
     }
 
 
-def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dict:
+def collect_branch_report(sources: ReportOpeners, request: ReportRequest) -> dict:
     generated_at = int(time.time())
     all_answers = load_word_list(sources.answer_list_path)
     answer_set = set(all_answers)
@@ -2328,9 +2328,9 @@ def collect_branch_report(sources: ReportSources, request: ReportRequest) -> dic
         "branch", sources, request.branch_target, generated_at, data, request
     )
     if queue_error is None:
-        _mark_queue_source_ok(report)
+        _mark_queue_opener_ok(report)
     else:
-        _mark_queue_source_error(report, queue_error)
+        _mark_queue_opener_error(report, queue_error)
 
     try:
         if cache is None:
@@ -2382,7 +2382,7 @@ def _branch_target_queue_scope(branch_target, queue=None):
     prefix = " ".join(tokens)
     scope = {"spine_prefix": prefix}
     if branch_target.kind == "word" and not branch_target.steps:
-        scope["source_word"] = branch_target.trailing_word
+        scope["opener"] = branch_target.trailing_word
     return scope, prefix
 
 
@@ -2395,7 +2395,7 @@ def _row_matches_branch_target(row, branch_target, prefix):
             return spine.startswith(prefix + " ")
         return (
             len(branch_target.steps) == 0
-            and (row.get("source_word") or "").lower() == branch_target.trailing_word
+            and (row.get("opener") or "").lower() == branch_target.trailing_word
         )
     if prefix and spine:
         return spine == prefix or spine.startswith(prefix + " ")
@@ -2433,7 +2433,7 @@ def _scoped_queue_rows(queue, request, apply_filters=True):
     return result["rows"], prefix
 
 
-def collect_queue_report(sources: ReportSources, request: ReportRequest) -> dict:
+def collect_queue_report(sources: ReportOpeners, request: ReportRequest) -> dict:
     generated_at = int(time.time())
     answer_set = _decorative_answer_set(sources)
     data = {"summary": {}, "matched_rows": 0, "rows": []}
@@ -2452,9 +2452,9 @@ def collect_queue_report(sources: ReportSources, request: ReportRequest) -> dict
             row["branch_reference"] = branch_reference(bytes(row.pop("branch_key")))
             row["spine"] = _normalized_branch_spine(row, answer_set)
             row["best_guess_is_answer"] = _is_answer(row.get("best_guess"), answer_set)
-        _mark_queue_source_ok(report)
+        _mark_queue_opener_ok(report)
     except (sqlite3.Error, OSError) as error:
-        _mark_queue_source_error(report, error)
+        _mark_queue_opener_error(report, error)
     finally:
         if queue is not None:
             queue.close()
@@ -2624,7 +2624,7 @@ def _tree_layout(rows, request, prefix, unfiltered_rows, answer_set):
     }
 
 
-def collect_tree_report(sources: ReportSources, request: ReportRequest) -> dict:
+def collect_tree_report(sources: ReportOpeners, request: ReportRequest) -> dict:
     generated_at = int(time.time())
     answer_set = _decorative_answer_set(sources)
     inferred_kind = request.report_kind
@@ -2670,16 +2670,16 @@ def collect_tree_report(sources: ReportSources, request: ReportRequest) -> dict:
         data.update(_tree_layout(
             list(filtered_rows), request, prefix, unfiltered_rows, answer_set
         ))
-        _mark_queue_source_ok(report)
+        _mark_queue_opener_ok(report)
     except (sqlite3.Error, OSError) as error:
-        _mark_queue_source_error(report, error)
+        _mark_queue_opener_error(report, error)
     finally:
         if queue is not None:
             queue.close()
     return report
 
 
-def collect_workers_report(sources: ReportSources, request: ReportRequest) -> dict:
+def collect_workers_report(sources: ReportOpeners, request: ReportRequest) -> dict:
     generated_at = int(time.time())
     all_answers = load_word_list(sources.answer_list_path)
     answer_set = set(all_answers)
@@ -2746,9 +2746,9 @@ def collect_workers_report(sources: ReportSources, request: ReportRequest) -> di
         data["matched_rows"] = len(workers)
         limit = request.filters.limit
         data["rows"] = workers[:limit] if limit is not None else workers
-        _mark_queue_source_ok(report)
+        _mark_queue_opener_ok(report)
     except (sqlite3.Error, OSError) as error:
-        _mark_queue_source_error(report, error)
+        _mark_queue_opener_error(report, error)
     finally:
         if queue is not None:
             queue.close()
@@ -2804,7 +2804,7 @@ def _candidate_group_skeletons(sources, all_answers, all_candidates, cache):
     return skeletons
 
 
-def collect_leaderboard_report(sources: ReportSources, request: ReportRequest) -> dict:
+def collect_leaderboard_report(sources: ReportOpeners, request: ReportRequest) -> dict:
     """Rank every candidate opener by its own ERD.
 
     Each candidate's ERD is folded exactly as the word report folds it
@@ -2916,7 +2916,7 @@ def collect_leaderboard_report(sources: ReportSources, request: ReportRequest) -
     return report
 
 
-def collect_cache_report(sources: ReportSources, request: ReportRequest) -> dict:
+def collect_cache_report(sources: ReportOpeners, request: ReportRequest) -> dict:
     generated_at = int(time.time())
     all_answers = load_word_list(sources.answer_list_path)
     answer_set = set(all_answers)
@@ -2927,9 +2927,9 @@ def collect_cache_report(sources: ReportSources, request: ReportRequest) -> dict
     queue = None
     try:
         queue = _open_report_queue(sources)
-        _mark_queue_source_ok(report)
+        _mark_queue_opener_ok(report)
     except (sqlite3.Error, OSError) as error:
-        _mark_queue_source_error(report, error)
+        _mark_queue_opener_error(report, error)
     cache = None
     try:
         cache = ScoreCache(
@@ -3014,7 +3014,7 @@ def collect_cache_report(sources: ReportSources, request: ReportRequest) -> dict
     return report
 
 
-def collect_hotspot_report(sources: ReportSources, request: ReportRequest) -> dict:
+def collect_hotspot_report(sources: ReportOpeners, request: ReportRequest) -> dict:
     generated_at = int(time.time())
     answer_set = _decorative_answer_set(sources)
     field = request.hotspot_field or "nodes"
@@ -3082,16 +3082,16 @@ def collect_hotspot_report(sources: ReportSources, request: ReportRequest) -> di
             "sample_truncated": result["sample_truncated"],
             "rows": normalized_rows,
         })
-        _mark_queue_source_ok(report)
+        _mark_queue_opener_ok(report)
     except (sqlite3.Error, OSError) as error:
-        _mark_queue_source_error(report, error)
+        _mark_queue_opener_error(report, error)
     finally:
         if queue is not None:
             queue.close()
     return report
 
 
-def collect_accuracy_report(sources: ReportSources, request: ReportRequest) -> dict:
+def collect_accuracy_report(sources: ReportOpeners, request: ReportRequest) -> dict:
     """Collect the candidate-work calibration corpus without changing it."""
     generated_at = int(time.time())
     data = {"epoch": request.epoch, "requested_sample_size": 0,
@@ -3110,15 +3110,15 @@ def collect_accuracy_report(sources: ReportSources, request: ReportRequest) -> d
         if request.branch_target.kind in ("branch", "branch_reference"):
             branch_key = resolve_branch_target(
                 request.branch_target, sorted(_decorative_answer_set(sources))).branch_key
-        source_word = request.source_word
-        if source_word is None and request.branch_target.kind == "word":
-            source_word = request.branch_target.trailing_word
+        opener = request.opener
+        if opener is None and request.branch_target.kind == "word":
+            opener = request.branch_target.trailing_word
         result = queue.report_candidate_accuracy(
             epoch=queue.epoch if request.epoch is None else request.epoch,
             budget=request.filters.budget,
             minimum_answer_count=request.filters.minimum_answer_count,
             maximum_answer_count=request.filters.maximum_answer_count,
-            source_word=source_word, branch_key=branch_key,
+            opener=opener, branch_key=branch_key,
             since=(generated_at - request.since_seconds
                    if request.since_seconds is not None else None),
             limit=request.filters.limit,
@@ -3133,17 +3133,17 @@ def collect_accuracy_report(sources: ReportSources, request: ReportRequest) -> d
                     row["branch_reference"] = branch_reference(
                         bytes(row_branch_key))
         data.update(result)
-        _mark_queue_source_ok(report)
+        _mark_queue_opener_ok(report)
     except (sqlite3.Error, OSError) as error:
-        _mark_queue_source_error(report, error)
+        _mark_queue_opener_error(report, error)
     finally:
         if queue is not None:
             queue.close()
     return report
 
 
-def _source_summary_payload(row, rollup, timing, generated_at):
-    """One source word, with its requests and branches rolled up.
+def _opener_summary_payload(row, rollup, timing, generated_at):
+    """One opener, with its requests and branches rolled up.
 
     This is the report's unit: a word that spawned a thousand branches is one
     row, not a thousand, and a word requested more than once is still one row.
@@ -3156,10 +3156,10 @@ def _source_summary_payload(row, rollup, timing, generated_at):
     later counts only in branch_count, so the two are equal until promotion
     starts.
     """
-    source_word = _row_value(row, "source_word")
+    opener = _row_value(row, "opener")
     branch_count = row["branch_count"] or 0
     open_branch_count = rollup["open_branch_count"]
-    state = _merged_source_state(row)
+    state = _merged_opener_state(row)
     completed_at = None
     elapsed_millis = worker_millis = None
     if state == "complete":
@@ -3173,7 +3173,7 @@ def _source_summary_payload(row, rollup, timing, generated_at):
         if started_at is not None:
             elapsed_millis = max(0, generated_at - started_at) * 1000
     return {
-        "source_word": source_word.lower() if source_word else None,
+        "opener": opener.lower() if opener else None,
         "requested_priority": row["requested_priority"],
         "requested_at": _row_value(row, "requested_at"),
         "started_at": _row_value(row, "started_at"),
@@ -3191,7 +3191,7 @@ def _source_summary_payload(row, rollup, timing, generated_at):
     }
 
 
-def _merged_source_state(row):
+def _merged_opener_state(row):
     """The state of a word whose requests may disagree.
 
     A word is only complete once every one of its requests is, and reads as
@@ -3201,52 +3201,52 @@ def _merged_source_state(row):
         return "complete"
     return "active" if _row_value(row, "has_active_request", 0) else "queued"
 
-def _source_erd_sort_key(row):
+def _opener_erd_sort_key(row):
     summary = row.get("erd_summary")
     if not summary:
-        return (3, float("inf"), row["source_word"] or "")
+        return (3, float("inf"), row["opener"] or "")
     if summary["state"] == "complete":
-        return (0, summary["erd"], row["source_word"] or "")
+        return (0, summary["erd"], row["opener"] or "")
     if summary["state"] == "pending":
-        return (1, float("inf"), row["source_word"] or "")
-    return (2, float("inf"), row["source_word"] or "")
+        return (1, float("inf"), row["opener"] or "")
+    return (2, float("inf"), row["opener"] or "")
 
 
-_SOURCE_SORT_KEYS = {
-    "default": _source_erd_sort_key,
+_OPENER_SORT_KEYS = {
+    "default": _opener_erd_sort_key,
     "age": lambda row: (row["requested_at"] or float("inf"),
-                        row["source_word"] or ""),
-    "word": lambda row: (row["source_word"] or "",),
+                        row["opener"] or ""),
+    "word": lambda row: (row["opener"] or "",),
     "priority": lambda row: (-(row["requested_priority"] or 0),
-                             row["source_word"] or ""),
-    "branches": lambda row: (-row["branch_count"], row["source_word"] or ""),
-    "open": lambda row: (-row["open_branch_count"], row["source_word"] or ""),
-    "done": lambda row: (-row["done_branch_count"], row["source_word"] or ""),
-    "workers": lambda row: (-row["worker_count"], row["source_word"] or ""),
+                             row["opener"] or ""),
+    "branches": lambda row: (-row["branch_count"], row["opener"] or ""),
+    "open": lambda row: (-row["open_branch_count"], row["opener"] or ""),
+    "done": lambda row: (-row["done_branch_count"], row["opener"] or ""),
+    "workers": lambda row: (-row["worker_count"], row["opener"] or ""),
     "completed": lambda row: (-(row["completed_at"] or 0)
                                if row["completed_at"] is not None else float("inf"),
-                               row["source_word"] or ""),
+                               row["opener"] or ""),
     "requested": lambda row: (-(row["requested_at"] or 0)
                                if row["requested_at"] is not None else float("inf"),
-                               row["source_word"] or ""),
-    "erd": _source_erd_sort_key,
+                               row["opener"] or ""),
+    "erd": _opener_erd_sort_key,
     "elapsed": lambda row: (-(row["elapsed_millis"] or 0)
                             if row["elapsed_millis"] is not None else float("inf"),
-                            row["source_word"] or ""),
+                            row["opener"] or ""),
     "worker_time": lambda row: (-(row["worker_millis"] or 0)
                                 if row["worker_millis"] is not None else float("inf"),
-                                row["source_word"] or ""),
+                                row["opener"] or ""),
 }
 
 
-def _sorted_source_words(rows, sort):
-    """Order collapsed source-word rows by the requested source-report field."""
-    key = _SOURCE_SORT_KEYS.get(sort or "default")
+def _sorted_openers(rows, sort):
+    """Order collapsed opener rows by the requested opener-report field."""
+    key = _OPENER_SORT_KEYS.get(sort or "default")
     return sorted(rows, key=key) if key is not None else rows
 
 
 def _duration_group_key(duration_millis):
-    """Bucket a non-negative duration into the Sources report's time ranges."""
+    """Bucket a non-negative duration into the Openers report's time ranges."""
     for index, (maximum_millis, label) in enumerate((
         (60 * 60 * 1000, "[0, 1 hour)"),
         (24 * 60 * 60 * 1000, "[1 hour, 1 day)"),
@@ -3276,11 +3276,11 @@ def _completed_at_group_key(completed_at, generated_at):
     return 4, "older"
 
 
-def _source_word_group_key(row, group_by, generated_at):
-    """Map a collapsed source row to (sort_key, label) for the strategy."""
+def _opener_group_key(row, group_by, generated_at):
+    """Map a collapsed opener row to (sort_key, label) for the strategy."""
     if group_by == "state":
         state = row["state"]
-        return (_SOURCE_STATE_GROUP_ORDER.get(state, 9), state)
+        return (_OPENER_STATE_GROUP_ORDER.get(state, 9), state)
     if group_by == "worker_presence":
         return ((0, "with workers") if row["worker_count"]
                 else (1, "no workers"))
@@ -3299,7 +3299,7 @@ def _source_word_group_key(row, group_by, generated_at):
     return (-(priority or 0), f"priority {priority}")
 
 
-def _grouped_source_words(rows, group_by, branch_totals, generated_at):
+def _grouped_openers(rows, group_by, branch_totals, generated_at):
     """Bucket the collapsed rows, each group carrying its own rollup.
 
     A group's branch totals are counted distinctly over the words in it, for
@@ -3308,21 +3308,21 @@ def _grouped_source_words(rows, group_by, branch_totals, generated_at):
     """
     grouped = {}
     for row in rows:
-        sort_key, label = _source_word_group_key(row, group_by, generated_at)
+        sort_key, label = _opener_group_key(row, group_by, generated_at)
         group = grouped.setdefault(
             (sort_key, label),
             {"label": label, "rows": [],
-             "rollup": {"source_word_count": 0, "branch_count": 0,
+             "rollup": {"opener_count": 0, "branch_count": 0,
                         "open_branch_count": 0, "done_branch_count": 0,
                         "worker_count": 0}},
         )
         group["rows"].append(row)
         rollup = group["rollup"]
-        rollup["source_word_count"] += 1
+        rollup["opener_count"] += 1
         rollup["worker_count"] += row["worker_count"]
     for group in grouped.values():
         branch_count, open_branch_count = branch_totals(
-            [row["source_word"] for row in group["rows"]]
+            [row["opener"] for row in group["rows"]]
         )
         group["rollup"]["branch_count"] = branch_count
         group["rollup"]["open_branch_count"] = open_branch_count
@@ -3332,35 +3332,35 @@ def _grouped_source_words(rows, group_by, branch_totals, generated_at):
     return [grouped[key] for key in sorted(grouped)]
 
 
-def _source_word_erd_summaries(sources, source_words, report, cache,
+def _opener_erd_summaries(sources, openers, report, cache,
                                all_answers):
     """Fold each word's own ERD, reusing summaries until the cache changes.
 
-    A source word's ERD is the whole point of queueing it.  It is derived from
+    An opener's ERD is the whole point of queueing it.  It is derived from
     the cached result of each of the word's response groups, the same way the
     word report derives it for one word.  ERD order requires every visible
-    source word's summary, so the fold is held in `_SOURCE_ERD_SUMMARY_CACHE`
+    opener's summary, so the fold is held in `_OPENER_ERD_SUMMARY_CACHE`
     for the life of one cache generation — keyed on the cache file's signature,
     including its WAL, so any write at all discards the whole set rather than
     outliving the branch rows it folded.
     """
     summaries = {}
-    if not source_words:
+    if not openers:
         return summaries
     try:
         response_cache = ResponseCache(all_answers, score_cache=None)
         cache_version = _score_cache_file_signature(sources.cache_path)
         cache_identity = (sources.cache_path, cache.answer_list_id)
-        cached_version, cached_summaries = _SOURCE_ERD_SUMMARY_CACHE.get(
+        cached_version, cached_summaries = _OPENER_ERD_SUMMARY_CACHE.get(
             cache_identity, (None, {})
         )
         if cached_version != cache_version:
             cached_summaries = {}
-            _SOURCE_ERD_SUMMARY_CACHE[cache_identity] = (
+            _OPENER_ERD_SUMMARY_CACHE[cache_identity] = (
                 cache_version, cached_summaries)
         # An opener spends the first guess, leaving the rest for its groups.
         group_budget = GAME_GUESSES - 1
-        for word in source_words:
+        for word in openers:
             if word is None:
                 continue
             cached_summary = cached_summaries.get(word)
@@ -3418,8 +3418,8 @@ def _score_cache_file_signature(cache_path):
     return file_signature(cache_path), file_signature(cache_path + "-wal")
 
 
-def _source_rollups(membership_rows):
-    """Per-word live-branch totals, keyed by source word.
+def _opener_rollups(membership_rows):
+    """Per-word live-branch totals, keyed by opener.
 
     A branch owned by two of a word's requests holds two membership rows, so
     branches are counted once per word rather than once per membership.
@@ -3428,8 +3428,8 @@ def _source_rollups(membership_rows):
         lambda: {"open_branch_count": 0, "worker_count": 0, "branch_ids": set()}
     )
     for row in membership_rows:
-        source_word = (_row_value(row, "source_word") or "").lower() or None
-        rollup = rollups[source_word]
+        opener = (_row_value(row, "opener") or "").lower() or None
+        rollup = rollups[opener]
         if row["branch_id"] in rollup["branch_ids"]:
             continue
         rollup["branch_ids"].add(row["branch_id"])
@@ -3444,10 +3444,10 @@ def _source_rollups(membership_rows):
     return rollups
 
 
-def _source_membership_payload(row, owner_count):
+def _opener_membership_payload(row, owner_count):
     branch_key = bytes(row["branch_key"])
     parent_branch_key = _row_value(row, "parent_branch_key")
-    source_word = _row_value(row, "source_word")
+    opener = _row_value(row, "opener")
     worker_count = _row_value(row, "worker_count", 0)
     # cache_state is omitted (unlike the queue/word/branch reports): a shared
     # branch's cache freshness is answer-set-wide, not per-owner, and adding a
@@ -3458,20 +3458,22 @@ def _source_membership_payload(row, owner_count):
         worker_count,
     )
     return {
-        "source_work_id": row["source_work_id"],
-        "source_word": source_word.lower() if source_word else None,
+        "opener_work_id": row["opener_work_id"],
+        "opener": opener.lower() if opener else None,
         "requested_priority": row["requested_priority"],
-        "source_state": row["source_state"],
+        "opener_state": row["opener_state"],
         "branch_reference": branch_reference(branch_key),
         "branch_key_hex": branch_key.hex(),
-        "root_pattern": _normalized_pattern(_row_value(row, "root_pattern")),
+        # wire key stays root_pattern; the browser client is outside this
+        # rename's scope and still reads that name from the response.
+        "root_pattern": _normalized_pattern(_row_value(row, "opener_pattern")),
         "parent_branch_reference": (
             branch_reference(bytes(parent_branch_key))
             if parent_branch_key is not None else None
         ),
         "branch_status": branch_status,
         "branch_worker_status": branch_worker_status,
-        # The branch's own materialized priority: set_source_work_priority
+        # The branch's own materialized priority: set_opener_work_priority
         # keeps it at MAX(owner_priority) across every live owner, so it can
         # exceed this row's own requested_priority on a shared branch — the
         # two are reported side by side rather than presenting one as if it
@@ -3484,8 +3486,8 @@ def _source_membership_payload(row, owner_count):
     }
 
 
-def collect_source_report(sources: ReportSources, request: ReportRequest) -> dict:
-    """Report every source word with its requests and branches rolled up —
+def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dict:
+    """Report every opener with its requests and branches rolled up —
     the reporting half of #200's operator surface.
 
     One word is one row: ten queued openers report ten rows, whatever the
@@ -3495,9 +3497,9 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
     request, with the branch's own effective (materialized) priority reported
     alongside each owner's individually requested priority."""
     generated_at = int(time.time())
-    data = {"summary": [], "total_source_word_count": 0,
-            "matched_source_word_count": 0, "matched_branch_count": 0,
-            "matched_open_branch_count": 0, "source_word_offset": 0,
+    data = {"summary": [], "total_opener_count": 0,
+            "matched_opener_count": 0, "matched_branch_count": 0,
+            "matched_open_branch_count": 0, "opener_offset": 0,
             "matched_rows": 0, "shared_branch_count": 0,
             "branch_row_offset": 0, "rows": []}
     report = _semantic_report(
@@ -3507,18 +3509,18 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
     timing_cache = None
     try:
         queue = _open_report_queue(sources)
-        source_word = (
+        opener = (
             request.branch_target.trailing_word
             if request.branch_target.kind == "word" else None
         )
-        summary_rows = queue.source_word_rows()
-        if source_word is not None:
+        summary_rows = queue.opener_rows()
+        if opener is not None:
             summary_rows = [row for row in summary_rows
-                            if (row["source_word"] or "").lower() == source_word]
+                            if (row["opener"] or "").lower() == opener]
         # Rolled up from every live membership, not only the named word's, so
         # each word's own totals are complete whichever word is in scope.
-        all_membership_rows = queue.source_membership_rows()
-        rollups = _source_rollups(all_membership_rows)
+        all_membership_rows = queue.opener_membership_rows()
+        rollups = _opener_rollups(all_membership_rows)
         all_answers = None
         try:
             all_answers = load_word_list(sources.answer_list_path)
@@ -3526,13 +3528,13 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
                                       checkpoint_on_close=False)
             timings = timing_cache.completed_source_summary_map(ERD_ALL)
             for row in summary_rows:
-                summary_source_word = (
-                    _row_value(row, "source_word") or "").lower()
-                if (not summary_source_word
-                        or summary_source_word in timings
-                        or _merged_source_state(row) != "complete"):
+                summary_opener = (
+                    _row_value(row, "opener") or "").lower()
+                if (not summary_opener
+                        or summary_opener in timings
+                        or _merged_opener_state(row) != "complete"):
                     continue
-                timing = queue.completed_source_timing(summary_source_word)
+                timing = queue.completed_opener_timing(summary_opener)
                 if timing["completed_at"] is None:
                     continue
                 telemetry_epochs = tuple(
@@ -3541,10 +3543,10 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
                 elapsed_millis = (
                     (timing["completed_at"] - timing["first_created_at"]) * 1000)
                 timing_cache.write_completed_source_summary(
-                    summary_source_word, ERD_ALL, timing["completed_at"],
+                    summary_opener, ERD_ALL, timing["completed_at"],
                     elapsed_millis, timing["worker_millis"] or 0,
                     telemetry_epochs)
-                timings[summary_source_word] = {
+                timings[summary_opener] = {
                     "completed_at": timing["completed_at"],
                     "elapsed_millis": elapsed_millis,
                     "worker_millis": timing["worker_millis"] or 0,
@@ -3555,10 +3557,10 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
             timings = {}
             report["sources"]["cache"]["error"] = str(error)
         collapsed = [
-            _source_summary_payload(
-                row, rollups[(_row_value(row, "source_word") or "").lower() or None],
+            _opener_summary_payload(
+                row, rollups[(_row_value(row, "opener") or "").lower() or None],
                 timings.get(
-                    (_row_value(row, "source_word") or "").lower() or None,
+                    (_row_value(row, "opener") or "").lower() or None,
                     {"completed_at": None, "elapsed_millis": None,
                      "worker_millis": None},
                 ),
@@ -3566,23 +3568,23 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
             )
             for row in summary_rows
         ]
-        source_sort = request.filters.sort or "completed"
-        data["total_source_word_count"] = len(collapsed)
-        source_states = request.filters.source_states
-        if source_states:
+        opener_sort = request.filters.sort or "completed"
+        data["total_opener_count"] = len(collapsed)
+        opener_states = request.filters.opener_states
+        if opener_states:
             collapsed = [row for row in collapsed
-                         if row["state"] in source_states]
-        if source_sort in ("default", "erd"):
+                         if row["state"] in opener_states]
+        if opener_sort in ("default", "erd"):
             erd_summaries = (
-                _source_word_erd_summaries(
-                    sources, [row["source_word"] for row in collapsed], report,
+                _opener_erd_summaries(
+                    sources, [row["opener"] for row in collapsed], report,
                     timing_cache, all_answers,
                 ) if timing_cache is not None else {}
             )
             for row in collapsed:
-                row["erd_summary"] = erd_summaries.get(row["source_word"])
-        collapsed = _sorted_source_words(collapsed, source_sort)
-        data["matched_source_word_count"] = len(collapsed)
+                row["erd_summary"] = erd_summaries.get(row["opener"])
+        collapsed = _sorted_openers(collapsed, opener_sort)
+        data["matched_opener_count"] = len(collapsed)
         # Counted with each branch counted once: two words can own the same
         # branch, so summing their per-word counts double-counts precisely the
         # shared ownership this report exists to show.
@@ -3590,7 +3592,7 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
             word_set = set(words)
             open_branch_ids = {
                 row["branch_id"] for row in all_membership_rows
-                if (_row_value(row, "source_word") or "").lower() in word_set
+                if (_row_value(row, "opener") or "").lower() in word_set
                 and branch_status_and_worker_status(
                     _row_value(row, "pending_status"),
                     _row_value(row, "active_status"),
@@ -3600,39 +3602,39 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
             return (queue.distinct_branch_count_for_words(words),
                     len(open_branch_ids))
 
-        matched_words = [row["source_word"] for row in collapsed]
+        matched_words = [row["opener"] for row in collapsed]
         (data["matched_branch_count"],
          data["matched_open_branch_count"]) = branch_totals(matched_words)
-        # limit is a page size and source_offset is where that page starts, so
+        # limit is a page size and opener_offset is where that page starts, so
         # the words past the first page stay reachable rather than truncated
         # away.  An offset past the end yields an empty page, not the last one:
         # the count above is what tells the client how far it can page.
-        offset = request.filters.source_offset or 0
+        offset = request.filters.opener_offset or 0
         limit = request.filters.limit
-        data["source_word_offset"] = offset
+        data["opener_offset"] = offset
         data["summary"] = (
             collapsed[offset:offset + limit] if limit is not None
             else collapsed[offset:]
         )
         # Folded for the page only, and attached to the rows it describes.
-        if source_sort not in ("default", "erd"):
+        if opener_sort not in ("default", "erd"):
             erd_summaries = (
-                _source_word_erd_summaries(
-                    sources, [row["source_word"] for row in data["summary"]], report,
+                _opener_erd_summaries(
+                    sources, [row["opener"] for row in data["summary"]], report,
                     timing_cache, all_answers,
                 ) if timing_cache is not None else {}
             )
             for row in data["summary"]:
-                row["erd_summary"] = erd_summaries.get(row["source_word"])
+                row["erd_summary"] = erd_summaries.get(row["opener"])
         group_by = request.filters.group_by
         if group_by is not None and group_by != "none":
-            data["summary_groups"] = _grouped_source_words(
+            data["summary_groups"] = _grouped_openers(
                 data["summary"], group_by, branch_totals, generated_at
             )
         # Branch rows belong to one named word.  Emitting them for every word
         # would bury ten queued roots under the hundreds of branches they
         # spawned, which is the explosion this report exists to roll up.
-        if source_word is not None:
+        if opener is not None:
             # Owner counts are computed from every live membership so a branch
             # shared with a request outside the word filter still reports
             # is_shared correctly, rather than only counting the filtered rows.
@@ -3640,9 +3642,9 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
                 row["branch_id"] for row in all_membership_rows
             )
             payload_rows = [
-                _source_membership_payload(row, owner_counts[row["branch_id"]])
+                _opener_membership_payload(row, owner_counts[row["branch_id"]])
                 for row in all_membership_rows
-                if (row["source_word"] or "").lower() == source_word
+                if (row["opener"] or "").lower() == opener
             ]
             data["matched_rows"] = len(payload_rows)
             # Counted over every matched row, like matched_rows itself: a shared
@@ -3660,9 +3662,9 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
                 if branch_row_limit is not None
                 else payload_rows[branch_row_offset:]
             )
-        _mark_queue_source_ok(report)
+        _mark_queue_opener_ok(report)
     except (sqlite3.Error, OSError) as error:
-        _mark_queue_source_error(report, error)
+        _mark_queue_opener_error(report, error)
     finally:
         if timing_cache is not None:
             timing_cache.close()
@@ -3672,7 +3674,7 @@ def collect_source_report(sources: ReportSources, request: ReportRequest) -> dic
 
 
 def collect_overview_report(
-    sources: ReportSources,
+    sources: ReportOpeners,
     request: ReportRequest | None = None,
 ) -> dict:
     if request is not None and request.report_kind not in ("auto", "overview"):
@@ -3694,7 +3696,7 @@ def collect_overview_report(
     return report
 
 
-def collect_report(sources: ReportSources, request: ReportRequest) -> dict:
+def collect_report(sources: ReportOpeners, request: ReportRequest) -> dict:
     if request.tree:
         if request.report_kind == "cache":
             raise ValueError("tree layout is unavailable for cache reports")
@@ -3726,7 +3728,7 @@ def collect_report(sources: ReportSources, request: ReportRequest) -> dict:
     if report_kind == "leaderboard":
         return collect_leaderboard_report(sources, request)
     if report_kind == "openers":
-        return collect_source_report(sources, request)
+        return collect_opener_report(sources, request)
     if report_kind == "root_progress":
         return collect_root_progress_report(sources, request)
     raise ValueError(f"unsupported report kind: {request.report_kind}")
