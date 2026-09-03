@@ -2406,6 +2406,34 @@ class TerminalUtilityTest(unittest.TestCase):
         self.assertEqual(report_terminal._semantic_worker_class(
             {"is_live": False, "updated_at": 0}, None, 1), "red")
 
+    def test_tree_renderer_shows_context_unknown_and_unavailable_topologies(self):
+        report = overview_report()
+        report["report_kind"] = "queue"
+        report["tree"] = True
+        report["data"] = {
+            "tree_available": False, "unavailable_reason": "no queue",
+            "nodes": [],
+        }
+        self.assertIn("unavailable: no queue", report_terminal.render_report(report, width=100))
+        report["data"] = {
+            "tree_available": True,
+            "nodes": [
+                {"node_id": "raise", "parent_node_id": None,
+                 "step": {"word": "raise", "pattern": "-----"},
+                 "branch_key_hex": "key", "branch_reference": "abcdefgh",
+                 "branch_status": "evaluating", "branch_worker_status": "active",
+                 "answer_count": 2, "worker_count": 1, "is_context": True},
+                {"node_id": "unknown", "parent_node_id": "raise", "step": None,
+                 "branch_key_hex": None, "branch_reference": None,
+                 "branch_status": None, "branch_worker_status": None,
+                 "answer_count": None, "worker_count": 0, "is_context": False},
+            ],
+        }
+        output = report_terminal.render_report(report, width=100)
+        self.assertIn("RAISE  1 branch", output)
+        self.assertIn("[context]", output)
+        self.assertIn("unknown", output)
+
 
 if __name__ == "__main__":
     unittest.main()
