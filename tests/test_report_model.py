@@ -292,6 +292,14 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(report["sources"]["cache"]["error"], "cache offline")
         queue.close.assert_called_once()
 
+    def test_cache_word_report_lists_response_group_cache_states(self):
+        report = report_model.collect_cache_report(
+            self.sources, ReportRequest(
+                report_kind="cache", branch_target=parse_report_branch_target("RAISE")))
+        self.assertTrue(report["sources"]["cache"]["ok"])
+        self.assertGreater(report["data"]["summary"]["response_group_count"], 0)
+        self.assertIn("branch_reference", report["data"]["rows"][0])
+
     def test_queue_and_current_hotspot_reports_normalize_rows(self):
         branch_key = ScoreCache.encode_subset(["salet"])
         queue = Mock(epoch=12)
