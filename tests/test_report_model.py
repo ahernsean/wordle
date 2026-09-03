@@ -317,6 +317,32 @@ class ReportModelTest(unittest.TestCase):
         self.assertIsNone(report["data"]["queue"])
         self.assertTrue(report["sources"]["queue"]["ok"])
 
+    def test_branch_reference_report_falls_back_to_cache_when_queue_is_unavailable(self):
+        branch_key = ScoreCache.encode_subset(["salet"])
+        cache = Mock()
+        cache.report_branch_state.return_value = {
+            "cache_state": "exact", "best_guess": "salet",
+            "best_erd": 1.0, "max_remaining_depth": 1,
+        }
+        cache_class = Mock(return_value=cache)
+        cache_class.report_branch_state_without_rows.return_value = {
+            "cache_state": "missing", "best_guess": None,
+            "best_erd": None, "max_remaining_depth": None,
+        }
+        referenced_row = {"branch_key": branch_key}
+        request = ReportRequest(
+            report_kind="branch",
+            branch_target=parse_report_branch_target("@" + branch_reference(branch_key)),
+        )
+        with (
+            patch("report_model.ScoreCache", cache_class),
+            patch("report_model._open_report_queue", side_effect=sqlite3.OperationalError("offline")),
+            patch("report_model.resolve_branch_reference", return_value=referenced_row),
+        ):
+            report = report_model.collect_branch_report(self.sources, request)
+        self.assertEqual(report["sources"]["queue"]["error"], "offline")
+        self.assertEqual(report["data"]["cache"]["cache_state"], "exact")
+
     def test_root_progress_report_handles_an_opener_without_started_work(self):
         report = report_model.collect_root_progress_report(
             self.sources, ReportRequest(
