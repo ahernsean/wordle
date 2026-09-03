@@ -2782,3 +2782,70 @@ class ChangeHighlightTest(unittest.TestCase):
         for empty in (None, {}):
             with self.subTest(empty=empty):
                 self.assertEqual(report_terminal._word_erd_line(empty), "ERD: n/a")
+
+
+class FinalizationScheduleLineTest(unittest.TestCase):
+    def test_a_winner_rank_alone_reports_only_what_it_supports(self):
+        # The two comparison facts are read against the winner's rank, so a
+        # finalization carrying only the rank reports neither.
+        lines = report_terminal._finalization_schedule_lines(
+            {"winner_best_first_rank": 1200}, 100
+        )
+        text = " ".join(lines)
+        self.assertIn("winner ranked 1,200", text)
+        self.assertNotIn("completed first", text)
+        self.assertNotIn("weakest", text)
+        self.assertNotIn("republished", text)
+
+
+class NavigationTargetTest(unittest.TestCase):
+    def _session(self):
+        return WatchSession(
+            view_args(watch=1.0), FakeInput(tty=True), io.StringIO()
+        )
+
+    def _report(self, branches=(), workers=()):
+        report = overview_report()
+        report["data"] = {"branches": list(branches), "workers": list(workers)}
+        return report
+
+    def test_branches_beyond_the_hotkey_alphabet_get_no_letter(self):
+        session = self._session()
+        branches = [
+            {"branch_key_hex": f"{index:04x}"}
+            for index in range(len(report_terminal.BRANCH_HOTKEYS) + 3)
+        ]
+        session._update_navigation_targets(self._report(branches=branches))
+        self.assertEqual(
+            len(session.branch_hotkeys), len(report_terminal.BRANCH_HOTKEYS)
+        )
+        self.assertLess(len(session.branch_hotkeys), len(branches))
+
+    def test_a_worker_without_a_numeric_number_gets_no_hotkey(self):
+        session = self._session()
+        workers = [
+            {"worker_id": "worker-a", "worker_number": None},
+            {"worker_id": "worker-1", "worker_number": "1"},
+        ]
+        session._update_navigation_targets(self._report(workers=workers))
+        self.assertEqual(session.worker_hotkeys, {"1": "worker-1"})
+
+    def test_a_row_whose_spine_names_no_branch_falls_back_to_its_digest(self):
+        session = self._session()
+        for spine in ([], "RAISE"):
+            with self.subTest(spine=spine):
+                target = session._branch_target(
+                    {"branch_key_hex": "0a0b", "spine": spine}
+                )
+                self.assertEqual(target.kind, "branch_reference")
+
+    def test_the_navigation_legend_omits_keys_that_select_nothing(self):
+        session = self._session()
+        session.branch_hotkeys = {}
+        session.worker_hotkeys = {}
+        legend = " ".join(
+            line for _, lines in session._navigation_section() for line in lines
+        )
+        self.assertNotIn("branch", legend)
+        self.assertNotIn("worker", legend)
+        self.assertIn("[q] quit", legend)

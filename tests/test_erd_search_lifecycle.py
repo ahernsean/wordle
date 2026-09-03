@@ -7,6 +7,7 @@ reaches this logic.
 """
 
 import argparse
+from contextlib import ExitStack
 import io
 import json
 import os
@@ -446,6 +447,19 @@ class QueueOperatorCommandTest(unittest.TestCase):
             (["view", "--minimum-answer-count", "2", "--maximum-answer-count", "1"], "cannot exceed"),
             (["view", "--by", "nodes"], "requires --hotspots"),
             (["view", "--accuracy-offset", "1"], "requires --accuracy"),
+            (["queue", "priority", "--opener-word", "raise",
+              "--pattern=-----", "--priority", "1"],
+             "pattern can only be used with --word"),
+            (["view", "NOTAWORD"], "five-letter word"),
+            (["view", "--since-seconds", "30"],
+             "require --hotspots or --accuracy"),
+            (["view", "--source-word", "raise"], "requires --accuracy"),
+            (["view", "--accuracy", "--accuracy-offset", "-1"],
+             "cannot be negative"),
+            (["view", "--hotspots", "--since-seconds", "0"],
+             "since-seconds must be at least 1"),
+            (["view", "--hotspots", "--sample-size", "0"],
+             "sample-size must be at least 1"),
         )
         for arguments, message in cases:
             with self.subTest(arguments=arguments), \
@@ -805,3 +819,197 @@ class QueueOperatorCommandTest(unittest.TestCase):
         queue.set_source_work_priority.assert_called_once_with(2, 5)
 if __name__ == '__main__':
     unittest.main()
+
+
+class SupervisorLoopTest(unittest.TestCase):
+    """The supervisor's periodic maintenance, worker upkeep, and shutdown."""
+
+    def _arguments(self, workers=0, recycle_hours=1.0):
+        return SimpleNamespace(
+            cache="cache.sqlite3", queue="queue.sqlite3", hint_cache=None,
+            workers=workers, recycle_hours=recycle_hours,
+            worker_timeout_seconds=30,
+        )
+
+    def _queue(self, counts=None, freed=0):
+        queue = Mock()
+        queue.disk_stop.return_value = None
+        queue.reset_stale_in_progress.return_value = 0
+        queue.recover_active_branches.return_value = (0, 0)
+        queue.counts_by_status.side_effect = counts or [
+            {}, {"pending": 0, "in_progress": 0}
+        ]
+        queue.branches_in_progress.return_value = []
+        queue.reclaim_stale_claims.return_value = freed
+        return queue
+
+    def _run(self, arguments, queue, stop_event, *, disk_guard=False,
+             wal_ceiling=False, periodic=False, invariants=None,
+             spawn=None, extra=()):
+        stack = ExitStack()
+        stack.enter_context(patch.object(
+            erd_search, "_hint_cache_is_usable", return_value=True))
+        stack.enter_context(patch.object(erd_search, "_checkpoint_cache_on_start"))
+        stack.enter_context(patch.object(erd_search, "ScoreCache"))
+        stack.enter_context(patch.object(erd_search, "ERDQueue", return_value=queue))
+        stack.enter_context(patch.object(
+            erd_search, "disk_stats",
+            return_value={"used_fraction": 0.1, "avail_bytes": 1}))
+        stack.enter_context(patch.object(erd_search, "_setup_supervisor_logging"))
+        stack.enter_context(patch.object(
+            erd_search.multiprocessing, "Event", return_value=stop_event))
+        stack.enter_context(patch.object(erd_search.time, "sleep"))
+        stack.enter_context(patch.object(erd_search, "_maybe_quiesce_truncate"))
+        if isinstance(disk_guard, Exception) or (
+            isinstance(disk_guard, type) and issubclass(disk_guard, Exception)
+        ):
+            stack.enter_context(patch.object(
+                erd_search, "_disk_guard", side_effect=disk_guard))
+        else:
+            stack.enter_context(patch.object(
+                erd_search, "_disk_guard", return_value=disk_guard))
+        stack.enter_context(patch.object(
+            erd_search, "_enforce_wal_hard_ceiling", return_value=wal_ceiling))
+        if periodic:
+            # Negative intervals make every periodic task due on the first pass.
+            stack.enter_context(patch.object(
+                erd_search, "DISK_SAMPLE_SECONDS", -1))
+            stack.enter_context(patch.object(
+                erd_search, "INVARIANT_CHECK_SECONDS", -1))
+            stack.enter_context(patch.object(
+                erd_search.erd_swarm, "CHECKPOINT_SECONDS", -1))
+            stack.enter_context(patch.object(erd_search, "_supervisor_checkpoint"))
+            stack.enter_context(patch.object(
+                erd_search, "_check_source_work_invariants",
+                side_effect=invariants))
+        if spawn is not None:
+            stack.enter_context(patch.object(
+                erd_search, "_spawn_worker", side_effect=spawn))
+            stack.enter_context(patch.object(erd_search, "_reap_worker"))
+        for context in extra:
+            stack.enter_context(context)
+        with stack:
+            erd_search.cmd_run(arguments)
+
+    def _stop_event(self, sequence):
+        stop_event = Mock()
+        stop_event.is_set.side_effect = sequence
+        return stop_event
+
+    def test_a_termination_signal_asks_the_supervisor_to_drain(self):
+        handlers = {}
+
+        def record(signum, handler):
+            handlers[signum] = handler
+
+        stop_event = self._stop_event([True])
+        with patch("sys.stdout", new_callable=io.StringIO) as output:
+            self._run(
+                self._arguments(), self._queue(), stop_event,
+                extra=[patch.object(erd_search.signal, "signal", record)],
+            )
+            handlers[erd_search.signal.SIGTERM](15, None)
+        stop_event.set.assert_called_with()
+        self.assertIn("draining workers", output.getvalue())
+
+    def test_a_stop_arriving_during_the_sleep_ends_the_loop_at_once(self):
+        queue = self._queue(counts=[{}])
+        self._run(
+            self._arguments(), queue, self._stop_event([False, True]),
+            extra=[patch.object(erd_search.signal, "signal")],
+        )
+        queue.counts_by_status.assert_called_once_with()
+
+    def test_a_disk_guard_trip_stops_the_swarm(self):
+        stop_event = self._stop_event([False, False])
+        queue = self._queue(counts=[{}])
+        self._run(
+            self._arguments(), queue, stop_event, disk_guard=True,
+            extra=[patch.object(erd_search.signal, "signal")],
+        )
+        stop_event.set.assert_called_with()
+        queue.reclaim_stale_claims.assert_not_called()
+
+    def test_a_wal_ceiling_breach_stops_the_swarm(self):
+        stop_event = self._stop_event([False, False])
+        queue = self._queue(counts=[{}])
+        self._run(
+            self._arguments(), queue, stop_event, wal_ceiling=True,
+            extra=[patch.object(erd_search.signal, "signal")],
+        )
+        stop_event.set.assert_called_with()
+        queue.reclaim_stale_claims.assert_not_called()
+
+    def test_a_queue_error_in_the_loop_stops_the_swarm(self):
+        stop_event = self._stop_event([False, False, True])
+        queue = self._queue(counts=[{}])
+        self._run(
+            self._arguments(), queue, stop_event,
+            disk_guard=sqlite3.OperationalError("disk I/O error"),
+            extra=[patch.object(erd_search.signal, "signal")],
+        )
+        stop_event.set.assert_called_with()
+
+    def test_periodic_maintenance_runs_when_each_interval_is_due(self):
+        stop_event = self._stop_event([False, False, True])
+        queue = self._queue(counts=[{"pending": 1}, {"pending": 0, "in_progress": 0}])
+        self._run(
+            self._arguments(), queue, stop_event, periodic=True,
+            extra=[patch.object(erd_search.signal, "signal")],
+        )
+        queue.record_disk_sample.assert_called_with(1)
+
+    def test_an_unavailable_invariant_check_is_skipped_not_fatal(self):
+        stop_event = self._stop_event([False, False, True])
+        queue = self._queue(counts=[{"pending": 1}, {"pending": 0, "in_progress": 0}])
+        self._run(
+            self._arguments(), queue, stop_event, periodic=True,
+            invariants=sqlite3.OperationalError("database is locked"),
+            extra=[patch.object(erd_search.signal, "signal")],
+        )
+        # The loop kept going and reached its ordinary end-of-pass work.
+        queue.reclaim_stale_claims.assert_called()
+
+    def test_a_second_pass_skips_maintenance_that_is_not_yet_due(self):
+        # The first pass records a disk sample; the second finds it too recent,
+        # and an undrained queue sends the loop round rather than stopping.
+        stop_event = self._stop_event([False, False, False, False, True])
+        queue = self._queue(counts=[
+            {}, {"pending": 1, "in_progress": 0}, {"pending": 0, "in_progress": 0},
+        ])
+        self._run(
+            self._arguments(), queue, stop_event,
+            extra=[patch.object(erd_search.signal, "signal")],
+        )
+        self.assertEqual(queue.record_disk_sample.call_count, 1)
+        self.assertEqual(queue.counts_by_status.call_count, 3)
+
+    def test_a_healthy_worker_is_left_alone_and_terminated_at_shutdown(self):
+        worker = Mock()
+        worker.is_alive.return_value = True
+        stop_event = self._stop_event([False, False, True])
+        queue = self._queue(counts=[{}, {"pending": 0, "in_progress": 0}])
+        self._run(
+            self._arguments(workers=1, recycle_hours=10.0), queue, stop_event,
+            spawn=[(worker, time.time())],
+            extra=[patch.object(erd_search.signal, "signal")],
+        )
+        # Left running through the pass, then stopped hard because it outlived
+        # SIGTERM at shutdown.
+        worker.terminate.assert_called_once_with()
+        worker.kill.assert_called_once_with()
+
+    def test_a_worker_that_outlives_sigterm_on_recycle_is_killed(self):
+        stale = Mock()
+        stale.is_alive.return_value = True
+        replacement = Mock()
+        replacement.is_alive.return_value = False
+        stop_event = self._stop_event([False, False, True])
+        queue = self._queue(counts=[{}, {"pending": 0, "in_progress": 0}])
+        self._run(
+            self._arguments(workers=1, recycle_hours=0.0), queue, stop_event,
+            spawn=[(stale, time.time() - 10), (replacement, time.time())],
+            extra=[patch.object(erd_search.signal, "signal")],
+        )
+        stale.terminate.assert_called_once_with()
+        stale.kill.assert_called_once_with()
