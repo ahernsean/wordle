@@ -1207,6 +1207,18 @@ class ViewSessionTest(unittest.TestCase):
         rows = WatchSession._identity_rows(report, "branch_key_hex")
         self.assertEqual([row["branch_key_hex"] for row in rows], ["one", "two", "three"])
 
+    def test_navigation_section_lists_available_back_branch_and_worker_keys(self):
+        session = WatchSession(view_args(), FakeInput(), io.StringIO())
+        session.branch_hotkeys = {"a": "one"}
+        session.worker_hotkeys = {"2": "worker-2"}
+        session.navigation_stack.append(session.current_request)
+        session._width = Mock(return_value=100)
+        lines = session._navigation_section()[0][1]
+        rendered = "\n".join(lines)
+        self.assertIn("[a-z] branch", rendered)
+        self.assertIn("[0-9] worker", rendered)
+        self.assertIn("[esc] back", rendered)
+
     def test_branch_navigation_targets_use_spine_then_reference_fallback(self):
         session = WatchSession(view_args(), FakeInput(), io.StringIO())
         from_list = session._branch_target({
