@@ -373,6 +373,22 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(report_model._source_word_group_key(
             {"worker_count": 0}, "worker_presence", 0), (1, "no workers"))
 
+    def test_source_rollups_and_membership_payload_preserve_shared_branch_context(self):
+        branch_key = ScoreCache.encode_subset(["salet"])
+        parent_key = ScoreCache.encode_subset(["crane"])
+        row = {
+            "branch_id": 3, "branch_key": branch_key, "parent_branch_key": parent_key,
+            "source_work_id": 7, "source_word": "raise", "requested_priority": 4,
+            "source_state": "active", "root_pattern": 0,
+            "pending_status": "in_progress", "active_status": "open", "worker_count": 2,
+            "branch_effective_priority": 6,
+        }
+        rollup = report_model._source_rollups([row, row])["raise"]
+        self.assertEqual(rollup["open_branch_count"], 1)
+        payload = report_model._source_membership_payload(row, 2)
+        self.assertTrue(payload["is_shared"])
+        self.assertEqual(payload["parent_branch_reference"], branch_reference(parent_key))
+
     def test_queue_and_current_hotspot_reports_normalize_rows(self):
         branch_key = ScoreCache.encode_subset(["salet"])
         queue = Mock(epoch=12)
