@@ -34,7 +34,7 @@
   "data": {
     "summary": [
       {
-        "source_word": "salet",
+        "opener": "salet",
         "requested_priority": 5,
       "requested_at": 400,
       "started_at": null,
@@ -59,20 +59,20 @@
         }
       }
     ],
-    "total_source_word_count": 1,
-    "matched_source_word_count": 1,
+    "total_opener_count": 1,
+    "matched_opener_count": 1,
     "matched_branch_count": 1240,
     "matched_open_branch_count": 1203,
-    "source_word_offset": 0,
+    "opener_offset": 0,
     "matched_rows": 4,
     "shared_branch_count": 1,
     "branch_row_offset": 0,
     "rows": [
       {
-        "source_work_id": 1,
-        "source_word": "salet",
+        "opener_work_id": 1,
+        "opener": "salet",
         "requested_priority": 5,
-        "source_state": "queued",
+        "opener_state": "queued",
         "branch_reference": "222222222222",
         "branch_key_hex": "02",
         "root_pattern": "-y---",
@@ -86,10 +86,10 @@
         "resolved_at": null
       },
       {
-        "source_work_id": 1,
-        "source_word": "salet",
+        "opener_work_id": 1,
+        "opener": "salet",
         "requested_priority": 5,
-        "source_state": "queued",
+        "opener_state": "queued",
         "branch_reference": "333333333333",
         "branch_key_hex": "03",
         "root_pattern": "--g--",
@@ -103,10 +103,10 @@
         "resolved_at": null
       },
       {
-        "source_work_id": 2,
-        "source_word": "raise",
+        "opener_work_id": 2,
+        "opener": "raise",
         "requested_priority": 3,
-        "source_state": "queued",
+        "opener_state": "queued",
         "branch_reference": "222222222222",
         "branch_key_hex": "02",
         "root_pattern": "-----",
@@ -120,10 +120,10 @@
         "resolved_at": null
       },
       {
-        "source_work_id": 2,
-        "source_word": "raise",
+        "opener_work_id": 2,
+        "opener": "raise",
         "requested_priority": 3,
-        "source_state": "queued",
+        "opener_state": "queued",
         "branch_reference": "444444444444",
         "branch_key_hex": "04",
         "root_pattern": "-----",

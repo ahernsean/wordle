@@ -17,8 +17,8 @@ from unittest.mock import patch
 
 import erd_search
 from erd_queue import (
-    SOURCE_PRIORITY_MAX,
-    SOURCE_PRIORITY_MIN,
+    OPENER_PRIORITY_MAX,
+    OPENER_PRIORITY_MIN,
     ERDQueue,
     encode_subset,
 )
@@ -214,7 +214,7 @@ class TestQueueAddMaxBranchSize(unittest.TestCase):
         self.addCleanup(queue.close)
         self.assertIsNone(queue.get_pending_branch(branch_key))
 
-    def test_fully_cached_word_reports_already_solved_without_source_work(self):
+    def test_fully_cached_word_reports_already_solved_without_opener_work(self):
         branch_key = self._all_gray_branch_key()
         args = _make_args(self._tmp.name, pattern='-----')
 
@@ -237,7 +237,7 @@ class TestQueueAddMaxBranchSize(unittest.TestCase):
         queue = ERDQueue(args.queue)
         self.addCleanup(queue.close)
         self.assertEqual(queue.total_branches(), 0)
-        self.assertEqual(queue.source_work_rows(), [])
+        self.assertEqual(queue.opener_work_rows(), [])
 
 
 class TestQueueAddDeleteErdCache(unittest.TestCase):
@@ -277,24 +277,24 @@ class TestQueueAddDeleteErdCache(unittest.TestCase):
         claimed = queue.claim_next(worker)
         queue.create_branch(branch_key, n_words, self.N_CANDIDATES,
                             priority=claimed['priority'],
-                            source_work_id=claimed['source_work_id'])
+                            opener_work_id=claimed['opener_work_id'])
         return branch_key, claimed
 
     def _claim_a_bundle(self, queue, branch_key, worker='worker-0',
                         claimed=None):
         """Claim real candidate slots, so claim counts have something to prove.
 
-        A source-owned branch refuses a bundle whose expected_source_work_id
+        An opener-owned branch refuses a bundle whose expected_opener_work_id
         does not match its owner, so the claim row from _promote has to be
-        carried through; a branch promoted without source ownership passes
+        carried through; a branch promoted without opener ownership passes
         None for both.
         """
         return queue.claim_next_bundle(
             branch_key, worker, self.N_CANDIDATES,
             list(range(self.N_CANDIDATES)), [0.0] * self.N_CANDIDATES,
-            expected_source_work_id=(
-                claimed['source_work_id'] if claimed else None),
-            expected_source_priority=(
+            expected_opener_work_id=(
+                claimed['opener_work_id'] if claimed else None),
+            expected_opener_priority=(
                 claimed['priority'] if claimed else None))
 
     def _status(self, queue):
@@ -501,7 +501,7 @@ class TestRequeueCompletedBranch(unittest.TestCase):
         claimed = self.queue.claim_next('worker-0')
         self.queue.create_branch(self.branch_key, 6, self.N_CANDIDATES,
                                  priority=claimed['priority'],
-                                 source_work_id=claimed['source_work_id'])
+                                 opener_work_id=claimed['opener_work_id'])
         self.queue.mark_done(self.branch_key)
         self.assertEqual(self.queue._conn.execute(
             "SELECT COUNT(*) FROM active_branches WHERE status = 'open'"
@@ -516,7 +516,7 @@ class TestRequeueCompletedBranch(unittest.TestCase):
         claimed = self.queue.claim_next('worker-0')
         self.queue.create_branch(self.branch_key, 6, self.N_CANDIDATES,
                                  priority=claimed['priority'],
-                                 source_work_id=claimed['source_work_id'])
+                                 opener_work_id=claimed['opener_work_id'])
         self.queue.mark_done(self.branch_key)
         self.queue.delete_branch(self.branch_key)
 
@@ -550,12 +550,12 @@ class TestPriorityLadder(unittest.TestCase):
         self.assertEqual(erd_search.priority_ladder(['alpha'], 4, 5),
                          {'alpha': 4})
 
-    def test_no_rung_falls_below_the_source_priority_minimum(self):
+    def test_no_rung_falls_below_the_opener_priority_minimum(self):
         words = [f'w{index:05d}' for index in range(500)]
 
-        ladder = erd_search.priority_ladder(words, SOURCE_PRIORITY_MAX, 5)
+        ladder = erd_search.priority_ladder(words, OPENER_PRIORITY_MAX, 5)
 
-        self.assertLessEqual(max(ladder.values()), SOURCE_PRIORITY_MAX)
+        self.assertLessEqual(max(ladder.values()), OPENER_PRIORITY_MAX)
         self.assertGreaterEqual(min(ladder.values()), 0)
 
     def test_overflowing_list_seats_leading_words_and_floors_the_tail(self):
@@ -574,7 +574,7 @@ class TestPriorityLadder(unittest.TestCase):
         self.assertGreater(len(candidate_words), 14_000)
 
         ladder = erd_search.priority_ladder(
-            candidate_words, SOURCE_PRIORITY_MAX,
+            candidate_words, OPENER_PRIORITY_MAX,
             erd_search.DEFAULT_PRIORITY_STEP)
 
         self.assertEqual(len(set(ladder.values())), len(candidate_words))
@@ -594,8 +594,8 @@ class TestQueueAddPriorityLadder(unittest.TestCase):
     def _requested_priority_by_word(self, queue_path):
         queue = ERDQueue(queue_path)
         self.addCleanup(queue.close)
-        return {row['source_word']: row['requested_priority']
-                for row in queue.source_work_rows()}
+        return {row['opener']: row['requested_priority']
+                for row in queue.opener_work_rows()}
 
     def _write_words_file(self, words):
         path = os.path.join(self._tmp.name, 'words.txt')
@@ -612,8 +612,8 @@ class TestQueueAddPriorityLadder(unittest.TestCase):
 
         self.assertEqual(
             self._requested_priority_by_word(args.queue),
-            {LARGE_BRANCH_WORD: SOURCE_PRIORITY_MAX,
-             SECOND_WORD: SOURCE_PRIORITY_MAX - 5})
+            {LARGE_BRANCH_WORD: OPENER_PRIORITY_MAX,
+             SECOND_WORD: OPENER_PRIORITY_MAX - 5})
 
     def test_priority_step_sets_the_gap_between_rungs(self):
         args = _make_args(self._tmp.name, priority_step=50,
@@ -624,8 +624,8 @@ class TestQueueAddPriorityLadder(unittest.TestCase):
 
         self.assertEqual(
             self._requested_priority_by_word(args.queue),
-            {LARGE_BRANCH_WORD: SOURCE_PRIORITY_MAX,
-             SECOND_WORD: SOURCE_PRIORITY_MAX - 50})
+            {LARGE_BRANCH_WORD: OPENER_PRIORITY_MAX,
+             SECOND_WORD: OPENER_PRIORITY_MAX - 50})
 
     def test_zero_step_restores_the_flat_single_priority_batch(self):
         args = _make_args(self._tmp.name, priority_step=0, priority=3,
@@ -663,8 +663,8 @@ class TestQueueAddPriorityLadder(unittest.TestCase):
 
         self.assertEqual(
             self._requested_priority_by_word(args.queue),
-            {LARGE_BRANCH_WORD: SOURCE_PRIORITY_MAX,
-             SECOND_WORD: SOURCE_PRIORITY_MAX - 5})
+            {LARGE_BRANCH_WORD: OPENER_PRIORITY_MAX,
+             SECOND_WORD: OPENER_PRIORITY_MAX - 5})
         self.assertIn('across 2 word(s)', output.getvalue())
 
     def test_overflowing_ladder_warns_that_the_tail_starts_together(self):
@@ -674,7 +674,7 @@ class TestQueueAddPriorityLadder(unittest.TestCase):
                           word=[LARGE_BRANCH_WORD, SECOND_WORD, 'crane'])
 
         output = StringIO()
-        with patch.object(erd_search, 'SOURCE_PRIORITY_MAX', 5), \
+        with patch.object(erd_search, 'OPENER_PRIORITY_MAX', 5), \
                 redirect_stdout(output):
             erd_search.cmd_queue_add(args)
 
@@ -703,7 +703,7 @@ class TestQueueAddPriorityLadder(unittest.TestCase):
             erd_search.cmd_queue_add(args)
 
     def test_out_of_range_priority_is_rejected_before_any_branch_is_queued(self):
-        args = _make_args(self._tmp.name, priority=SOURCE_PRIORITY_MAX + 1)
+        args = _make_args(self._tmp.name, priority=OPENER_PRIORITY_MAX + 1)
 
         with self.assertRaisesRegex(ValueError, 'opener-work priority'):
             erd_search.cmd_queue_add(args)
@@ -723,12 +723,12 @@ class TestQueueAddPriorityLadder(unittest.TestCase):
             erd_search.cmd_queue_add(second)
 
         priorities = self._requested_priority_by_word(first.queue)
-        self.assertEqual(priorities[LARGE_BRANCH_WORD], SOURCE_PRIORITY_MAX)
-        self.assertEqual(priorities[SECOND_WORD], SOURCE_PRIORITY_MAX - 5)
+        self.assertEqual(priorities[LARGE_BRANCH_WORD], OPENER_PRIORITY_MAX)
+        self.assertEqual(priorities[SECOND_WORD], OPENER_PRIORITY_MAX - 5)
         # The second batch descends from just below the first, so every one
         # of its words ranks under everything already queued.
-        self.assertEqual(priorities['crane'], SOURCE_PRIORITY_MAX - 6)
-        self.assertEqual(priorities['irate'], SOURCE_PRIORITY_MAX - 11)
+        self.assertEqual(priorities['crane'], OPENER_PRIORITY_MAX - 6)
+        self.assertEqual(priorities['irate'], OPENER_PRIORITY_MAX - 11)
         self.assertLess(max(priorities['crane'], priorities['irate']),
                         min(priorities[LARGE_BRANCH_WORD],
                             priorities[SECOND_WORD]))
@@ -777,7 +777,7 @@ class TestQueueAddPriorityLadder(unittest.TestCase):
             erd_search.cmd_queue_add(first)
 
         queue = ERDQueue(first.queue)
-        queue._conn.execute("UPDATE source_work SET state = 'complete'")
+        queue._conn.execute("UPDATE opener_work SET state = 'complete'")
         queue._conn.commit()
         queue.close()
 
@@ -788,8 +788,8 @@ class TestQueueAddPriorityLadder(unittest.TestCase):
             erd_search.cmd_queue_add(second)
 
         priorities = self._requested_priority_by_word(first.queue)
-        self.assertEqual(priorities['crane'], SOURCE_PRIORITY_MAX)
-        self.assertEqual(priorities['irate'], SOURCE_PRIORITY_MAX - 5)
+        self.assertEqual(priorities['crane'], OPENER_PRIORITY_MAX)
+        self.assertEqual(priorities['irate'], OPENER_PRIORITY_MAX - 5)
 
     def test_first_batch_into_an_empty_queue_starts_at_the_ceiling(self):
         args = _make_args(self._tmp.name, pattern='-----',
@@ -802,14 +802,14 @@ class TestQueueAddPriorityLadder(unittest.TestCase):
         # leaves the whole space below it for later batches to append into.
         self.assertEqual(
             self._requested_priority_by_word(args.queue),
-            {LARGE_BRANCH_WORD: SOURCE_PRIORITY_MAX,
-             SECOND_WORD: SOURCE_PRIORITY_MAX - 5})
+            {LARGE_BRANCH_WORD: OPENER_PRIORITY_MAX,
+             SECOND_WORD: OPENER_PRIORITY_MAX - 5})
 
     def test_explicit_priority_past_the_range_is_refused_not_clamped(self):
         # Seating the batch lower would hand back a last rung below the one
         # --priority names, and tie it with whatever already sits up there.
         args = _make_args(
-            self._tmp.name, pattern='-----', priority=SOURCE_PRIORITY_MAX - 5,
+            self._tmp.name, pattern='-----', priority=OPENER_PRIORITY_MAX - 5,
             word=[LARGE_BRANCH_WORD, SECOND_WORD, 'crane'])
 
         with self.assertRaisesRegex(ValueError, 'above the maximum'):
@@ -821,7 +821,7 @@ class TestQueueAddPriorityLadder(unittest.TestCase):
     def test_explicit_priority_that_exactly_fits_is_accepted(self):
         args = _make_args(
             self._tmp.name, pattern='-----',
-            priority=SOURCE_PRIORITY_MAX - 10,
+            priority=OPENER_PRIORITY_MAX - 10,
             word=[LARGE_BRANCH_WORD, SECOND_WORD, 'crane'])
 
         with redirect_stdout(StringIO()):
@@ -829,13 +829,13 @@ class TestQueueAddPriorityLadder(unittest.TestCase):
 
         self.assertEqual(
             self._requested_priority_by_word(args.queue),
-            {LARGE_BRANCH_WORD: SOURCE_PRIORITY_MAX,
-             SECOND_WORD: SOURCE_PRIORITY_MAX - 5,
-             'crane': SOURCE_PRIORITY_MAX - 10})
+            {LARGE_BRANCH_WORD: OPENER_PRIORITY_MAX,
+             SECOND_WORD: OPENER_PRIORITY_MAX - 5,
+             'crane': OPENER_PRIORITY_MAX - 10})
 
     def test_appending_onto_floor_priority_reports_a_tie_not_an_order(self):
         first = _make_args(self._tmp.name, pattern='-----',
-                           priority=SOURCE_PRIORITY_MIN,
+                           priority=OPENER_PRIORITY_MIN,
                            word=[LARGE_BRANCH_WORD])
         with redirect_stdout(StringIO()):
             erd_search.cmd_queue_add(first)
@@ -859,23 +859,23 @@ class TestQueueAddPriorityLadder(unittest.TestCase):
         # figure reported to the user and the one the ladder uses identical.
         self.assertEqual(
             erd_search.ladder_top_priority(None, None, 5, 3),
-            SOURCE_PRIORITY_MAX)
+            OPENER_PRIORITY_MAX)
         self.assertEqual(erd_search.ladder_top_priority(900, None, 5, 3), 899)
         self.assertEqual(erd_search.ladder_top_priority(0, None, 5, 3),
-                         SOURCE_PRIORITY_MIN)
+                         OPENER_PRIORITY_MIN)
         self.assertEqual(erd_search.ladder_top_priority(900, 100, 5, 3), 110)
 
     def test_queue_add_queries_the_lowest_priority_once(self):
         args = _make_args(self._tmp.name, pattern='-----',
                           word=[LARGE_BRANCH_WORD, SECOND_WORD])
         calls = []
-        original = ERDQueue.lowest_unfinished_source_priority
+        original = ERDQueue.lowest_unfinished_opener_priority
 
         def counting(self):
             calls.append(1)
             return original(self)
 
-        with patch.object(ERDQueue, 'lowest_unfinished_source_priority',
+        with patch.object(ERDQueue, 'lowest_unfinished_opener_priority',
                           counting), redirect_stdout(StringIO()):
             erd_search.cmd_queue_add(args)
 
@@ -892,8 +892,8 @@ class TestQueueAddPriorityLadder(unittest.TestCase):
 
         self.assertEqual(
             self._requested_priority_by_word(args.queue),
-            {LARGE_BRANCH_WORD: SOURCE_PRIORITY_MAX,
-             SECOND_WORD: SOURCE_PRIORITY_MAX - 5})
+            {LARGE_BRANCH_WORD: OPENER_PRIORITY_MAX,
+             SECOND_WORD: OPENER_PRIORITY_MAX - 5})
 
 
 if __name__ == '__main__':

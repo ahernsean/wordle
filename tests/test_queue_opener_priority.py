@@ -1,7 +1,7 @@
-"""Unit tests for erd_search.cmd_queue_source_priority (issue #206).
+"""Unit tests for erd_search.cmd_queue_opener_priority (issue #206).
 
-Exercises the CLI surface for ERDQueue.set_source_work_priority(): word ->
-source_work_id resolution restricted to open (non-complete) requests, the
+Exercises the CLI surface for ERDQueue.set_opener_work_priority(): word ->
+opener_work_id resolution restricted to open (non-complete) requests, the
 --opener-work-id disambiguation and direct-completed-request targeting, the
 MAX(owner_priority) branch-sharing behaviour, and the distinct out-of-range /
 unknown-word / all-complete / ambiguous / complete-request messages.
@@ -16,8 +16,8 @@ import unittest
 import erd_search
 from cache_sqlite import ScoreCache
 from erd_queue import (
-    SOURCE_PRIORITY_MAX,
-    SOURCE_PRIORITY_MIN,
+    OPENER_PRIORITY_MAX,
+    OPENER_PRIORITY_MIN,
     ERDQueue,
 )
 
@@ -39,7 +39,7 @@ def _make_args(queue_path, **overrides):
     return args
 
 
-class TestQueueSourcePriority(unittest.TestCase):
+class TestQueueOpenerPriority(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
@@ -48,7 +48,7 @@ class TestQueueSourcePriority(unittest.TestCase):
     def _run(self, args):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            erd_search.cmd_queue_source_priority(args)
+            erd_search.cmd_queue_opener_priority(args)
         return buf.getvalue()
 
     def _run_branch_priority(self, args):
@@ -69,12 +69,12 @@ class TestQueueSourcePriority(unittest.TestCase):
         claimed = queue.claim_next('worker-0')
         queue.create_branch(key_root, len(WORDS_A), 20,
                              priority=claimed['priority'],
-                             source_work_id=claimed['source_work_id'])
+                             opener_work_id=claimed['opener_work_id'])
         # A promoted descendant discovered while solving key_root: created
-        # directly (never queued), owned by the same source-work request.
+        # directly (never queued), owned by the same opener-work request.
         queue.create_branch(key_child, len(WORDS_B), 5,
                              priority=claimed['priority'],
-                             source_work_id=claimed['source_work_id'],
+                             opener_work_id=claimed['opener_work_id'],
                              parent_branch_key=key_root)
         queue.close()
 
@@ -113,28 +113,28 @@ class TestQueueSourcePriority(unittest.TestCase):
         queue.close()
 
         output = self._run(_make_args(
-            self.queue_path, priority=SOURCE_PRIORITY_MAX + 1))
+            self.queue_path, priority=OPENER_PRIORITY_MAX + 1))
         self.assertIn(
-            f'between {SOURCE_PRIORITY_MIN} and {SOURCE_PRIORITY_MAX}', output)
+            f'between {OPENER_PRIORITY_MIN} and {OPENER_PRIORITY_MAX}', output)
 
         queue = ERDQueue(self.queue_path)
         self.addCleanup(queue.close)
         self.assertEqual(queue.get_pending_branch(key)['priority'], 0)
 
-    def test_ownerless_source_word_updates_only_open_ownerless_branches(self):
+    def test_ownerless_opener_updates_only_open_ownerless_branches(self):
         queue = ERDQueue(self.queue_path)
         ownerless_key = ScoreCache.encode_subset(WORDS_A)
         owned_key = ScoreCache.encode_subset(WORDS_B)
         done_key = ScoreCache.encode_subset(WORDS_C)
         queue.create_branch(ownerless_key, len(WORDS_A), 20,
-                            priority=0, source_word='salet')
+                            priority=0, opener='salet')
         queue.add_pending_many([(owned_key, len(WORDS_B), 1, 'salet', 0)])
         claimed = queue.claim_next('worker-0')
         queue.create_branch(owned_key, len(WORDS_B), 20,
-                            priority=claimed['priority'], source_word='salet',
-                            source_work_id=claimed['source_work_id'])
+                            priority=claimed['priority'], opener='salet',
+                            opener_work_id=claimed['opener_work_id'])
         queue.create_branch(done_key, len(WORDS_C), 20,
-                            priority=0, source_word='salet')
+                            priority=0, opener='salet')
         queue._conn.execute(
             "UPDATE active_branches SET status = 'finalized' WHERE branch_id = ?",
             (queue._intern_branch(done_key),))
@@ -162,8 +162,8 @@ class TestQueueSourcePriority(unittest.TestCase):
         queue = ERDQueue(self.queue_path)
         key = ScoreCache.encode_subset(WORDS_C)
         queue.add_pending_many([(key, len(WORDS_C), 0, 'salet', 0)])
-        source_work_id = queue.source_work_rows()[0]['source_work_id']
-        queue.claim_next('worker-0', source_work_id)
+        opener_work_id = queue.opener_work_rows()[0]['opener_work_id']
+        queue.claim_next('worker-0', opener_work_id)
         queue.mark_done(key)
         queue.close()
 
@@ -178,13 +178,13 @@ class TestQueueSourcePriority(unittest.TestCase):
         queue = ERDQueue(self.queue_path)
         key_done = ScoreCache.encode_subset(WORDS_C)
         queue.add_pending_many([(key_done, len(WORDS_C), 0, 'salet', 0)])
-        done_id = queue.source_work_rows()[0]['source_work_id']
+        done_id = queue.opener_work_rows()[0]['opener_work_id']
         queue.claim_next('worker-0', done_id)
         queue.mark_done(key_done)
 
         key_open = ScoreCache.encode_subset(WORDS_A)
         queue.add_pending_many([(key_open, len(WORDS_A), 0, 'salet', 0)])
-        rows = queue.source_work_rows()
+        rows = queue.opener_work_rows()
         self.assertEqual(len(rows), 2)
         queue.close()
 
@@ -194,27 +194,27 @@ class TestQueueSourcePriority(unittest.TestCase):
 
         queue = ERDQueue(self.queue_path)
         self.addCleanup(queue.close)
-        by_id = {row['source_work_id']: row['requested_priority']
-                  for row in queue.source_work_rows()}
+        by_id = {row['opener_work_id']: row['requested_priority']
+                  for row in queue.opener_work_rows()}
         self.assertEqual(by_id[done_id], 0)
 
     def test_ambiguous_word_lists_candidate_details_and_requires_disambiguation(self):
         queue = ERDQueue(self.queue_path)
         key_a = ScoreCache.encode_subset(WORDS_A)
         key_b = ScoreCache.encode_subset(WORDS_B)
-        # Distinct priorities -> distinct source_work rows for the same word.
+        # Distinct priorities -> distinct opener_work rows for the same word.
         queue.add_pending_many([(key_a, len(WORDS_A), 0, 'salet', 0)])
         queue.add_pending_many([(key_b, len(WORDS_B), 1, 'salet', 0)])
-        rows = queue.source_work_rows()
+        rows = queue.opener_work_rows()
         self.assertEqual(len(rows), 2)
-        ids = sorted(row['source_work_id'] for row in rows)
+        ids = sorted(row['opener_work_id'] for row in rows)
         queue.close()
 
         output = self._run(_make_args(self.queue_path, priority=5))
         self.assertIn('ambiguous', output)
         self.assertIn('--opener-work-id', output)
-        for source_work_id in ids:
-            self.assertIn(f'id {source_work_id}', output)
+        for opener_work_id in ids:
+            self.assertIn(f'id {opener_work_id}', output)
         self.assertIn('direct', output)
         self.assertIn('branch(es)', output)
         self.assertIn('queued', output)
@@ -222,21 +222,21 @@ class TestQueueSourcePriority(unittest.TestCase):
         queue = ERDQueue(self.queue_path)
         self.addCleanup(queue.close)
         priorities = sorted(row['requested_priority']
-                             for row in queue.source_work_rows())
+                             for row in queue.opener_work_rows())
         self.assertEqual(priorities, [0, 1])
 
         output = self._run(_make_args(self.queue_path, priority=5,
                                        opener_work_id=ids[0]))
         self.assertIn('requested priority set to 5', output)
 
-    def test_source_work_id_disambiguates(self):
+    def test_opener_work_id_disambiguates(self):
         queue = ERDQueue(self.queue_path)
         key_a = ScoreCache.encode_subset(WORDS_A)
         key_b = ScoreCache.encode_subset(WORDS_B)
         queue.add_pending_many([(key_a, len(WORDS_A), 0, 'salet', 0)])
         queue.add_pending_many([(key_b, len(WORDS_B), 1, 'salet', 0)])
-        rows = {row['requested_priority']: row['source_work_id']
-                for row in queue.source_work_rows()}
+        rows = {row['requested_priority']: row['opener_work_id']
+                for row in queue.opener_work_rows()}
         target_id = rows[0]
         queue.close()
 
@@ -246,8 +246,8 @@ class TestQueueSourcePriority(unittest.TestCase):
 
         queue = ERDQueue(self.queue_path)
         self.addCleanup(queue.close)
-        by_id = {row['source_work_id']: row['requested_priority']
-                  for row in queue.source_work_rows()}
+        by_id = {row['opener_work_id']: row['requested_priority']
+                  for row in queue.opener_work_rows()}
         self.assertEqual(by_id[target_id], 7)
         self.assertEqual(by_id[rows[1]], 1)
 
@@ -255,34 +255,34 @@ class TestQueueSourcePriority(unittest.TestCase):
         queue = ERDQueue(self.queue_path)
         key = ScoreCache.encode_subset(WORDS_A)
         queue.add_pending_many([(key, len(WORDS_A), 0, 'salet', 0)])
-        rows = queue.source_work_rows()
-        bogus_id = max(row['source_work_id'] for row in rows) + 1000
+        rows = queue.opener_work_rows()
+        bogus_id = max(row['opener_work_id'] for row in rows) + 1000
         queue.close()
 
         output = self._run(_make_args(self.queue_path,
                                        opener_work_id=bogus_id))
         self.assertIn(f'no opener-work request with id {bogus_id}', output)
 
-    def test_source_work_id_can_target_completed_request_directly(self):
+    def test_opener_work_id_can_target_completed_request_directly(self):
         # A completed id named explicitly is resolved (it belongs to the
         # word) and only then reported as complete -- not "not found".
         queue = ERDQueue(self.queue_path)
         key = ScoreCache.encode_subset(WORDS_C)
         queue.add_pending_many([(key, len(WORDS_C), 0, 'salet', 0)])
-        source_work_id = queue.source_work_rows()[0]['source_work_id']
-        queue.claim_next('worker-0', source_work_id)
+        opener_work_id = queue.opener_work_rows()[0]['opener_work_id']
+        queue.claim_next('worker-0', opener_work_id)
         queue.mark_done(key)
         queue.close()
 
         output = self._run(_make_args(self.queue_path, priority=2,
-                                       opener_work_id=source_work_id))
+                                       opener_work_id=opener_work_id))
         self.assertIn('request is complete, cannot reprioritize', output)
         self.assertNotIn('no opener-work request with id', output)
 
         queue = ERDQueue(self.queue_path)
         self.addCleanup(queue.close)
         self.assertEqual(
-            queue.source_work_rows()[0]['requested_priority'], 0)
+            queue.opener_work_rows()[0]['requested_priority'], 0)
 
 
 if __name__ == '__main__':

@@ -228,7 +228,7 @@ def main():
     typical = load_cost_model(conn)
     all_rows = conn.execute("""
         SELECT n_words, budget, bound_erd, erd_lower_bound_pruned, actual_nodes,
-               group_sizes, source_word, candidate_cost_lower_bound
+               group_sizes, opener, candidate_cost_lower_bound
         FROM telemetry.candidate_accuracy WHERE epoch = ?
     """, (args.epoch,)).fetchall()
 

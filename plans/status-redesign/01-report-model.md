@@ -48,9 +48,9 @@ The model prints nothing and contains no terminal, HTTP, or HTML logic.
     parse_rich_spine(path: str | None) -> list[RichSpineStep]
     normalize_worker_descent(parsed_path: list[RichSpineStep],
                              answer_set: set[str]) -> list[dict]
-    collect_overview_report(sources: ReportSources,
+    collect_overview_report(sources: ReportOpeners,
                             request: ReportRequest | None = None) -> dict
-    collect_report(sources: ReportSources, request: ReportRequest) -> dict
+    collect_report(sources: ReportOpeners, request: ReportRequest) -> dict
 
 And these frozen dataclasses:
 
@@ -58,7 +58,7 @@ And these frozen dataclasses:
         report_kind: str = "overview",
     )
 
-    ReportSources(
+    ReportOpeners(
         queue_path: str,
         cache_path: str,
         answer_list_path: str,
@@ -66,7 +66,7 @@ And these frozen dataclasses:
         telemetry_path: str | None = None,
     )
 
-    ReportSources.defaults() -> ReportSources
+    ReportOpeners.defaults() -> ReportOpeners
 
 `collect_report` dispatches `overview` in this phase and raises
 `ValueError("unsupported report kind: ...")` for anything else. Later phases
@@ -80,7 +80,7 @@ Its fields are `(guess_depth, word, pattern, answer_count_text)`. Keeping the
 four-tuple contract lets phase 1 alias the parser into the legacy renderer
 without adapting its call sites.
 
-`ReportSources.defaults()` reads all defaults from `runtime_paths.py`.
+`ReportOpeners.defaults()` reads all defaults from `runtime_paths.py`.
 `runtime_paths.py` owns current database, telemetry, answer-list, and
 guess-list paths. Export full names such as `DEFAULT_ANSWER_LIST_PATH` and
 `DEFAULT_GUESS_LIST_PATH`; `erd_search.py` may import those as its legacy
@@ -315,8 +315,8 @@ Every overview branch has:
 | `bulk_completed_candidate_count` | int |
 | `priority` | int |
 | `is_cooperative` | bool |
-| `source_word` | lowercase str or null |
-| `source_pattern` | normalized pattern or null |
+| `opener` | lowercase str or null |
+| `opener_pattern` | normalized pattern or null |
 | `best_guess` | lowercase str or null |
 | `best_guess_is_answer` | bool |
 | `best_erd` | float or null |
@@ -330,7 +330,7 @@ Every overview branch has:
 | `ceiling` | float or null |
 
 `guess_depth` is the number of stored spine pairs. For a legacy row without a
-spine, use 1 only when both `source_word` is present and `source_pattern is
+spine, use 1 only when both `opener` is present and `opener_pattern is
 not None`; pattern code 0 is valid.
 
 ## Normalized worker object
@@ -376,7 +376,7 @@ still a renderer concern.
 5. Unavailable queue and unavailable cache fail independently.
 6. Queue epoch metadata comes from the main queue database and is reported
    under `sources.queue`; telemetry source health has no epoch fields.
-7. Custom answer-list and guess-list paths flow through `ReportSources`
+7. Custom answer-list and guess-list paths flow through `ReportOpeners`
    without importing `erd_search`.
 8. One active branch and worker normalize spine, `guess_depth`, answer flags,
    candidate progress, and renamed guess-axis fields correctly.

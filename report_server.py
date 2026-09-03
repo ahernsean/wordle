@@ -23,13 +23,13 @@ from report_model import (
     is_overview_request,
     GROUP_BY_STRATEGIES,
     SCHEMA_VERSION,
-    SOURCE_GROUP_BY_STRATEGIES,
-    SOURCE_SORT_FIELDS,
-    SOURCE_STATES,
+    OPENER_GROUP_BY_STRATEGIES,
+    OPENER_SORT_FIELDS,
+    OPENER_STATES,
     TREE_CURSOR_PATTERN,
     ReportFilters,
     ReportRequest,
-    ReportSources,
+    ReportOpeners,
     collect_ambiguous_branch_reference_report,
     collect_report,
     parse_branch_filter,
@@ -72,7 +72,7 @@ FINALIZATION_CURSOR_PATTERN = re.compile(r"(after|before):(\d+):(\d+)")
 ALLOWED_PARAMETERS = SCALAR_PARAMETERS
 SORT_FIELDS = {
     "default", "age", "size", "workers", "priority", "nodes", "slowest",
-    *SOURCE_SORT_FIELDS,
+    *OPENER_SORT_FIELDS,
 }
 HOTSPOT_FIELDS = {
     "nodes", "age", "size", "workers", "priority", "slowest",
@@ -94,7 +94,7 @@ class InFlightLeaderboardReport:
 
 @dataclass(frozen=True)
 class ServerConfiguration:
-    sources: ReportSources
+    sources: ReportOpeners
     client_path: str
     fixture_directory: str | None = None
     fixtures: dict[str, dict] | None = None
@@ -177,7 +177,7 @@ def parse_report_request(path, query):
         raise InvalidRequest("tree_cursor must name a tree page group")
     branch_status_value = _single_value(parameters, "branch_status")
     branch_worker_status_value = _single_value(parameters, "branch_worker_status")
-    source_state_value = _single_value(parameters, "opener_state")
+    opener_state_value = _single_value(parameters, "opener_state")
     try:
         overview = is_overview_request(explicit_kind, branch_target.kind, tree)
         branch_statuses = (
@@ -195,9 +195,9 @@ def parse_report_request(path, query):
             if branch_worker_status_value is not None
             else (OVERVIEW_BRANCH_WORKER_STATUSES if overview else ())
         )
-        source_states = (
-            parse_branch_filter(source_state_value, "opener state", SOURCE_STATES)
-            if source_state_value is not None else ()
+        opener_states = (
+            parse_branch_filter(opener_state_value, "opener state", OPENER_STATES)
+            if opener_state_value is not None else ()
         )
     except ValueError as error:
         raise InvalidRequest(str(error)) from error
@@ -242,7 +242,7 @@ def parse_report_request(path, query):
         raise InvalidRequest(f"invalid sort field {sort!r}")
     group_by = _single_value(parameters, "group_by")
     if group_by is not None and group_by not in (
-        set(GROUP_BY_STRATEGIES) | set(SOURCE_GROUP_BY_STRATEGIES)
+        set(GROUP_BY_STRATEGIES) | set(OPENER_GROUP_BY_STRATEGIES)
     ):
         raise InvalidRequest(f"invalid group_by field {group_by!r}")
 
@@ -286,8 +286,8 @@ def parse_report_request(path, query):
         priority=integer_values["priority"],
         sort=sort,
         group_by=group_by,
-        source_states=source_states,
-        source_offset=integer_values["opener_offset"],
+        opener_states=opener_states,
+        opener_offset=integer_values["opener_offset"],
         branch_row_offset=integer_values["branch_row_offset"],
         limit=limit,
         finalization_cursor_direction=finalization_cursor_direction,
@@ -476,8 +476,8 @@ def make_handler(configuration):
 
 
 def build_configuration(queue_path, cache_path, fixture_directory=None):
-    defaults = ReportSources.defaults()
-    sources = ReportSources(
+    defaults = ReportOpeners.defaults()
+    sources = ReportOpeners(
         queue_path=queue_path,
         cache_path=cache_path,
         answer_list_path=defaults.answer_list_path,

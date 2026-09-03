@@ -34,7 +34,7 @@
   "data": {
     "summary": [
       {
-        "source_word": "salet",
+        "opener": "salet",
         "requested_priority": 5,
       "requested_at": 400,
       "started_at": null,
@@ -59,7 +59,7 @@
         }
       },
       {
-        "source_word": "raise",
+        "opener": "raise",
         "requested_priority": 3,
       "requested_at": 200,
       "started_at": null,
@@ -84,7 +84,7 @@
         }
       },
       {
-        "source_word": "crane",
+        "opener": "crane",
         "requested_priority": 1,
       "requested_at": 100,
       "started_at": null,
@@ -114,7 +114,7 @@
         "label": "queued",
         "rows": [
           {
-            "source_word": "salet",
+            "opener": "salet",
             "requested_priority": 5,
             "requested_at": 400,
             "completed_at": null,
@@ -138,7 +138,7 @@
             }
           },
           {
-            "source_word": "raise",
+            "opener": "raise",
             "requested_priority": 3,
             "requested_at": 200,
             "completed_at": null,
@@ -163,7 +163,7 @@
           }
         ],
         "rollup": {
-          "source_word_count": 2,
+          "opener_count": 2,
           "branch_count": 1336,
           "open_branch_count": 1211,
           "done_branch_count": 125,
@@ -174,7 +174,7 @@
         "label": "complete",
         "rows": [
           {
-            "source_word": "crane",
+            "opener": "crane",
             "requested_priority": 1,
             "requested_at": 100,
             "request_count": 1,
@@ -199,7 +199,7 @@
           }
         ],
         "rollup": {
-          "source_word_count": 1,
+          "opener_count": 1,
           "branch_count": 40,
           "open_branch_count": 0,
           "done_branch_count": 40,
@@ -207,11 +207,11 @@
         }
       }
     ],
-    "total_source_word_count": 3,
-    "matched_source_word_count": 3,
+    "total_opener_count": 3,
+    "matched_opener_count": 3,
     "matched_branch_count": 1376,
     "matched_open_branch_count": 1211,
-    "source_word_offset": 0,
+    "opener_offset": 0,
     "matched_rows": 0,
     "shared_branch_count": 0,
     "branch_row_offset": 0,

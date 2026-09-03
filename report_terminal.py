@@ -15,7 +15,7 @@ import time
 from report_model import (
     ROOT_PROGRESS_GROUP_STATES,
     ReportRequest,
-    ReportSources,
+    ReportOpeners,
     WORKER_STALE_SECONDS,
     collect_ambiguous_branch_reference_report,
     collect_report,
@@ -385,7 +385,7 @@ def _fit(line, width):
 
 
 def _display_spine(row):
-    """Return the recorded spine, or the source guess when it is all that remains."""
+    """Return the recorded spine, or the opener guess when it is all that remains."""
     spine = row.get("spine")
     if isinstance(spine, list):
         return " ".join(
@@ -393,10 +393,10 @@ def _display_spine(row):
         )
     if spine:
         return spine
-    source_word = row.get("source_word")
-    source_pattern = row.get("source_pattern") or row.get("source_pattern_text")
-    if source_word and source_pattern:
-        return f"{source_word.upper()} {source_pattern}"
+    opener = row.get("opener")
+    opener_pattern = row.get("opener_pattern") or row.get("opener_pattern_text")
+    if opener and opener_pattern:
+        return f"{opener.upper()} {opener_pattern}"
     return ""
 
 
@@ -1583,7 +1583,7 @@ def _render_hotspot_sections(report, width, display_order):
     return [("header", header), ("hotspots", lines)]
 
 
-def _display_source_erd(summary):
+def _display_opener_erd(summary):
     """A word's own ERD, once every one of its response groups is solved."""
     if not summary:
         return "—"
@@ -1594,19 +1594,19 @@ def _display_source_erd(summary):
     return f"{summary['resolved_group_count']:,}/{summary['response_group_count']:,}"
 
 
-def _source_display_row(source, generated_at):
-    requested_at = source.get("requested_at")
+def _opener_display_row(opener_row, generated_at):
+    requested_at = opener_row.get("requested_at")
     return {
-        **source,
-        "display_requests": f"{source.get('request_count', 1):,}",
-        "display_word": (source["source_word"] or "-").upper(),
-        "display_state": source["state"],
-        "display_erd": _display_source_erd(source.get("erd_summary")),
-        "display_direct": f"{source['direct_branch_count']:,}",
-        "display_branches": f"{source['branch_count']:,}",
-        "display_open": f"{source.get('open_branch_count', 0):,}",
-        "display_done": f"{source.get('done_branch_count', 0):,}",
-        "display_workers": f"{source.get('worker_count', 0):,}",
+        **opener_row,
+        "display_requests": f"{opener_row.get('request_count', 1):,}",
+        "display_word": (opener_row["opener"] or "-").upper(),
+        "display_state": opener_row["state"],
+        "display_erd": _display_opener_erd(opener_row.get("erd_summary")),
+        "display_direct": f"{opener_row['direct_branch_count']:,}",
+        "display_branches": f"{opener_row['branch_count']:,}",
+        "display_open": f"{opener_row.get('open_branch_count', 0):,}",
+        "display_done": f"{opener_row.get('done_branch_count', 0):,}",
+        "display_workers": f"{opener_row.get('worker_count', 0):,}",
         "display_age": (
             _abbreviate_duration(generated_at - requested_at)
             if requested_at is not None else "—"
@@ -1614,7 +1614,7 @@ def _source_display_row(source, generated_at):
     }
 
 
-def _source_columns(summary):
+def _opener_columns(summary):
     # A word usually holds one request, so the request count earns a column
     # only where some word holds more than one.
     merged = [
@@ -1651,10 +1651,10 @@ def _source_columns(summary):
     ]
 
 
-def _render_source_sections(report, width, display_order):
-    """One line per source word, with its requests and branches rolled up.
+def _render_opener_sections(report, width, display_order):
+    """One line per opener, with its requests and branches rolled up.
 
-    The branch lines appear only for a named source word: listing every word's
+    The branch lines appear only for a named opener: listing every word's
     branches would bury ten queued roots under the hundreds each of them
     spawned.
     """
@@ -1663,7 +1663,7 @@ def _render_source_sections(report, width, display_order):
     header = _semantic_header(report, "Openers report", width)
     summary = data.get("summary", [])
     request_count = sum(row.get("request_count", 1) for row in summary)
-    total_words = data.get("total_source_word_count", len(summary))
+    total_words = data.get("total_opener_count", len(summary))
     shown_words = (
         f"{len(summary):,}" if len(summary) == total_words
         else f"{len(summary):,} of {total_words:,}"
@@ -1674,8 +1674,8 @@ def _render_source_sections(report, width, display_order):
     lines = [counts]
     if summary:
         lines.extend(_render_table(
-            _source_columns(summary),
-            [_source_display_row(source, generated_at) for source in summary],
+            _opener_columns(summary),
+            [_opener_display_row(opener_row, generated_at) for opener_row in summary],
             width, indent="  ",
         ))
     named_word = (report["branch_target"] or {}).get("trailing_word")
@@ -1689,7 +1689,7 @@ def _render_source_sections(report, width, display_order):
             "finished and released them."
             if named_word else
             "  Name an opener for its branches: view --openers "
-            f"{(summary[0]['source_word'] or 'WORD').upper()}",
+            f"{(summary[0]['opener'] or 'WORD').upper()}",
             width,
         ))
     if data.get("rows"):
@@ -1704,8 +1704,8 @@ def _render_source_sections(report, width, display_order):
         parent = (f" parent=@{_display_reference(row['parent_branch_reference'])}"
                  if row.get("parent_branch_reference") else "")
         lines.append(_fit(
-            f"    {hotkey_prefix}#{row['source_work_id']} "
-            f"{(row['source_word'] or '-').upper()} "
+            f"    {hotkey_prefix}#{row['opener_work_id']} "
+            f"{(row['opener'] or '-').upper()} "
             f"@{_display_reference(row['branch_reference'])} "
             f"{row['branch_status']}/{row['branch_worker_status'] or '-'} "
             f"requested={row['requested_priority']} "
@@ -1715,7 +1715,7 @@ def _render_source_sections(report, width, display_order):
             f"workers={row['worker_count']}",
             width,
         ))
-    return [("header", header), ("source_rows", lines)]
+    return [("header", header), ("opener_rows", lines)]
 
 
 def _render_leaderboard_sections(report, width):
@@ -1918,7 +1918,7 @@ def _report_sections(report, previous_report, color, width, display_order):
     if report["report_kind"] == "leaderboard":
         return _render_leaderboard_sections(report, width)
     if report["report_kind"] == "openers":
-        return _render_source_sections(report, width, display_order)
+        return _render_opener_sections(report, width, display_order)
     if report["report_kind"] == "root_progress":
         return _render_root_progress_sections(report, width, display_order)
     raise ValueError(f"unsupported report kind: {report['report_kind']}")
@@ -2005,8 +2005,8 @@ class WatchSession:
         self.pending_input_character = None
 
     def _sources(self):
-        defaults = ReportSources.defaults()
-        return ReportSources(
+        defaults = ReportOpeners.defaults()
+        return ReportOpeners(
             queue_path=self.args.queue_path,
             cache_path=self.args.cache_path,
             answer_list_path=defaults.answer_list_path,
@@ -2031,7 +2031,7 @@ class WatchSession:
             epoch=getattr(self.args, "epoch", None),
             since_seconds=getattr(self.args, "since_seconds", None),
             sample_size=getattr(self.args, "sample_size", None),
-            source_word=getattr(self.args, "source_word", None),
+            opener=getattr(self.args, "opener", None),
             raw_row_offset=getattr(self.args, "accuracy_offset", 0),
         )
 

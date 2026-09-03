@@ -1461,7 +1461,7 @@
       const best=bestGuessCell(worker,worker.answer_count);
       const search=[["best",best],["effective bound",worker.bound_erd===null||worker.bound_erd===undefined?null:fixed(worker.bound_erd)],["solved",worker.solved_evaluation_count],["ERD cutoffs",worker.erd_cutoff_evaluation_count],["depth prunes",worker.remaining_depth_pruned_evaluation_count]];
       fragment.append(section("Search state",labeledFacts(search)));
-      const cumulative=[["completed claims",worker.completed_claim_count],["cache hits",worker.cache_hit_count],["cache misses",worker.cache_miss_count],["opener work",worker.source_work_id],["scheduling",worker.scheduling_role_reason||worker.scheduling_role]];
+      const cumulative=[["completed claims",worker.completed_claim_count],["cache hits",worker.cache_hit_count],["cache misses",worker.cache_miss_count],["opener work",worker.opener_work_id],["scheduling",worker.scheduling_role_reason||worker.scheduling_role]];
       fragment.append(section("Cumulative worker counters",labeledFacts(cumulative)));
       // Its own section, never mixed into the cache counters above: a hint is
       // an ordering suggestion from a read-only historical artifact, not a
@@ -1480,21 +1480,21 @@
     }
     // A membership is a (request, branch) pair, so neither half identifies it
     // on its own: the same branch appears once per owning request.
-    const membershipIdentity=row=>row.source_work_id+":"+row.branch_key_hex;
+    const membershipIdentity=row=>row.opener_work_id+":"+row.branch_key_hex;
     const withMembershipIdentity=rows=>(rows||[]).map(row=>({...row,membership_identity:membershipIdentity(row)}));
     function sourceWordCard(row,previous,state,generatedAt){
       const card=element("article","card source-word clickable "+changeClass(row,previous));
-      card.dataset.identity=String(row.source_word);
+      card.dataset.identity=String(row.opener);
       // The filtering card is also the clearing card: clicking the word the
       // view is already narrowed to widens it back to every word, and the
       // narrowed-to card says so.  The filter is word-scoped, and so is the
       // card, so the marked card and the filter always name the same thing
       // however many requests that word holds.
-      const word=String(row.source_word||"").toUpperCase();
+      const word=String(row.opener||"").toUpperCase();
       const isFiltered=state.branch_target.toUpperCase()===word&&word!=="";
       if(isFiltered)card.classList.add("filtered");
       const title=element("div","card-title");
-      title.append(wordTiles(row.source_word,null,false,"word-md"),element("span","chip",valueOrDash(row.state)));
+      title.append(wordTiles(row.opener,null,false,"word-md"),element("span","chip",valueOrDash(row.state)));
       // The branch list is the other thing this card leads to, so it gets its
       // own control rather than taking the card's own click.
       const branchesButton=element("button","",isFiltered?"Hide branches":"Branches");
@@ -1531,9 +1531,9 @@
       card.append(title);
       // The root (word, response) the membership descends from is a spine step,
       // so it is drawn as one rather than spelled out as a bare pattern.
-      if(row.root_pattern)card.append(renderSpine([{word:row.source_word,pattern:row.root_pattern}],"word-sm"));
+      if(row.root_pattern)card.append(renderSpine([{word:row.opener,pattern:row.root_pattern}],"word-sm"));
       card.append(labeledFacts([
-        ["opener","#"+row.source_work_id+" "+String(row.source_word||"-").toUpperCase()],
+        ["opener","#"+row.opener_work_id+" "+String(row.opener||"-").toUpperCase()],
         ["requested priority",row.requested_priority],
         ["effective priority",row.branch_effective_priority],
         ["owners",row.owner_count],
@@ -1580,8 +1580,8 @@
     function renderSources(report,previous,state){
       const fragment=document.createDocumentFragment(),data=report.data;
       const sourceWords=data.summary||[],rows=withMembershipIdentity(data.rows);
-      const totalWords=data.total_source_word_count??sourceWords.length;
-      const matchedWords=data.matched_source_word_count??sourceWords.length;
+      const totalWords=data.total_opener_count??sourceWords.length;
+      const matchedWords=data.matched_opener_count??sourceWords.length;
       const metrics=element("div","metrics");
       // The branch totals come from the model, which counts each branch once
       // across the matched words; summing the per-word counts here would
@@ -1595,8 +1595,8 @@
       // and released its ownership.
       else if(!rows.length&&namedWord)fragment.append(element("p","dim",
         namedWord.toUpperCase()+" owns no live branches: its work has finished and released them."));
-      const previousWords=previousBy(previous,"summary","source_word");
-      const wordCard=row=>sourceWordCard(row,previousWords.get(String(row.source_word)),state,report.generated_at);
+      const previousWords=previousBy(previous,"summary","opener");
+      const wordCard=row=>sourceWordCard(row,previousWords.get(String(row.opener)),state,report.generated_at);
       if(data.summary_groups){
         // Each group carries its own rollup, so a collapsed group still says
         // how much work it holds.
@@ -1607,20 +1607,20 @@
           details.open=!collapsedResponseGroups.has(groupKey);
           details.addEventListener("toggle",()=>details.open?collapsedResponseGroups.delete(groupKey):collapsedResponseGroups.add(groupKey));
           const rollup=group.rollup,summaryEl=element("summary","clickable");
-          summaryEl.append(element("strong","",group.label),element("span","dim"," "+numText(rollup.source_word_count)+(rollup.source_word_count===1?" word":" words")+" · "+numText(rollup.branch_count)+(rollup.branch_count===1?" branch":" branches")+" · "+numText(rollup.open_branch_count)+" open · "+numText(rollup.done_branch_count)+" done · "+numText(rollup.worker_count)+(rollup.worker_count===1?" worker":" workers")));
+          summaryEl.append(element("strong","",group.label),element("span","dim"," "+numText(rollup.opener_count)+(rollup.opener_count===1?" word":" words")+" · "+numText(rollup.branch_count)+(rollup.branch_count===1?" branch":" branches")+" · "+numText(rollup.open_branch_count)+" open · "+numText(rollup.done_branch_count)+" done · "+numText(rollup.worker_count)+(rollup.worker_count===1?" worker":" workers")));
           const grid=gridElement("source-words/"+group.label);
-          for(const row of ordered(group.rows,"source_word","source-words/"+group.label,state))grid.append(wordCard(row));
+          for(const row of ordered(group.rows,"opener","source-words/"+group.label,state))grid.append(wordCard(row));
           details.append(summaryEl,grid);
           container.append(details);
         }
         fragment.append(container);
       }else{
         const wordGrid=gridElement("source-words");
-        for(const row of ordered(sourceWords,"source_word","source-words",state))wordGrid.append(wordCard(row));
+        for(const row of ordered(sourceWords,"opener","source-words",state))wordGrid.append(wordCard(row));
         fragment.append(wordGrid);
       }
       const wordPager=sourceListPager({
-        state,offset:data.source_word_offset??0,shownCount:sourceWords.length,
+        state,offset:data.opener_offset??0,shownCount:sourceWords.length,
         matchedCount:matchedWords,noun:"words",offsetField:"opener_offset",
         className:"source-word-pager"});
       if(wordPager)fragment.append(wordPager);

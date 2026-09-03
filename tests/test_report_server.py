@@ -19,7 +19,7 @@ import report_server
 from report_model import (
     ReportFilters,
     ReportRequest,
-    ReportSources,
+    ReportOpeners,
     _tree_layout,
     collect_report,
 )
@@ -65,7 +65,7 @@ def request(base_url, path, method="GET"):
 
 
 def fixture_configuration():
-    sources = ReportSources("unused-queue", "unused-cache", "unused-answers", "unused-guesses")
+    sources = ReportOpeners("unused-queue", "unused-cache", "unused-answers", "unused-guesses")
     return ServerConfiguration(
         sources, CLIENT_PATH, FIXTURE_DIRECTORY, load_fixtures(FIXTURE_DIRECTORY)
     )
@@ -88,7 +88,7 @@ class ReportServerTest(unittest.TestCase):
             answer_file.write("cigar\nrebut\nsissy\nhumph\nawake\n")
         with open(self.guess_list_path, "w") as guess_file:
             guess_file.write("cigar\nrebut\nsissy\nhumph\nawake\nraise\n")
-        self.sources = ReportSources(
+        self.sources = ReportOpeners(
             os.path.join(directory, "queue.sqlite3"),
             os.path.join(directory, "cache.sqlite3"),
             self.answer_list_path,
@@ -427,7 +427,7 @@ class ReportServerTest(unittest.TestCase):
 
     def test_build_configuration_uses_candidate_list_path(self):
         configuration = build_configuration("queue.sqlite3", "cache.sqlite3")
-        defaults = ReportSources.defaults()
+        defaults = ReportOpeners.defaults()
         self.assertEqual(
             configuration.sources.candidate_list_path,
             defaults.candidate_list_path,
@@ -479,7 +479,7 @@ class ReportServerTest(unittest.TestCase):
         self.assertEqual(second_report["generated_at"], 2000)
 
     def test_partial_source_failure_remains_200(self):
-        missing_sources = ReportSources(
+        missing_sources = ReportOpeners(
             os.path.join(self.temporary_directory.name, "missing", "queue.sqlite3"),
             self.sources.cache_path,
             self.answer_list_path,
@@ -654,12 +654,12 @@ class SourcesRequestTest(unittest.TestCase):
         self.assertEqual(request.tree_parent, "RAISE -----")
 
     def test_configuration_uses_telemetry_only_for_the_default_queue(self):
-        defaults = ReportSources.defaults()
+        defaults = ReportOpeners.defaults()
         with patch("report_server.load_fixtures", return_value={}) as load:
             configured = build_configuration("another.sqlite3", "cache.sqlite3", "fixtures")
         self.assertIsNone(configured.sources.telemetry_path)
         load.assert_called_once_with("fixtures")
-        self.assertEqual(defaults.queue_path, ReportSources.defaults().queue_path)
+        self.assertEqual(defaults.queue_path, ReportOpeners.defaults().queue_path)
 
     def test_bare_endpoint_and_word_target_are_accepted(self):
         rooted = parse_report_request("/api/view/openers", "")
@@ -687,7 +687,7 @@ class SourcesRequestTest(unittest.TestCase):
                 with self.assertRaisesRegex(InvalidRequest, message):
                     parse_report_request("/api/view/openers", query)
 
-    def test_fixture_shapes_match_a_live_source_report(self):
+    def test_fixture_shapes_match_a_live_opener_report(self):
         with tempfile.TemporaryDirectory() as directory:
             queue_path = os.path.join(directory, "queue.sqlite3")
             queue = ERDQueue(queue_path)
@@ -695,7 +695,7 @@ class SourcesRequestTest(unittest.TestCase):
             queue.add_pending_many([(shared, 2, 3, "salet", "-y---")])
             queue.add_pending_many([(shared, 2, 5, "raise", "-----")])
             queue.close()
-            sources = ReportSources(
+            sources = ReportOpeners(
                 queue_path, os.path.join(directory, "cache.sqlite3"),
                 "unused-answers", "unused-guesses",
             )

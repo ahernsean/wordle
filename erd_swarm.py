@@ -136,10 +136,10 @@ MIN_PUBLISH_BRANCH_WORDS = 2  # frames with fewer answer words are base cases, n
 
 @dataclass(frozen=True)
 class WorkContext:
-    source_work_id: int | None
-    source_priority: int
-    source_word: str | None
-    source_pattern: int | None
+    opener_work_id: int | None
+    opener_priority: int
+    opener: str | None
+    opener_pattern: int | None
     branch_key: bytes | None
     spine: str | None
     scheduling_role: str | None
@@ -153,28 +153,28 @@ class WorkContext:
         """Build a context for a branch selected under the given scheduling
         role (SCHEDULING_ROLE_PREFERRED/FALLBACK/DIRECT — see erd_queue.py):
         the caller states, at the point of selection, whether this branch was
-        the highest-priority eligible source, a lower-priority source claimed
+        the highest-priority eligible opener, a lower-priority opener claimed
         because the preferred one had no claimable bundle, or a branch with no
-        live source-work ownership.  That decision cannot be reconstructed
+        live opener-work ownership.  That decision cannot be reconstructed
         later from membership rows alone, so it is threaded in rather than
         derived here."""
         values = dict(branch)
-        source_word = values["owner_source_word"]
-        source_pattern = values["owner_root_pattern"]
+        opener = values["owner_opener"]
+        opener_pattern = values["owner_opener_pattern"]
         spine = values.get("spine")
-        if spine is None and source_word and source_pattern is not None:
-            spine = f"{source_word.upper()} {fmt_pattern(source_pattern)}"
+        if spine is None and opener and opener_pattern is not None:
+            spine = f"{opener.upper()} {fmt_pattern(opener_pattern)}"
         return cls(
-            values["source_work_id"], values["owner_priority"], source_word,
-            source_pattern, bytes(values["branch_key"]), spine, scheduling_role)
+            values["opener_work_id"], values["owner_priority"], opener,
+            opener_pattern, bytes(values["branch_key"]), spine, scheduling_role)
 
     def descend(self, branch_key, spine):
         # A promoted descendant keeps the parent's scheduling role: recursive
-        # promotion helps the owning source tree without becoming a new,
+        # promotion helps the owning opener tree without becoming a new,
         # independently-ranked scheduling decision.
         return WorkContext(
-            self.source_work_id, self.source_priority, self.source_word,
-            self.source_pattern, bytes(branch_key), spine, self.scheduling_role)
+            self.opener_work_id, self.opener_priority, self.opener,
+            self.opener_pattern, bytes(branch_key), spine, self.scheduling_role)
 
 # Adaptive publish threshold (node-equivalents): SAFETY_FACTOR * coordination_time
 # / node_time.  Publishing pays only when the handed-off work exceeds the cost of
@@ -248,11 +248,11 @@ MAX_WORKERS_PER_BRANCH = 2   # workers sharing a branch race a stale best_erd
                              # when it has no unoccupied branch to take instead.
 MAX_HELP_RECURSION_DEPTH = 4
 
-# _promote_source_work sentinel: a pending branch was promoted (or found
+# _promote_opener_work sentinel: a pending branch was promoted (or found
 # already solved and marked done) but no bundle is claimable from it right
-# now — distinct from None, which means the source has no pending branch
+# now — distinct from None, which means the opener has no pending branch
 # left to promote at all.  Both _claim_one_uninstrumented and
-# _help_other_branch treat this as "this source is handled for this call",
+# _help_other_branch treat this as "this opener is handled for this call",
 # not as "fall through to something else".
 _PROMOTED_NO_BUNDLE = object()
 
@@ -432,15 +432,15 @@ class _MidLoopPublisher:
         context = self._worker._work_context
         created = self._worker.queue.create_branch(
             branch_key, n, self._worker.n_candidates,
-            priority=context.source_priority,
-            source_word=context.source_word,
-            source_pattern=context.source_pattern,
+            priority=context.opener_priority,
+            opener=context.opener,
+            opener_pattern=context.opener_pattern,
             budget=budget,
             spine=self._worker._promoted_spine(
                 self._worker.root_budget - budget),
             root_budget=self._worker.root_budget,
             ceiling=branch_ceiling,
-            source_work_id=context.source_work_id,
+            opener_work_id=context.opener_work_id,
             parent_branch_key=context.branch_key)
 
         if created:
@@ -463,12 +463,12 @@ class _MidLoopPublisher:
         if not joinable:
             token[5] = False
             return None
-        # A compatible raced branch adopts the selected source ownership only
+        # A compatible raced branch adopts the selected opener ownership only
         # after the surviving row has passed the joinability checks above.
-        if not created and context.source_work_id is not None:
-            self._worker.queue.attach_branch_source_work(
-                branch_key, context.source_work_id, budget, ours, n,
-                context.source_pattern, context.branch_key)
+        if not created and context.opener_work_id is not None:
+            self._worker.queue.attach_branch_opener_work(
+                branch_key, context.opener_work_id, budget, ours, n,
+                context.opener_pattern, context.branch_key)
 
         # Record every wall-clock backstop firing so COLD_BACKSTOP_SECONDS can be
         # tuned offline; the node-proportionate path is the model working as
@@ -685,9 +685,9 @@ class _BranchWorker:
         # scan is paid once per claim, like the claim transaction itself).
         self._pending_scheduling_millis = 0
         # Direct cooperative callers can create active branches without a
-        # source-work request.  Keep their tight claim loop free of the
-        # source-admission query used by queued source work.
-        self._source_work_enabled = self.queue.has_source_work()
+        # opener-work request.  Keep their tight claim loop free of the
+        # opener-admission query used by queued opener work.
+        self._opener_work_enabled = self.queue.has_opener_work()
         # Counts ERD-pruned candidate_accuracy claims for 1-in-N down-sampling.
         self._erd_lower_bound_pruned_accuracy_n = 0
         # In-memory cache of cost-model predictions keyed by sub-branch size.
@@ -834,11 +834,11 @@ class _BranchWorker:
             if d > claimed_guess_depth)
 
     @staticmethod
-    def _opener_spine(source_word, source_pattern):
+    def _opener_spine(opener, opener_pattern):
         """Single-guess spine string for a top-level branch: 'SALET -g-g-'."""
-        if not source_word or source_pattern is None:
+        if not opener or opener_pattern is None:
             return None
-        return f'{source_word.upper()} {fmt_pattern(source_pattern)}'
+        return f'{opener.upper()} {fmt_pattern(opener_pattern)}'
 
     def _spine_budget(self, spine):
         """Remaining guess budget for a branch reached by the guesses on `spine`:
@@ -859,7 +859,7 @@ class _BranchWorker:
         """Absolute root -> promoted-branch spine: the claimed branch's base plus
         the live descent guesses (guess_depth-ordered "GUESS pattern" tokens).
         Returns None when the base is unknown, leaving the branch row to fall back
-        to the source word.  Sentinel/size-only spine entries (no guess) are skipped.
+        to the opener word.  Sentinel/size-only spine entries (no guess) are skipped.
 
         max_guess_depth caps the composed spine at the promoted branch's own
         guess depth (root_budget - its budget).  The live descent map keeps
@@ -1112,7 +1112,7 @@ class _BranchWorker:
             cur_nodes=self._nodes, node_rate=node_rate,
             cur_path=self._hb_spine_str(),
             cur_help_depth=self._help_recursion_depth,
-            source_work_id=self._work_context.source_work_id,
+            opener_work_id=self._work_context.opener_work_id,
             scheduling_role=self._work_context.scheduling_role)
         self._hb_max_spine = {}
         if self._cur_candidate and now - self._last_progress_log >= PROGRESS_LOG_SECONDS:  # pragma: no cover
@@ -1252,8 +1252,8 @@ class _BranchWorker:
         return [idx] + order[:position] + order[position + 1:]
 
     def _claim_bundle(self, branch_key, n_candidates, words, budget,
-                      expected_source_work_id=None,
-                      expected_source_priority=None,
+                      expected_opener_work_id=None,
+                      expected_opener_priority=None,
                       max_other_workers=None):
         """claim_next_bundle for `branch_key`, supplying this worker's
         (cached) packing stats.  Returns (bundle_id, indices, forced) or None
@@ -1290,8 +1290,8 @@ class _BranchWorker:
                 branch_key, self.name, n_candidates, order, cost_lower_bound,
                 small_count=self.small_count, count_cap=self.count_cap,
                 republish_limit=self.republish_limit,
-                expected_source_work_id=expected_source_work_id,
-                expected_source_priority=expected_source_priority,
+                expected_opener_work_id=expected_opener_work_id,
+                expected_opener_priority=expected_opener_priority,
                 max_other_workers=max_other_workers)
             if result is not CLAIM_RETRY:
                 return result
@@ -1454,7 +1454,7 @@ class _BranchWorker:
                     metric['bound'], metric['candidate_cost_lower_bound'],
                     metric['erd_lower_bound_pruned'], nodes_delta,
                     group_sizes=metric['group_sizes'],
-                    source_word=self._work_context.source_word,
+                    opener=self._work_context.opener,
                     candidate_word=candidate, worker_id=self.name,
                     bundle_id=bundle_id, idx=idx, started_at=int(cand_t0),
                     evaluation_millis=round(cand_elapsed * 1e3),
@@ -1700,22 +1700,22 @@ class _BranchWorker:
                             wall_t0, censored=False)
         return True
 
-    def _snapshot_completed_sources(self, source_words):
-        for source_word in source_words or ():
+    def _snapshot_completed_openers(self, openers):
+        for opener in openers or ():
             try:
-                timing = self.queue.completed_source_timing(source_word)
+                timing = self.queue.completed_opener_timing(opener)
                 if timing["completed_at"] is None:
                     continue
                 telemetry_epochs = tuple(
                     int(epoch) for epoch in (timing["telemetry_epochs"] or "").split(",")
                     if epoch)
                 self.score_cache.write_completed_source_summary(
-                    source_word, ERD_ALL, timing["completed_at"],
+                    opener, ERD_ALL, timing["completed_at"],
                     (timing["completed_at"] - timing["first_created_at"]) * 1000,
                     timing["worker_millis"] or 0, telemetry_epochs)
             except Exception:
                 logger.exception("%s could not snapshot completed opener %s",
-                                 self.name, source_word)
+                                 self.name, opener)
 
     def _finish_bundle(self, branch_key, bundle_id, nodes_at_start, wall_t0,
                        censored):
@@ -1899,7 +1899,7 @@ class _BranchWorker:
                 'already published; continuing to cleanup', self.name,
                 branch_key[:25])
         loss = best_guess is None and (not cut or ceiling_proves_loss)
-        completed_source_words = []
+        completed_openers = []
         try:
             if loss:
                 self.queue.complete_pending_for_loss(
@@ -1907,7 +1907,7 @@ class _BranchWorker:
             elif cut:
                 self.queue.requeue_pending(branch_key)
             else:
-                completed_source_words.extend(
+                completed_openers.extend(
                     self.queue.mark_done(branch_key) or [])
         except Exception:
             logger.exception('%s pending completion failed for branch %s; '
@@ -1917,8 +1917,8 @@ class _BranchWorker:
             except Exception:
                 logger.exception('%s could not requeue branch %s', self.name,
                                  branch_key[:25])
-        completed_source_words.extend(self.queue.delete_branch(branch_key) or [])
-        self._snapshot_completed_sources(completed_source_words)
+        completed_openers.extend(self.queue.delete_branch(branch_key) or [])
+        self._snapshot_completed_openers(completed_openers)
         # Every budget this worker cached an order for: the key carries the
         # branch's budget, and a branch re-created later at a different one
         # must not inherit the finalized branch's order.
@@ -1990,7 +1990,7 @@ class _BranchWorker:
     def _help_other_branch(self, exclude_branch_key: bytes) -> bool:
         """Evaluate one bundle of candidate claims from any open branch other
         than exclude_branch_key — promoting a higher-priority pending-only
-        source first if one outranks the branch this call would otherwise
+        opener first if one outranks the branch this call would otherwise
         join.
 
         Called when the worker is waiting on a dependency branch whose remaining
@@ -2001,25 +2001,25 @@ class _BranchWorker:
 
         Work is taken one worker to a branch: an unoccupied branch first, and
         a branch holding exactly one worker only when nothing is free.  A
-        source counts as covered by the join loop below only if it has an
-        unoccupied branch, so a source whose open branches are all worked
+        opener counts as covered by the join loop below only if it has an
+        unoccupied branch, so an opener whose open branches are all worked
         still promotes its pending ones and gains breadth.
 
-        Without the promotion below, a source word with only pending
-        branches can never start while any other source has active branches
+        Without the promotion below, an opener word with only pending
+        branches can never start while any other opener has active branches
         to help with, regardless of its requested priority: this method
         would only ever join already-active branches (issue #214).  The
-        priority check here compares a candidate source's requested_priority
+        priority check here compares a candidate opener's requested_priority
         against the priority of the branch this call would fall back to
         helping — either another joinable active branch, or (with none
         available) the branch already being served, i.e. the one whose
         dependency this call was invoked to wait out — not merely against
         iteration order, so a blocked worker widens a genuinely higher-or-
-        equal-priority source rather than promoting whichever pending source
+        equal-priority opener rather than promoting whichever pending opener
         happens to sort first, and never abandons its own higher-priority
         branch for a strictly lower-priority pending one just because
         nothing else is active right now.  Equal priority is allowed through
-        deliberately: the source a worker is already serving always ties its
+        deliberately: the opener a worker is already serving always ties its
         own gate, and that is exactly the case the issue asks for — a
         worker blocked on AUDIO's only active branch must be able to widen
         AUDIO by promoting more of AUDIO's own pending branches.
@@ -2032,44 +2032,44 @@ class _BranchWorker:
         if self._help_recursion_depth >= MAX_HELP_RECURSION_DEPTH:
             return False
         exclude_branch_key = bytes(exclude_branch_key)
-        source_rows = self.queue.source_work_candidates()  # priority DESC
+        opener_work_rows = self.queue.opener_work_candidates()  # priority DESC
         owned_branches = []
-        for source_work in source_rows:
+        for opener_work in opener_work_rows:
             owned_branches.extend(
-                self.queue.branches_in_progress(source_work['source_work_id']))
+                self.queue.branches_in_progress(opener_work['opener_work_id']))
         branches = [
             b for b in owned_branches + list(self.queue.direct_branches_in_progress())
             if bytes(b['branch_key']) != exclude_branch_key]
-        fallback_priority = self._work_context.source_priority
+        fallback_priority = self._work_context.opener_priority
         if branches and branches[0]['owner_priority'] > fallback_priority:
             fallback_priority = branches[0]['owner_priority']
         occupancy = self._branch_occupancy()
         unoccupied = [b for b in branches
                       if occupancy.get(bytes(b['branch_key']), 0) == 0]
-        # Sources with an unoccupied branch surviving the exclude-filter above
+        # Openers with an unoccupied branch surviving the exclude-filter above
         # are joinable by the loop below; excluding exclude_branch_key here
-        # (not just above) matters when a source's ONLY active branch is the
+        # (not just above) matters when an opener's ONLY active branch is the
         # one this call was invoked to wait out — the join loop cannot touch
-        # that branch, so re-querying branches_in_progress(source_work_id)
+        # that branch, so re-querying branches_in_progress(opener_work_id)
         # directly (unfiltered) would wrongly count it as "covered below"
-        # and block the source from ever widening past that single branch.
+        # and block the opener from ever widening past that single branch.
         #
-        # Occupied branches do not count as covering their source either: a
-        # source whose open branches all have workers still needs its pending
+        # Occupied branches do not count as covering their opener either: an
+        # opener whose open branches all have workers still needs its pending
         # branches promoted to absorb another worker, and treating it as
         # covered is what leaves an opener running one branch at a time with
         # dozens of response groups still waiting.
-        joinable_source_ids = {b['source_work_id'] for b in unoccupied}
+        joinable_opener_ids = {b['opener_work_id'] for b in unoccupied}
 
-        for source_work in source_rows:
-            source_work_id = source_work['source_work_id']
-            priority = source_work['requested_priority']
+        for opener_work in opener_work_rows:
+            opener_work_id = opener_work['opener_work_id']
+            priority = opener_work['requested_priority']
             if priority < fallback_priority:
                 continue
-            if source_work_id in joinable_source_ids:
+            if opener_work_id in joinable_opener_ids:
                 continue  # already has a joinable active branch below
-            promoted = self._promote_source_work(
-                source_work_id, SCHEDULING_ROLE_PREFERRED)
+            promoted = self._promote_opener_work(
+                opener_work_id, SCHEDULING_ROLE_PREFERRED)
             if promoted is None:
                 continue
             if promoted is _PROMOTED_NO_BUNDLE:
@@ -2103,23 +2103,23 @@ class _BranchWorker:
             other_key = bytes(branch['branch_key'])
             n_candidates = branch['n_candidates']
             words = decode_subset(other_key)
-            source_work_id = (branch['source_work_id']
-                              if 'source_work_id' in branch.keys() else None)
+            opener_work_id = (branch['opener_work_id']
+                              if 'opener_work_id' in branch.keys() else None)
             budget = self._branch_budget(branch)
             claim = self._claim_bundle(
                 other_key, n_candidates, words, budget,
-                expected_source_work_id=source_work_id,
-                expected_source_priority=branch['owner_priority'],
+                expected_opener_work_id=opener_work_id,
+                expected_opener_priority=branch['owner_priority'],
                 max_other_workers=max_other_workers)
             if claim is None:
                 continue
             bundle_id, indices, forced = claim
             # Reached only because the worker's own branch is blocked on a
-            # dependency: draining any other claimable source-owned branch
-            # instead of idling is fallback work, regardless of which source
-            # owns it.  A direct branch (no live source-work ownership) stays
-            # direct — no source-first admission decision was made for it.
-            role = (SCHEDULING_ROLE_FALLBACK if source_work_id is not None
+            # dependency: draining any other claimable opener-owned branch
+            # instead of idling is fallback work, regardless of which opener
+            # owns it.  A direct branch (no live opener-work ownership) stays
+            # direct — no opener-first admission decision was made for it.
+            role = (SCHEDULING_ROLE_FALLBACK if opener_work_id is not None
                    else SCHEDULING_ROLE_DIRECT)
             context = WorkContext.from_branch_row(branch, role)
             self._help_recursion_depth += 1
@@ -2281,12 +2281,12 @@ class _BranchWorker:
                 branch_ceiling = ceiling
             created = self.queue.create_branch(
                 branch_key, n_words, self.n_candidates,
-                priority=parent_context.source_priority,
-                source_word=parent_context.source_word,
-                source_pattern=parent_context.source_pattern, budget=budget,
+                priority=parent_context.opener_priority,
+                opener=parent_context.opener,
+                opener_pattern=parent_context.opener_pattern, budget=budget,
                 spine=child_spine, root_budget=self.root_budget,
                 ceiling=branch_ceiling,
-                source_work_id=parent_context.source_work_id,
+                opener_work_id=parent_context.opener_work_id,
                 parent_branch_key=parent_context.branch_key)
             if not created:
                 # Raced or joined an existing branch: its budget and ceiling
@@ -2310,12 +2310,12 @@ class _BranchWorker:
                     if row_ceiling is not None and (
                             ours is None or not erd_ge(row_ceiling, ours, n_words)):
                         return None
-                    # A compatible raced branch adopts the selected source
+                    # A compatible raced branch adopts the selected opener
                     # ownership only after this surviving row is joinable.
-                    if parent_context.source_work_id is not None:
-                        self.queue.attach_branch_source_work(
-                            branch_key, parent_context.source_work_id, budget,
-                            ours, n_words, parent_context.source_pattern,
+                    if parent_context.opener_work_id is not None:
+                        self.queue.attach_branch_opener_work(
+                            branch_key, parent_context.opener_work_id, budget,
+                            ours, n_words, parent_context.opener_pattern,
                             parent_context.branch_key)
             # Descents into this branch promote grandchildren relative to its spine.
             context_stack.enter_context(self._entered(
@@ -2353,7 +2353,7 @@ class _BranchWorker:
                 # branch of its own than sitting second on this one.
                 claim = self._claim_bundle(
                     branch_key, self.n_candidates, words, budget,
-                    expected_source_work_id=self._work_context.source_work_id,
+                    expected_opener_work_id=self._work_context.opener_work_id,
                     max_other_workers=0)
                 if claim is not None:
                     self._evaluate_dependency_bundle(
@@ -2404,8 +2404,8 @@ class _BranchWorker:
                         self.queue.reclaim_stale_claims(HB_TIMEOUT_SECONDS)
                         paired = self._claim_bundle(
                             branch_key, self.n_candidates, words, budget,
-                            expected_source_work_id=(
-                                self._work_context.source_work_id),
+                            expected_opener_work_id=(
+                                self._work_context.opener_work_id),
                             max_other_workers=MAX_WORKERS_PER_BRANCH - 1)
                         if paired is not None:
                             self._evaluate_dependency_bundle(
@@ -2420,7 +2420,7 @@ class _BranchWorker:
 
     # -- scheduling: claim one candidate from the best available branch ------
 
-    def _claim_active_branch(self, branches, source_work_id=None,
+    def _claim_active_branch(self, branches, opener_work_id=None,
                              scheduling_role=SCHEDULING_ROLE_DIRECT,
                              occupancy=None, max_other_workers=0):
         """Claim a candidate bundle from an open branch, if one is available.
@@ -2458,10 +2458,10 @@ class _BranchWorker:
                 claim = self._claim_bundle(
                     branch_key, active_branch['n_candidates'], words,
                     self._branch_budget(branch),
-                    expected_source_work_id=source_work_id,
-                    expected_source_priority=(
+                    expected_opener_work_id=opener_work_id,
+                    expected_opener_priority=(
                         active_branch['owner_priority']
-                        if source_work_id is not None else None),
+                        if opener_work_id is not None else None),
                     max_other_workers=max_other_workers)
                 if claim is not None:
                     bundle_id, indices, forced = claim
@@ -2510,19 +2510,19 @@ class _BranchWorker:
                 + self.queue._last_claim_transaction_millis
                 + self.queue._last_claim_commit_millis)
 
-    def _promote_source_work(self, source_work_id, scheduling_role):
-        """Promote one pending branch of source_work_id into active_branches.
+    def _promote_opener_work(self, opener_work_id, scheduling_role):
+        """Promote one pending branch of opener_work_id into active_branches.
 
         Mirrors claim_next's cache-reuse skip: a claimed branch already
         solved at its budget (e.g. synced in from elsewhere) is marked done
         without being promoted — no candidate work is needed — and the loop
-        keeps pulling pending branches for this source until it finds one
-        genuinely worth promoting or the source is exhausted.
+        keeps pulling pending branches for this opener until it finds one
+        genuinely worth promoting or the opener is exhausted.
 
         scheduling_role labels the resulting WorkContext (SCHEDULING_ROLE_
         PREFERRED/FALLBACK — see erd_queue.py): the caller states, at the
-        point of selection, whether this source was the highest-priority
-        eligible one or a fallback reached because a higher-priority source
+        point of selection, whether this opener was the highest-priority
+        eligible one or a fallback reached because a higher-priority opener
         had no claimable bundle.
 
         Returns:
@@ -2530,14 +2530,14 @@ class _BranchWorker:
           claimed off the newly promoted branch;
         - _PROMOTED_NO_BUNDLE if a branch was created (or fully resolved via
           ERD-prune/finalize) but no bundle is claimable right now;
-        - None if source_work_id has no pending branch left to promote.
+        - None if opener_work_id has no pending branch left to promote.
         """
         while True:
-            claimed = self.queue.claim_next(self.name, source_work_id)
+            claimed = self.queue.claim_next(self.name, opener_work_id)
             if claimed is None:
                 return None
-            opener_spine = self._opener_spine(claimed['source_word'],
-                                          claimed['source_pattern'])
+            opener_spine = self._opener_spine(claimed['opener'],
+                                          claimed['opener_pattern'])
             budget = self._spine_budget(opener_spine)
             reuse = _cache_reuse(
                 self.score_cache.read_for_budget(
@@ -2545,16 +2545,16 @@ class _BranchWorker:
                 budget)
             if reuse is None:
                 break
-            self._snapshot_completed_sources(self.queue.mark_done(claimed['branch_key']))
+            self._snapshot_completed_openers(self.queue.mark_done(claimed['branch_key']))
 
         n_words = claimed['n_words']
         self.queue.create_branch(
             claimed['branch_key'], n_words, self.n_candidates,
-            priority=claimed['priority'], source_word=claimed['source_word'],
-            source_pattern=claimed['source_pattern'], budget=budget,
+            priority=claimed['priority'], opener=claimed['opener'],
+            opener_pattern=claimed['opener_pattern'], budget=budget,
             spine=opener_spine, root_budget=self.root_budget,
-            source_work_id=claimed['source_work_id'])
-        self._source_work_enabled = True
+            opener_work_id=claimed['opener_work_id'])
+        self._opener_work_enabled = True
         words = decode_subset(claimed['branch_key'])
         # create_branch has already committed, so the branch has been visible
         # and unoccupied to every other worker since then.  Creating it is no
@@ -2562,18 +2562,18 @@ class _BranchWorker:
         # this one should open a sibling rather than take a second seat.
         claim = self._claim_bundle(
             claimed['branch_key'], self.n_candidates, words, budget,
-            expected_source_work_id=claimed['source_work_id'],
-            expected_source_priority=claimed['priority'],
+            expected_opener_work_id=claimed['opener_work_id'],
+            expected_opener_priority=claimed['priority'],
             max_other_workers=0)
         branch = {
             'branch_key': claimed['branch_key'], 'n_words': n_words,
             'n_candidates': self.n_candidates,
-            'source_word': claimed['source_word'],
-            'source_pattern': claimed['source_pattern'],
+            'opener': claimed['opener'],
+            'opener_pattern': claimed['opener_pattern'],
             'priority': claimed['priority'],
-            'source_work_id': claimed['source_work_id'],
-            'owner_source_word': claimed['source_word'],
-            'owner_root_pattern': claimed['source_pattern'],
+            'opener_work_id': claimed['opener_work_id'],
+            'owner_opener': claimed['opener'],
+            'owner_opener_pattern': claimed['opener_pattern'],
             'owner_priority': claimed['priority'],
             'spine': opener_spine,
             'budget': budget,
@@ -2593,71 +2593,71 @@ class _BranchWorker:
 
     def _claim_one_uninstrumented(self):
         """claim_one's work selection.  See claim_one for the contract: one
-        worker per branch.  Within a source it takes an unoccupied open branch
-        first and otherwise PROMOTES one of that source's pending branches,
-        widening the source it is already on before descending the priority
+        worker per branch.  Within an opener it takes an unoccupied open branch
+        first and otherwise PROMOTES one of that opener's pending branches,
+        widening the opener it is already on before descending the priority
         ladder to the next.  A branch held by another live worker is passed
-        over, so sources are exhausted by breadth rather than by piling onto
+        over, so openers are exhausted by breadth rather than by piling onto
         whichever branch is already underway.
 
-        Only when no source offers an unoccupied branch or a promotable
+        Only when no opener offers an unoccupied branch or a promotable
         pending one does a worker pair up (_claim_paired_branch).  Because
         this selection reruns at every claim boundary and reads occupancy
         fresh each time, a pairing lasts only until an unoccupied branch
         appears — including a sub-branch published by the shared branch
         itself — at which point the second worker takes it.
 
-        Selection order also carries preemption: source_work_candidates() is
+        Selection order also carries preemption: opener_work_candidates() is
         ordered requested_priority DESC, so a worker that descended to a
-        lower-priority source returns to a higher-priority one as soon as
-        that source has claimable work, without cancelling anything.  The
+        lower-priority opener returns to a higher-priority one as soon as
+        that opener has claimable work, without cancelling anything.  The
         branch it leaves keeps its claims and best_erd and is resumable.
         """
         occupancy = self._branch_occupancy()
-        if not self._source_work_enabled:
+        if not self._opener_work_enabled:
             direct_work = self._claim_active_branch(
                 self.queue.direct_branches_in_progress(), occupancy=occupancy)
             if direct_work is not None:
                 return direct_work
-            self._source_work_enabled = self.queue.has_source_work()
-        source_work_rows = (self.queue.source_work_candidates()
-                            if self._source_work_enabled else ())
-        top_priority = (source_work_rows[0]['requested_priority']
-                        if source_work_rows else None)
-        for source_work in source_work_rows:
-            source_work_id = source_work['source_work_id']
-            # source_work_candidates() is source-first admission order
+            self._opener_work_enabled = self.queue.has_opener_work()
+        opener_work_rows = (self.queue.opener_work_candidates()
+                            if self._opener_work_enabled else ())
+        top_priority = (opener_work_rows[0]['requested_priority']
+                        if opener_work_rows else None)
+        for opener_work in opener_work_rows:
+            opener_work_id = opener_work['opener_work_id']
+            # opener_work_candidates() is opener-first admission order
             # (requested_priority DESC), so every entry tied with the top
             # requested priority is preferred — none of them was skipped in
             # favor of another; an entry strictly below it is reached only
-            # because every higher-priority source had no claimable bundle at
+            # because every higher-priority opener had no claimable bundle at
             # this claim boundary, whether or not IT had claimable work.
             role = (SCHEDULING_ROLE_PREFERRED
-                   if source_work['requested_priority'] == top_priority
+                   if opener_work['requested_priority'] == top_priority
                    else SCHEDULING_ROLE_FALLBACK)
             active_work = self._claim_active_branch(
-                self.queue.branches_in_progress(source_work_id), source_work_id,
+                self.queue.branches_in_progress(opener_work_id), opener_work_id,
                 role, occupancy=occupancy)
             if active_work is not None:
                 return active_work
 
-            promoted = self._promote_source_work(source_work_id, role)
+            promoted = self._promote_opener_work(opener_work_id, role)
             if promoted is not None:
                 return None if promoted is _PROMOTED_NO_BUNDLE else promoted
         # A queue upgraded while active work is present can carry branches
-        # from before source lineage was recorded.  They remain claimable
-        # until finalization; new work always follows source-first order.
+        # from before opener lineage was recorded.  They remain claimable
+        # until finalization; new work always follows opener-first order.
         direct_work = self._claim_active_branch(
             self.queue.direct_branches_in_progress(), occupancy=occupancy)
         if direct_work is not None:
             return direct_work
-        return self._claim_paired_branch(source_work_rows, top_priority,
+        return self._claim_paired_branch(opener_work_rows, top_priority,
                                          occupancy)
 
-    def _claim_paired_branch(self, source_work_rows, top_priority, occupancy):
+    def _claim_paired_branch(self, opener_work_rows, top_priority, occupancy):
         """Join a branch already held by exactly one other worker, or None.
 
-        The last resort of work selection, reached only when no source offers
+        The last resort of work selection, reached only when no opener offers
         an unoccupied branch or a promotable pending one.  Six workers with
         three branches left have three workers with nowhere to go; a second
         worker on a branch returns about 0.16 of what it returns on a branch
@@ -2667,13 +2667,13 @@ class _BranchWorker:
         The cap of one other worker is what keeps this safe: the second worker
         on a branch is the only one whose marginal contribution is positive.
         """
-        for source_work in source_work_rows:
+        for opener_work in opener_work_rows:
             role = (SCHEDULING_ROLE_PREFERRED
-                   if source_work['requested_priority'] == top_priority
+                   if opener_work['requested_priority'] == top_priority
                    else SCHEDULING_ROLE_FALLBACK)
             paired = self._claim_active_branch(
-                self.queue.branches_in_progress(source_work['source_work_id']),
-                source_work['source_work_id'], role, occupancy=occupancy,
+                self.queue.branches_in_progress(opener_work['opener_work_id']),
+                opener_work['opener_work_id'], role, occupancy=occupancy,
                 max_other_workers=MAX_WORKERS_PER_BRANCH - 1)
             if paired is not None:
                 return paired
@@ -2724,12 +2724,12 @@ class _BranchWorker:
         if branch_row is None:
             return
         branch = dict(branch_row)
-        # Bypasses source-first admission entirely — this targets one branch
-        # directly rather than selecting among eligible sources — but role
-        # still tracks live ownership: a source-owned branch is never DIRECT
+        # Bypasses opener-first admission entirely — this targets one branch
+        # directly rather than selecting among eligible openers — but role
+        # still tracks live ownership: an opener-owned branch is never DIRECT
         # (that would misreport it as unowned), so treat direct targeting of
         # already-owned work as preferred.
-        role = (SCHEDULING_ROLE_PREFERRED if branch['source_work_id'] is not None
+        role = (SCHEDULING_ROLE_PREFERRED if branch['opener_work_id'] is not None
                else SCHEDULING_ROLE_DIRECT)
         context = WorkContext.from_branch_row(branch, role)
         with self._entered(context):
@@ -2750,7 +2750,7 @@ class _BranchWorker:
                 break
             claim = self._claim_bundle(
                 branch_key, n_candidates, words, budget,
-                expected_source_work_id=self._work_context.source_work_id,
+                expected_opener_work_id=self._work_context.opener_work_id,
                 max_other_workers=MAX_WORKERS_PER_BRANCH - 1)
             if claim is None:
                 # Every candidate is claimed.  If coverage is complete, finalize

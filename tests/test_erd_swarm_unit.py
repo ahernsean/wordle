@@ -31,7 +31,7 @@ from erd_swarm import (_BranchWorker, WorkContext, ROOT_BUDGET,
 from cache_sqlite import ScoreCache
 from wordle_engine import ERD_ALL, SOLVED, OVER_DEPTH_BUDGET, OVER_ERD_LIMIT
 from erd_queue import guess_depth_from_spine, SCHEDULING_ROLE_PREFERRED
-from tests.queue_invariants import SourceWorkInvariantCheckMixin
+from tests.queue_invariants import OpenerWorkInvariantCheckMixin
 
 BRANCH = ["crane", "slate", "trace", "stale", "tales"]
 CANDIDATES = BRANCH + ["brain", "stove", "cloud", "piano", "train"]
@@ -40,7 +40,7 @@ CANDIDATES = BRANCH + ["brain", "stove", "cloud", "piano", "train"]
 ProductionERDQueue = erd_queue.ERDQueue
 
 
-class InvariantCheckedERDQueue(SourceWorkInvariantCheckMixin,
+class InvariantCheckedERDQueue(OpenerWorkInvariantCheckMixin,
                                ProductionERDQueue):
     pass
 
@@ -133,11 +133,11 @@ def _bare_worker():
     return w
 
 
-def _context(branch_key=b"branch", spine=None, source_work_id=None,
-             source_priority=0, source_word=None, source_pattern=None,
+def _context(branch_key=b"branch", spine=None, opener_work_id=None,
+             opener_priority=0, opener=None, opener_pattern=None,
              scheduling_role=None):
     return WorkContext(
-        source_work_id, source_priority, source_word, source_pattern,
+        opener_work_id, opener_priority, opener, opener_pattern,
         branch_key, spine, scheduling_role)
 
 
@@ -518,7 +518,7 @@ class TestEvaluateClaimPatternMatrix(unittest.TestCase):
 
     def test_candidate_accuracy_carries_identity_and_lifecycle_fields(self):
         w = _bare_worker()
-        w._work_context = _context(source_word="salet")
+        w._work_context = _context(opener="salet")
         branch_key = ScoreCache.encode_subset(BRANCH)
 
         def evaluate_with_metric(*args, **kwargs):
@@ -537,7 +537,7 @@ class TestEvaluateClaimPatternMatrix(unittest.TestCase):
         self.assertEqual(call.kwargs["bundle_id"], "worker-0:99:1")
         self.assertEqual(call.kwargs["idx"], 0)
         self.assertEqual(call.kwargs["outcome"], "exact")
-        self.assertEqual(call.kwargs["source_word"], "salet")
+        self.assertEqual(call.kwargs["opener"], "salet")
         self.assertIsInstance(call.kwargs["started_at"], int)
         self.assertIsInstance(call.kwargs["evaluation_millis"], int)
         self.assertGreaterEqual(call.kwargs["evaluation_millis"], 0)
@@ -633,7 +633,7 @@ class TestSpineComposition(unittest.TestCase):
         self.assertEqual(w._opener_spine('salet', 0),
                          f'SALET {fmt_pattern(0)}')
 
-    def test_opener_spine_none_without_source(self):
+    def test_opener_spine_none_without_opener(self):
         w = _bare_worker()
         self.assertIsNone(w._opener_spine(None, 0))
         self.assertIsNone(w._opener_spine('salet', None))
@@ -822,7 +822,7 @@ class TestSolveBranchFocusedLostFinalizeRace(unittest.TestCase):
             'n_candidates': w.n_candidates,
             'n_words': len(BRANCH),
             'budget': ROOT_BUDGET,
-            'source_work_id': None,
+            'opener_work_id': None,
         }
 
     def test_lost_race_with_claim_exhausted_retries_via_await_rival(self):
@@ -1383,7 +1383,7 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
         finally:
             w.close()
 
-    def test_solve_branch_focused_records_preferred_role_for_source_owned_branch(self):
+    def test_solve_branch_focused_records_preferred_role_for_opener_owned_branch(self):
         from erd_queue import ERDQueue
         ScoreCache(self.cache_path, BRANCH).close()
         branch_key = ScoreCache.encode_subset(BRANCH[:3])
@@ -1392,26 +1392,26 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
         claimed = q.claim_next("peer")
         q.create_branch(
             branch_key, 3, len(CANDIDATES), budget=ROOT_BUDGET,
-            priority=claimed["priority"], source_word=claimed["source_word"],
-            source_pattern=claimed["source_pattern"],
-            source_work_id=claimed["source_work_id"])
+            priority=claimed["priority"], opener=claimed["opener"],
+            opener_pattern=claimed["opener_pattern"],
+            opener_work_id=claimed["opener_work_id"])
         q.close()
 
         w = _BranchWorker(0, self.cache_path, self.queue_path, None)
         recorded = {}
 
         def capture(*_args, **_kwargs):
-            recorded['source_work_id'] = w._work_context.source_work_id
+            recorded['opener_work_id'] = w._work_context.opener_work_id
             recorded['scheduling_role'] = w._work_context.scheduling_role
 
         w._solve_branch_focused_in_context = mock.MagicMock(side_effect=capture)
         try:
             w.solve_branch_focused(branch_key)
-            self.assertEqual(recorded['source_work_id'], claimed["source_work_id"])
-            # source_work_id is not NULL: must be preferred/fallback, never
-            # direct (check_source_work_invariants rejects that pairing).
+            self.assertEqual(recorded['opener_work_id'], claimed["opener_work_id"])
+            # opener_work_id is not NULL: must be preferred/fallback, never
+            # direct (check_opener_work_invariants rejects that pairing).
             self.assertEqual(recorded['scheduling_role'], "preferred")
-            self.assertEqual(w.queue.check_source_work_invariants(), [])
+            self.assertEqual(w.queue.check_opener_work_invariants(), [])
         finally:
             w.close()
 
@@ -1427,13 +1427,13 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
         recorded = {}
 
         def capture(*_args, **_kwargs):
-            recorded['source_work_id'] = w._work_context.source_work_id
+            recorded['opener_work_id'] = w._work_context.opener_work_id
             recorded['scheduling_role'] = w._work_context.scheduling_role
 
         w._solve_branch_focused_in_context = mock.MagicMock(side_effect=capture)
         try:
             w.solve_branch_focused(branch_key)
-            self.assertIsNone(recorded['source_work_id'])
+            self.assertIsNone(recorded['opener_work_id'])
             self.assertEqual(recorded['scheduling_role'], "direct")
         finally:
             w.close()
@@ -1465,10 +1465,10 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
 
         w = _BranchWorker(0, self.cache_path, self.queue_path, None)
         try:
-            with mock.patch.object(w.queue, 'source_work_candidates',
-                                   wraps=w.queue.source_work_candidates) as source_rows:
+            with mock.patch.object(w.queue, 'opener_work_candidates',
+                                   wraps=w.queue.opener_work_candidates) as opener_rows:
                 result = w.claim_one()
-            self.assertEqual(source_rows.call_count, 0)
+            self.assertEqual(opener_rows.call_count, 0)
         finally:
             w.close()
 
@@ -1522,7 +1522,7 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
         finally:
             w.close()
 
-    def test_claim_one_discovers_source_work_after_unclaimable_direct_branch(self):
+    def test_claim_one_discovers_opener_work_after_unclaimable_direct_branch(self):
         from erd_queue import ERDQueue
         ScoreCache(self.cache_path, BRANCH).close()
         q = ERDQueue(self.queue_path)
@@ -1533,8 +1533,8 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
         q.claim_next_bundle(direct_key, "other-worker", n_candidates,
                             list(range(n_candidates)), [0.0] * n_candidates,
                             small_count=n_candidates, count_cap=n_candidates)
-        source_key = ScoreCache.encode_subset(BRANCH[:4])
-        q.add_pending_many([(source_key, 4, 7, "crane", 0)])
+        opener_key = ScoreCache.encode_subset(BRANCH[:4])
+        q.add_pending_many([(opener_key, 4, 7, "crane", 0)])
         q.close()
 
         w = _BranchWorker(0, self.cache_path, self.queue_path, None)
@@ -1545,18 +1545,18 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
 
         self.assertIsNotNone(result)
         _context_value, branch, _bundle_id, indices, _forced = result
-        self.assertEqual(branch['branch_key'], source_key)
-        self.assertEqual(branch['source_word'], "crane")
+        self.assertEqual(branch['branch_key'], opener_key)
+        self.assertEqual(branch['opener'], "crane")
         self.assertTrue(indices)
 
-    def test_stale_worker_preserves_owner_when_joining_source_active_branch(self):
+    def test_stale_worker_preserves_owner_when_joining_opener_active_branch(self):
         from erd_queue import ERDQueue
         ScoreCache(self.cache_path, BRANCH).close()
         stale_worker = _BranchWorker(0, self.cache_path, self.queue_path, None)
         q = ERDQueue(self.queue_path)
         branch_key = ScoreCache.encode_subset(BRANCH)
         q.add_pending_many([(branch_key, len(BRANCH), 7, "crane", 0)])
-        source_work_id = q.source_work_rows()[0]["source_work_id"]
+        opener_work_id = q.opener_work_rows()[0]["opener_work_id"]
         q.close()
 
         promoting_worker = _BranchWorker(1, self.cache_path, self.queue_path, None)
@@ -1572,7 +1572,7 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
         self.assertIsNotNone(result)
         context, branch, _bundle_id, indices, _forced = result
         self.assertEqual(branch['branch_key'], branch_key)
-        self.assertEqual(context.source_work_id, source_work_id)
+        self.assertEqual(context.opener_work_id, opener_work_id)
         self.assertTrue(indices)
 
     def test_claim_one_joins_existing_in_progress_branch(self):
@@ -1599,7 +1599,7 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
         self.assertEqual(branch['branch_key'], branch_key)
         self.assertTrue(indices)
 
-    def test_claim_one_joins_active_source_work_branch(self):
+    def test_claim_one_joins_active_opener_work_branch(self):
         from erd_queue import ERDQueue
         branch_key = ScoreCache.encode_subset(BRANCH)
         ScoreCache(self.cache_path, BRANCH).close()
@@ -1631,26 +1631,26 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
         q = ERDQueue(self.queue_path)
         q.add_pending_many([(branch_key, len(BRANCH), 1, "crane", 7)])
         q.add_pending_many([(branch_key, len(BRANCH), 9, "slate", 42)])
-        sources = {row["source_word"]: row for row in q.source_work_rows()}
-        crane = q.claim_next("peer", sources["crane"]["source_work_id"])
+        openers = {row["opener"]: row for row in q.opener_work_rows()}
+        crane = q.claim_next("peer", openers["crane"]["opener_work_id"])
         q.create_branch(
             branch_key, len(BRANCH), len(CANDIDATES), budget=ROOT_BUDGET,
-            priority=crane["priority"], source_word=crane["source_word"],
-            source_pattern=crane["source_pattern"],
-            source_work_id=crane["source_work_id"])
-        slate_rows = q.branches_in_progress(sources["slate"]["source_work_id"])
+            priority=crane["priority"], opener=crane["opener"],
+            opener_pattern=crane["opener_pattern"],
+            opener_work_id=crane["opener_work_id"])
+        slate_rows = q.branches_in_progress(openers["slate"]["opener_work_id"])
         q.close()
 
         w = _BranchWorker(0, self.cache_path, self.queue_path, None)
         try:
             result = w._claim_active_branch(
-                slate_rows, sources["slate"]["source_work_id"])
+                slate_rows, openers["slate"]["opener_work_id"])
         finally:
             w.close()
         context, _branch, _bundle_id, indices, _forced = result
-        self.assertEqual(context.source_word, "slate")
-        self.assertEqual(context.source_pattern, 42)
-        self.assertEqual(context.source_priority, 9)
+        self.assertEqual(context.opener, "slate")
+        self.assertEqual(context.opener_pattern, 42)
+        self.assertEqual(context.opener_priority, 9)
         self.assertTrue(indices)
 
     def test_claim_one_finalizes_completed_direct_branch(self):
@@ -1681,31 +1681,31 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
         finally:
             q.close()
 
-    def test_claim_one_records_fallback_role_when_preferred_source_is_held(self):
+    def test_claim_one_records_fallback_role_when_preferred_opener_is_held(self):
         from erd_queue import ERDQueue, SCHEDULING_ROLE_FALLBACK
         ScoreCache(self.cache_path, BRANCH).close()
         q = ERDQueue(self.queue_path)
         n_candidates = len(CANDIDATES)
-        # crane (priority 9) is the preferred source, but its only branch is
+        # crane (priority 9) is the preferred opener, but its only branch is
         # already fully held by another worker: no claimable bundle.
         crane_key = ScoreCache.encode_subset(BRANCH[:3])
         q.add_pending_many([(crane_key, 3, 9, "crane", 0)])
-        crane_id = q.source_work_rows()[0]["source_work_id"]
+        crane_id = q.opener_work_rows()[0]["opener_work_id"]
         claimed = q.claim_next("other-worker", crane_id)
         q.create_branch(claimed['branch_key'], claimed['n_words'], n_candidates,
                         priority=claimed['priority'],
-                        source_word=claimed['source_word'],
-                        source_pattern=claimed['source_pattern'],
-                        source_work_id=claimed['source_work_id'])
+                        opener=claimed['opener'],
+                        opener_pattern=claimed['opener_pattern'],
+                        opener_work_id=claimed['opener_work_id'])
         q.claim_next_bundle(
             crane_key, "other-worker", n_candidates, list(range(n_candidates)),
             [0.0] * n_candidates, small_count=n_candidates, count_cap=n_candidates,
-            expected_source_work_id=crane_id, expected_source_priority=9)
+            expected_opener_work_id=crane_id, expected_opener_priority=9)
         # slate (priority 1) has claimable work: the only eligible fallback.
         slate_key = ScoreCache.encode_subset(BRANCH[1:4])
         q.add_pending_many([(slate_key, 3, 1, "slate", 0)])
-        slate_id = next(row["source_work_id"] for row in q.source_work_rows()
-                        if row["source_word"] == "slate")
+        slate_id = next(row["opener_work_id"] for row in q.opener_work_rows()
+                        if row["opener"] == "slate")
         q.close()
 
         w = _BranchWorker(0, self.cache_path, self.queue_path, None)
@@ -1717,13 +1717,13 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
         self.assertIsNotNone(result)
         context, branch, _bundle_id, indices, _forced = result
         self.assertEqual(branch['branch_key'], slate_key)
-        self.assertEqual(context.source_work_id, slate_id)
+        self.assertEqual(context.opener_work_id, slate_id)
         self.assertEqual(context.scheduling_role, SCHEDULING_ROLE_FALLBACK)
         self.assertTrue(indices)
 
     def test_claim_one_records_preferred_role_for_equal_priority_tiebreak_winner(self):
-        """Two sources at the SAME requested priority: source_work_candidates()
-        picks one via its tiebreak (state, then source_work_id), but neither was
+        """Two openers at the SAME requested priority: opener_work_candidates()
+        picks one via its tiebreak (state, then opener_work_id), but neither was
         skipped in favor of a higher-priority peer, so both are 'preferred', not
         just the admission-order-first one."""
         from erd_queue import ERDQueue, SCHEDULING_ROLE_PREFERRED
@@ -1733,7 +1733,7 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
         slate_key = ScoreCache.encode_subset(BRANCH[1:4])
         q.add_pending_many([(crane_key, 3, 5, "crane", 0)])
         q.add_pending_many([(slate_key, 3, 5, "slate", 0)])
-        admission_order = [row["source_word"] for row in q.source_work_candidates()]
+        admission_order = [row["opener"] for row in q.opener_work_candidates()]
         q.close()
 
         w = _BranchWorker(0, self.cache_path, self.queue_path, None)
@@ -1744,7 +1744,7 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
 
         self.assertIsNotNone(result)
         context, branch, _bundle_id, indices, _forced = result
-        # Whichever of the two equal-priority sources the tiebreak orders
+        # Whichever of the two equal-priority openers the tiebreak orders
         # first is the one claim_one() actually claims; either way it must
         # be reported preferred — nothing higher-priority was skipped.
         self.assertIn(admission_order[0], ("crane", "slate"))
@@ -1759,17 +1759,17 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
         n_candidates = len(CANDIDATES)
         crane_key = ScoreCache.encode_subset(BRANCH[:3])
         q.add_pending_many([(crane_key, 3, 9, "crane", 0)])
-        crane_id = q.source_work_rows()[0]["source_work_id"]
+        crane_id = q.opener_work_rows()[0]["opener_work_id"]
         claimed = q.claim_next("other-worker", crane_id)
         q.create_branch(claimed['branch_key'], claimed['n_words'], n_candidates,
                         priority=claimed['priority'],
-                        source_word=claimed['source_word'],
-                        source_pattern=claimed['source_pattern'],
-                        source_work_id=claimed['source_work_id'])
+                        opener=claimed['opener'],
+                        opener_pattern=claimed['opener_pattern'],
+                        opener_work_id=claimed['opener_work_id'])
         q.claim_next_bundle(
             crane_key, "other-worker", n_candidates, list(range(n_candidates)),
             [0.0] * n_candidates, small_count=n_candidates, count_cap=n_candidates,
-            expected_source_work_id=crane_id, expected_source_priority=9)
+            expected_opener_work_id=crane_id, expected_opener_priority=9)
         slate_key = ScoreCache.encode_subset(BRANCH[1:4])
         q.add_pending_many([(slate_key, 3, 1, "slate", 0)])
         q.close()
@@ -1861,18 +1861,18 @@ class TestCooperativeSolveFullPath(unittest.TestCase):
         self.assertIsNotNone(cached)
         self.assertAlmostEqual(cached[1], cost, places=6)
 
-    def test_cooperative_solve_claims_after_source_reprioritization(self):
+    def test_cooperative_solve_claims_after_opener_reprioritization(self):
         from erd_queue import ERDQueue
 
         root_key = ScoreCache.encode_subset(BRANCH[:3])
         q = ERDQueue(self.queue_path)
         q.add_pending_many([(root_key, 3, 1, "crane", 0)])
-        source_work_id = q.source_work_rows()[0]["source_work_id"]
+        opener_work_id = q.opener_work_rows()[0]["opener_work_id"]
         q.close()
 
         w = _BranchWorker(0, self.cache_path, self.queue_path, None)
         w._work_context = WorkContext(
-            source_work_id, 1, "crane", 0, root_key, None,
+            opener_work_id, 1, "crane", 0, root_key, None,
             SCHEDULING_ROLE_PREFERRED)
         original_claim_bundle = w._claim_bundle
         reprioritized = False
@@ -1894,8 +1894,8 @@ class TestCooperativeSolveFullPath(unittest.TestCase):
                 reprioritized = True
                 updated = ERDQueue(self.queue_path)
                 try:
-                    self.assertTrue(updated.set_source_work_priority(
-                        source_work_id, 9))
+                    self.assertTrue(updated.set_opener_work_priority(
+                        opener_work_id, 9))
                 finally:
                     updated.close()
             return original_claim_bundle(*args, **kwargs)
@@ -2051,7 +2051,7 @@ class TestHelpOtherBranch(unittest.TestCase):
         self.assertIsNotNone(q.get_branch(key_b))   # not finalized
         q.close()
 
-    def test_help_other_branch_switches_and_restores_source_context(self):
+    def test_help_other_branch_switches_and_restores_opener_context(self):
         from erd_queue import ERDQueue
         ScoreCache(self.cache_path, BRANCH).close()
         words_b = BRANCH[:4]
@@ -2061,25 +2061,25 @@ class TestHelpOtherBranch(unittest.TestCase):
         claimed = q.claim_next("peer")
         q.create_branch(
             key_b, len(words_b), len(CANDIDATES), budget=ROOT_BUDGET,
-            priority=claimed["priority"], source_word=claimed["source_word"],
-            source_pattern=claimed["source_pattern"],
-            source_work_id=claimed["source_work_id"])
+            priority=claimed["priority"], opener=claimed["opener"],
+            opener_pattern=claimed["opener_pattern"],
+            opener_work_id=claimed["opener_work_id"])
         q.close()
 
         w = _BranchWorker(0, self.cache_path, self.queue_path, None)
         waiting_context = _context(
-            branch_key=b"waiting", source_work_id=999, source_priority=1,
-            source_word="crane", source_pattern=7)
+            branch_key=b"waiting", opener_work_id=999, opener_priority=1,
+            opener="crane", opener_pattern=7)
         w._work_context = waiting_context
 
         def evaluate(*_args, **_kwargs):
             self.assertEqual(w._work_context.branch_key, key_b)
             self.assertEqual(
-                w._work_context.source_work_id, claimed["source_work_id"])
-            self.assertEqual(w._work_context.source_priority, 9)
-            self.assertEqual(w._work_context.source_word, "slate")
-            self.assertEqual(w._work_context.source_pattern, 42)
-            # Source-owned: fallback, regardless of which source owns it —
+                w._work_context.opener_work_id, claimed["opener_work_id"])
+            self.assertEqual(w._work_context.opener_priority, 9)
+            self.assertEqual(w._work_context.opener, "slate")
+            self.assertEqual(w._work_context.opener_pattern, 42)
+            # Opener-owned: fallback, regardless of which opener owns it —
             # the worker's own branch is blocked, so this is fallback work.
             self.assertEqual(w._work_context.scheduling_role, "fallback")
             return False
@@ -2099,20 +2099,20 @@ class TestHelpOtherBranch(unittest.TestCase):
         q = ERDQueue(self.queue_path)
         q.create_branch(
             key_b, len(words_b), len(CANDIDATES), budget=ROOT_BUDGET,
-            priority=9, source_word="crane", source_pattern=7)
+            priority=9, opener="crane", opener_pattern=7)
         q.close()
 
         w = _BranchWorker(0, self.cache_path, self.queue_path, None)
 
         def evaluate(*_args, **_kwargs):
-            self.assertIsNone(w._work_context.source_work_id)
-            self.assertEqual(w._work_context.source_priority, 9)
-            self.assertEqual(w._work_context.source_word, "crane")
-            self.assertEqual(w._work_context.source_pattern, 7)
-            # No live source-work ownership: direct, not fallback — no
-            # source-first admission decision was made for this branch, and
-            # source_work_id IS NULL pairs only with DIRECT
-            # (check_source_work_invariants rejects source_work_id IS NULL
+            self.assertIsNone(w._work_context.opener_work_id)
+            self.assertEqual(w._work_context.opener_priority, 9)
+            self.assertEqual(w._work_context.opener, "crane")
+            self.assertEqual(w._work_context.opener_pattern, 7)
+            # No live opener-work ownership: direct, not fallback — no
+            # opener-first admission decision was made for this branch, and
+            # opener_work_id IS NULL pairs only with DIRECT
+            # (check_opener_work_invariants rejects opener_work_id IS NULL
             # paired with preferred/fallback).
             self.assertEqual(w._work_context.scheduling_role, "direct")
             return False
@@ -2121,7 +2121,7 @@ class TestHelpOtherBranch(unittest.TestCase):
         try:
             self.assertTrue(w._help_other_branch(b"excluded"))
             self.assertEqual(
-                w.queue.check_source_work_invariants(), [])
+                w.queue.check_opener_work_invariants(), [])
         finally:
             w.close()
 
@@ -2181,9 +2181,9 @@ class TestHelpOtherBranch(unittest.TestCase):
 
 
 class TestHelpOtherBranchPromotesHigherPriority(unittest.TestCase):
-    """issue #214: a source with only pending branches must be able to start
-    while a lower-priority source has active branches available to help
-    with — and the reverse must not happen (a lower-priority pending source
+    """issue #214: an opener with only pending branches must be able to start
+    while a lower-priority opener has active branches available to help
+    with — and the reverse must not happen (a lower-priority pending opener
     must not preempt a higher-priority branch already in progress)."""
 
     def setUp(self):
@@ -2205,31 +2205,31 @@ class TestHelpOtherBranchPromotesHigherPriority(unittest.TestCase):
             f.write("\n".join(words) + "\n")
         return p
 
-    def _source_work_id(self, q, source_word):
+    def _opener_work_id(self, q, opener):
         return next(
-            row["source_work_id"] for row in q.source_work_candidates()
-            if row["source_word"] == source_word)
+            row["opener_work_id"] for row in q.opener_work_candidates()
+            if row["opener"] == opener)
 
-    def test_promotes_pending_higher_priority_source_over_active_lower_priority_one(self):
+    def test_promotes_pending_higher_priority_opener_over_active_lower_priority_one(self):
         from erd_queue import ERDQueue
         ScoreCache(self.cache_path, BRANCH).close()
         q = ERDQueue(self.queue_path)
         n_candidates = len(CANDIDATES)
 
-        # Source "low" (priority 1) has an active branch with free candidates —
+        # Opener "low" (priority 1) has an active branch with free candidates —
         # the branch this call would otherwise fall back to joining.
         words_low = BRANCH[:4]
         key_low = ScoreCache.encode_subset(words_low)
         q.add_pending_many([(key_low, len(words_low), 1, "low", 10)])
-        claimed_low = q.claim_next("setup", self._source_work_id(q, "low"))
+        claimed_low = q.claim_next("setup", self._opener_work_id(q, "low"))
         q.create_branch(
             key_low, len(words_low), n_candidates, budget=ROOT_BUDGET,
             priority=claimed_low["priority"],
-            source_word=claimed_low["source_word"],
-            source_pattern=claimed_low["source_pattern"],
-            source_work_id=claimed_low["source_work_id"])
+            opener=claimed_low["opener"],
+            opener_pattern=claimed_low["opener_pattern"],
+            opener_work_id=claimed_low["opener_work_id"])
 
-        # Source "high" (priority 9) has only a pending branch: 74-pending/
+        # Opener "high" (priority 9) has only a pending branch: 74-pending/
         # 0-active AUDIO from the issue.  It must start without being promoted
         # by a setup helper first.
         words_high = BRANCH
@@ -2257,25 +2257,25 @@ class TestHelpOtherBranchPromotesHigherPriority(unittest.TestCase):
         # "high" is now promoted into an active branch.
         self.assertIsNotNone(row)
 
-    def test_does_not_promote_lower_priority_pending_source_over_active_higher_priority_one(self):
+    def test_does_not_promote_lower_priority_pending_opener_over_active_higher_priority_one(self):
         from erd_queue import ERDQueue
         ScoreCache(self.cache_path, BRANCH).close()
         q = ERDQueue(self.queue_path)
         n_candidates = len(CANDIDATES)
 
-        # Source "high" (priority 9) already has an active branch.
+        # Opener "high" (priority 9) already has an active branch.
         words_high = BRANCH[:4]
         key_high = ScoreCache.encode_subset(words_high)
         q.add_pending_many([(key_high, len(words_high), 9, "high", 10)])
-        claimed_high = q.claim_next("setup", self._source_work_id(q, "high"))
+        claimed_high = q.claim_next("setup", self._opener_work_id(q, "high"))
         q.create_branch(
             key_high, len(words_high), n_candidates, budget=ROOT_BUDGET,
             priority=claimed_high["priority"],
-            source_word=claimed_high["source_word"],
-            source_pattern=claimed_high["source_pattern"],
-            source_work_id=claimed_high["source_work_id"])
+            opener=claimed_high["opener"],
+            opener_pattern=claimed_high["opener_pattern"],
+            opener_work_id=claimed_high["opener_work_id"])
 
-        # Source "low" (priority 1) has only a pending branch: lower priority
+        # Opener "low" (priority 1) has only a pending branch: lower priority
         # than the branch already in progress, so it must not be promoted.
         words_low = BRANCH
         key_low = ScoreCache.encode_subset(words_low)
@@ -2301,10 +2301,10 @@ class TestHelpOtherBranchPromotesHigherPriority(unittest.TestCase):
         # "low" was never promoted: it stays pending, not active.
         self.assertIsNone(row)
 
-    def test_does_not_promote_lower_priority_pending_source_over_branch_already_being_served(self):
+    def test_does_not_promote_lower_priority_pending_opener_over_branch_already_being_served(self):
         """A worker blocked deep inside a higher-priority branch's dependency
         (no OTHER active branches exist at all) must not abandon it for a
-        lower-priority pending source just because nothing else is active."""
+        lower-priority pending opener just because nothing else is active."""
         from erd_queue import ERDQueue
         ScoreCache(self.cache_path, BRANCH).close()
         q = ERDQueue(self.queue_path)
@@ -2319,8 +2319,8 @@ class TestHelpOtherBranchPromotesHigherPriority(unittest.TestCase):
         # branch exists, but the context this call is nested under outranks
         # "low".
         w._work_context = _context(
-            branch_key=b"served-branch", source_priority=9,
-            source_word="served", source_pattern=1)
+            branch_key=b"served-branch", opener_priority=9,
+            opener="served", opener_pattern=1)
         w.evaluate_bundle = mock.MagicMock(return_value=False)
         try:
             result = w._help_other_branch(b"served-branch")
@@ -2332,22 +2332,22 @@ class TestHelpOtherBranchPromotesHigherPriority(unittest.TestCase):
         self.assertIsNone(row)
         w.evaluate_bundle.assert_not_called()
 
-    def test_widens_its_own_source_when_only_active_branch_is_the_one_excluded(self):
+    def test_widens_its_own_opener_when_only_active_branch_is_the_one_excluded(self):
         """The production shape from the issue: a worker blocked on AUDIO's
         only active branch, with AUDIO also holding a pending branch under
-        the SAME source_work_id and a lower-priority source (SCOPE) holding
+        the SAME opener_work_id and a lower-priority opener (SCOPE) holding
         an active one.  The worker must widen AUDIO — promote its own
         pending branch — rather than serve SCOPE, and rather than treat
         AUDIO's active branch (the one excluded, since it's the one being
-        waited on) as already covering the source.
+        waited on) as already covering the opener.
 
         Both AUDIO branches are added in a single add_pending_many call so
-        they share one source_work_id (add_pending_many creates a fresh
-        source_work row per call, even for a repeated source_word/priority
+        they share one opener_work_id (add_pending_many creates a fresh
+        opener_work row per call, even for a repeated opener/priority
         pair) — otherwise the pending branch would land under a second,
-        merely coincidentally-tied source_work_id whose own
+        merely coincidentally-tied opener_work_id whose own
         branches_in_progress() is trivially empty, which would exercise the
-        equal-priority fix but not the joinable_source_ids fix.
+        equal-priority fix but not the joinable_opener_ids fix.
         """
         from erd_queue import ERDQueue
         ScoreCache(self.cache_path, BRANCH).close()
@@ -2356,7 +2356,7 @@ class TestHelpOtherBranchPromotesHigherPriority(unittest.TestCase):
 
         # AUDIO (priority 9): one active branch (the one this call excludes,
         # standing in for "already being served") plus one pending branch,
-        # both under the same source_work_id.  n_words picks which pending
+        # both under the same opener_work_id.  n_words picks which pending
         # row claim_next promotes first (largest n_words wins), so the
         # larger branch becomes "active" and the smaller stays pending.
         words_audio_active = BRANCH
@@ -2367,15 +2367,15 @@ class TestHelpOtherBranchPromotesHigherPriority(unittest.TestCase):
             (key_audio_active, len(words_audio_active), 9, "audio", 10),
             (key_audio_pending, len(words_audio_pending), 9, "audio", 10),
         ])
-        audio_source_work_id = self._source_work_id(q, "audio")
-        claimed_audio = q.claim_next("setup", audio_source_work_id)
+        audio_opener_work_id = self._opener_work_id(q, "audio")
+        claimed_audio = q.claim_next("setup", audio_opener_work_id)
         self.assertEqual(claimed_audio["branch_key"], key_audio_active)
         q.create_branch(
             key_audio_active, len(words_audio_active), n_candidates,
             budget=ROOT_BUDGET, priority=claimed_audio["priority"],
-            source_word=claimed_audio["source_word"],
-            source_pattern=claimed_audio["source_pattern"],
-            source_work_id=claimed_audio["source_work_id"])
+            opener=claimed_audio["opener"],
+            opener_pattern=claimed_audio["opener_pattern"],
+            opener_work_id=claimed_audio["opener_work_id"])
 
         # SCOPE (priority 1): one active branch, joinable and lower priority.
         # A BRANCH subset (not CANDIDATES-only words like "brain"): branch
@@ -2387,20 +2387,20 @@ class TestHelpOtherBranchPromotesHigherPriority(unittest.TestCase):
         words_penis = BRANCH[-2:]
         key_penis = ScoreCache.encode_subset(words_penis)
         q.add_pending_many([(key_penis, len(words_penis), 1, "scope", 20)])
-        claimed_penis = q.claim_next("setup", self._source_work_id(q, "scope"))
+        claimed_penis = q.claim_next("setup", self._opener_work_id(q, "scope"))
         q.create_branch(
             key_penis, len(words_penis), n_candidates, budget=ROOT_BUDGET,
             priority=claimed_penis["priority"],
-            source_word=claimed_penis["source_word"],
-            source_pattern=claimed_penis["source_pattern"],
-            source_work_id=claimed_penis["source_work_id"])
+            opener=claimed_penis["opener"],
+            opener_pattern=claimed_penis["opener_pattern"],
+            opener_work_id=claimed_penis["opener_work_id"])
         q.close()
 
         w = _BranchWorker(0, self.cache_path, self.queue_path, None)
         w._work_context = _context(
-            branch_key=key_audio_active, source_work_id=audio_source_work_id,
-            source_priority=9, source_word="audio",
-            source_pattern=claimed_audio["source_pattern"])
+            branch_key=key_audio_active, opener_work_id=audio_opener_work_id,
+            opener_priority=9, opener="audio",
+            opener_pattern=claimed_audio["opener_pattern"])
         served = []
 
         def fake_evaluate(branch_key, *_args, **_kwargs):
@@ -2420,8 +2420,8 @@ class TestHelpOtherBranchPromotesHigherPriority(unittest.TestCase):
         # AUDIO's pending branch is now promoted (active), not left pending.
         self.assertIsNotNone(audio_pending_row)
 
-    def test_prefers_joining_own_sources_other_active_branch_over_promoting(self):
-        """When the worker's own source already has ANOTHER joinable active
+    def test_prefers_joining_own_openers_other_active_branch_over_promoting(self):
+        """When the worker's own opener already has ANOTHER joinable active
         branch (distinct from the one excluded), the promotion loop must
         skip it — 'prefer joining over promoting' — and leave its pending
         branch alone; the join loop below picks up the other active branch
@@ -2446,30 +2446,30 @@ class TestHelpOtherBranchPromotesHigherPriority(unittest.TestCase):
             (key_joinable, len(words_joinable), 9, "audio", 10),
             (key_pending, len(words_pending), 9, "audio", 10),
         ])
-        audio_source_work_id = self._source_work_id(q, "audio")
-        claimed_excluded = q.claim_next("setup", audio_source_work_id)
+        audio_opener_work_id = self._opener_work_id(q, "audio")
+        claimed_excluded = q.claim_next("setup", audio_opener_work_id)
         self.assertEqual(claimed_excluded["branch_key"], key_excluded)
         q.create_branch(
             key_excluded, len(words_excluded), n_candidates,
             budget=ROOT_BUDGET, priority=claimed_excluded["priority"],
-            source_word=claimed_excluded["source_word"],
-            source_pattern=claimed_excluded["source_pattern"],
-            source_work_id=claimed_excluded["source_work_id"])
-        claimed_joinable = q.claim_next("setup", audio_source_work_id)
+            opener=claimed_excluded["opener"],
+            opener_pattern=claimed_excluded["opener_pattern"],
+            opener_work_id=claimed_excluded["opener_work_id"])
+        claimed_joinable = q.claim_next("setup", audio_opener_work_id)
         self.assertEqual(claimed_joinable["branch_key"], key_joinable)
         q.create_branch(
             key_joinable, len(words_joinable), n_candidates,
             budget=ROOT_BUDGET, priority=claimed_joinable["priority"],
-            source_word=claimed_joinable["source_word"],
-            source_pattern=claimed_joinable["source_pattern"],
-            source_work_id=claimed_joinable["source_work_id"])
+            opener=claimed_joinable["opener"],
+            opener_pattern=claimed_joinable["opener_pattern"],
+            opener_work_id=claimed_joinable["opener_work_id"])
         q.close()
 
         w = _BranchWorker(0, self.cache_path, self.queue_path, None)
         w._work_context = _context(
-            branch_key=key_excluded, source_work_id=audio_source_work_id,
-            source_priority=9, source_word="audio",
-            source_pattern=claimed_excluded["source_pattern"])
+            branch_key=key_excluded, opener_work_id=audio_opener_work_id,
+            opener_priority=9, opener="audio",
+            opener_pattern=claimed_excluded["opener_pattern"])
         served = []
 
         def fake_evaluate(branch_key, *_args, **_kwargs):
@@ -2523,15 +2523,15 @@ class TestHelpOtherBranchRecursionBound(unittest.TestCase):
 
         w = _BranchWorker(0, self.cache_path, self.queue_path, None)
         w._help_recursion_depth = erd_swarm.MAX_HELP_RECURSION_DEPTH
-        w.queue.source_work_candidates = mock.MagicMock(
-            wraps=w.queue.source_work_candidates)
+        w.queue.opener_work_candidates = mock.MagicMock(
+            wraps=w.queue.opener_work_candidates)
         try:
             result = w._help_other_branch(b"excluded")
         finally:
             w.close()
 
         self.assertFalse(result)
-        w.queue.source_work_candidates.assert_not_called()
+        w.queue.opener_work_candidates.assert_not_called()
 
     def test_recursion_never_exceeds_the_configured_cap(self):
         from erd_queue import ERDQueue
@@ -3342,49 +3342,49 @@ class TestFinalizeTelemetryFailureIsolation(unittest.TestCase):
         w.queue.mark_done.assert_called_once_with(key)
         w.queue.delete_branch.assert_called_once_with(key)
 
-    def test_branch_cleanup_snapshots_the_source_that_just_completed(self):
+    def test_branch_cleanup_snapshots_the_opener_that_just_completed(self):
         w = self._finalizing_worker()
         key = b"branch-key"
         w.queue.delete_branch.return_value = ["salet"]
-        w._snapshot_completed_sources = mock.MagicMock()
+        w._snapshot_completed_openers = mock.MagicMock()
         with mock.patch.object(erd_swarm, "cache_all_scores"):
             w.maybe_finalize(key, BRANCH, len(BRANCH))
-        w._snapshot_completed_sources.assert_called_once_with(["salet"])
+        w._snapshot_completed_openers.assert_called_once_with(["salet"])
 
 
-class TestCompletedSourceSnapshots(unittest.TestCase):
+class TestCompletedOpenerSnapshots(unittest.TestCase):
     def test_snapshot_skips_empty_completion_lists_without_queue_aggregation(self):
         worker = _bare_worker()
 
-        worker._snapshot_completed_sources(None)
+        worker._snapshot_completed_openers(None)
 
-        worker.queue.completed_source_timing.assert_not_called()
-        worker.queue.source_word_rows.assert_not_called()
+        worker.queue.completed_opener_timing.assert_not_called()
+        worker.queue.opener_rows.assert_not_called()
 
-    def test_snapshot_persists_the_completed_source_timing(self):
+    def test_snapshot_persists_the_completed_opener_timing(self):
         worker = _bare_worker()
-        worker.queue.completed_source_timing.return_value = {
+        worker.queue.completed_opener_timing.return_value = {
             "first_created_at": 100,
             "completed_at": 160,
             "worker_millis": 2_000,
             "telemetry_epochs": "3",
         }
 
-        worker._snapshot_completed_sources(["SALET"])
+        worker._snapshot_completed_openers(["SALET"])
 
         worker.score_cache.write_completed_source_summary.assert_called_once_with(
             "SALET", erd_swarm.ERD_ALL, 160, 60_000, 2_000, (3,))
 
     def test_snapshot_failure_does_not_abort_the_worker(self):
         worker = _bare_worker()
-        worker.queue.completed_source_timing.side_effect = [
+        worker.queue.completed_opener_timing.side_effect = [
             RuntimeError("locked"),
             {"first_created_at": 100, "completed_at": 160,
              "worker_millis": 2_000, "telemetry_epochs": "3"},
         ]
 
         with self.assertLogs("wordle", level="ERROR"):
-            worker._snapshot_completed_sources(["salet", "crane"])
+            worker._snapshot_completed_openers(["salet", "crane"])
 
         worker.score_cache.write_completed_source_summary.assert_called_once_with(
             "crane", erd_swarm.ERD_ALL, 160, 60_000, 2_000, (3,))
@@ -3559,18 +3559,18 @@ class TestCooperativeSolveCeiling(unittest.TestCase):
         result = w.cooperative_solve(BRANCH, 4, ceiling=2.5)
         self.assertIsNotNone(result)
 
-    def test_compatible_raced_branch_adopts_selected_source(self):
+    def test_compatible_raced_branch_adopts_selected_opener(self):
         w = self._worker()
         parent_key = b"parent-branch"
         w._work_context = _context(
-            branch_key=parent_key, source_work_id=41, source_priority=1,
-            source_word="crane", source_pattern=42)
+            branch_key=parent_key, opener_work_id=41, opener_priority=1,
+            opener="crane", opener_pattern=42)
         w.queue.create_branch.return_value = False
         w.queue.get_branch.return_value = {"ceiling": None, "budget": 4}
 
         w.cooperative_solve(BRANCH, 4, ceiling=2.5)
 
-        w.queue.attach_branch_source_work.assert_called_once_with(
+        w.queue.attach_branch_opener_work.assert_called_once_with(
             ScoreCache.encode_subset(BRANCH), 41, 4, 2.5, len(BRANCH), 42,
             parent_key)
 
@@ -3726,12 +3726,12 @@ class TestMaybeFinalizeTriage(unittest.TestCase):
         w = self._worker(("crane", 1.8, 2, False, 4, None, False))
         w.queue.mark_done.return_value = ["salet"]
         w.queue.delete_branch.return_value = []
-        w._snapshot_completed_sources = mock.MagicMock()
+        w._snapshot_completed_openers = mock.MagicMock()
 
         with mock.patch.object(erd_swarm, "cache_all_scores"):
             w.maybe_finalize(key, BRANCH, len(CANDIDATES))
 
-        w._snapshot_completed_sources.assert_called_once_with(["salet"])
+        w._snapshot_completed_openers.assert_called_once_with(["salet"])
 
 
 class TestMidLoopPublisherCeiling(unittest.TestCase):
@@ -3807,18 +3807,18 @@ class TestMidLoopPublisherCeiling(unittest.TestCase):
         pub.check(token, CANDIDATES, 1, None, 2.5, None, 5)
         w.queue.mark_claims_done.assert_not_called()
 
-    def test_compatible_race_adopts_selected_source(self):
+    def test_compatible_race_adopts_selected_opener(self):
         pub, w, token = self._overrunning()
         parent_key = b"parent-branch"
         w._work_context = _context(
-            branch_key=parent_key, source_work_id=41, source_priority=1,
-            source_word="crane", source_pattern=42)
+            branch_key=parent_key, opener_work_id=41, opener_priority=1,
+            opener="crane", opener_pattern=42)
         w.queue.create_branch.return_value = False
         w.queue.get_branch.return_value = {"ceiling": None, "budget": 5}
 
         pub.check(token, CANDIDATES, 1, "crane", 1.8, None, 5)
 
-        w.queue.attach_branch_source_work.assert_called_once_with(
+        w.queue.attach_branch_opener_work.assert_called_once_with(
             ScoreCache.encode_subset(BRANCH[:6]), 41, 5, None,
             len(BRANCH[:6]), 42, parent_key)
 
@@ -3909,14 +3909,14 @@ class TestCeilingFinalizeIntegration(unittest.TestCase):
         q.create_branch(self.key, len(BRANCH), n, budget=budget, ceiling=ceiling)
         if queue_user_request:
             q.add_pending_many([(self.key, len(BRANCH), 0, "crane", 0)])
-        source_work_id = (q.source_work_rows()[0]["source_work_id"]
+        opener_work_id = (q.opener_work_rows()[0]["opener_work_id"]
                           if queue_user_request else None)
         order = list(range(n))
         _, indices, _ = q.claim_next_bundle(
             self.key, "other", n, order, [0.0] * n,
             small_count=n, count_cap=n,
-            expected_source_work_id=source_work_id,
-            expected_source_priority=0 if queue_user_request else None)
+            expected_opener_work_id=opener_work_id,
+            expected_opener_priority=0 if queue_user_request else None)
         for idx in indices:
             q.complete_candidate(self.key, idx)
         if cut:
@@ -4058,30 +4058,30 @@ class TestOneWorkerPerBranch(unittest.TestCase):
         self.addCleanup(w.close)
         return w
 
-    def _queue_source(self, words_per_branch, source_word="crane", priority=0):
+    def _queue_opener(self, words_per_branch, opener="crane", priority=0):
         """Queue one opener's branches as a single request, so every branch
-        shares the source work the way an opener's response groups do."""
+        shares the opener work the way an opener's response groups do."""
         keys = [ScoreCache.encode_subset(w) for w in words_per_branch]
         self.queue.add_pending_many([
-            (key, len(words), priority, source_word, 0)
+            (key, len(words), priority, opener, 0)
             for key, words in zip(keys, words_per_branch)])
         return keys
 
-    def _promote(self, source_word=None):
-        """Open the next pending branch of a source the way a worker does."""
-        source_work_id = None
-        if source_word is not None:
-            source_work_id = self.queue._conn.execute(
-                "SELECT source_work_id FROM source_work WHERE source_word = ?",
-                (source_word,)).fetchone()[0]
-        claimed = self.queue.claim_next("promoter", source_work_id)
+    def _promote(self, opener=None):
+        """Open the next pending branch of an opener the way a worker does."""
+        opener_work_id = None
+        if opener is not None:
+            opener_work_id = self.queue._conn.execute(
+                "SELECT opener_work_id FROM opener_work WHERE opener = ?",
+                (opener,)).fetchone()[0]
+        claimed = self.queue.claim_next("promoter", opener_work_id)
         self.queue.create_branch(
             claimed["branch_key"], claimed["n_words"], len(CANDIDATES),
             budget=ROOT_BUDGET, priority=claimed["priority"],
-            source_word=claimed["source_word"],
-            source_pattern=claimed["source_pattern"],
-            source_work_id=claimed["source_work_id"])
-        return bytes(claimed["branch_key"]), claimed["source_work_id"]
+            opener=claimed["opener"],
+            opener_pattern=claimed["opener_pattern"],
+            opener_work_id=claimed["opener_work_id"])
+        return bytes(claimed["branch_key"]), claimed["opener_work_id"]
 
     def _occupy(self, branch_key, worker_id):
         """Put a worker on a branch the way production does: an unfinished
@@ -4092,8 +4092,8 @@ class TestOneWorkerPerBranch(unittest.TestCase):
         claim = w._claim_bundle(
             branch_key, owner["n_candidates"], decode_subset(branch_key),
             w._branch_budget(owner),
-            expected_source_work_id=owner["source_work_id"],
-            expected_source_priority=owner["owner_priority"])
+            expected_opener_work_id=owner["opener_work_id"],
+            expected_opener_priority=owner["owner_priority"])
         self.assertIsNotNone(claim, "fixture worker took no claim to hold")
         _bundle_id, indices, _forced = claim
         return w, list(indices)
@@ -4108,8 +4108,8 @@ class TestOneWorkerPerBranch(unittest.TestCase):
         while w._claim_bundle(
                 branch_key, owner["n_candidates"], decode_subset(branch_key),
                 w._branch_budget(owner),
-                expected_source_work_id=owner["source_work_id"],
-                expected_source_priority=owner["owner_priority"]) is not None:
+                expected_opener_work_id=owner["opener_work_id"],
+                expected_opener_priority=owner["owner_priority"]) is not None:
             pass
         return w
 
@@ -4120,7 +4120,7 @@ class TestOneWorkerPerBranch(unittest.TestCase):
     # -- occupancy -------------------------------------------------------
 
     def test_free_branch_is_preferred_over_an_occupied_one(self):
-        self._queue_source([BRANCH, BRANCH[:3]])
+        self._queue_opener([BRANCH, BRANCH[:3]])
         busy_key, _ = self._promote()
         free_key, _ = self._promote()
         self._occupy(busy_key, 9)
@@ -4138,7 +4138,7 @@ class TestOneWorkerPerBranch(unittest.TestCase):
         before finding free work.  So the thing to assert is the attempt, not
         the outcome.
         """
-        self._queue_source([BRANCH, BRANCH[:3]])
+        self._queue_opener([BRANCH, BRANCH[:3]])
         busy_key, _ = self._promote()
         free_key, _ = self._promote()
         self._occupy(busy_key, 9)
@@ -4161,7 +4161,7 @@ class TestOneWorkerPerBranch(unittest.TestCase):
         Counting its own unfinished claims would push it off its own branch."""
         # Two free branches, the worker's own sorting first (more answer words
         # at equal priority), so a wrong answer is visible as a move.
-        self._queue_source([BRANCH, BRANCH[:3]])
+        self._queue_opener([BRANCH, BRANCH[:3]])
         own_key, _ = self._promote()
         other_key, _ = self._promote()
         self.assertNotEqual(own_key, other_key)
@@ -4175,7 +4175,7 @@ class TestOneWorkerPerBranch(unittest.TestCase):
         the branch immediately claimable — this is how a partly-solved branch
         resumes, and a filter that blocked it would starve the swarm while
         passing every other test here."""
-        self._queue_source([BRANCH])
+        self._queue_opener([BRANCH])
         only_key, _ = self._promote()
         holder, _ = self._occupy(only_key, 8)
         self._occupy(only_key, 9)
@@ -4190,7 +4190,7 @@ class TestOneWorkerPerBranch(unittest.TestCase):
     def test_finished_claims_do_not_reserve_a_branch(self):
         """Only UNFINISHED claims are occupancy.  Counting completed ones
         would make every branch anyone ever worked look permanently taken."""
-        self._queue_source([BRANCH])
+        self._queue_opener([BRANCH])
         only_key, _ = self._promote()
         _holder, indices = self._occupy(only_key, 8)
         self.assertEqual(self.queue.claim_holders_by_branch()[only_key], 1)
@@ -4208,7 +4208,7 @@ class TestOneWorkerPerBranch(unittest.TestCase):
         This pins the dependency rather than new code: if reclaim stopped
         freeing claims, branches held by dead workers would never reopen.
         """
-        self._queue_source([BRANCH])
+        self._queue_opener([BRANCH])
         only_key, _ = self._promote()
         self._occupy(only_key, 8)
         self._occupy(only_key, 9)
@@ -4229,7 +4229,7 @@ class TestOneWorkerPerBranch(unittest.TestCase):
     # -- last-resort pairing ---------------------------------------------
 
     def test_second_worker_joins_when_no_branch_is_free(self):
-        self._queue_source([BRANCH])
+        self._queue_opener([BRANCH])
         only_key, _ = self._promote()
         self._occupy(only_key, 9)
 
@@ -4237,7 +4237,7 @@ class TestOneWorkerPerBranch(unittest.TestCase):
                          only_key)
 
     def test_third_worker_never_joins(self):
-        self._queue_source([BRANCH])
+        self._queue_opener([BRANCH])
         only_key, _ = self._promote()
         self._occupy(only_key, 8)
         self._occupy(only_key, 9)
@@ -4247,7 +4247,7 @@ class TestOneWorkerPerBranch(unittest.TestCase):
     def test_pairing_loses_to_a_promotable_pending_branch(self):
         """A second worker on a branch is worth a fraction of the same worker
         on a branch of its own, so every other path is tried first."""
-        keys = self._queue_source([BRANCH, BRANCH[:3]])
+        keys = self._queue_opener([BRANCH, BRANCH[:3]])
         busy_key, _ = self._promote()
         self._occupy(busy_key, 9)
 
@@ -4260,7 +4260,7 @@ class TestOneWorkerPerBranch(unittest.TestCase):
         """Selection filters on occupancy read before the claim, so two
         workers can both see the same branch as free.  The claim transaction
         re-counts and only one of them gets in."""
-        self._queue_source([BRANCH])
+        self._queue_opener([BRANCH])
         only_key, _ = self._promote()
         self._occupy(only_key, 8)
         third = self._worker(9, small_count=1, count_cap=1)
@@ -4269,34 +4269,34 @@ class TestOneWorkerPerBranch(unittest.TestCase):
         stale_occupancy = {}
 
         self.assertIsNone(third._claim_active_branch(
-            self.queue.branches_in_progress(owner["source_work_id"]),
-            owner["source_work_id"], SCHEDULING_ROLE_PREFERRED,
+            self.queue.branches_in_progress(owner["opener_work_id"]),
+            owner["opener_work_id"], SCHEDULING_ROLE_PREFERRED,
             occupancy=stale_occupancy, max_other_workers=0))
 
     # -- widening and preemption -----------------------------------------
 
-    def test_occupied_source_promotes_another_of_its_own_pending_branches(self):
+    def test_occupied_opener_promotes_another_of_its_own_pending_branches(self):
         """Widen the opener already in flight rather than stacking onto the
         branch of it that is running."""
-        self._queue_source([BRANCH, BRANCH[:3]])
-        busy_key, source_work_id = self._promote()
+        self._queue_opener([BRANCH, BRANCH[:3]])
+        busy_key, opener_work_id = self._promote()
         self._occupy(busy_key, 9)
 
         work = self._worker().claim_one()
 
         self.assertNotEqual(self._claimed_key(work), busy_key)
-        self.assertEqual(work[1]["source_work_id"], source_work_id)
+        self.assertEqual(work[1]["opener_work_id"], opener_work_id)
 
-    def test_worker_takes_a_higher_priority_source_at_the_next_claim(self):
+    def test_worker_takes_a_higher_priority_opener_at_the_next_claim(self):
         """Preemption needs no cancellation: selection reruns at every claim
-        boundary and source_work_candidates() is ordered by requested
+        boundary and opener_work_candidates() is ordered by requested
         priority, so newly-queued higher-priority work wins the next claim."""
-        self._queue_source([BRANCH[:3]], source_word="slate", priority=10)
+        self._queue_opener([BRANCH[:3]], opener="slate", priority=10)
         low_key, _ = self._promote()
         w = self._worker()
         self.assertEqual(self._claimed_key(w.claim_one()), low_key)
 
-        high_keys = self._queue_source([BRANCH[:4]], source_word="crane",
+        high_keys = self._queue_opener([BRANCH[:4]], opener="crane",
                                        priority=500)
 
         self.assertEqual(self._claimed_key(w.claim_one()), high_keys[0])
@@ -4305,7 +4305,7 @@ class TestOneWorkerPerBranch(unittest.TestCase):
         """A worker that moves to higher-priority work abandons nothing: the
         branch stays open with its completed claims and its discovered
         best_erd, so whoever resumes it continues rather than restarting."""
-        self._queue_source([BRANCH[:3]], source_word="slate", priority=10)
+        self._queue_opener([BRANCH[:3]], opener="slate", priority=10)
         low_key, _ = self._promote()
         # One candidate per bundle, so the move happens mid-branch.
         w = self._worker(small_count=1, count_cap=1)
@@ -4321,7 +4321,7 @@ class TestOneWorkerPerBranch(unittest.TestCase):
         before = self.queue.owner_row_for_branch(low_key)
         self.assertIsNotNone(before["best_erd"])
 
-        high_keys = self._queue_source([BRANCH[:4]], source_word="crane",
+        high_keys = self._queue_opener([BRANCH[:4]], opener="crane",
                                        priority=500)
         self.assertEqual(self._claimed_key(w.claim_one()), high_keys[0])
 
@@ -4331,12 +4331,12 @@ class TestOneWorkerPerBranch(unittest.TestCase):
         self.assertEqual(self.queue.branch_done_candidates(low_key),
                          done_claims)
 
-    def test_higher_priority_pending_only_source_still_starts(self):
-        """Issue #214: a source with no active branch must still be able to
-        start while other sources hold active ones."""
-        self._queue_source([BRANCH], source_word="slate", priority=10)
+    def test_higher_priority_pending_only_opener_still_starts(self):
+        """Issue #214: an opener with no active branch must still be able to
+        start while other openers hold active ones."""
+        self._queue_opener([BRANCH], opener="slate", priority=10)
         self._promote()
-        high_keys = self._queue_source([BRANCH[:4]], source_word="crane",
+        high_keys = self._queue_opener([BRANCH[:4]], opener="crane",
                                        priority=500)
 
         self.assertEqual(self._claimed_key(self._worker().claim_one()),
@@ -4344,31 +4344,31 @@ class TestOneWorkerPerBranch(unittest.TestCase):
 
     # -- widening from a blocked worker ----------------------------------
 
-    def test_blocked_worker_widens_a_source_whose_branches_are_all_worked(self):
-        """_help_other_branch treats a source as covered only when it has an
-        unoccupied branch.  A source whose open branches all have workers
+    def test_blocked_worker_widens_a_opener_whose_branches_are_all_worked(self):
+        """_help_other_branch treats an opener as covered only when it has an
+        unoccupied branch.  A opener whose open branches all have workers
         still needs its pending branches promoted to absorb another worker,
         which is what leaves an opener running one response group at a time
         with the rest waiting."""
-        # Three branches under one source: the one this worker is blocked on,
+        # Three branches under one opener: the one this worker is blocked on,
         # one another worker holds, and one still pending.  The occupied
-        # branch must not count as covering the source — if it does, the
+        # branch must not count as covering the opener — if it does, the
         # promote loop is skipped and the worker joins it instead of opening
         # the pending one, which is the failure being fixed.
-        self._queue_source([BRANCH, BRANCH[:3], BRANCH[:4]])
-        own_key, source_work_id = self._promote()
+        self._queue_opener([BRANCH, BRANCH[:3], BRANCH[:4]])
+        own_key, opener_work_id = self._promote()
         busy_key, _ = self._promote()
         self._occupy(busy_key, 9)
         self.assertEqual(
-            len(self.queue.branches_in_progress(source_work_id)), 2)
+            len(self.queue.branches_in_progress(opener_work_id)), 2)
 
         w = self._worker(small_count=1, count_cap=1)
         self.assertTrue(w._help_other_branch(own_key))
 
-        open_after = self.queue.branches_in_progress(source_work_id)
+        open_after = self.queue.branches_in_progress(opener_work_id)
         self.assertEqual(len(open_after), 3)
-        self.assertEqual({b["source_work_id"] for b in open_after},
-                         {source_work_id})
+        self.assertEqual({b["opener_work_id"] for b in open_after},
+                         {opener_work_id})
 
     def test_promoter_beaten_to_its_own_branch_does_not_join_it(self):
         """create_branch commits before the promoter claims, so between the two
@@ -4382,7 +4382,7 @@ class TestOneWorkerPerBranch(unittest.TestCase):
         claiming from another worker inside create_branch, at exactly the point
         the real race occurs.
         """
-        keys = self._queue_source([BRANCH, BRANCH[:3]])
+        keys = self._queue_opener([BRANCH, BRANCH[:3]])
         w = self._worker(small_count=1, count_cap=1)
         create_branch = self.queue.create_branch
         stolen = []
@@ -4477,7 +4477,7 @@ class TestOneWorkerPerBranch(unittest.TestCase):
         pair is simply progressing.  Getting this backwards converts a rare
         write into a per-iteration one — exactly the regression this pins.
         """
-        self._queue_source([BRANCH, BRANCH[:4]])
+        self._queue_opener([BRANCH, BRANCH[:4]])
         parent_key, _ = self._promote()
         free_key, _ = self._promote()
         w = self._worker(small_count=1, count_cap=1)
@@ -4541,7 +4541,7 @@ class TestOneWorkerPerBranch(unittest.TestCase):
         work rather than seat itself second.  The hard cap alone would permit
         the pair; the last-resort rule is what forbids it while anything else
         is claimable."""
-        self._queue_source([BRANCH, BRANCH[:4]])
+        self._queue_opener([BRANCH, BRANCH[:4]])
         parent_key, _ = self._promote()
         free_key, _ = self._promote()
 
@@ -4565,7 +4565,7 @@ class TestOneWorkerPerBranch(unittest.TestCase):
     def test_dependency_pair_forms_when_nothing_else_is_claimable(self):
         """The rule is last resort, not never: with no other branch to take,
         a second worker on the dependency beats idling."""
-        self._queue_source([BRANCH])
+        self._queue_opener([BRANCH])
         parent_key, _ = self._promote()
         # Every candidate of the parent is claimed, so it offers no bundle to
         # fall back on — occupying it alone would leave a pairing slot open and
@@ -4595,7 +4595,7 @@ class TestOneWorkerPerBranch(unittest.TestCase):
         pair onto an occupied dependency while a free branch sits untouched,
         reached whenever the worker happens to already be deep in nested help
         calls (issue #214's blocked-worker chains)."""
-        self._queue_source([BRANCH, BRANCH[:4]])
+        self._queue_opener([BRANCH, BRANCH[:4]])
         parent_key, _ = self._promote()
         free_key, _ = self._promote()
         w = self._worker(small_count=1, count_cap=1)
@@ -4636,26 +4636,26 @@ class TestOneWorkerPerBranch(unittest.TestCase):
                          "paired onto a recursion-capped dependency while a "
                          "branch was free")
 
-    # -- branches with no source ownership --------------------------------
+    # -- branches with no opener ownership --------------------------------
 
     def _direct_branch(self, words):
-        """A branch with no source-work owner, as a queue upgraded while work
+        """A branch with no opener-work owner, as a queue upgraded while work
         was in flight leaves behind."""
         branch_key = ScoreCache.encode_subset(words)
         self.queue.create_branch(branch_key, len(words), len(CANDIDATES),
                                  budget=ROOT_BUDGET)
         return branch_key
 
-    def test_unowned_branch_is_claimed_when_no_source_can_supply_work(self):
-        self._queue_source([BRANCH])
+    def test_unowned_branch_is_claimed_when_no_opener_can_supply_work(self):
+        self._queue_opener([BRANCH])
         owned_key, _ = self._promote()
         self._occupy(owned_key, 8)
         self._occupy(owned_key, 9)
         direct_key = self._direct_branch(BRANCH[:3])
         w = self._worker()
-        # A worker that has already seen source work does not re-check the
-        # unowned branches until every source has been tried.
-        w._source_work_enabled = True
+        # A worker that has already seen opener work does not re-check the
+        # unowned branches until every opener has been tried.
+        w._opener_work_enabled = True
 
         self.assertEqual(self._claimed_key(w.claim_one()), direct_key)
 
@@ -4682,7 +4682,7 @@ if __name__ == "__main__":
         pair onto an occupied dependency while a free branch sits untouched,
         reached only when the worker happens to already be deep in nested
         help calls (issue #214's blocked-worker chains)."""
-        self._queue_source([BRANCH, BRANCH[:4]])
+        self._queue_opener([BRANCH, BRANCH[:4]])
         parent_key, _ = self._promote()
         free_key, _ = self._promote()
         w = self._worker(small_count=1, count_cap=1)

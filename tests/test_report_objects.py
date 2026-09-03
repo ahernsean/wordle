@@ -11,7 +11,7 @@ from erd_queue import ERDQueue
 from report_model import (
     ReportFilters,
     ReportRequest,
-    ReportSources,
+    ReportOpeners,
     WORKER_LIVENESS_SECONDS,
     branch_reference,
     collect_report,
@@ -45,7 +45,7 @@ class SemanticReportTest(unittest.TestCase):
             candidate_file.write(
                 "\n".join(ANSWERS + ["raise", "queue", "cache"]) + "\n"
             )
-        self.sources = ReportSources(
+        self.sources = ReportOpeners(
             self.queue_path,
             self.cache_path,
             self.answer_list_path,
@@ -241,8 +241,8 @@ class SemanticReportTest(unittest.TestCase):
         pattern = fmt_pattern(pattern_code)
         queue = ERDQueue(self.queue_path, telemetry_path=self.telemetry_path)
         queue.create_branch(
-            branch_key, len(answer_words), 10, source_word="raise",
-            source_pattern=pattern_code, budget=5, spine=f"RAISE {pattern}",
+            branch_key, len(answer_words), 10, opener="raise",
+            opener_pattern=pattern_code, budget=5, spine=f"RAISE {pattern}",
         )
         branch_id = queue._intern_branch(branch_key)
         queue._conn.executemany(
@@ -565,9 +565,9 @@ class SemanticReportTest(unittest.TestCase):
         self.assertTrue(any(node["answer_count"] == 150 for node in branch_nodes))
         self.assertFalse(any(node["answer_count"] == 3 for node in branch_nodes))
 
-    def test_tree_uses_source_step_and_pages_child_word_groups(self):
-        first_key = b"sourcebranch0001"
-        second_key = b"sourcebranch0002"
+    def test_tree_uses_opener_step_and_pages_child_word_groups(self):
+        first_key = b"openerbranch0001"
+        second_key = b"openerbranch0002"
         queue = ERDQueue(self.queue_path, telemetry_path=self.telemetry_path)
         queue.add_pending_many([
             (first_key, 3, 1, "audio", 1),
@@ -777,8 +777,8 @@ class SemanticReportTest(unittest.TestCase):
         pattern_code, answer_words, branch_key = self._largest_group()
         queue = ERDQueue(self.queue_path, telemetry_path=self.telemetry_path)
         queue.create_branch(
-            branch_key, len(answer_words), 4, source_word="raise",
-            source_pattern=pattern_code, budget=5,
+            branch_key, len(answer_words), 4, opener="raise",
+            opener_pattern=pattern_code, budget=5,
             spine=f"RAISE {fmt_pattern(pattern_code)}",
         )
         queue.heartbeat("worker-1", 1, branch_key, 1, int(time.time()), 0)

@@ -119,7 +119,7 @@ class TestSchemaMigration(unittest.TestCase):
         with self.assertRaises(RuntimeError) as raised:
             ERDQueue(self.path)
         self.assertIn("pending_branches", str(raised.exception))
-        self.assertIn("source_word", str(raised.exception))
+        self.assertIn("opener", str(raised.exception))
 
     def test_unmigratable_telemetry_file_refuses_to_open(self):
         # The assertion covers the telemetry file too: a bad-shaped table

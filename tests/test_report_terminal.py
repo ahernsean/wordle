@@ -90,8 +90,8 @@ def overview_report():
                 "two_level_erd_pruned_candidate_count": 1,
                 "priority": 10,
                 "is_cooperative": False,
-                "source_word": "salet",
-                "source_pattern": "-----",
+                "opener": "salet",
+                "opener_pattern": "-----",
                 "best_guess": "crane",
                 "best_guess_is_answer": True,
                 "best_erd": 2.25,
@@ -1193,8 +1193,8 @@ class CollectionRendererTest(unittest.TestCase):
                 "branch_status": "evaluating",
                 "branch_worker_status": "waiting",
                 "answer_count": 2,
-                "source_word": "raise",
-                "source_pattern": "-----",
+                "opener": "raise",
+                "opener_pattern": "-----",
                 "priority": 7,
                 "worker_count": 0,
             }],
@@ -1628,7 +1628,7 @@ class ViewSessionTest(unittest.TestCase):
         self.assertEqual(session.branch_hotkeys[letter], "010203")
 
 
-class SourcesCommandEndToEndTest(unittest.TestCase):
+class OpenersCommandEndToEndTest(unittest.TestCase):
     """`view --openers` end to end against a real temp queue.  An earlier
     `--sources` attempt raised TypeError on every invocation and was backed
     out during #203 review because no test ever actually ran it."""
@@ -1682,7 +1682,7 @@ class SourcesCommandEndToEndTest(unittest.TestCase):
         self.assertIn("view --openers", text)
 
     def test_a_word_queued_twice_is_one_row_counting_its_branches_once(self):
-        # Source work is keyed by (word, priority), so queueing RAISE again at
+        # Opener work is keyed by (word, priority), so queueing RAISE again at
         # a new priority makes a second request that shares a branch with the
         # first.  The report merges them without counting that branch twice.
         queue = ERDQueue(self.queue_path)
@@ -1694,7 +1694,7 @@ class SourcesCommandEndToEndTest(unittest.TestCase):
 
         report = json.loads(self._run("--format", "json"))
 
-        rollups = {row["source_word"]: row for row in report["data"]["summary"]}
+        rollups = {row["opener"]: row for row in report["data"]["summary"]}
         self.assertEqual(rollups["raise"]["request_count"], 2)
         # Nine branches from the first request plus one new one; the branch
         # both requests own is counted once.
@@ -1706,7 +1706,7 @@ class SourcesCommandEndToEndTest(unittest.TestCase):
 
     def test_a_named_word_with_no_live_branches_says_so(self):
         # Naming a word whose branches have all finished must not print the
-        # "name a source word" hint naming the word already named.
+        # "name an opener" hint naming the word already named.
         queue = ERDQueue(self.queue_path)
         queue.mark_done(encode_subset(["crane", "slate"]))
         queue.close()
@@ -1718,7 +1718,7 @@ class SourcesCommandEndToEndTest(unittest.TestCase):
         # The unnamed report still points the way in.
         self.assertIn("Name an opener", self._run())
 
-    def test_source_state_filter_and_sort_reach_the_rendered_table(self):
+    def test_opener_state_filter_and_sort_reach_the_rendered_table(self):
         # --opener-state and --sort are the terminal's half of the same
         # filtering the browser gets; grouping is browser-only.
         sorted_by_word = self._run("--sort", "word")
@@ -1745,7 +1745,7 @@ class SourcesCommandEndToEndTest(unittest.TestCase):
         self.assertEqual(report["report_kind"], "openers")
         self.assertTrue(report["sources"]["queue"]["ok"])
         self.assertEqual(report["data"]["rows"], [])
-        rollups = {row["source_word"]: row for row in report["data"]["summary"]}
+        rollups = {row["opener"]: row for row in report["data"]["summary"]}
         self.assertEqual(rollups["slate"]["requested_priority"], 1)
         self.assertEqual(rollups["raise"]["branch_count"], 9)
         self.assertEqual(rollups["raise"]["open_branch_count"], 9)
@@ -1760,10 +1760,10 @@ class SourcesCommandEndToEndTest(unittest.TestCase):
     def test_word_filter_narrows_to_the_matching_request(self):
         report = json.loads(self._run("slate", "--format", "json"))
         self.assertEqual(
-            [row["source_word"] for row in report["data"]["summary"]], ["slate"]
+            [row["opener"] for row in report["data"]["summary"]], ["slate"]
         )
         self.assertEqual(
-            [row["source_word"] for row in report["data"]["rows"]], ["slate"]
+            [row["opener"] for row in report["data"]["rows"]], ["slate"]
         )
 
     def test_mutually_exclusive_with_other_view_kinds(self):
@@ -1918,7 +1918,7 @@ class ViewParserTest(unittest.TestCase):
         handler_names = (
             "cmd_start", "cmd_stop", "cmd_restart", "cmd_run", "cmd_view",
             "cmd_queue_add", "cmd_queue_clear", "cmd_queue_remove",
-            "cmd_queue_priority", "cmd_queue_source_priority",
+            "cmd_queue_priority", "cmd_queue_opener_priority",
             "cmd_reset_stale", "cmd_queue_clear_disk_stop",
             "cmd_queue_set_disk_stop", "cmd_queue_reconcile_orphaned_ownership",
             "cmd_epoch_show", "cmd_epoch_set",
@@ -1935,7 +1935,7 @@ class ViewParserTest(unittest.TestCase):
                 with patch("sys.argv", ["erd_search.py", *arguments]):
                     erd_search.main()
         self.assertTrue(any(handler.called for handler in handlers.values()))
-        self.assertTrue(handlers["cmd_queue_source_priority"].called)
+        self.assertTrue(handlers["cmd_queue_opener_priority"].called)
         self.assertTrue(handlers["cmd_queue_reconcile_orphaned_ownership"].called)
 
     def test_removed_read_commands_fail_argparse(self):
@@ -2477,7 +2477,7 @@ class TerminalUtilityTest(unittest.TestCase):
                                                 truncation="tail")
         self.assertEqual(report_terminal._fit("hello", 1), "h")
         self.assertEqual(report_terminal._truncate_cell("hello", 3, "tail"), "…lo")
-        self.assertEqual(report_terminal._display_spine({"source_word": "raise", "source_pattern": "-----"}), "RAISE -----")
+        self.assertEqual(report_terminal._display_spine({"opener": "raise", "opener_pattern": "-----"}), "RAISE -----")
         self.assertIsNone(report_terminal._table_layout([column], [{"word": "hello"}], 2))
         stacked = report_terminal._render_table([column], [{"word": "hello"}], 2)
         self.assertTrue(stacked)
@@ -2538,15 +2538,15 @@ class TerminalUtilityTest(unittest.TestCase):
         self.assertIn("[context]", output)
         self.assertIn("unknown", output)
 
-    def test_source_erd_display_distinguishes_pending_and_infeasible(self):
-        self.assertEqual(report_terminal._display_source_erd(None), "—")
-        self.assertEqual(report_terminal._display_source_erd({
+    def test_opener_erd_display_distinguishes_pending_and_infeasible(self):
+        self.assertEqual(report_terminal._display_opener_erd(None), "—")
+        self.assertEqual(report_terminal._display_opener_erd({
             "state": "complete", "erd": 2.5,
         }), "2.500")
-        self.assertEqual(report_terminal._display_source_erd({
+        self.assertEqual(report_terminal._display_opener_erd({
             "state": "infeasible",
         }), "∞")
-        self.assertEqual(report_terminal._display_source_erd({
+        self.assertEqual(report_terminal._display_opener_erd({
             "state": "pending", "resolved_group_count": 2,
             "response_group_count": 4,
         }), "2/4")
@@ -2621,7 +2621,7 @@ class TerminalUtilityTest(unittest.TestCase):
         report.update({"report_kind": "openers", "tree": False,
                        "branch_target": {"trailing_word": "raise"}})
         summary = {
-            "source_word": "raise", "request_count": 2,
+            "opener": "raise", "request_count": 2,
             "requested_priority": 7, "state": "active",
             "erd_summary": {"state": "pending", "resolved_group_count": 1,
                             "response_group_count": 2},
@@ -2630,11 +2630,11 @@ class TerminalUtilityTest(unittest.TestCase):
             "worker_count": 1, "requested_at": 900,
         }
         report["data"] = {
-            "summary": [summary], "total_source_word_count": 2,
+            "summary": [summary], "total_opener_count": 2,
             "matched_rows": 1,
             "rows": [{
-                "branch_key_hex": "key", "source_work_id": 4,
-                "source_word": "raise", "branch_reference": "abcdefgh",
+                "branch_key_hex": "key", "opener_work_id": 4,
+                "opener": "raise", "branch_reference": "abcdefgh",
                 "branch_status": "evaluating", "branch_worker_status": "active",
                 "requested_priority": 7, "branch_effective_priority": 9,
                 "is_shared": True, "owner_count": 2, "root_pattern": "-----",

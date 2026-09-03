@@ -312,10 +312,23 @@ A descendant inherits its opener and the opener's response pattern from its
 parent unchanged, so a branch four levels deep still names the opener that
 requested it; the guess at the root of *that* branch appears only in the spine.
 
-**Legacy naming.** Storage and most identifiers still spell this `source_work`
-/ `source_word` / `source_pattern`, and `branch_source_work.root_pattern` is
-the same value as `source_pattern` under a second name. Read all of them as
-opener terms. Do not introduce new `source_*` names.
+**Legacy naming.** Tier B (#280) renamed the Linux-only queue identifiers and
+schema — `erd_queue.py`, `erd_swarm.py`, `erd_search.py`, `report_model.py`,
+`report_terminal.py`, and their tests — from `source_*` to `opener_*`. Two
+`source_*` spellings remain deliberately:
+
+1. The phone-shared cache (`runtime/wordle_cache.sqlite3`) is Tier C (#281,
+   still open): `cache_sqlite.py`'s `completed_source_summaries` and
+   `root_response_group_summaries` tables, and their `source_word` columns,
+   are untouched by Tier B and stay `source_word` until that tier lands.
+2. `report_model.py`'s branch/membership JSON output keeps the wire key
+   `"root_pattern"` even though the field is read internally from the
+   renamed `opener_pattern` column — `report_client.html` reads that exact
+   key and is outside Tier B's rename scope, so the key name is a deliberate
+   compatibility exception, not a leftover.
+
+Do not introduce new `source_*` names anywhere else; read every other
+`source_*` spelling you encounter as a Tier C carryover or a bug.
 
 The phase boundary between candidate and guess is explicit in the code:
 ```python
