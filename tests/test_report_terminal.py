@@ -2446,6 +2446,9 @@ class TerminalUtilityTest(unittest.TestCase):
             "state": "pending", "resolved_group_count": 2,
             "response_group_count": 4,
         }), "2/4")
+        self.assertEqual(report_terminal._timestamp_text(None), "—")
+        self.assertEqual(report_terminal._format_node_count(1_200), "1.2K")
+        self.assertEqual(report_terminal._format_node_count(2_000_000), "2.0M")
 
     def test_collection_renderers_include_queue_worker_cache_and_hotspot_rows(self):
         report = overview_report()
