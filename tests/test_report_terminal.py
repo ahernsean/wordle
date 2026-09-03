@@ -1228,6 +1228,13 @@ class ViewSessionTest(unittest.TestCase):
             session._navigate_back()
         self.assertEqual(len(session.navigation_stack), 1)
 
+    def test_terminal_error_lines_fall_back_when_ambiguity_rendering_fails(self):
+        session = WatchSession(view_args(), FakeInput(), io.StringIO())
+        error = ValueError("ambiguous")
+        error.candidates = []
+        with patch("report_terminal._ambiguous_reference_lines", side_effect=OSError("offline")):
+            self.assertEqual(session._error_lines(error), ["view: ambiguous"])
+
     def test_branch_navigation_targets_use_spine_then_reference_fallback(self):
         session = WatchSession(view_args(), FakeInput(), io.StringIO())
         from_list = session._branch_target({
