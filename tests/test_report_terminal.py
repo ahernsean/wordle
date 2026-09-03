@@ -2434,6 +2434,19 @@ class TerminalUtilityTest(unittest.TestCase):
         self.assertIn("[context]", output)
         self.assertIn("unknown", output)
 
+    def test_source_erd_display_distinguishes_pending_and_infeasible(self):
+        self.assertEqual(report_terminal._display_source_erd(None), "—")
+        self.assertEqual(report_terminal._display_source_erd({
+            "state": "complete", "erd": 2.5,
+        }), "2.500")
+        self.assertEqual(report_terminal._display_source_erd({
+            "state": "infeasible",
+        }), "∞")
+        self.assertEqual(report_terminal._display_source_erd({
+            "state": "pending", "resolved_group_count": 2,
+            "response_group_count": 4,
+        }), "2/4")
+
 
 if __name__ == "__main__":
     unittest.main()
