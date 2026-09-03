@@ -7,7 +7,7 @@ reaches this logic.
 """
 
 import argparse
-from contextlib import ExitStack
+from contextlib import ExitStack, redirect_stdout
 import io
 import json
 import os
@@ -1053,3 +1053,109 @@ class SupervisorSafetyAndDispatchTest(unittest.TestCase):
             with self.assertRaises(SystemExit) as raised:
                 erd_search.main()
         self.assertEqual(raised.exception.code, 2)
+
+
+class QueueMutationReportingTest(unittest.TestCase):
+    """What queue remove and queue priority tell the operator they did."""
+
+    def setUp(self):
+        self.score_cache = Mock()
+        self.response_cache = Mock()
+        self.response_cache.group_words.return_value = {0: ["cigar", "rebut"]}
+        self.queue = Mock()
+        self.queue.get_active_branch.return_value = None
+        self.arguments = SimpleNamespace(
+            queue="queue.sqlite3", cache="cache.sqlite3", word="raise",
+            pattern="-----", force=False, priority=9, opener_word=None,
+        )
+
+    def _run(self, command):
+        with (
+            patch.object(erd_search, "load_word_list",
+                         return_value=["cigar", "rebut"]),
+            patch.object(erd_search, "ScoreCache",
+                         return_value=self.score_cache),
+            patch.object(erd_search, "ResponseCache",
+                         return_value=self.response_cache),
+            patch.object(erd_search, "ERDQueue", return_value=self.queue),
+            redirect_stdout(io.StringIO()) as output,
+        ):
+            command(self.arguments)
+        return output.getvalue()
+
+    def test_remove_says_whether_the_branch_was_pending(self):
+        self.queue.remove_pending.return_value = True
+        self.assertIn("Removed", self._run(erd_search.cmd_queue_remove))
+        self.queue.remove_pending.return_value = False
+        self.assertIn("not found", self._run(erd_search.cmd_queue_remove))
+
+    def test_priority_says_whether_the_branch_was_repriced(self):
+        self.queue.set_priority.return_value = True
+        self.assertIn("priority set to 9",
+                      self._run(erd_search.cmd_queue_priority))
+        self.queue.set_priority.return_value = False
+        self.assertIn("not found", self._run(erd_search.cmd_queue_priority))
+
+    def test_priority_on_a_pattern_with_no_answers_has_no_branch(self):
+        self.response_cache.group_words.return_value = {}
+        self.assertIn("no branch", self._run(erd_search.cmd_queue_priority))
+
+
+class QueueAddReportingTest(unittest.TestCase):
+    """What queue add tells the operator it skipped and why."""
+
+    def setUp(self):
+        self.queue = Mock()
+        self.queue.lowest_unfinished_source_priority.return_value = None
+        self.queue.total_branches.return_value = 0
+        self.queue.status_by_branch_keys.return_value = {}
+        self.queue.add_pending_many.return_value = 0
+        self.response_cache = Mock()
+        self.response_cache.group_words.return_value = {0: ["cigar", "rebut"]}
+        self.arguments = SimpleNamespace(
+            queue="queue.sqlite3", cache="cache.sqlite3",
+            word=["raise"], words_file=None, pattern=None,
+            priority=None, priority_step=5, priority_words=None,
+            max_branch_size=None, delete_erd_cache=False,
+        )
+
+    def _run(self):
+        score_cache = Mock()
+        score_cache.report_branch_states.return_value = {}
+        with (
+            patch.object(erd_search, "load_word_list",
+                         return_value=["cigar", "rebut", "raise"]),
+            patch.object(erd_search, "ScoreCache", return_value=score_cache),
+            patch.object(erd_search, "ResponseCache",
+                         return_value=self.response_cache),
+            patch.object(erd_search, "ERDQueue", return_value=self.queue),
+            redirect_stdout(io.StringIO()) as output,
+        ):
+            erd_search.cmd_queue_add(self.arguments)
+        return output.getvalue()
+
+    def test_priority_words_without_a_words_file_are_ignored(self):
+        self.arguments.priority_words = ["raise"]
+        self.assertIn("only applies with --words-file", self._run())
+
+    def test_priority_words_outside_the_word_list_are_named(self):
+        self.arguments.word = None
+        self.arguments.words_file = "words.txt"
+        self.arguments.priority_words = ["crane"]
+        self.assertIn("priority words not in the word list", self._run())
+
+    def test_a_response_group_too_small_to_search_is_not_queued(self):
+        self.arguments.pattern = "-----"
+        self.response_cache.group_words.return_value = {0: ["cigar"]}
+        self.assertIn("nothing to queue", self._run())
+
+    def test_a_response_group_over_the_size_limit_is_skipped(self):
+        self.arguments.pattern = "-----"
+        self.arguments.max_branch_size = 1
+        self.assertIn("exceeds --max-branch-size", self._run())
+
+    def test_an_interrupted_add_says_so_and_still_closes_its_stores(self):
+        self.arguments.pattern = "-----"
+        self.response_cache.group_words.side_effect = KeyboardInterrupt
+        self.assertIn("Interrupted", self._run())
+        self.queue.close.assert_called_once_with()
