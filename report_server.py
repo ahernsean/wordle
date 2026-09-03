@@ -26,6 +26,7 @@ from report_model import (
     SOURCE_GROUP_BY_STRATEGIES,
     SOURCE_SORT_FIELDS,
     SOURCE_STATES,
+    TREE_CURSOR_PATTERN,
     ReportFilters,
     ReportRequest,
     ReportSources,
@@ -172,8 +173,8 @@ def parse_report_request(path, query):
             value for step in tree_parent_target.steps
             for value in (step.word.upper(), step.pattern)
         )
-    if tree_cursor is not None and not re.fullmatch(r"[a-z]{5}", tree_cursor):
-        raise InvalidRequest("tree_cursor must be a five-letter word")
+    if tree_cursor is not None and not TREE_CURSOR_PATTERN.fullmatch(tree_cursor):
+        raise InvalidRequest("tree_cursor must name a tree page group")
     branch_status_value = _single_value(parameters, "branch_status")
     branch_worker_status_value = _single_value(parameters, "branch_worker_status")
     source_state_value = _single_value(parameters, "opener_state")
