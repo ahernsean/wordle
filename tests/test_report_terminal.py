@@ -2449,6 +2449,8 @@ class TerminalUtilityTest(unittest.TestCase):
         self.assertEqual(report_terminal._timestamp_text(None), "—")
         self.assertEqual(report_terminal._format_node_count(1_200), "1.2K")
         self.assertEqual(report_terminal._format_node_count(2_000_000), "2.0M")
+        with self.assertRaisesRegex(ValueError, "unsupported report kind"):
+            report_terminal.render_report({"report_kind": "unknown", "data": {}})
 
     def test_collection_renderers_include_queue_worker_cache_and_hotspot_rows(self):
         report = overview_report()
