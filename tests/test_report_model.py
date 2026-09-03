@@ -350,6 +350,13 @@ class ReportModelTest(unittest.TestCase):
         timing_cache.write_completed_source_summary.assert_called_once()
         self.assertEqual(report["data"]["summary"], [payload])
 
+    def test_response_group_scale_skips_empty_and_unbuilt_matrices(self):
+        self.assertIsNone(report_model._maximum_response_group_count(
+            self.sources, ANSWERS, [], b"key", None))
+        with patch("report_model.PatternMatrix.load_if_built", return_value=None):
+            self.assertIsNone(report_model._maximum_response_group_count(
+                self.sources, ANSWERS, ANSWERS, b"other", None))
+
     def test_queue_and_current_hotspot_reports_normalize_rows(self):
         branch_key = ScoreCache.encode_subset(["salet"])
         queue = Mock(epoch=12)
