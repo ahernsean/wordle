@@ -119,6 +119,12 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(report_model.branch_status_and_worker_status("pending", None, 0), ("queued", None))
         self.assertEqual(report_model.branch_status_and_worker_status(None, "open", 1), ("evaluating", "active"))
         self.assertEqual(report_model._response_group_key({}, "none"), (0, "all"))
+        self.assertEqual(report_model._root_progress_group_state(
+            {"answer_count": 3, "started": False},
+            {"best_erd": 2, "max_remaining_depth": 3, "cache_state": "exact"}, 2), "solved")
+        self.assertEqual(report_model._root_progress_group_state(
+            {"answer_count": 3, "started": False},
+            {"best_erd": None, "max_remaining_depth": None, "cache_state": "loss"}, 2), "loss")
         self.assertEqual(report_model.branch_status_and_worker_status(None, "finalized", 0), ("finalizing", "waiting"))
 
     def test_branch_reference_resolution_and_ambiguity_report(self):
