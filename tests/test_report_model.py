@@ -231,6 +231,27 @@ class ReportModelTest(unittest.TestCase):
             hotspots = report_model.collect_hotspot_report(self.sources, request)
         self.assertEqual(hotspots["data"]["rows"][0]["branch_key_hex"], branch_key.hex())
 
+    def test_workers_report_filters_normalized_worker_rows(self):
+        queue = Mock()
+        queue.report_queue_rows.return_value = {"rows": [{
+            "branch_key_hex": "a", "branch_status": "evaluating",
+        }]}
+        queue.heartbeats_with_branch.return_value = [{"worker_id": "worker-2"}]
+        worker = {
+            "worker_id": "worker-2", "worker_number": "2",
+            "branch_key_hex": "a", "is_live": True, "updated_at": 1,
+        }
+        request = ReportRequest(report_kind="workers", worker_id="2")
+        with (
+            patch("report_model._open_report_queue", return_value=queue),
+            patch("report_model._normalize_worker", return_value=worker),
+            patch("report_model.worker_state", return_value="working"),
+            patch("report_model.load_word_list", return_value=ANSWERS),
+        ):
+            report = collect_workers_report(self.sources, request)
+        self.assertEqual(report["data"]["summary"]["worker_count"], 1)
+        self.assertEqual(report["data"]["rows"][0]["state"], "working")
+
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         directory = self.temporary_directory.name
