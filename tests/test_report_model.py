@@ -317,6 +317,14 @@ class ReportModelTest(unittest.TestCase):
         self.assertIsNone(report["data"]["queue"])
         self.assertTrue(report["sources"]["queue"]["ok"])
 
+    def test_root_progress_report_handles_an_opener_without_started_work(self):
+        report = report_model.collect_root_progress_report(
+            self.sources, ReportRequest(
+                report_kind="root_progress",
+                branch_target=parse_report_branch_target("RAISE")))
+        self.assertEqual(report["data"]["word"], "raise")
+        self.assertEqual(report["data"]["estimate"], None)
+
     def test_queue_and_current_hotspot_reports_normalize_rows(self):
         branch_key = ScoreCache.encode_subset(["salet"])
         queue = Mock(epoch=12)
