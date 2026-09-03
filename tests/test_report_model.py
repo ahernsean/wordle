@@ -2600,3 +2600,88 @@ class RootProgressReportTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TreePageCursorTest(unittest.TestCase):
+    """Paging a tree page whose groups are not all named by a guess word.
+
+    A node with no spine has no word to group by, so its group is keyed by a
+    synthetic node id that sorts ahead of every worded group.  A cursor names
+    one or the other, and the two do not order against each other as plain
+    strings.
+    """
+
+    def _row(self, word, spine=None):
+        branch_key = ScoreCache.encode_subset([word])
+        row = {
+            "branch_key": branch_key,
+            "branch_key_hex": branch_key.hex(),
+            "branch_status": "queued",
+            "branch_worker_status": None,
+            "answer_count": 1,
+            "worker_count": 0,
+            "priority": 1,
+            "completed_candidate_count": 0,
+            "candidate_count": 3,
+        }
+        if spine is not None:
+            row["spine"] = spine
+        return row
+
+    def _worded_rows(self):
+        return [
+            self._row("crane", "CRANE y----"),
+            self._row("nurdy", "NURDY -y---"),
+            self._row("salet", "SALET --g--"),
+        ]
+
+    def _page(self, rows, cursor=None, limit=1):
+        request = ReportRequest(
+            report_kind="queue",
+            tree=True,
+            filters=ReportFilters(limit=limit),
+            tree_cursor=cursor,
+        )
+        return report_model._tree_layout(rows, request, "", rows, set(ANSWERS))
+
+    def _words(self, page):
+        return [(node["step"] or {}).get("word") for node in page["nodes"]]
+
+    def test_paging_past_a_spineless_group_keeps_every_worded_group(self):
+        spineless = self._row("khaki")
+        rows = [spineless] + self._worded_rows()
+        first = self._page(rows)
+        cursor = first["paging"]["next_cursor"]
+        self.assertEqual(cursor, "unknown:1:" + spineless["branch_key_hex"])
+        # Each worded group sorts after the spineless one in the page order and
+        # below it as a plain string, which is what a string cursor gets wrong.
+        self.assertTrue(all(word < cursor for word in ("crane", "nurdy", "salet")))
+        second = self._page(rows, cursor=cursor)
+        self.assertEqual(second["paging"]["total_group_count"], 4)
+        self.assertEqual(second["paging"]["returned_group_count"], 1)
+        self.assertEqual(self._words(second), ["crane"])
+
+    def test_walking_every_page_visits_each_group_exactly_once(self):
+        rows = [self._row("khaki")] + self._worded_rows()
+        visited, cursor = [], None
+        for _ in range(len(rows) + 1):
+            page = self._page(rows, cursor=cursor)
+            visited.extend(
+                (node["step"] or {}).get("word") or node["node_id"]
+                for node in page["nodes"]
+            )
+            cursor = page["paging"]["next_cursor"]
+            if cursor is None:
+                break
+        self.assertIsNone(cursor)
+        self.assertEqual(len(visited), len(set(visited)))
+        self.assertEqual(visited[1:], ["crane", "nurdy", "salet"])
+
+    def test_a_cursor_whose_group_has_gone_resumes_where_it_stood(self):
+        rows = self._worded_rows()
+        after_word = self._page(rows, cursor="khaki", limit=10)
+        self.assertEqual(self._words(after_word), ["nurdy", "salet"])
+        after_spineless = self._page(rows, cursor="unknown:1:" + "ab" * 5, limit=10)
+        self.assertEqual(
+            self._words(after_spineless), ["crane", "nurdy", "salet"]
+        )
