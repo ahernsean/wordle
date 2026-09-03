@@ -312,6 +312,27 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(hotspots["data"]["population"], "current_queue_branches")
         self.assertEqual(len(hotspots["data"]["rows"]), 1)
 
+    def test_tree_report_limits_rows_to_the_selected_worker(self):
+        selected_key = ScoreCache.encode_subset(["salet"])
+        other_key = ScoreCache.encode_subset(["crane"])
+        queue = Mock()
+        queue.report_queue_rows.return_value = {"rows": [
+            {"branch_key_hex": selected_key.hex()},
+            {"branch_key_hex": other_key.hex()},
+        ]}
+        queue.heartbeats_with_branch.return_value = [{
+            "worker_id": "worker-2", "current_branch_key": selected_key,
+        }]
+        layout = {"tree_available": True, "nodes": ["selected"]}
+        request = ReportRequest(report_kind="queue", tree=True, worker_id="2")
+        with (
+            patch("report_model._open_report_queue", return_value=queue),
+            patch("report_model._tree_layout", return_value=layout) as tree_layout,
+        ):
+            report = report_model.collect_tree_report(self.sources, request)
+        self.assertEqual(report["data"]["nodes"], ["selected"])
+        self.assertEqual(len(tree_layout.call_args.args[0]), 1)
+
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         directory = self.temporary_directory.name
