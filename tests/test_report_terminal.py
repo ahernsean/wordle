@@ -2227,6 +2227,23 @@ class RootProgressRendererTest(unittest.TestCase):
         self.assertIn("524,184", output)
 
 class TerminalUtilityTest(unittest.TestCase):
+    def test_finalization_schedule_renderer_covers_rank_and_republish_evidence(self):
+        self.assertEqual(report_terminal._finalization_schedule_lines({}, 80), [])
+        lines = report_terminal._finalization_schedule_lines({
+            "winner_best_first_rank": 2,
+            "candidates_completed_before_winner": 5,
+            "weakest_best_first_rank_before_winner": 9,
+            "winner_republish_count": 2,
+            "republished_candidate_count": 3,
+            "max_candidate_republish_count": 4,
+        }, 120)
+        rendered = "\n".join(lines)
+        self.assertIn("winner ranked 2", rendered)
+        self.assertIn("5 candidates completed first", rendered)
+        self.assertIn("weakest of them ranked 9", rendered)
+        self.assertIn("winner republished 2x", rendered)
+        self.assertIn("3 candidates republished (up to 4x each)", rendered)
+
     def test_terminal_labels_sweeps_and_change_highlighting_cover_edge_cases(self):
         display_order = report_terminal.DisplayOrder()
         display_order.hotkey_letters["key"] = "a"
