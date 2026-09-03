@@ -2476,6 +2476,19 @@ class TerminalUtilityTest(unittest.TestCase):
         output = report_terminal.render_report(report, width=100)
         self.assertIn("bucket", output)
         self.assertIn("best_erd=2.500", output)
+        report["report_kind"] = "cache"
+        report["data"] = {
+            "summary": {"exact_branch_count": 3, "loss_branch_count": 1,
+                        "recent_exact_branch_count": 2},
+            "distributions": {
+                "state_branch_counts": {"exact": 3},
+                "exact_branch_count_by_max_remaining_depth": {"3": 3},
+                "exact_branch_count_by_solve_budget": {"4": 3},
+                "exact_branch_count_by_taint": {"clean": 3},
+                "loss_branch_count_by_loss_budget": {"2": 1},
+            },
+        }
+        self.assertIn("max remaining depth: 3=3", report_terminal.render_report(report, width=100))
 
     def test_opener_renderer_shows_paged_summary_and_shared_ownership(self):
         report = overview_report()
