@@ -620,25 +620,36 @@ class OverviewRendererTest(unittest.TestCase):
             "queue": {
                 "branch_status": "evaluating", "branch_worker_status": "active",
                 "priority": 0, "budget": 6, "best_guess": None,
-                "ceiling": None, "search_node_count": 0,
-                "candidate_count": 3, "completed_candidate_count": 0,
+                "ceiling": None, "search_node_count": 1200,
+                "candidate_count": 3, "completed_candidate_count": 2,
                 "bulk_completed_candidate_count": 0,
-                "one_level_erd_pruned_candidate_count": 0,
-                "two_level_erd_pruned_candidate_count": 0,
+                "one_level_erd_pruned_candidate_count": 1,
+                "two_level_erd_pruned_candidate_count": 1,
             },
             "cache": {
                 "cache_state": "missing", "best_guess": None,
                 "best_erd": None, "max_remaining_depth": None,
             },
-            "workers": [],
-            "republished_candidates": [],
+            "workers": [{
+                **deepcopy(overview_report()["data"]["workers"][0]),
+                "candidate_index": 2, "worker_number": "0",
+            }],
+            "bundle_summary": {"wall_millis": 120000},
+            "candidate_eta": {
+                "state": "ready", "sample_duration_seconds": 180,
+                "sample_worker_count": 1, "current_worker_count": 2,
+                "worker_count_changed": True, "estimated_seconds": 90,
+                "remaining_inspection_count": 8,
+                "expected_full_evaluation_count": 3,
+            },
+            "republished_candidates": [{"republish_count": 2}],
             "claims": None,
             "claim_summary": {
                 "total_claim_count": 12972, "done_count": 12819,
                 "in_flight_count": 5, "evaluated_count": 11200,
                 "one_level_erd_pruned_count": 1500,
                 "two_level_erd_pruned_count": 119,
-                "provenance_unknown_count": 0,
+                "provenance_unknown_count": 3,
                 "worker_contributions": [
                     {"worker_id": "worker-0", "done_count": 6484},
                     {"worker_id": "worker-2", "done_count": 6335},
@@ -648,12 +659,16 @@ class OverviewRendererTest(unittest.TestCase):
         }
         output = render_report(report, width=100)
         self.assertNotIn("12,819 done", output)
-        self.assertIn("candidates 0/3 =", output)
+        self.assertIn("candidates 2/3 =", output)
         self.assertNotIn("=  + evaluated", output)
         self.assertIn("evaluated 11,200", output)
-        self.assertNotIn("1,500 one-level ERD prunes", output)
-        self.assertNotIn("119 two-level ERD prunes", output)
+        self.assertIn("one-level ERD prunes 1", output)
+        self.assertIn("two-level ERD prunes 1", output)
         self.assertIn("in flight 5", output)
+        self.assertIn("wall-time=2m", output)
+        self.assertIn("+ unattributed 3", output)
+        self.assertIn("scaling 1→2 workers", output)
+        self.assertIn("1 re-queued (up to 2x each)", output)
         self.assertIn("worker evals w0:6,484 w2:6,335", output)
         self.assertNotIn("idx=", output)
 
