@@ -597,6 +597,53 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(eta["expected_full_evaluation_count"], 150)
         self.assertEqual(eta["estimated_seconds"], 105)
 
+    def test_candidate_eta_withholds_an_estimate_it_cannot_support(self):
+        base = {
+            "best_updated_at": 900, "window_started_at": 900,
+            "inspected_candidate_count": 200, "pruned_candidate_count": 150,
+            "inspection_worker_millis": 20_000,
+            "evaluated_candidate_count": 50,
+            "evaluation_worker_millis": 50_000,
+        }
+        work = {"candidate_count": 1_000, "completed_candidate_count": 400}
+
+        def eta(payload=None, **sample):
+            return _candidate_eta(
+                payload or work, {**base, **sample},
+                live_worker_count=2, now=1_600,
+            )
+
+        # Nothing left to evaluate is not a slow estimate, it is no estimate.
+        self.assertIsNone(
+            eta({"candidate_count": 400, "completed_candidate_count": 400})
+        )
+        # A timing the sample never observed would divide by zero, so the
+        # estimate is withheld instead.
+        for sample in (
+            {"inspection_worker_millis": 0},
+            {"evaluated_candidate_count": 0},
+            {"inspected_candidate_count": 0, "pruned_candidate_count": 0,
+             "evaluated_candidate_count": 0},
+        ):
+            with self.subTest(sample=sample):
+                self.assertNotEqual(eta(**sample)["state"], "ready")
+
+    def test_candidate_eta_expects_no_evaluations_when_every_check_prunes(self):
+        eta = _candidate_eta(
+            {"candidate_count": 1_000, "completed_candidate_count": 400},
+            {
+                "best_updated_at": 900, "window_started_at": 900,
+                "inspected_candidate_count": 200,
+                "pruned_candidate_count": 200,
+                "inspection_worker_millis": 20_000,
+                "evaluated_candidate_count": 50,
+                "evaluation_worker_millis": 50_000,
+            },
+            live_worker_count=2, now=1_600,
+        )
+        self.assertEqual(eta["expected_full_evaluation_count"], 0)
+        self.assertEqual(eta["state"], "ready")
+
     def test_candidate_eta_learns_after_a_new_best_erd(self):
         eta = _candidate_eta(
             {"candidate_count": 1_000, "completed_candidate_count": 400},
@@ -1058,6 +1105,144 @@ class ReportModelTest(unittest.TestCase):
             sum(group["rollup"]["answer_count"] for group in groups),
             summary["answer_count"],
         )
+
+    def test_branch_target_scoping_and_row_matching_cover_each_kind(self):
+        root = parse_report_branch_target("")
+        reference = parse_report_branch_target("@abcdef12")
+        word = parse_report_branch_target("salet")
+        branch = parse_report_branch_target("salet -----")
+
+        # A reference names a branch only the queue can resolve, so without one
+        # it scopes nothing rather than guessing.
+        self.assertEqual(
+            report_model._branch_target_queue_scope(reference, None), ({}, "")
+        )
+        # A resolved reference whose row carries no spine scopes by key alone.
+        with patch.object(
+            report_model, "resolve_branch_reference",
+            return_value={"branch_key": b"salet", "spine": None},
+        ):
+            scope, prefix = report_model._branch_target_queue_scope(
+                reference, Mock()
+            )
+        self.assertEqual(prefix, "")
+        self.assertNotIn("spine_prefix", scope)
+
+        self.assertTrue(report_model._row_matches_branch_target({}, root, ""))
+        self.assertTrue(report_model._row_matches_branch_target(
+            {"spine": None, "source_word": "SALET"}, word, "SALET"
+        ))
+        self.assertFalse(report_model._row_matches_branch_target(
+            {"spine": None, "source_word": "crane"}, word, "SALET"
+        ))
+        # A spine-scoped target cannot match a row that has no spine.
+        self.assertFalse(report_model._row_matches_branch_target(
+            {"spine": None}, branch, ""
+        ))
+
+    def test_queue_report_scopes_to_a_tree_parent_and_survives_a_queue_error(self):
+        tree_request = ReportRequest(
+            report_kind="queue", tree=True, tree_parent="SALET -----",
+        )
+        collect_report(self.sources, tree_request)
+        flat_request = ReportRequest(report_kind="queue")
+        collect_report(self.sources, flat_request)
+        with patch.object(report_model, "_open_report_queue",
+                          side_effect=sqlite3.OperationalError("queue locked")):
+            for request in (tree_request, flat_request):
+                with self.subTest(tree=request.tree):
+                    report = collect_report(self.sources, request)
+                    self.assertFalse(report["sources"]["queue"]["ok"])
+
+    def test_branch_report_survives_a_cache_that_will_not_open(self):
+        request = ReportRequest(
+            branch_target=parse_report_branch_target("salet -----")
+        )
+        with patch.object(
+            report_model, "ScoreCache",
+            side_effect=sqlite3.OperationalError("cache locked"),
+        ):
+            report = collect_report(self.sources, request)
+        self.assertFalse(report["sources"]["cache"]["ok"])
+
+    def test_branch_report_pages_finalizations_in_both_directions(self):
+        for direction in ("after", "before"):
+            with self.subTest(direction=direction):
+                request = ReportRequest(
+                    branch_target=parse_report_branch_target("salet -----"),
+                    filters=ReportFilters(
+                        finalization_cursor_direction=direction,
+                        finalization_cursor_recorded_at=1_700_000_000,
+                        finalization_cursor_id=42,
+                    ),
+                )
+                collect_report(self.sources, request)
+
+    def test_a_branch_reference_needs_a_queue_or_a_cache_to_resolve(self):
+        request = ReportRequest(
+            branch_target=parse_report_branch_target("@abcdef12")
+        )
+        with (
+            patch.object(report_model, "ScoreCache",
+                         side_effect=sqlite3.OperationalError("cache locked")),
+            patch.object(report_model, "_open_report_queue",
+                         side_effect=sqlite3.OperationalError("queue locked")),
+        ):
+            with self.assertRaises(sqlite3.OperationalError):
+                collect_report(self.sources, request)
+
+    def test_a_branch_report_resolves_from_the_answer_list_without_a_queue(self):
+        request = ReportRequest(
+            branch_target=parse_report_branch_target("salet -----")
+        )
+        with patch.object(report_model, "_open_report_queue",
+                          side_effect=sqlite3.OperationalError("queue locked")):
+            report = collect_report(self.sources, request)
+        self.assertFalse(report["sources"]["queue"]["ok"])
+
+    def test_word_report_filters_and_sorts_its_response_groups(self):
+        target = parse_report_branch_target("salet")
+
+        def groups(**filter_values):
+            request = ReportRequest(
+                branch_target=target, filters=ReportFilters(**filter_values)
+            )
+            return collect_report(
+                self.sources, request
+            )["data"]["response_groups"]
+
+        everything = groups()
+        self.assertTrue(everything)
+        self.assertLessEqual(
+            len(groups(branch_statuses=("evaluating",))), len(everything)
+        )
+        self.assertLessEqual(
+            len(groups(branch_worker_statuses=("active",))), len(everything)
+        )
+        self.assertTrue(all(
+            row["answer_count"] <= 1 for row in groups(maximum_answer_count=1)
+        ))
+        self.assertTrue(all(
+            row["priority"] == 4 for row in groups(priority=4)
+        ))
+        # A budget other than the one these groups are solved at matches none.
+        self.assertEqual(groups(budget=2), [])
+        for sort, rank in (
+            ("size", lambda row: -row["answer_count"]),
+            ("workers", lambda row: -row["worker_count"]),
+            ("priority", lambda row: -(row["priority"] or 0)),
+        ):
+            with self.subTest(sort=sort):
+                ranks = [rank(row) for row in groups(sort=sort)]
+                self.assertEqual(ranks, sorted(ranks))
+
+    def test_word_report_includes_answer_words_on_request(self):
+        request = ReportRequest(
+            branch_target=parse_report_branch_target("salet"),
+            include_answers=True,
+        )
+        groups = collect_report(self.sources, request)["data"]["response_groups"]
+        self.assertTrue(any("answer_words" in row for row in groups))
 
     def test_collect_word_report_omits_groups_when_ungrouped(self):
         request = ReportRequest(branch_target=parse_report_branch_target("salet"))
