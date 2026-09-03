@@ -148,6 +148,18 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(report["data"]["candidates"][0]["answer_count"], 2)
         self.assertTrue(report["sources"]["queue"]["ok"])
 
+    def test_openers_filter_offsets_and_sort_validation(self):
+        for filters, message in (
+            (ReportFilters(source_offset=-1), "cannot be negative"),
+            (ReportFilters(branch_row_offset=-1), "cannot be negative"),
+            (ReportFilters(sort="nope"), "must be one"),
+        ):
+            with self.subTest(filters=filters):
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_report_request(ReportRequest(report_kind="openers", filters=filters))
+        allowed = ReportFilters(source_offset=0, branch_row_offset=0, sort="word")
+        validate_report_request(ReportRequest(report_kind="openers", filters=allowed))
+
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         directory = self.temporary_directory.name
