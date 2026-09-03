@@ -307,6 +307,16 @@ class ReportModelTest(unittest.TestCase):
         self.assertIn("cache", report["data"])
         self.assertIn("branch_reference", report["data"])
 
+    def test_branch_report_collects_an_unqueued_spine_without_creating_work(self):
+        request = ReportRequest(
+            report_kind="branch", branch_target=parse_report_branch_target("RAISE -----"),
+            include_answers=True,
+        )
+        report = report_model.collect_branch_report(self.sources, request)
+        self.assertIn(report["data"]["branch"]["branch_status"], ("done", "unqueued"))
+        self.assertIsNone(report["data"]["queue"])
+        self.assertTrue(report["sources"]["queue"]["ok"])
+
     def test_queue_and_current_hotspot_reports_normalize_rows(self):
         branch_key = ScoreCache.encode_subset(["salet"])
         queue = Mock(epoch=12)
