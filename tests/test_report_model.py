@@ -355,7 +355,23 @@ class ReportModelTest(unittest.TestCase):
             self.sources, ANSWERS, [], b"key", None))
         with patch("report_model.PatternMatrix.load_if_built", return_value=None):
             self.assertIsNone(report_model._maximum_response_group_count(
-                self.sources, ANSWERS, ANSWERS, b"other", None))
+               self.sources, ANSWERS, ANSWERS, b"other", None))
+
+    def test_source_summary_and_group_helpers_cover_active_and_empty_states(self):
+        row = {"source_word": "raise", "branch_count": 3,
+               "requested_priority": 4, "request_count": 1,
+               "direct_branch_count": 2, "direct_done_branch_count": 1,
+               "has_incomplete_request": 1, "has_active_request": 1,
+               "started_at": 10}
+        payload = report_model._source_summary_payload(
+            row, {"open_branch_count": 2, "worker_count": 1},
+            {"completed_at": None, "elapsed_millis": None, "worker_millis": None}, 20)
+        self.assertEqual(payload["state"], "active")
+        self.assertEqual(payload["elapsed_millis"], 10_000)
+        self.assertEqual(report_model._source_erd_sort_key({"source_word": "raise"})[0], 3)
+        self.assertEqual(report_model._duration_group_key(31 * 24 * 60 * 60 * 1000)[1], "[1 month, ∞)")
+        self.assertEqual(report_model._source_word_group_key(
+            {"worker_count": 0}, "worker_presence", 0), (1, "no workers"))
 
     def test_queue_and_current_hotspot_reports_normalize_rows(self):
         branch_key = ScoreCache.encode_subset(["salet"])
