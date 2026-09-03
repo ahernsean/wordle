@@ -2474,6 +2474,36 @@ class TerminalUtilityTest(unittest.TestCase):
         self.assertIn("bucket", output)
         self.assertIn("best_erd=2.500", output)
 
+    def test_opener_renderer_shows_paged_summary_and_shared_ownership(self):
+        report = overview_report()
+        report.update({"report_kind": "openers", "tree": False,
+                       "branch_target": {"trailing_word": "raise"}})
+        summary = {
+            "source_word": "raise", "request_count": 2,
+            "requested_priority": 7, "state": "active",
+            "erd_summary": {"state": "pending", "resolved_group_count": 1,
+                            "response_group_count": 2},
+            "direct_branch_count": 2, "branch_count": 3,
+            "open_branch_count": 2, "done_branch_count": 1,
+            "worker_count": 1, "requested_at": 900,
+        }
+        report["data"] = {
+            "summary": [summary], "total_source_word_count": 2,
+            "matched_rows": 1,
+            "rows": [{
+                "branch_key_hex": "key", "source_work_id": 4,
+                "source_word": "raise", "branch_reference": "abcdefgh",
+                "branch_status": "evaluating", "branch_worker_status": "active",
+                "requested_priority": 7, "branch_effective_priority": 9,
+                "is_shared": True, "owner_count": 2, "root_pattern": "-----",
+                "parent_branch_reference": "ijklmnop", "worker_count": 1,
+            }],
+        }
+        output = report_terminal.render_report(report, width=120)
+        self.assertIn("Openers: 1 of 2", output)
+        self.assertIn("Ownership:", output)
+        self.assertIn("shared, 2 owner(s)", output)
+
 
 if __name__ == "__main__":
     unittest.main()
