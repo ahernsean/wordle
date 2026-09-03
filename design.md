@@ -330,7 +330,7 @@ displays a warning.
 ## Parallel ERD Precache (Swarm)
 
 The precache fills `branch_best_by_policy` for `ERD_ALL` across all branches
-reachable from the opener (typically SALET). Because evaluating every candidate
+reachable from the opener (typically TARSE). Because evaluating every candidate
 against a branch is slow, multiple workers cooperate:
 
 ### Architecture

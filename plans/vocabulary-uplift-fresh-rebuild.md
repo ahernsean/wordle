@@ -1,4 +1,4 @@
-# Vocabulary uplift: fresh cache rebuild, SALET-first
+# Vocabulary uplift: fresh cache rebuild, TARSE-first
 
 ## Status and scope
 
@@ -37,8 +37,8 @@ The retention plan was measured and reviewed into irrelevance:
 
 The cost is bounded, visible compute: the same solves the retention plan
 would have run anyway (measured 3.0–8.7 days on 6 workers for the full old
-population; SALET-first scope is a fraction of that and reaches the
-production milestone — the SALET tree on the phone — earliest).
+population; TARSE-first scope is a fraction of that and reaches the
+production milestone — the TARSE tree on the phone — earliest).
 
 ## Dropped from the retired plan, and why
 
@@ -161,7 +161,7 @@ step 3, never before.
 Keeps rebuild telemetry windowable apart from epoch 8's baseline:
 
 ```
-python3.13 erd_search.py epoch set 9 --label fresh-rebuild-salet --notes "vocabulary uplift rebuild"
+python3.13 erd_search.py epoch set 9 --label fresh-rebuild-tarse --notes "vocabulary uplift rebuild"
 ```
 
 Refuses while worker heartbeats are live (the swarm is already stopped from
@@ -170,13 +170,13 @@ to the current checkout's short SHA. `erd_search.py epoch show` prints the
 active epoch's metadata at any time — including right after this command, to
 confirm it took.
 
-### 6. Seed SALET only
+### 6. Seed TARSE only
 
 ```
-python3.13 erd_search.py queue add --word salet
+python3.13 erd_search.py queue add --word tarse
 ```
 
-This enqueues every SALET root response branch with ≥2 answer words, each
+This enqueues every TARSE root response branch with ≥2 answer words, each
 carrying its (guess, pattern) spine, so budgets derive exactly as they
 always have (`budget = GAME_GUESSES − guess_depth`). Nothing else about
 worker behavior changes: missing children solve inline, tainted results
@@ -194,12 +194,12 @@ python3.13 erd_search.py start
 python3.13 erd_search.py view --watch
 ```
 
-`view --workers` for worker health, `view salet` for the cone, `view
+`view --workers` for worker health, `view tarse` for the cone, `view
 --queue` for queue totals. A reboot mid-run simply resumes the queue.
 
 ### 8. Drain, then decide
 
-When the SALET cone drains (no pending or active branches), the SALET tree
+When the TARSE cone drains (no pending or active branches), the TARSE tree
 is complete in the new cache. Decide: add more openers (step 6 again), or
 proceed to the phone. Partial coverage is fine for the phone — anything
 uncached solves on device, slower but correct.
