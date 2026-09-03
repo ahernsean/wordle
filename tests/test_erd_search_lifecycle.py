@@ -479,6 +479,13 @@ class QueueOperatorCommandTest(unittest.TestCase):
             [((True,), {}), ((False,), {})],
         )
 
+        queue.reset_mock()
+        queue.wal_size_bytes.return_value = erd_search.QUEUE_WAL_QUIESCE_BYTES
+        queue.checkpoint.return_value = (1, 0, 0)
+        with patch.object(erd_search.time, "time", side_effect=[0, 1_000]):
+            erd_search._maybe_quiesce_truncate(queue)
+        self.assertEqual(queue.set_checkpoint_pause.call_args_list, [((True,), {}), ((False,), {})])
+
         process = Mock(pid=1)
         process.is_alive.return_value = True
         with patch.object(erd_search.os, "kill", side_effect=OSError("gone")):
