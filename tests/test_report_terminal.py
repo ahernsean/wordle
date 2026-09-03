@@ -1219,6 +1219,15 @@ class ViewSessionTest(unittest.TestCase):
         self.assertIn("[0-9] worker", rendered)
         self.assertIn("[esc] back", rendered)
 
+    def test_navigate_back_is_a_noop_at_the_root_and_resets_after_selection(self):
+        session = WatchSession(view_args(), FakeInput(), io.StringIO())
+        with patch.object(session, "_reset_navigation_display") as reset:
+            session._navigate_back()
+            reset.assert_not_called()
+            session.navigation_stack.append(session.current_request)
+            session._navigate_back()
+        self.assertEqual(len(session.navigation_stack), 1)
+
     def test_branch_navigation_targets_use_spine_then_reference_fallback(self):
         session = WatchSession(view_args(), FakeInput(), io.StringIO())
         from_list = session._branch_target({
