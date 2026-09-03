@@ -7,7 +7,7 @@ import tempfile
 import time
 import unittest
 from dataclasses import replace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from cache_sqlite import ScoreCache
 from pattern_matrix import PatternMatrix
@@ -119,6 +119,34 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(report_model.branch_status_and_worker_status("pending", None, 0), ("queued", None))
         self.assertEqual(report_model.branch_status_and_worker_status(None, "open", 1), ("evaluating", "active"))
         self.assertEqual(report_model.branch_status_and_worker_status(None, "finalized", 0), ("finalizing", "waiting"))
+
+    def test_branch_reference_resolution_and_ambiguity_report(self):
+        key = ScoreCache.encode_subset(["salet", "crane"])
+        queue = Mock()
+        queue.branch_rows_for_reference_prefix.return_value = []
+        cache = Mock()
+        cache.branch_keys_for_reference_prefix.return_value = []
+        with self.assertRaisesRegex(ValueError, "No queued"):
+            resolve_branch_reference(queue, "abcd", cache)
+        cache.branch_keys_for_reference_prefix.return_value = [key, b"other"]
+        with self.assertRaisesRegex(ValueError, "ambiguous") as raised:
+            resolve_branch_reference(queue, "abcd", cache)
+        self.assertEqual(len(raised.exception.candidates), 2)
+
+        request = ReportRequest(branch_target=parse_report_branch_target("@abcd"))
+        error = ValueError("ambiguous")
+        error.candidates = [{"branch_reference": "abcd", "branch_key": key, "spine": None}]
+        base = {"sources": {"queue": {}, "cache": {}}}
+        with (
+            patch("report_model._decorative_answer_set", return_value={"salet", "crane"}),
+            patch("report_model._semantic_report", side_effect=lambda *_args: {
+                **base, "data": _args[4],
+            }),
+        ):
+            report = report_model.collect_ambiguous_branch_reference_report(
+                self.sources, request, error)
+        self.assertEqual(report["data"]["candidates"][0]["answer_count"], 2)
+        self.assertTrue(report["sources"]["queue"]["ok"])
 
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
