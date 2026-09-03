@@ -2557,6 +2557,26 @@ class TerminalUtilityTest(unittest.TestCase):
         }
         self.assertIn("max remaining depth: 3=3", report_terminal.render_report(report, width=100))
 
+    def test_cache_collection_renders_group_rows_and_a_single_branch(self):
+        report = overview_report()
+        report.update({"report_kind": "cache", "tree": False})
+        report["data"] = {"rows": [
+            {"branch_key_hex": "aa", "branch_reference": "abcdefgh",
+             "pattern": "-y---", "answer_count": 4, "cache_state": "missing"},
+            {"branch_key_hex": "bb", "branch_reference": "12345678",
+             "pattern": "g----", "answer_count": 2, "cache_state": "exact"},
+        ]}
+        rows_output = report_terminal.render_report(report, width=120)
+        self.assertIn("-y--- n=4 not cached", rows_output)
+        self.assertIn("g---- n=2 exact", rows_output)
+        report["data"] = {
+            "branch_reference": "abcdefgh",
+            "cache": {"cache_state": "missing"},
+        }
+        self.assertIn(
+            "not cached", report_terminal.render_report(report, width=120)
+        )
+
     def test_opener_renderer_shows_paged_summary_and_shared_ownership(self):
         report = overview_report()
         report.update({"report_kind": "openers", "tree": False,
@@ -2628,3 +2648,137 @@ class TerminalUtilityTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WatchSessionInputTest(unittest.TestCase):
+    """Keystroke handling in the interactive watch loop."""
+
+    def _session(self, text="", watch=1.0):
+        return WatchSession(
+            view_args(watch=watch), FakeInput(text, tty=True), io.StringIO()
+        )
+
+    def test_the_watch_interval_expiring_refreshes_without_a_keystroke(self):
+        session = self._session(watch=0)
+        self.assertTrue(session._wait_for_refresh())
+
+    def test_a_character_held_from_the_previous_read_is_consumed_first(self):
+        session = self._session()
+        session.pending_input_character = " "
+        self.assertTrue(session._wait_for_refresh())
+        self.assertIsNone(session.pending_input_character)
+
+    def test_an_idle_poll_keeps_waiting_until_a_keystroke_arrives(self):
+        session = self._session(" ")
+        polls = [([], [], []), ([session.input_stream], [], [])]
+        with patch("report_terminal.select.select", side_effect=polls):
+            self.assertTrue(session._wait_for_refresh())
+
+    def test_a_back_keystroke_navigates_back_and_refreshes(self):
+        for key in ("\x08", "\x7f", "\x1b"):
+            with self.subTest(key=key):
+                session = self._session(key)
+                session._navigate_back = Mock()
+                with patch(
+                    "report_terminal.select.select",
+                    return_value=([session.input_stream], [], []),
+                ):
+                    self.assertTrue(session._wait_for_refresh())
+                session._navigate_back.assert_called_once_with()
+
+    def test_a_digit_naming_no_worker_is_ignored_and_the_wait_resumes(self):
+        session = self._session("9")
+        session.worker_hotkeys = {}
+        with patch(
+            "report_terminal.select.select",
+            return_value=([session.input_stream], [], []),
+        ):
+            # "9" selects nothing, so the loop goes round and reads the empty
+            # stream, which ends the session rather than selecting a worker.
+            self.assertFalse(session._wait_for_refresh())
+        self.assertIsNone(session.current_request.worker_id)
+
+    def test_a_worker_number_stops_at_a_quiet_input_stream(self):
+        session = self._session()
+        session.worker_hotkeys = {"12": "worker-12"}
+        with patch("report_terminal.select.select", return_value=([], [], [])):
+            self.assertEqual(session._read_worker_number("1"), "1")
+
+    def test_a_worker_number_stops_at_a_non_digit_and_holds_it(self):
+        session = self._session("q")
+        session.worker_hotkeys = {"12": "worker-12"}
+        with patch(
+            "report_terminal.select.select",
+            return_value=([session.input_stream], [], []),
+        ):
+            self.assertEqual(session._read_worker_number("1"), "1")
+        self.assertEqual(session.pending_input_character, "q")
+
+    def test_an_interrupt_while_preparing_the_terminal_restores_it(self):
+        session = WatchSession(
+            view_args(watch=1.0), FakeInput(tty=True), FakeOutput(tty=True)
+        )
+        with (
+            patch("report_terminal.termios.tcgetattr", return_value=[0, 0, 0, 0]),
+            patch(
+                "report_terminal.termios.tcsetattr",
+                side_effect=[KeyboardInterrupt, None],
+            ) as set_attributes,
+        ):
+            session._run_tty_text()
+        # The cursor was never hidden, so it is not restored, but the saved
+        # terminal settings are put back either way.
+        self.assertFalse(session.cursor_hidden)
+        self.assertEqual(set_attributes.call_count, 2)
+
+
+class StackedRowRenderingTest(unittest.TestCase):
+    """The narrow-width fallback that stacks each field on its own line."""
+
+    def _columns(self):
+        return [
+            report_terminal.TerminalColumn(heading="word", value="word"),
+            report_terminal.TerminalColumn(
+                heading="spine", value="spine", truncation="tail",
+            ),
+        ]
+
+    def _render(self, rows, width):
+        return report_terminal._render_stacked_rows(
+            self._columns(), rows, width, "  ", None, False,
+        )
+
+    def test_a_field_that_fits_stays_on_one_line(self):
+        lines = self._render([{"word": "salet", "spine": "RAISE -----"}], 60)
+        self.assertIn("  word: salet", lines)
+        self.assertIn("  spine: RAISE -----", lines)
+
+    def test_a_truncatable_field_is_cut_to_the_room_left_by_its_heading(self):
+        lines = self._render(
+            [{"word": "salet", "spine": "RAISE ----- CRANE y----"}], 20
+        )
+        self.assertIn("  word: salet", lines)
+        self.assertTrue(any(line.startswith("  spine: ") and "…" in line
+                            for line in lines))
+
+    def test_consecutive_rows_are_separated_by_a_blank_line(self):
+        lines = self._render(
+            [{"word": "salet", "spine": "a"}, {"word": "crane", "spine": "b"}],
+            60,
+        )
+        self.assertIn("", lines)
+        self.assertLess(lines.index(""), lines.index("  word: crane"))
+
+
+class ChangeHighlightTest(unittest.TestCase):
+    def test_a_change_that_ends_mid_line_is_closed_before_the_tail(self):
+        highlighted = report_terminal._highlight_changes("abXde", "abcde")
+        self.assertIn(report_terminal.RED, highlighted)
+        self.assertIn(report_terminal.RESET, highlighted)
+        # The reset lands before the unchanged tail, not at end of line.
+        self.assertTrue(highlighted.endswith("de"))
+
+    def test_an_absent_erd_summary_reads_as_not_available(self):
+        for empty in (None, {}):
+            with self.subTest(empty=empty):
+                self.assertEqual(report_terminal._word_erd_line(empty), "ERD: n/a")

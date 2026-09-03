@@ -1,6 +1,7 @@
 """Tests for the read-only HTTP report adapter."""
 
 from contextlib import contextmanager
+import errno
 from http.server import ThreadingHTTPServer
 from threading import Event, Lock, Thread
 import io
@@ -183,6 +184,17 @@ class ReportServerTest(unittest.TestCase):
             with self.subTest(query=query):
                 with self.assertRaisesRegex(InvalidRequest, message):
                     parse_report_request("/api/view", query)
+
+    def test_a_boolean_parameter_accepts_both_spellings_of_false(self):
+        for query in ("tree=0", "tree=false", "tree=FALSE"):
+            with self.subTest(query=query):
+                self.assertFalse(parse_report_request("/api/view", query).tree)
+
+    def test_a_tree_parent_that_is_not_a_branch_target_is_an_invalid_request(self):
+        # parse_report_branch_target raises ValueError on a malformed token,
+        # which reaches the reader as a bad request rather than a crash.
+        with self.assertRaisesRegex(InvalidRequest, "hexadecimal"):
+            parse_report_request("/api/view", "tree=1&tree_parent=@zz")
 
     def test_root_overview_defaults_to_worked_branches_and_all_disables_filter(self):
         default_request = parse_report_request("/api/view", "")
@@ -530,6 +542,23 @@ class ReportServerMainTest(unittest.TestCase):
         ):
             main()
         server.server_close.assert_called_once_with()
+
+
+class ReportServerStartupTest(unittest.TestCase):
+    def test_a_startup_failure_that_is_not_a_port_collision_is_raised(self):
+        refused = OSError(errno.EACCES, "permission denied")
+        with (
+            patch("sys.argv", ["report_server.py"]),
+            patch("report_server.ensure_runtime_dir"),
+            patch(
+                "report_server.build_configuration",
+                return_value=fixture_configuration(),
+            ),
+            patch("report_server.ThreadingHTTPServer", side_effect=refused),
+        ):
+            with self.assertRaises(OSError) as raised:
+                main()
+        self.assertEqual(raised.exception.errno, errno.EACCES)
 
 
 class SourcesRequestTest(unittest.TestCase):
