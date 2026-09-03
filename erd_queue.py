@@ -1065,6 +1065,17 @@ class ERDQueue:
             self._conn.execute("DROP VIEW IF EXISTS live_branch_source_rows")
             self._conn.execute("DROP VIEW IF EXISTS live_branch_opener_rows")
         if "source_work" in existing_tables:
+            # ALTER TABLE ... RENAME TO renames the table but leaves any index
+            # on it under its old name -- idx_source_work_priority_order does
+            # not become idx_opener_work_priority_order, it stays exactly as
+            # named and simply now points at opener_work.  Dropping only the
+            # new name here is therefore a no-op on a real old-schema database
+            # (that name has never existed yet) and leaves the genuinely old
+            # one behind, duplicating the index CREATE INDEX below adds.  Both
+            # names must be dropped; which happens before or after the rename
+            # makes no difference, since DROP INDEX addresses the index by its
+            # own name regardless of which table it is currently attached to.
+            self._conn.execute("DROP INDEX IF EXISTS idx_source_work_priority_order")
             self._conn.execute("DROP INDEX IF EXISTS idx_opener_work_priority_order")
             self._conn.execute("DROP TABLE IF EXISTS opener_work")
             self._conn.execute("ALTER TABLE source_work RENAME TO opener_work")
@@ -1078,6 +1089,8 @@ class ERDQueue:
                     ON opener_work(requested_priority DESC, opener_work_id)
             """)
         if "branch_source_work" in existing_tables:
+            # Same index-survives-the-rename hazard as opener_work above.
+            self._conn.execute("DROP INDEX IF EXISTS idx_branch_source_work_source")
             self._conn.execute("DROP INDEX IF EXISTS idx_branch_opener_work_opener")
             self._conn.execute("DROP TABLE IF EXISTS branch_opener_work")
             self._conn.execute(

@@ -401,7 +401,16 @@ class TestBranchLifecycle(_TmpQueue):
         source_work/branch_source_work/source_word/source_pattern shape,
         starting from whatever opener_* rows the current test has already
         populated through self.q.  Used to prove rename_source_to_opener
-        migrates a real legacy database rather than only a synthetic one."""
+        migrates a real legacy database rather than only a synthetic one.
+
+        ALTER TABLE ... RENAME TO does not rename a table's indexes -- a
+        real pre-Tier-B database carries idx_source_work_priority_order and
+        idx_branch_source_work_source under those exact names, from when
+        they were first created against source_work/branch_source_work, not
+        under the new names with the old ones dropped.  So the old-named
+        indexes are recreated here (before the column/table renames below,
+        so RENAME COLUMN carries their definitions forward the same way it
+        does for the views) rather than simply removing the new ones."""
         self.q.close()
         conn = sqlite3.connect(self.queue_path)
         try:
@@ -409,7 +418,11 @@ class TestBranchLifecycle(_TmpQueue):
                 DROP VIEW IF EXISTS active_branch_owner_rows;
                 DROP VIEW IF EXISTS live_branch_opener_rows;
                 DROP INDEX IF EXISTS idx_opener_work_priority_order;
+                CREATE INDEX idx_source_work_priority_order
+                    ON opener_work(requested_priority DESC, opener_work_id);
                 DROP INDEX IF EXISTS idx_branch_opener_work_opener;
+                CREATE INDEX idx_branch_source_work_source
+                    ON branch_opener_work(opener_work_id, branch_id);
                 ALTER TABLE opener_work RENAME COLUMN opener TO source_word;
                 ALTER TABLE opener_work
                     RENAME COLUMN opener_work_id TO source_work_id;
@@ -464,6 +477,18 @@ class TestBranchLifecycle(_TmpQueue):
             self.assertIn("branch_opener_work", table_names)
             self.assertNotIn("source_work", table_names)
             self.assertNotIn("branch_source_work", table_names)
+
+            # ALTER TABLE ... RENAME TO does not rename a table's indexes, so
+            # the legacy-named indexes (still attached to opener_work/
+            # branch_opener_work after the table rename above) must be
+            # dropped explicitly rather than left to coexist as duplicates
+            # alongside the newly created ones.
+            index_names = {row["name"] for row in migrated._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'")}
+            self.assertNotIn("idx_source_work_priority_order", index_names)
+            self.assertNotIn("idx_branch_source_work_source", index_names)
+            self.assertIn("idx_opener_work_priority_order", index_names)
+            self.assertIn("idx_branch_opener_work_opener", index_names)
 
             opener_rows = {row["opener"]: row
                           for row in migrated.opener_work_rows()}
