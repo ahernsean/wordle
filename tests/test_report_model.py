@@ -194,6 +194,43 @@ class ReportModelTest(unittest.TestCase):
             "", rows, set(ANSWERS))
         self.assertEqual(second_page["paging"]["returned_group_count"], 1)
 
+    def test_accuracy_report_normalizes_each_calibration_collection(self):
+        branch_key = ScoreCache.encode_subset(["salet"])
+        queue = Mock(epoch=9)
+        queue.report_candidate_accuracy.return_value = {
+            "rows": [{"branch_key": branch_key}],
+            "largest_under_predicted": [{"branch_key": branch_key}],
+            "largest_over_predicted": [{"branch_key": branch_key}],
+            "requested_sample_size": 2,
+        }
+        request = ReportRequest(report_kind="accuracy", sample_size=2)
+        with patch("report_model._open_report_queue", return_value=queue):
+            report = report_model.collect_accuracy_report(self.sources, request)
+        self.assertTrue(report["sources"]["queue"]["ok"])
+        self.assertEqual(report["data"]["rows"][0]["branch_key_hex"], branch_key.hex())
+        self.assertIn("branch_reference", report["data"]["largest_under_predicted"][0])
+        queue.close.assert_called_once()
+
+    def test_accuracy_and_historical_hotspot_reports_surface_queue_errors(self):
+        queue = Mock(epoch=9)
+        queue.report_candidate_accuracy.side_effect = sqlite3.OperationalError("offline")
+        with patch("report_model._open_report_queue", return_value=queue):
+            accuracy = report_model.collect_accuracy_report(
+                self.sources, ReportRequest(report_kind="accuracy"))
+        self.assertEqual(accuracy["sources"]["queue"]["error"], "offline")
+
+        branch_key = ScoreCache.encode_subset(["salet"])
+        queue = Mock(epoch=9)
+        queue.report_hotspots.return_value = {
+            "population": "candidate_claims", "epoch": 9, "since": 4,
+            "sample_size": 10, "sampled_row_count": 1, "sample_truncated": False,
+            "rows": [{"branch_key": branch_key, "best_guess": "salet"}],
+        }
+        request = ReportRequest(report_kind="hotspots", hotspot_field="cut-reuse")
+        with patch("report_model._open_report_queue", return_value=queue):
+            hotspots = report_model.collect_hotspot_report(self.sources, request)
+        self.assertEqual(hotspots["data"]["rows"][0]["branch_key_hex"], branch_key.hex())
+
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         directory = self.temporary_directory.name
