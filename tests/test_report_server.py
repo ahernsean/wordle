@@ -65,6 +65,12 @@ def fixture_configuration():
 
 
 class ReportServerTest(unittest.TestCase):
+    def test_request_parser_rejects_invalid_boolean_and_tree_parent(self):
+        with self.assertRaisesRegex(InvalidRequest, "must be 1, 0, true, or false"):
+            parse_report_request("/api/view", "tree=maybe")
+        with self.assertRaisesRegex(InvalidRequest, "complete spine"):
+            parse_report_request("/api/view", "tree=1&tree_parent=RAISE")
+
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
