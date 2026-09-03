@@ -2577,7 +2577,12 @@ def _tree_layout(rows, request, prefix, unfiltered_rows, answer_set):
         grouped_nodes.setdefault(group_key, []).append(node)
     group_keys = list(grouped_nodes)
     if request.tree_cursor is not None:
-        group_keys = [key for key in group_keys if key > request.tree_cursor]
+        try:
+            cursor_index = group_keys.index(request.tree_cursor)
+        except ValueError:
+            group_keys = [key for key in group_keys if key > request.tree_cursor]
+        else:
+            group_keys = group_keys[cursor_index + 1:]
     page_size = request.filters.limit or DEFAULT_TREE_PAGE_SIZE
     page_keys = group_keys[:page_size]
     page_nodes = [node for key in page_keys for node in grouped_nodes[key]]

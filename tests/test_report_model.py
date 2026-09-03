@@ -160,6 +160,40 @@ class ReportModelTest(unittest.TestCase):
         allowed = ReportFilters(source_offset=0, branch_row_offset=0, sort="word")
         validate_report_request(ReportRequest(report_kind="openers", filters=allowed))
 
+    def test_tree_layout_handles_empty_legacy_and_paged_topology(self):
+        request = ReportRequest(
+            report_kind="queue", tree=True,
+            filters=ReportFilters(limit=1),
+        )
+        self.assertFalse(report_model._tree_layout(
+            [], request, "", [], set())["tree_available"])
+        legacy_key = ScoreCache.encode_subset(["salet"])
+        rows = [
+            {
+                "branch_key": legacy_key, "branch_key_hex": legacy_key.hex(),
+                "budget": 4, "branch_status": "evaluating",
+                "branch_worker_status": "active", "answer_count": 1,
+                "worker_count": 2, "priority": 4,
+                "completed_candidate_count": 2, "candidate_count": 3,
+            },
+            {
+                "branch_key": ScoreCache.encode_subset(["crane"]),
+                "branch_key_hex": ScoreCache.encode_subset(["crane"]).hex(),
+                "spine": "RAISE ----- CRANE y----", "branch_status": "queued",
+                "branch_worker_status": None, "answer_count": 1,
+                "worker_count": 0, "priority": 2,
+                "completed_candidate_count": 0, "candidate_count": 3,
+            },
+        ]
+        layout = report_model._tree_layout(rows, request, "", rows, set(ANSWERS))
+        self.assertTrue(layout["tree_available"])
+        self.assertEqual(layout["paging"]["next_cursor"], "unknown:1:" + legacy_key.hex())
+        self.assertEqual(layout["nodes"][0]["guess_depth"], 1)
+        second_page = report_model._tree_layout(
+            rows, replace(request, tree_cursor=layout["paging"]["next_cursor"]),
+            "", rows, set(ANSWERS))
+        self.assertEqual(second_page["paging"]["returned_group_count"], 1)
+
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         directory = self.temporary_directory.name
