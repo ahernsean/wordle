@@ -372,6 +372,11 @@ class ReportModelTest(unittest.TestCase):
                     self.sources, ReportRequest(report_kind=kind)), {"kind": kind})
         with self.assertRaisesRegex(ValueError, "tree layout"):
             collect_report(self.sources, ReportRequest(report_kind="cache", tree=True))
+        with patch("report_model.collect_overview_report", return_value={"kind": "overview"}):
+            self.assertEqual(collect_report(self.sources, ReportRequest()), {"kind": "overview"})
+        with patch("report_model.collect_word_report", return_value={"kind": "word"}):
+            self.assertEqual(collect_report(self.sources, ReportRequest(
+                branch_target=parse_report_branch_target("RAISE"))), {"kind": "word"})
 
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
