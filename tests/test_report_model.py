@@ -355,6 +355,23 @@ class ReportModelTest(unittest.TestCase):
         self.assertTrue(report_model._row_matches_branch_target(
             {"branch_key": branch_key}, reference_target, ""))
 
+    def test_report_dispatches_each_explicit_collection_kind(self):
+        request = ReportRequest(report_kind="queue")
+        with patch("report_model.collect_queue_report", return_value={"kind": "queue"}):
+            self.assertEqual(collect_report(self.sources, request), {"kind": "queue"})
+        for kind, function_name in (
+            ("workers", "collect_workers_report"), ("cache", "collect_cache_report"),
+            ("hotspots", "collect_hotspot_report"), ("accuracy", "collect_accuracy_report"),
+            ("leaderboard", "collect_leaderboard_report"), ("openers", "collect_source_report"),
+            ("root_progress", "collect_root_progress_report"),
+        ):
+            with self.subTest(kind=kind), patch("report_model." + function_name,
+                                                return_value={"kind": kind}):
+                self.assertEqual(collect_report(
+                    self.sources, ReportRequest(report_kind=kind)), {"kind": kind})
+        with self.assertRaisesRegex(ValueError, "tree layout"):
+            collect_report(self.sources, ReportRequest(report_kind="cache", tree=True))
+
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         directory = self.temporary_directory.name
