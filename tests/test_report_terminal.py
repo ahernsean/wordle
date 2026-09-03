@@ -608,6 +608,45 @@ class OverviewRendererTest(unittest.TestCase):
         )
         self.assertLess(output.index("w2"), output.index("w1"))
 
+    def test_claim_progress_reports_only_the_counts_it_has(self):
+        report = overview_report()
+        report["report_kind"] = "branch"
+        report["data"] = {
+            "branch": {
+                "branch_reference": "0123456789ab", "branch_key_hex": "010203",
+                "spine": [], "guess_depth": 0, "answer_count": 3, "budget": 6,
+                "branch_status": "evaluating", "branch_worker_status": "active",
+            },
+            "queue": {
+                "branch_status": "evaluating", "branch_worker_status": "active",
+                "priority": 0, "budget": 6, "best_guess": None,
+                "ceiling": None, "search_node_count": 1200,
+                "candidate_count": None, "completed_candidate_count": 0,
+                "bulk_completed_candidate_count": 0,
+                "one_level_erd_pruned_candidate_count": 0,
+                "two_level_erd_pruned_candidate_count": 0,
+            },
+            "cache": {
+                "cache_state": "missing", "best_guess": None,
+                "best_erd": None, "max_remaining_depth": None,
+            },
+            "workers": [],
+            "bundle_summary": {},
+            "candidate_eta": None,
+            "republished_candidates": [],
+            "claims": None,
+            "claim_summary": {"total_claim_count": 40, "evaluated_count": 25},
+            "recent_finalizations": [],
+            "finalization_total_count": 0,
+            "cut_reuse_misses": [],
+            "provenance_unknown": False,
+        }
+        output = render_report(report, width=100)
+        self.assertIn("25 evaluated", output)
+        for absent in ("unattributed", "in flight", "worker evals"):
+            with self.subTest(absent=absent):
+                self.assertNotIn(absent, output)
+
     def test_candidate_state_renders_bounded_claim_summary(self):
         report = overview_report()
         report["report_kind"] = "branch"
@@ -2849,3 +2888,24 @@ class NavigationTargetTest(unittest.TestCase):
         self.assertNotIn("branch", legend)
         self.assertNotIn("worker", legend)
         self.assertIn("[q] quit", legend)
+
+
+class WordReportRenderingTest(unittest.TestCase):
+    def _word_report(self):
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "tests", "fixtures", "reports", "word.json",
+        )
+        with open(path) as handle:
+            return json.load(handle)
+
+    def test_a_changed_group_is_highlighted_and_answer_words_are_listed(self):
+        report = self._word_report()
+        previous = deepcopy(report)
+        previous["data"]["response_groups"][0]["answer_count"] = 99
+        report["data"]["response_groups"][0]["answer_words"] = ["salet", "crane"]
+        output = render_report(
+            report, previous, color=True, width=140,
+        )
+        self.assertIn(report_terminal.RED, output)
+        self.assertIn("salet crane", output)
