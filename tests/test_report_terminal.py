@@ -2375,6 +2375,12 @@ class TerminalUtilityTest(unittest.TestCase):
         row = report_terminal._worker_display_row(worker, 20, "finalizing")
         self.assertEqual(row["display_state"], "final")
         self.assertEqual(row["display_candidate"], "RAISE*")
+        self.assertEqual(report_terminal._display_best({}), "—")
+        self.assertEqual(report_terminal._display_best({"best_guess": "raise"}), "RAISE")
+        idle = report_terminal._worker_display_row(
+            {"worker_id": "worker-x", "updated_at": 30}, 20, "transitioning")
+        self.assertEqual(idle["display_state"], "trans")
+        self.assertEqual(idle["display_candidate"], "—")
 
     def test_ambiguous_reference_renderer_lists_preview_and_spine(self):
         report = {"data": {"candidates": [{
