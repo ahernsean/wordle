@@ -325,6 +325,31 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(report["data"]["word"], "raise")
         self.assertEqual(report["data"]["estimate"], None)
 
+    def test_opener_report_persists_missing_completed_timing(self):
+        queue = Mock()
+        queue.source_word_rows.return_value = [{"source_word": "raise", "state": "done"}]
+        queue.source_membership_rows.return_value = []
+        queue.completed_source_timing.return_value = {
+            "completed_at": 20, "first_created_at": 10,
+            "worker_millis": 4, "telemetry_epochs": "2,4",
+        }
+        queue.distinct_branch_count_for_words.return_value = 0
+        timing_cache = Mock()
+        timing_cache.completed_source_summary_map.return_value = {}
+        payload = {"source_word": "raise", "state": "complete", "branch_count": 0,
+                   "completed_at": 20, "requested_priority": 0}
+        with (
+            patch("report_model._open_report_queue", return_value=queue),
+            patch("report_model.ScoreCache", return_value=timing_cache),
+            patch("report_model.load_word_list", return_value=ANSWERS),
+            patch("report_model._source_rollups", return_value={"raise": {}}),
+            patch("report_model._source_summary_payload", return_value=payload),
+            patch("report_model._source_word_erd_summaries", return_value={}),
+        ):
+            report = collect_source_report(self.sources, ReportRequest(report_kind="openers"))
+        timing_cache.write_completed_source_summary.assert_called_once()
+        self.assertEqual(report["data"]["summary"], [payload])
+
     def test_queue_and_current_hotspot_reports_normalize_rows(self):
         branch_key = ScoreCache.encode_subset(["salet"])
         queue = Mock(epoch=12)
