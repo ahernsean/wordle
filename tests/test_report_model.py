@@ -333,6 +333,28 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(report["data"]["nodes"], ["selected"])
         self.assertEqual(len(tree_layout.call_args.args[0]), 1)
 
+    def test_branch_target_queue_scopes_and_row_matching_cover_each_target_kind(self):
+        branch_key = ScoreCache.encode_subset(["salet"])
+        queue = Mock()
+        queue.branch_rows_for_reference_prefix.return_value = [{
+            "branch_key": branch_key, "spine": "RAISE -----",
+        }]
+        reference_target = parse_report_branch_target("@" + branch_reference(branch_key))
+        scope, prefix = report_model._branch_target_queue_scope(reference_target, queue)
+        self.assertEqual(scope["branch_key"], branch_key)
+        self.assertEqual(prefix, "RAISE -----")
+        word_target = parse_report_branch_target("RAISE")
+        scope, prefix = report_model._branch_target_queue_scope(word_target)
+        self.assertEqual(scope["source_word"], "raise")
+        self.assertEqual(prefix, "RAISE")
+        self.assertTrue(report_model._row_matches_branch_target(
+            {"spine": "RAISE ----- CRANE y----"}, word_target, prefix))
+        branch_target = parse_report_branch_target("RAISE -----")
+        self.assertTrue(report_model._row_matches_branch_target(
+            {"spine": "RAISE ----- CRANE y----"}, branch_target, "RAISE -----"))
+        self.assertTrue(report_model._row_matches_branch_target(
+            {"branch_key": branch_key}, reference_target, ""))
+
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         directory = self.temporary_directory.name

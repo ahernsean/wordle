@@ -1202,6 +1202,12 @@ class ViewSessionTest(unittest.TestCase):
             "spine": "bad", "branch_key_hex": "0102",
         })
         self.assertEqual(fallback.kind, "branch_reference")
+        word_session = WatchSession(view_args(
+            branch_target=parse_report_branch_target("RAISE")), FakeInput(), io.StringIO())
+        pattern_target = word_session._branch_target({
+            "pattern": "-----", "branch_key_hex": "0102",
+        })
+        self.assertEqual(pattern_target.kind, "branch")
 
     def test_json_output_round_trips_exact_report(self):
         report = overview_report()
