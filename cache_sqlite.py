@@ -313,29 +313,65 @@ class ScoreCache:
     def _rename_source_summaries_to_opener(self):
         # Runs before the CREATE TABLE IF NOT EXISTS statements below, so —
         # unlike the older renames in this file — there is no empty
-        # new-named shell to drop first. Both old and new present means an
-        # interrupted or hand-rolled migration; fail loudly rather than
-        # guess which table holds the good rows.
-        if self._is_migration_done('rename_source_summaries_to_opener'):
-            return
-        tables = {row["name"] for row in self._conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'")}
-        for old_table, new_table in (
+        # new-named shell to drop first.
+        #
+        # The plan is re-derived from actual table/column state on every
+        # open rather than trusting schema_migrations alone: the table
+        # rename and the column rename are two statements, and a process
+        # that dies between them leaves a table already carrying the new
+        # name but still holding the old column -- a state indistinguishable
+        # from "not started" if this only checked the old table's presence.
+        # Recomputing catches that state (and a database left there by an
+        # earlier, non-atomic version of this migration) and finishes it
+        # instead of silently skipping it forever.
+        plan = (
             ('completed_source_summaries', 'completed_opener_summaries'),
             ('root_response_group_summaries', 'opener_response_group_summaries'),
-        ):
+        )
+        tables = {row["name"] for row in self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        statements = []
+        for old_table, new_table in plan:
             old_present = old_table in tables
             new_present = new_table in tables
             if old_present and new_present:
                 raise RuntimeError(
                     f"both {old_table} and {new_table} exist: half-applied "
                     "opener-rename migration, needs manual repair")
-            if not old_present:
-                continue
-            self._conn.execute(f"ALTER TABLE {old_table} RENAME TO {new_table}")
-            self._conn.execute(
-                f"ALTER TABLE {new_table} RENAME COLUMN source_word TO opener")
-        self._mark_migration_done('rename_source_summaries_to_opener')
+            if old_present:
+                statements.append(f"ALTER TABLE {old_table} RENAME TO {new_table}")
+                statements.append(
+                    f"ALTER TABLE {new_table} RENAME COLUMN source_word TO opener")
+            elif new_present:
+                cols = {row["name"] for row in
+                        self._conn.execute(f"PRAGMA table_info({new_table})")}
+                if "opener" in cols:
+                    continue
+                if "source_word" in cols:
+                    statements.append(
+                        f"ALTER TABLE {new_table} RENAME COLUMN source_word TO opener")
+                else:
+                    raise RuntimeError(
+                        f"{new_table} has neither opener nor source_word: "
+                        "unrecognized schema, needs manual repair")
+            # else: neither present -- CREATE TABLE IF NOT EXISTS below
+            # creates it directly under the current name.
+        if not statements:
+            self._mark_migration_done('rename_source_summaries_to_opener')
+            return
+        # Table rename, column rename, and the migration marker all land in
+        # one transaction so a crash anywhere in the sequence leaves either
+        # the untouched legacy schema or the fully renamed one -- never a
+        # table with the new name and the old column.
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            for statement in statements:
+                self._conn.execute(statement)
+            self._mark_migration_done('rename_source_summaries_to_opener')
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
 
     def _ensure_schema(self):
         # Must be first: every migration guard below reads from this table.
