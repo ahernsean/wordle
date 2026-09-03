@@ -372,6 +372,9 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(report_model._duration_group_key(31 * 24 * 60 * 60 * 1000)[1], "[1 month, ∞)")
         self.assertEqual(report_model._source_word_group_key(
             {"worker_count": 0}, "worker_presence", 0), (1, "no workers"))
+        self.assertEqual(report_model._completed_at_group_key(None, 0), (5, "not completed"))
+        self.assertEqual(report_model._source_word_group_key(
+            {"elapsed_millis": None}, "elapsed", 0), (5, "not completed"))
 
     def test_source_rollups_and_membership_payload_preserve_shared_branch_context(self):
         branch_key = ScoreCache.encode_subset(["salet"])
