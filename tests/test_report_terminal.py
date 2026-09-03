@@ -1187,6 +1187,22 @@ class CollectionRendererTest(unittest.TestCase):
 
 
 class ViewSessionTest(unittest.TestCase):
+    def test_branch_navigation_targets_use_spine_then_reference_fallback(self):
+        session = WatchSession(view_args(), FakeInput(), io.StringIO())
+        from_list = session._branch_target({
+            "spine": [{"word": "raise", "pattern": "-----"}],
+            "branch_key_hex": "01",
+        })
+        self.assertEqual(from_list.kind, "branch")
+        from_text = session._branch_target({
+            "spine": "RAISE -----", "branch_key_hex": "01",
+        })
+        self.assertEqual(from_text.kind, "branch")
+        fallback = session._branch_target({
+            "spine": "bad", "branch_key_hex": "0102",
+        })
+        self.assertEqual(fallback.kind, "branch_reference")
+
     def test_json_output_round_trips_exact_report(self):
         report = overview_report()
         output = io.StringIO()
