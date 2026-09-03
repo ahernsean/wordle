@@ -657,6 +657,33 @@ class OverviewRendererTest(unittest.TestCase):
         self.assertIn("worker evals w0:6,484 w2:6,335", output)
         self.assertNotIn("idx=", output)
 
+    def test_unqueued_branch_renders_claim_progress_and_answer_preview(self):
+        report = overview_report()
+        report["report_kind"] = "branch"
+        report["data"] = {
+            "branch": {
+                "branch_reference": "0123456789ab", "branch_key_hex": "010203",
+                "spine": [], "guess_depth": 0, "answer_count": 3, "budget": 6,
+                "branch_status": "unqueued", "branch_worker_status": None,
+                "answer_words": ["cigar", "rebut"],
+            },
+            "queue": None,
+            "cache": {"cache_state": "missing", "best_guess": None,
+                      "best_erd": None, "max_remaining_depth": None},
+            "workers": [], "republished_candidates": [], "claims": None,
+            "claim_summary": {
+                "total_claim_count": 4, "evaluated_count": 2,
+                "provenance_unknown_count": 1, "in_flight_count": 1,
+                "worker_contributions": [{"worker_id": "worker-3", "done_count": 2}],
+            },
+            "provenance_unknown": False,
+        }
+        output = render_report(report, width=100)
+        self.assertIn("answers: cigar rebut", output)
+        self.assertIn("2 evaluated", output)
+        self.assertIn("1 unattributed", output)
+        self.assertIn("worker evals w3:2", output)
+
     def test_selected_branch_detail_survives_parent_status_filter(self):
         report = overview_report()
         report["report_kind"] = "branch"
