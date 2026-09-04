@@ -1709,7 +1709,7 @@ class _BranchWorker:
                 telemetry_epochs = tuple(
                     int(epoch) for epoch in (timing["telemetry_epochs"] or "").split(",")
                     if epoch)
-                self.score_cache.write_completed_source_summary(
+                self.score_cache.write_completed_opener_summary(
                     opener, ERD_ALL, timing["completed_at"],
                     (timing["completed_at"] - timing["first_created_at"]) * 1000,
                     timing["worker_millis"] or 0, telemetry_epochs)
@@ -1889,7 +1889,7 @@ class _BranchWorker:
                         ('exact' if best_guess is not None else 'loss')))
             spine_tokens = (spine or "").split()
             if len(spine_tokens) >= 2:
-                self.score_cache.add_root_response_group_summary(
+                self.score_cache.add_opener_response_group_summary(
                     spine_tokens[0], spine_tokens[1], ERD_ALL, nodes_spent,
                     total_bundle_wall_millis, created_at, finalized_at,
                     self.queue.epoch)

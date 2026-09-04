@@ -310,6 +310,69 @@ class ScoreCache:
             (name, int(time.time()))
         )
 
+    def _rename_source_summaries_to_opener(self):
+        # Runs before the CREATE TABLE IF NOT EXISTS statements below, so —
+        # unlike the older renames in this file — there is no empty
+        # new-named shell to drop first.
+        #
+        # The plan is re-derived from actual table/column state on every
+        # open rather than trusting schema_migrations alone: the table
+        # rename and the column rename are two statements, and a process
+        # that dies between them leaves a table already carrying the new
+        # name but still holding the old column -- a state indistinguishable
+        # from "not started" if this only checked the old table's presence.
+        # Recomputing catches that state (and a database left there by an
+        # earlier, non-atomic version of this migration) and finishes it
+        # instead of silently skipping it forever.
+        plan = (
+            ('completed_source_summaries', 'completed_opener_summaries'),
+            ('root_response_group_summaries', 'opener_response_group_summaries'),
+        )
+        tables = {row["name"] for row in self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        statements = []
+        for old_table, new_table in plan:
+            old_present = old_table in tables
+            new_present = new_table in tables
+            if old_present and new_present:
+                raise RuntimeError(
+                    f"both {old_table} and {new_table} exist: half-applied "
+                    "opener-rename migration, needs manual repair")
+            if old_present:
+                statements.append(f"ALTER TABLE {old_table} RENAME TO {new_table}")
+                statements.append(
+                    f"ALTER TABLE {new_table} RENAME COLUMN source_word TO opener")
+            elif new_present:
+                cols = {row["name"] for row in
+                        self._conn.execute(f"PRAGMA table_info({new_table})")}
+                if "opener" in cols:
+                    continue
+                if "source_word" in cols:
+                    statements.append(
+                        f"ALTER TABLE {new_table} RENAME COLUMN source_word TO opener")
+                else:
+                    raise RuntimeError(
+                        f"{new_table} has neither opener nor source_word: "
+                        "unrecognized schema, needs manual repair")
+            # else: neither present -- CREATE TABLE IF NOT EXISTS below
+            # creates it directly under the current name.
+        if not statements:
+            self._mark_migration_done('rename_source_summaries_to_opener')
+            return
+        # Table rename, column rename, and the migration marker all land in
+        # one transaction so a crash anywhere in the sequence leaves either
+        # the untouched legacy schema or the fully renamed one -- never a
+        # table with the new name and the old column.
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            for statement in statements:
+                self._conn.execute(statement)
+            self._mark_migration_done('rename_source_summaries_to_opener')
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+
     def _ensure_schema(self):
         # Must be first: every migration guard below reads from this table.
         self._conn.execute("""
@@ -442,29 +505,30 @@ class ScoreCache:
                 PRIMARY KEY (branch_key, policy, answer_list_id)
             )
         """)
+        self._rename_source_summaries_to_opener()
         self._conn.execute("""
-            CREATE TABLE IF NOT EXISTS completed_source_summaries (
-                source_word TEXT NOT NULL, policy TEXT NOT NULL,
+            CREATE TABLE IF NOT EXISTS completed_opener_summaries (
+                opener TEXT NOT NULL, policy TEXT NOT NULL,
                 answer_list_id TEXT NOT NULL, completed_at INTEGER NOT NULL,
                 elapsed_millis INTEGER, worker_millis INTEGER NOT NULL,
                 telemetry_epochs TEXT NOT NULL DEFAULT '',
-                PRIMARY KEY (source_word, policy, answer_list_id)
+                PRIMARY KEY (opener, policy, answer_list_id)
             )
         """)
         summary_columns = {row["name"] for row in self._conn.execute(
-            "PRAGMA table_info(completed_source_summaries)")}
+            "PRAGMA table_info(completed_opener_summaries)")}
         if "telemetry_epochs" not in summary_columns:
             self._conn.execute(
-                "ALTER TABLE completed_source_summaries "
+                "ALTER TABLE completed_opener_summaries "
                 "ADD COLUMN telemetry_epochs TEXT NOT NULL DEFAULT ''")
         self._conn.execute("""
-            CREATE TABLE IF NOT EXISTS root_response_group_summaries (
-                source_word TEXT NOT NULL, response_pattern TEXT NOT NULL,
+            CREATE TABLE IF NOT EXISTS opener_response_group_summaries (
+                opener TEXT NOT NULL, response_pattern TEXT NOT NULL,
                 policy TEXT NOT NULL, answer_list_id TEXT NOT NULL,
                 branch_count INTEGER NOT NULL, search_node_count INTEGER NOT NULL,
                 worker_millis INTEGER NOT NULL, first_created_at INTEGER,
                 last_finalized_at INTEGER, telemetry_epochs TEXT NOT NULL,
-                PRIMARY KEY (source_word, response_pattern, policy, answer_list_id)
+                PRIMARY KEY (opener, response_pattern, policy, answer_list_id)
             )
         """)
         # 'subset_blob' was renamed to 'subset_key' — same encoding, cleaner
@@ -1245,66 +1309,66 @@ class ScoreCache:
             self._conn.execute("ROLLBACK")
             raise
 
-    def completed_source_summary_map(self, policy):
-        return {row["source_word"].lower(): dict(row) for row in self._conn.execute("""
-            SELECT source_word, completed_at, elapsed_millis, worker_millis,
+    def completed_opener_summary_map(self, policy):
+        return {row["opener"].lower(): dict(row) for row in self._conn.execute("""
+            SELECT opener, completed_at, elapsed_millis, worker_millis,
                    telemetry_epochs
-            FROM completed_source_summaries
+            FROM completed_opener_summaries
             WHERE policy = ? AND answer_list_id = ?
         """, (policy, self.answer_list_id))}
 
-    def write_completed_source_summary(self, source_word, policy, completed_at,
+    def write_completed_opener_summary(self, opener, policy, completed_at,
                                        elapsed_millis, worker_millis,
                                        telemetry_epochs=()):
         try:
             self._conn.execute("""
-                INSERT OR REPLACE INTO completed_source_summaries
-                    (source_word, policy, answer_list_id, completed_at,
+                INSERT OR REPLACE INTO completed_opener_summaries
+                    (opener, policy, answer_list_id, completed_at,
                      elapsed_millis, worker_millis, telemetry_epochs)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (source_word.lower(), policy, self.answer_list_id, completed_at,
+            """, (opener.lower(), policy, self.answer_list_id, completed_at,
                   elapsed_millis, worker_millis,
                   ",".join(str(epoch) for epoch in sorted(set(telemetry_epochs)))))
         except sqlite3.OperationalError as exc:
             if not _is_disk_io_error(exc):
                 raise
-            logger.warning("write_completed_source_summary(%s, %s) failed: %s",
-                           source_word, policy, exc)
+            logger.warning("write_completed_opener_summary(%s, %s) failed: %s",
+                           opener, policy, exc)
 
-    def add_root_response_group_summary(self, source_word, response_pattern,
-                                        policy, nodes, worker_millis,
-                                        created_at, finalized_at, epoch):
+    def add_opener_response_group_summary(self, opener, response_pattern,
+                                          policy, nodes, worker_millis,
+                                          created_at, finalized_at, epoch):
         row = self._conn.execute("""
-            SELECT telemetry_epochs FROM root_response_group_summaries
-            WHERE source_word = ? AND response_pattern = ? AND policy = ?
+            SELECT telemetry_epochs FROM opener_response_group_summaries
+            WHERE opener = ? AND response_pattern = ? AND policy = ?
               AND answer_list_id = ?
-        """, (source_word.lower(), response_pattern, policy,
+        """, (opener.lower(), response_pattern, policy,
               self.answer_list_id)).fetchone()
         epochs = {str(epoch)}
         if row is not None:
             epochs.update(filter(None, row["telemetry_epochs"].split(",")))
         self._conn.execute("""
-            INSERT INTO root_response_group_summaries
-                (source_word, response_pattern, policy, answer_list_id,
+            INSERT INTO opener_response_group_summaries
+                (opener, response_pattern, policy, answer_list_id,
                  branch_count, search_node_count, worker_millis,
                  first_created_at, last_finalized_at, telemetry_epochs)
             VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
-            ON CONFLICT(source_word, response_pattern, policy, answer_list_id)
+            ON CONFLICT(opener, response_pattern, policy, answer_list_id)
             DO UPDATE SET branch_count = branch_count + 1,
                 search_node_count = search_node_count + excluded.search_node_count,
                 worker_millis = worker_millis + excluded.worker_millis,
                 first_created_at = MIN(first_created_at, excluded.first_created_at),
                 last_finalized_at = MAX(last_finalized_at, excluded.last_finalized_at),
                 telemetry_epochs = excluded.telemetry_epochs
-        """, (source_word.lower(), response_pattern, policy, self.answer_list_id,
+        """, (opener.lower(), response_pattern, policy, self.answer_list_id,
               nodes, worker_millis or 0, created_at, finalized_at,
               ",".join(sorted(epochs, key=int))))
 
-    def root_response_group_summary_map(self, source_word, policy):
+    def opener_response_group_summary_map(self, opener, policy):
         rows = self._conn.execute("""
-            SELECT * FROM root_response_group_summaries
-            WHERE source_word = ? AND policy = ? AND answer_list_id = ?
-        """, (source_word.lower(), policy, self.answer_list_id)).fetchall()
+            SELECT * FROM opener_response_group_summaries
+            WHERE opener = ? AND policy = ? AND answer_list_id = ?
+        """, (opener.lower(), policy, self.answer_list_id)).fetchall()
         return {row["response_pattern"]: dict(row) for row in rows}
 
     def last_write_ts(self):

@@ -124,8 +124,8 @@ class TestCacheSQLiteDiskIOSwallow(unittest.TestCase):
         with self.assertRaises(sqlite3.OperationalError):
             sc.write(key, "full", "heart", 2.5)
 
-    # ---- write_completed_source_summary() ----
-    def test_completed_source_summary_swallows_disk_io_error(self):
+    # ---- write_completed_opener_summary() ----
+    def test_completed_opener_summary_swallows_disk_io_error(self):
         sc = ScoreCache(self.db, ANSWERS)
         self.addCleanup(sc.close)
 
@@ -134,12 +134,12 @@ class TestCacheSQLiteDiskIOSwallow(unittest.TestCase):
 
         sc._conn = _ConnProxy(sc._conn, execute=boom)
         with self.assertLogs("wordle", level="WARNING") as logs:
-            sc.write_completed_source_summary(
+            sc.write_completed_opener_summary(
                 "salet", ERD_ANSWERS, 160, 60_000, 2_000)
-        self.assertTrue(any("write_completed_source_summary" in message
+        self.assertTrue(any("write_completed_opener_summary" in message
                             for message in logs.output))
 
-    def test_completed_source_summary_reraises_non_disk_io_error(self):
+    def test_completed_opener_summary_reraises_non_disk_io_error(self):
         sc = ScoreCache(self.db, ANSWERS)
         self.addCleanup(sc.close)
 
@@ -148,7 +148,7 @@ class TestCacheSQLiteDiskIOSwallow(unittest.TestCase):
 
         sc._conn = _ConnProxy(sc._conn, execute=boom)
         with self.assertRaises(sqlite3.OperationalError):
-            sc.write_completed_source_summary(
+            sc.write_completed_opener_summary(
                 "salet", ERD_ANSWERS, 160, 60_000, 2_000)
 
     # ---- write_loss() ----
@@ -675,6 +675,201 @@ class TestOverErdLimitTaintJoin(unittest.TestCase):
         best_guess, best_score, max_depth, solve_budget = sc.read_for_budget(
             key, ERD_ANSWERS, 5)
         self.assertEqual(solve_budget, 5)
+
+
+class TestRenameSourceSummariesToOpener(unittest.TestCase):
+    """cache_sqlite.py's completed_source_summaries/root_response_group_summaries
+    -> completed_opener_summaries/opener_response_group_summaries migration."""
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
+        self.tmp.close()
+        self.db = self.tmp.name
+
+    def tearDown(self):
+        try:
+            os.unlink(self.db)
+        except OSError:
+            pass
+
+    def _create_legacy_schema(self):
+        conn = sqlite3.connect(self.db)
+        conn.execute("""
+            CREATE TABLE completed_source_summaries (
+                source_word TEXT NOT NULL, policy TEXT NOT NULL,
+                answer_list_id TEXT NOT NULL, completed_at INTEGER NOT NULL,
+                elapsed_millis INTEGER, worker_millis INTEGER NOT NULL,
+                telemetry_epochs TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (source_word, policy, answer_list_id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE root_response_group_summaries (
+                source_word TEXT NOT NULL, response_pattern TEXT NOT NULL,
+                policy TEXT NOT NULL, answer_list_id TEXT NOT NULL,
+                branch_count INTEGER NOT NULL, search_node_count INTEGER NOT NULL,
+                worker_millis INTEGER NOT NULL, first_created_at INTEGER,
+                last_finalized_at INTEGER, telemetry_epochs TEXT NOT NULL,
+                PRIMARY KEY (source_word, response_pattern, policy, answer_list_id)
+            )
+        """)
+        conn.execute(
+            "INSERT INTO completed_source_summaries VALUES "
+            "('salet', 'erd_all', 'list1', 100, 5000, 4000, '')")
+        conn.execute(
+            "INSERT INTO root_response_group_summaries VALUES "
+            "('salet', 'ggggg', 'erd_all', 'list1', 1, 10, 500, 90, 100, '3')")
+        conn.commit()
+        conn.close()
+
+    def test_old_names_present_are_renamed_with_data_preserved(self):
+        self._create_legacy_schema()
+        sc = ScoreCache(self.db, ANSWERS)
+        self.addCleanup(sc.close)
+        tables = {row["name"] for row in sc._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        self.assertNotIn("completed_source_summaries", tables)
+        self.assertNotIn("root_response_group_summaries", tables)
+        self.assertIn("completed_opener_summaries", tables)
+        self.assertIn("opener_response_group_summaries", tables)
+        row = sc._conn.execute(
+            "SELECT opener FROM completed_opener_summaries").fetchone()
+        self.assertEqual(row["opener"], "salet")
+        row = sc._conn.execute(
+            "SELECT opener FROM opener_response_group_summaries").fetchone()
+        self.assertEqual(row["opener"], "salet")
+
+    def test_fresh_database_gets_new_names_directly(self):
+        sc = ScoreCache(self.db, ANSWERS)
+        self.addCleanup(sc.close)
+        tables = {row["name"] for row in sc._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        self.assertIn("completed_opener_summaries", tables)
+        self.assertIn("opener_response_group_summaries", tables)
+        self.assertNotIn("completed_source_summaries", tables)
+        self.assertNotIn("root_response_group_summaries", tables)
+
+    def test_already_migrated_database_reopens_idempotently(self):
+        sc = ScoreCache(self.db, ANSWERS)
+        sc.write_completed_opener_summary("salet", "erd_all", 100, 5000, 4000)
+        sc.close()
+        sc2 = ScoreCache(self.db, ANSWERS)
+        self.addCleanup(sc2.close)
+        timings = sc2.completed_opener_summary_map("erd_all")
+        self.assertIn("salet", timings)
+
+    def test_both_old_and_new_present_fails_loudly(self):
+        self._create_legacy_schema()
+        conn = sqlite3.connect(self.db)
+        conn.execute("""
+            CREATE TABLE completed_opener_summaries (
+                opener TEXT NOT NULL, policy TEXT NOT NULL,
+                answer_list_id TEXT NOT NULL, completed_at INTEGER NOT NULL,
+                elapsed_millis INTEGER, worker_millis INTEGER NOT NULL,
+                telemetry_epochs TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (opener, policy, answer_list_id)
+            )
+        """)
+        conn.commit()
+        conn.close()
+        with self.assertRaises(RuntimeError):
+            ScoreCache(self.db, ANSWERS)
+
+    def test_recovers_from_a_table_renamed_with_its_column_not(self):
+        """A process that dies between the table RENAME TO and the column
+        RENAME COLUMN leaves exactly this shape: the new table name, still
+        holding the old column. Also seed a schema_migrations row claiming
+        the migration already completed, matching what an earlier,
+        non-atomic version of this migration could have left behind --
+        recovery must not depend on that flag being absent."""
+        conn = sqlite3.connect(self.db)
+        conn.execute("""
+            CREATE TABLE schema_migrations (
+                name TEXT PRIMARY KEY, completed_at INTEGER NOT NULL
+            )
+        """)
+        conn.execute(
+            "INSERT INTO schema_migrations VALUES "
+            "('rename_source_summaries_to_opener', 100)")
+        conn.execute("""
+            CREATE TABLE completed_opener_summaries (
+                source_word TEXT NOT NULL, policy TEXT NOT NULL,
+                answer_list_id TEXT NOT NULL, completed_at INTEGER NOT NULL,
+                elapsed_millis INTEGER, worker_millis INTEGER NOT NULL,
+                telemetry_epochs TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (source_word, policy, answer_list_id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE opener_response_group_summaries (
+                source_word TEXT NOT NULL, response_pattern TEXT NOT NULL,
+                policy TEXT NOT NULL, answer_list_id TEXT NOT NULL,
+                branch_count INTEGER NOT NULL, search_node_count INTEGER NOT NULL,
+                worker_millis INTEGER NOT NULL, first_created_at INTEGER,
+                last_finalized_at INTEGER, telemetry_epochs TEXT NOT NULL,
+                PRIMARY KEY (source_word, response_pattern, policy, answer_list_id)
+            )
+        """)
+        conn.execute(
+            "INSERT INTO completed_opener_summaries VALUES "
+            "('salet', 'erd_all', 'list1', 100, 5000, 4000, '')")
+        conn.execute(
+            "INSERT INTO opener_response_group_summaries VALUES "
+            "('salet', 'ggggg', 'erd_all', 'list1', 1, 10, 500, 90, 100, '3')")
+        conn.commit()
+        conn.close()
+
+        sc = ScoreCache(self.db, ANSWERS)
+        self.addCleanup(sc.close)
+        cols = {row["name"] for row in sc._conn.execute(
+            "PRAGMA table_info(completed_opener_summaries)")}
+        self.assertIn("opener", cols)
+        self.assertNotIn("source_word", cols)
+        row = sc._conn.execute(
+            "SELECT opener FROM completed_opener_summaries").fetchone()
+        self.assertEqual(row["opener"], "salet")
+        row = sc._conn.execute(
+            "SELECT opener FROM opener_response_group_summaries").fetchone()
+        self.assertEqual(row["opener"], "salet")
+        # The write path that failed before this fix now succeeds.
+        sc.write_completed_opener_summary("crane", "erd_all", 200, 6000, 4500)
+
+    def test_migration_failure_rolls_back_leaving_legacy_schema_intact(self):
+        """Injects a failure on the second table's column rename -- the last
+        of four statements -- to prove the whole sequence is one transaction:
+        a mid-sequence failure must undo the first table's already-applied
+        rename too, not just leave the failing statement uncommitted."""
+        self._create_legacy_schema()
+        real_connect = sqlite3.connect
+
+        def make_flaky_connection(*args, **kwargs):
+            real = real_connect(*args, **kwargs)
+            real.row_factory = sqlite3.Row
+
+            def flaky_execute(sql, *params):
+                if "opener_response_group_summaries RENAME COLUMN" in sql:
+                    raise sqlite3.OperationalError("simulated crash mid-migration")
+                return real.execute(sql, *params)
+
+            return _ConnProxy(real, execute=flaky_execute)
+
+        with mock.patch("cache_sqlite.sqlite3.connect",
+                         side_effect=make_flaky_connection):
+            with self.assertRaises(sqlite3.OperationalError):
+                ScoreCache(self.db, ANSWERS)
+
+        conn = sqlite3.connect(self.db)
+        conn.row_factory = sqlite3.Row
+        tables = {row["name"] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        self.assertIn("completed_source_summaries", tables)
+        self.assertIn("root_response_group_summaries", tables)
+        self.assertNotIn("completed_opener_summaries", tables)
+        self.assertNotIn("opener_response_group_summaries", tables)
+        row = conn.execute(
+            "SELECT source_word FROM completed_source_summaries").fetchone()
+        self.assertEqual(row["source_word"], "salet")
+        conn.close()
 
 
 if __name__ == "__main__":

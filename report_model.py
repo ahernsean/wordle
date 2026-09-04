@@ -1785,7 +1785,7 @@ def collect_root_progress_report(sources: ReportOpeners,
             list(branch_keys_by_pattern.values()), ERD_ALL, group_budget)
         if (not progress["groups"] and not resolved.steps
                 and request.epoch is None):
-            for pattern, summary in cache.root_response_group_summary_map(
+            for pattern, summary in cache.opener_response_group_summary_map(
                     word, ERD_ALL).items():
                 progress["groups"][pattern] = {
                     "branch_count": summary["branch_count"],
@@ -3526,7 +3526,7 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
             all_answers = load_word_list(sources.answer_list_path)
             timing_cache = ScoreCache(sources.cache_path, all_answers,
                                       checkpoint_on_close=False)
-            timings = timing_cache.completed_source_summary_map(ERD_ALL)
+            timings = timing_cache.completed_opener_summary_map(ERD_ALL)
             for row in summary_rows:
                 summary_opener = (
                     _row_value(row, "opener") or "").lower()
@@ -3542,7 +3542,7 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
                     if epoch)
                 elapsed_millis = (
                     (timing["completed_at"] - timing["first_created_at"]) * 1000)
-                timing_cache.write_completed_source_summary(
+                timing_cache.write_completed_opener_summary(
                     summary_opener, ERD_ALL, timing["completed_at"],
                     elapsed_millis, timing["worker_millis"] or 0,
                     telemetry_epochs)

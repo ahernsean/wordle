@@ -379,7 +379,7 @@ class ReportModelTest(unittest.TestCase):
         }
         queue.distinct_branch_count_for_words.return_value = 0
         timing_cache = Mock()
-        timing_cache.completed_source_summary_map.return_value = {}
+        timing_cache.completed_opener_summary_map.return_value = {}
         payload = {"opener": "raise", "state": "complete", "branch_count": 0,
                    "completed_at": 20, "requested_priority": 0}
         with (
@@ -391,7 +391,7 @@ class ReportModelTest(unittest.TestCase):
             patch("report_model._opener_erd_summaries", return_value={}),
         ):
             report = collect_opener_report(self.sources, ReportRequest(report_kind="openers"))
-        timing_cache.write_completed_source_summary.assert_called_once()
+        timing_cache.write_completed_opener_summary.assert_called_once()
         self.assertEqual(report["data"]["summary"], [payload])
 
     def test_response_group_scale_skips_empty_and_unbuilt_matrices(self):
@@ -2642,8 +2642,8 @@ class OpenerReportTest(unittest.TestCase):
         queue.mark_done(crane_key)
         queue.close()
         cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
-        cache.write_completed_source_summary("salet", ERD_ALL, 40, 30_000, 2_000)
-        cache.write_completed_source_summary("crane", ERD_ALL, 30, 10_000, 5_000)
+        cache.write_completed_opener_summary("salet", ERD_ALL, 40, 30_000, 2_000)
+        cache.write_completed_opener_summary("crane", ERD_ALL, 30, 10_000, 5_000)
         cache.close()
 
         rows = {row["opener"]: row for row in self._openers()["summary"]}
@@ -2703,7 +2703,7 @@ class OpenerReportTest(unittest.TestCase):
     def test_requeued_opener_hides_completed_run_timing(self):
         self._queue_words(("salet", 5, 1))
         cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
-        cache.write_completed_source_summary("salet", ERD_ALL, 160, 60_000, 2_000)
+        cache.write_completed_opener_summary("salet", ERD_ALL, 160, 60_000, 2_000)
         cache.close()
 
         row = self._openers()["summary"][0]
@@ -3232,7 +3232,7 @@ class RootProgressReportTest(unittest.TestCase):
 
     def test_root_progress_prefers_queue_telemetry_to_cached_summary(self):
         cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
-        cache.add_root_response_group_summary(
+        cache.add_opener_response_group_summary(
             "salet", "-y---", ERD_ALL, 900, 9_000, 1, 2, 0)
         cache.close()
         queue = self._open_queue()
@@ -3247,9 +3247,9 @@ class RootProgressReportTest(unittest.TestCase):
 
     def test_root_progress_uses_cached_summary_without_queue_telemetry(self):
         cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
-        cache.add_root_response_group_summary(
+        cache.add_opener_response_group_summary(
             "salet", "-y---", ERD_ALL, 100, 1_000, 10, 20, 0)
-        cache.add_root_response_group_summary(
+        cache.add_opener_response_group_summary(
             "salet", "-y---", ERD_ALL, 900, 9_000, 12, 30, 1)
         cache.close()
 
