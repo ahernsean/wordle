@@ -3014,7 +3014,8 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertGreater(len(result["moved"]), 1)
         self.assertEqual(result["after"], list(reversed(result["before"])))
 
-    def test_identity_and_spine_share_one_two_column_row(self):
+    def test_spine_and_identity_share_one_two_column_row(self):
+        """The spine reads first, so it takes the left half."""
         self.apply_branch_target("RAISE .....")
         self.page.wait_for_selector("section:has-text('Reached via')")
         result = self.page.evaluate("""() => {
@@ -3026,7 +3027,7 @@ class ReportClientBrowserTest(unittest.TestCase):
                   columns:getComputedStyle(pair).gridTemplateColumns.split(' ').filter(Boolean).length};
         }""")
         self.assertTrue(result["found"])
-        self.assertEqual(result["titles"], ["Identity", "Reached via"])
+        self.assertEqual(result["titles"], ["Reached via", "Identity"])
         self.assertEqual(result["columns"], 2)
         # The pair wrapper is a div, so a section-scoped selector still lands on
         # the one section it names rather than on both halves of the row.
