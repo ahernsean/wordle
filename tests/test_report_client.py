@@ -3182,9 +3182,9 @@ class ReportClientBrowserTest(unittest.TestCase):
         }""")
         self.assertNotIn("bundle", text)
 
-    def _sweep_markers(self, workers_js):
+    def _sweep(self, workers_js):
         """Render a 100-candidate strip whose first half is complete, and
-        report how each worker's marker was drawn."""
+        report how each worker's marker was drawn against the cell geometry."""
         return self.page.evaluate("""async (workersJs) => {
           const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
           branch.data.queue.candidate_count=100;
@@ -3194,28 +3194,50 @@ class ReportClientBrowserTest(unittest.TestCase):
             current_candidate:'crane',branch_reference:'eb81eb81eb81',...worker}));
           applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
           const cells=[...document.querySelectorAll('.sweep-cell')]
-            .map(node=>node.getBoundingClientRect());
-          const nearestCell=rect=>{
-            const centre=rect.left+rect.width/2;
-            let best=0;
-            cells.forEach((cell,index)=>{
-              if(Math.abs(cell.left+cell.width/2-centre)
-                 <Math.abs(cells[best].left+cells[best].width/2-centre))best=index;});
-            return best;};
-          return [...document.querySelectorAll('.sweep-marker')].map(node=>({
-            classes:node.className,
-            zIndex:getComputedStyle(node).zIndex,
-            cell:nearestCell(node.getBoundingClientRect()),
-            barWidth:getComputedStyle(node,'::after').width,
-            barHeight:getComputedStyle(node,'::after').height}));
+            .map(node=>{const box=node.getBoundingClientRect();
+                        return {left:box.left,width:box.width};});
+          return {cells, markers:[...document.querySelectorAll('.sweep-marker')].map(node=>{
+            const box=node.getBoundingClientRect();
+            return {classes:node.className,
+                    zIndex:getComputedStyle(node).zIndex,
+                    centre:box.left+box.width/2,
+                    barWidth:getComputedStyle(node,'::after').width,
+                    barHeight:getComputedStyle(node,'::after').height};})};
         }""", json.dumps(workers_js))
+
+    def test_a_marker_lands_proportionally_inside_its_cell(self):
+        """A cell spans many candidates, so a marker must show where in the
+        cell its candidate falls rather than snapping to the cell."""
+        # 100 candidates over 50 cells: cell 40 holds candidates 80 and 81.
+        sweep = self._sweep([
+            {"worker_id": "worker-1", "candidate_index": 80,
+             "work_position": {"candidate_index": 80, "state": "working"}},
+            {"worker_id": "worker-2", "candidate_index": 81,
+             "work_position": {"candidate_index": 81, "state": "working"}}])
+        cell = sweep["cells"][40]
+        opening, halfway = (marker["centre"] for marker in sweep["markers"])
+        self.assertAlmostEqual(opening, cell["left"], delta=1.0)
+        self.assertAlmostEqual(halfway, cell["left"] + cell["width"] / 2, delta=1.0)
+        # And the two must actually be apart, or nothing above is proved.
+        self.assertGreater(halfway - opening, 1.0)
+
+    def test_markers_across_the_strip_stay_in_candidate_order(self):
+        """Proportional placement must be monotone: a later candidate never
+        draws left of an earlier one."""
+        sweep = self._sweep([
+            {"worker_id": "worker-%d" % number, "candidate_index": index,
+             "work_position": {"candidate_index": index, "state": "working"}}
+            for number, index in enumerate((0, 25, 51, 80, 81, 99))])
+        centres = [marker["centre"] for marker in sweep["markers"]]
+        self.assertEqual(centres, sorted(centres))
+        self.assertEqual(len(set(centres)), len(centres))
 
     def test_a_last_reported_marker_draws_a_bar_not_a_pointer(self):
         """A worker between bundles has an area, not a point, so its pointer
         becomes a bar as wide as the marker."""
-        markers = self._sweep_markers([
+        markers = self._sweep([
             {"worker_id": "worker-1", "candidate_index": 20,
-             "work_position": {"candidate_index": 20, "state": "last_reported"}}])
+             "work_position": {"candidate_index": 20, "state": "last_reported"}}])["markers"]
         self.assertEqual(len(markers), 1)
         self.assertIn("last-reported", markers[0]["classes"])
         # The pointer is a zero-width border triangle; the bar has real width.
@@ -3223,19 +3245,19 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertNotEqual(markers[0]["barHeight"], "0px")
 
     def test_a_working_marker_keeps_its_pointer(self):
-        markers = self._sweep_markers([
+        markers = self._sweep([
             {"worker_id": "worker-1", "candidate_index": 70,
-             "work_position": {"candidate_index": 70, "state": "working"}}])
+             "work_position": {"candidate_index": 70, "state": "working"}}])["markers"]
         self.assertNotIn("last-reported", markers[0]["classes"])
         self.assertEqual(markers[0]["barWidth"], "0px")
 
     def test_a_last_reported_marker_sits_behind_a_working_one(self):
         """An uncertain position must never hide a known one."""
-        markers = self._sweep_markers([
+        markers = self._sweep([
             {"worker_id": "worker-1", "candidate_index": 20,
              "work_position": {"candidate_index": 20, "state": "last_reported"}},
             {"worker_id": "worker-2", "candidate_index": 21,
-             "work_position": {"candidate_index": 21, "state": "working"}}])
+             "work_position": {"candidate_index": 21, "state": "working"}}])["markers"]
         behind = next(m for m in markers if "last-reported" in m["classes"])
         in_front = next(m for m in markers if "last-reported" not in m["classes"])
         self.assertLess(int(behind["zIndex"]), int(in_front["zIndex"]))
@@ -3243,11 +3265,12 @@ class ReportClientBrowserTest(unittest.TestCase):
     def test_the_marker_follows_work_position_not_the_heartbeat_index(self):
         """The heartbeat names a candidate in the completed first half; the
         derived position is in the second half, and that is where it draws."""
-        markers = self._sweep_markers([
+        sweep = self._sweep([
             {"worker_id": "worker-1", "candidate_index": 10,
              "work_position": {"candidate_index": 80, "state": "working"}}])
-        # Candidate 80 of 100 falls in cell 40 of 50; candidate 10 in cell 5.
-        self.assertEqual(markers[0]["cell"], 40)
+        # Candidate 80 of 100 opens cell 40 of 50; the heartbeat's 10 is cell 5.
+        self.assertAlmostEqual(
+            sweep["markers"][0]["centre"], sweep["cells"][40]["left"], delta=1.0)
 
     def test_republished_candidates_render_as_summary_not_raw_list(self):
         self.apply_branch_target("RAISE .....")

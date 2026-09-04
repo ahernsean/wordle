@@ -1025,8 +1025,16 @@
         if(complete)cellNode.classList.add("complete");
         strip.append(cellNode);
       }
-      const cellFor=index=>Math.min(cellCount-1,Math.floor(cellCount*index/candidateCount));
-      const cellLeft=cell=>`calc((100% - ${cellCount-1}px) * ${cell} / ${cellCount} + ${cell}px)`;
+      // A candidate's own place along the strip, not its cell's centre.  A
+      // cell spans hundreds of candidates at production sizes, so snapping a
+      // marker to cells discards every bit of position the strip can express
+      // and leaves it with cellCount distinct places to stand.  The integer
+      // term counts the 1px gaps closed before this point.
+      const stripOffset=index=>{
+        const position=Math.max(0,Math.min(cellCount,cellCount*index/candidateCount));
+        const gaps=Math.min(cellCount-1,Math.floor(position));
+        return `calc((100% - ${cellCount-1}px) * ${position} / ${cellCount} + ${gaps}px)`;
+      };
       const animate=comparisonAvailable&&!matchMedia("(prefers-reduced-motion: reduce)").matches;
       // Read once per strip, not once per worker: the halo/fill colors are the
       // same for every marker in this render pass.
@@ -1035,22 +1043,25 @@
       for(const worker of workers||[]){
         const position=workerMarkerPosition(worker);
         if(position===null)continue;
-        const cell=cellFor(position.candidate_index),workerNumber=workerName(worker).replace(/^w/,"");
+        const offset=stripOffset(position.candidate_index),workerNumber=workerName(worker).replace(/^w/,"");
         const marker=element("span","sweep-marker"+(position.state==="last_reported"?" last-reported":""));
         marker.dataset.workerNumber=workerNumber;
         marker.style.width=`calc((100% - ${cellCount-1}px) / ${cellCount})`;
+        // Centred on the candidate's point, so the pointer beneath -- itself
+        // centred in the marker -- lands on that point at any box width.
+        marker.style.transform="translateX(-50%)";
         marker.style.backgroundImage=workerMarkerImage(workerNumber,markerHalo,markerInk);
         const previous=previousWorkersById?.get(String(worker.worker_id));
         const previousPosition=previous&&previous.branch_key_hex===worker.branch_key_hex?workerMarkerPosition(previous):null;
         const previousIndex=previousPosition&&previousPosition.candidate_index;
         if(animate&&previousIndex!==null&&previousIndex!==undefined){
-          // FLIP: start at the previous poll's cell; applyReport slides the
-          // marker to its current cell once the strip is in the document.
-          const previousCell=cellFor(previousIndex);
-          marker.style.left=cellLeft(previousCell);
-          if(previousCell!==cell)marker.dataset.moveTo=cellLeft(cell);
+          // FLIP: start at the previous poll's point; applyReport slides the
+          // marker to its current one once the strip is in the document.
+          const previousOffset=stripOffset(previousIndex);
+          marker.style.left=previousOffset;
+          if(previousOffset!==offset)marker.dataset.moveTo=offset;
         }else{
-          marker.style.left=cellLeft(cell);
+          marker.style.left=offset;
           if(animate){marker.style.opacity="0";marker.dataset.fadeIn="1";}
         }
         strip.append(marker);
