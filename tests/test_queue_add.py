@@ -833,7 +833,10 @@ class TestQueueAddPriorityLadder(unittest.TestCase):
              SECOND_WORD: OPENER_PRIORITY_MAX - 5,
              'crane': OPENER_PRIORITY_MAX - 10})
 
-    def test_appending_onto_floor_priority_reports_a_tie_not_an_order(self):
+    def test_appending_onto_floor_priority_reladders_instead_of_tying(self):
+        # Issue #276: the old ceiling formula (lowest_queued - 1) had nowhere
+        # to go once the incumbent sat at OPENER_PRIORITY_MIN, so the append
+        # tied with it.  Now the incumbent is shifted up to make room instead.
         first = _make_args(self._tmp.name, pattern='-----',
                            priority=OPENER_PRIORITY_MIN,
                            word=[LARGE_BRANCH_WORD])
@@ -848,11 +851,122 @@ class TestQueueAddPriorityLadder(unittest.TestCase):
             erd_search.cmd_queue_add(second)
 
         text = output.getvalue()
-        self.assertIn('TIED WITH queued work at priority 0', text)
-        self.assertNotIn('behind queued work', text)
-        # And the advice names a remedy that can actually work at the floor.
-        self.assertIn('Raise the queued work with queue opener-priority', text)
-        self.assertNotIn('smaller --priority-step', text)
+        self.assertNotIn('TIED WITH', text)
+        self.assertIn('Raised every unfinished opener-work request by 6 to '
+                      'make room', text)
+        self.assertIn('behind queued work down to priority 6', text)
+
+        priorities = self._requested_priority_by_word(first.queue)
+        self.assertEqual(priorities[LARGE_BRANCH_WORD], 6)
+        self.assertEqual(priorities['crane'], 5)
+        self.assertEqual(priorities['irate'], OPENER_PRIORITY_MIN)
+
+    def test_reladdering_preserves_relative_order_of_shifted_work(self):
+        first = _make_args(self._tmp.name, pattern='-----', priority=1,
+                           word=[LARGE_BRANCH_WORD, SECOND_WORD])
+        with redirect_stdout(StringIO()):
+            erd_search.cmd_queue_add(first)
+        priorities_before = self._requested_priority_by_word(first.queue)
+        self.assertEqual(priorities_before[LARGE_BRANCH_WORD], 6)
+        self.assertEqual(priorities_before[SECOND_WORD], 1)
+
+        second = _make_args(self._tmp.name, pattern='-----',
+                            word=['crane', 'irate'],
+                            cache=first.cache, queue=first.queue)
+        with redirect_stdout(StringIO()):
+            erd_search.cmd_queue_add(second)
+
+        priorities = self._requested_priority_by_word(first.queue)
+        # Both incumbents moved up by the same amount, so their gap (5, the
+        # step they were queued at) survives the shift unchanged.
+        self.assertEqual(priorities[LARGE_BRANCH_WORD] - priorities[SECOND_WORD],
+                         priorities_before[LARGE_BRANCH_WORD]
+                         - priorities_before[SECOND_WORD])
+        self.assertGreater(priorities[SECOND_WORD],
+                           priorities_before[SECOND_WORD])
+        self.assertLess(max(priorities['crane'], priorities['irate']),
+                        priorities[SECOND_WORD])
+
+    def test_reladdering_moves_the_incumbents_pending_branch_priority_too(self):
+        first = _make_args(self._tmp.name, pattern='-----',
+                           priority=OPENER_PRIORITY_MIN,
+                           word=[LARGE_BRANCH_WORD])
+        with redirect_stdout(StringIO()):
+            erd_search.cmd_queue_add(first)
+
+        second = _make_args(self._tmp.name, pattern='-----',
+                            word=['crane', 'irate'],
+                            cache=first.cache, queue=first.queue)
+        with redirect_stdout(StringIO()):
+            erd_search.cmd_queue_add(second)
+
+        queue = ERDQueue(first.queue)
+        self.addCleanup(queue.close)
+        incumbent_priority = queue._conn.execute("""
+            SELECT p.priority FROM pending_branches p
+            JOIN branch_opener_work m ON m.branch_id = p.branch_id
+            JOIN opener_work o ON o.opener_work_id = m.opener_work_id
+            WHERE o.opener = ?
+        """, (LARGE_BRANCH_WORD,)).fetchone()[0]
+        # The reladder moved fuzzy's request from 0 to 6 (see the priorities
+        # test above); its pending_branches row must track that, not the
+        # stale priority=0 it was created with.
+        self.assertEqual(incumbent_priority, 6)
+
+    def test_reladdering_reports_headroom_and_refuses_when_range_is_full(self):
+        # Patching the ceiling down to 0 leaves no headroom above the
+        # incumbent to shift into, so the batch cannot be seated at all --
+        # and must fail before writing anything, naming what it needed.
+        first = _make_args(self._tmp.name, pattern='-----', priority=0,
+                           word=[LARGE_BRANCH_WORD])
+        with patch.object(erd_search, 'OPENER_PRIORITY_MAX', 0), \
+                redirect_stdout(StringIO()):
+            erd_search.cmd_queue_add(first)
+
+        second = _make_args(self._tmp.name, pattern='-----',
+                            word=['crane', 'irate'],
+                            cache=first.cache, queue=first.queue)
+        with patch.object(erd_search, 'OPENER_PRIORITY_MAX', 0):
+            with self.assertRaisesRegex(ValueError, 'ceiling of at least'):
+                erd_search.cmd_queue_add(second)
+
+        priorities = self._requested_priority_by_word(first.queue)
+        self.assertEqual(priorities, {LARGE_BRANCH_WORD: 0})
+        self.assertNotIn('crane', priorities)
+        self.assertNotIn('irate', priorities)
+
+    def test_repeated_appends_do_not_shrink_the_rungs_available(self):
+        # Issue #276 acceptance: repeated appends against a non-draining
+        # queue must not reduce the rungs a fixed-size batch can seat on.
+        # Seat one word near the priority floor to start from an already
+        # ratcheted-down position (the real-world state the issue measured),
+        # then append several 3-word batches and confirm every one of them
+        # keeps landing on 3 fully distinct rungs -- never clamping into a
+        # tie the way the old lowest_queued - 1 ceiling eventually would.
+        queue_path = os.path.join(self._tmp.name, 'queue.sqlite3')
+        cache_path = os.path.join(self._tmp.name, 'cache.sqlite3')
+        seed = _make_args(self._tmp.name, pattern='-----', priority=10,
+                          word=['salet'], cache=cache_path, queue=queue_path)
+        with redirect_stdout(StringIO()):
+            erd_search.cmd_queue_add(seed)
+
+        batches = [
+            ['crane', 'tulip', 'video'],
+            ['nomad', 'rocky', 'piano'],
+            ['melon', 'banjo', 'crisp'],
+            ['flame', 'grape', 'honey'],
+            ['joker', 'knife', 'lemon'],
+        ]
+        for batch in batches:
+            args = _make_args(self._tmp.name, pattern='-----', word=batch,
+                              cache=cache_path, queue=queue_path)
+            with redirect_stdout(StringIO()):
+                erd_search.cmd_queue_add(args)
+            priorities = self._requested_priority_by_word(queue_path)
+            batch_priorities = [priorities[word] for word in batch]
+            self.assertEqual(len(set(batch_priorities)), len(batch),
+                             f'batch {batch} did not seat on distinct rungs: '
+                             f'{batch_priorities}')
 
     def test_ladder_top_priority_is_a_pure_function_of_its_arguments(self):
         # Taking lowest_queued as a value rather than re-querying keeps the

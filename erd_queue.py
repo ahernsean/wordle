@@ -2103,6 +2103,75 @@ class ERDQueue:
             WHERE state != 'complete'
         """).fetchone()[0]
 
+    def max_unfinished_opener_priority(self):
+        """The highest requested priority still owed work, or None if none is.
+
+        Paired with lowest_unfinished_opener_priority, this bounds the span
+        unfinished opener-work already occupies.  An append whose ladder would
+        clamp onto OPENER_PRIORITY_MIN reads this to see how much headroom sits
+        above that span before shifting it upward with
+        shift_unfinished_opener_priorities, rather than ratcheting its own
+        floor below the minimum.
+        """
+        return self._conn.execute("""
+            SELECT MAX(requested_priority) FROM opener_work
+            WHERE state != 'complete'
+        """).fetchone()[0]
+
+    def shift_unfinished_opener_priorities(self, amount: int) -> int:
+        """Raise every unfinished opener-work request's priority by `amount`.
+
+        Reclaims room below the incumbent for an append that would otherwise
+        clamp onto OPENER_PRIORITY_MIN: every request the queue still owes
+        work on moves up together, so their relative order and every tie is
+        preserved, and a batch appending beneath them still ranks below all of
+        them.  Mirrors set_opener_work_priority's propagation to owned
+        pending/active branches, applied to every unfinished request in one
+        transaction instead of one at a time.
+
+        Raises ValueError, touching nothing, if the shift would push the
+        highest unfinished priority past OPENER_PRIORITY_MAX.  Returns the
+        number of opener-work requests shifted.
+        """
+        if amount <= 0:
+            raise ValueError('shift amount must be positive')
+        current_max = self.max_unfinished_opener_priority()
+        if current_max is not None and current_max + amount > OPENER_PRIORITY_MAX:
+            raise ValueError(
+                f'shifting unfinished opener-work up by {amount:,} would '
+                f'push priority {current_max:,} past the maximum '
+                f'{OPENER_PRIORITY_MAX:,}')
+        self._conn.execute("BEGIN")
+        try:
+            cur = self._conn.execute("""
+                UPDATE opener_work SET requested_priority = requested_priority + ?
+                WHERE state != 'complete'
+            """, (amount,))
+            if cur.rowcount:
+                self._conn.execute("""
+                    UPDATE pending_branches
+                    SET priority = (
+                        SELECT MAX(owner_priority)
+                        FROM live_branch_opener_rows
+                        WHERE branch_id = pending_branches.branch_id
+                    )
+                    WHERE branch_id IN (SELECT branch_id FROM live_branch_opener_rows)
+                """)
+                self._conn.execute("""
+                    UPDATE active_branches
+                    SET priority = (
+                        SELECT MAX(owner_priority)
+                        FROM live_branch_opener_rows
+                        WHERE branch_id = active_branches.branch_id
+                    )
+                    WHERE branch_id IN (SELECT branch_id FROM live_branch_opener_rows)
+                """)
+            self._conn.execute("COMMIT")
+            return cur.rowcount
+        except Exception:  # pragma: no cover
+            self._conn.execute("ROLLBACK")
+            raise
+
     def _opener_response_group_is_live(self, opener_work_id, opener_pattern):
         """Whether an opener request still needs work below one direct response group."""
         if opener_pattern is None:

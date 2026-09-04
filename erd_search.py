@@ -28,7 +28,12 @@ queue add       Add branches for one or more words to the work queue.
                 a descending priority ladder in the order given, --priority-step
                 apart, so the swarm works them one at a time, and the batch is
                 appended below every word the queue still owes work unless
-                --priority names a rung outright.  With --words-file,
+                --priority names a rung outright.  If there is not enough room
+                below the queue's current floor to seat the batch on distinct
+                rungs, every unfinished request is shifted upward first to
+                reclaim it, rather than clamping the new batch onto the
+                priority floor; reports the headroom left below the batch it
+                seats.  With --words-file,
                 --priority-words restricts the ladder to a subset of the file's
                 words.  --delete-erd-cache forces a recompute of branches that
                 are already cached, discarding both the cache entry and the
@@ -199,6 +204,48 @@ def priority_ladder(words, top_priority, step):
             for index, word in enumerate(words)}
 
 
+def _make_room_for_append(queue, lowest_queued, step, n_words):
+    """Reclaim room for an append whose ladder would clamp onto
+    OPENER_PRIORITY_MIN, by shifting every unfinished opener-work request
+    upward instead of ratcheting the append's own floor below the minimum.
+
+    Called only when `queue add` has no explicit --priority and the queue
+    already owes work.  Without this, `lowest_queued - 1` is the append's
+    only ceiling and it only ever falls as batches accumulate, making
+    OPENER_PRIORITY_MAX practically unreachable on a queue that never fully
+    drains (issue #276).  Shifting the unfinished set up by the shortfall
+    instead preserves every request's relative order and every tie, and
+    frees exactly the room this batch needs.
+
+    Returns (lowest_queued, shift): the (possibly raised) floor to seat the
+    new batch below, and how far unfinished work was shifted (0 if it
+    already fit).  Raises ValueError, before touching anything, if shifting
+    every unfinished request up to OPENER_PRIORITY_MAX still cannot make
+    room — the range is already fully occupied.
+    """
+    required_span = step * max(0, n_words - 1)
+    naive_floor = (lowest_queued - 1) - required_span
+    if naive_floor >= OPENER_PRIORITY_MIN:
+        return lowest_queued, 0
+    max_unfinished = queue.max_unfinished_opener_priority()
+    headroom_above = OPENER_PRIORITY_MAX - max_unfinished
+    shortfall = OPENER_PRIORITY_MIN - naive_floor
+    shift = min(shortfall, headroom_above)
+    if naive_floor + shift < OPENER_PRIORITY_MIN:
+        needed_ceiling = lowest_queued - 1 + (shortfall - headroom_above)
+        raise ValueError(
+            f'{n_words:,} words at step {step:,} need a ladder reaching '
+            f'{shortfall:,} below the current queue floor of '
+            f'{lowest_queued:,}; shifting every unfinished opener-work '
+            f'request up to the maximum {OPENER_PRIORITY_MAX:,} only frees '
+            f'{headroom_above:,}.  The range would need a ceiling of at '
+            f'least {needed_ceiling:,} to hold both.  Use queue '
+            f'opener-priority to make room by hand, or pass --priority to '
+            f'place this batch deliberately.')
+    queue.shift_unfinished_opener_priorities(shift)
+    return lowest_queued + shift, shift
+
+
 def ladder_top_priority(lowest_queued, explicit_priority, step, n_words):
     """The rung a batch's first word takes.
 
@@ -291,6 +338,14 @@ def cmd_queue_add(args):
     the minimum.  A word repeated in the input takes its first position and is
     queued once.
 
+    An append (no --priority) whose ladder would run past the priority
+    minimum first shifts every unfinished request upward by the shortfall,
+    reclaiming exactly the room the new batch needs rather than ratcheting
+    its own floor down or clamping onto the minimum — a queue fed
+    continuously (never fully draining) therefore does not lose rungs to
+    successive appends.  Reports the headroom left below the batch it seats,
+    and raises before queuing anything if even that shift cannot make room.
+
     Already-queued branches are never duplicated; their priority is upgraded
     if the new request is higher.  Branches with reusable cached results are
     already solved and are not queued, unless --delete-erd-cache is given.
@@ -347,28 +402,31 @@ def cmd_queue_add(args):
     laddered_words = [word for word in words_to_process
                       if not priority_words or word in priority_words]
     lowest_queued = queue.lowest_unfinished_opener_priority()
+    shift = 0
+    if args.priority is None and lowest_queued is not None and laddered_words:
+        lowest_queued, shift = _make_room_for_append(
+            queue, lowest_queued, args.priority_step, len(laddered_words))
     top_priority = ladder_top_priority(
         lowest_queued, args.priority, args.priority_step, len(laddered_words))
     ladder = priority_ladder(laddered_words, top_priority, args.priority_step)
     if laddered_words:
+        if shift:
+            print(f'Raised every unfinished opener-work request by '
+                  f'{shift:,} to make room for this batch below priority '
+                  f'{lowest_queued:,}.')
+        # _make_room_for_append guarantees room below lowest_queued (or
+        # raises before we get here), so an append never ties the incumbent.
         appended = args.priority is None and lowest_queued is not None
-        # An append whose top rung is the incumbent's own priority had no room
-        # below it, so the batch ties with queued work rather than ranking
-        # under it.  Saying "behind" there would misreport a tie as an order.
-        ties_incumbent = appended and top_priority >= lowest_queued
-        if not appended:
-            placement = ''
-        elif ties_incumbent:
-            placement = (f', TIED WITH queued work at priority '
-                         f'{lowest_queued:,} — nothing below it to append into')
-        else:
-            placement = (f', behind queued work down to priority '
-                         f'{lowest_queued:,}')
+        placement = (f', behind queued work down to priority {lowest_queued:,}'
+                     if appended else '')
         print(f'{laddered_words[0].upper()} first at priority '
               f'{ladder[laddered_words[0]]:,}, '
               f'{laddered_words[-1].upper()} last at '
               f'{ladder[laddered_words[-1]]:,}{placement}.')
         floor = min(ladder.values())
+        headroom = floor - OPENER_PRIORITY_MIN
+        print(f'{headroom:,} priority value(s) of headroom remain below it, '
+              f'down to {OPENER_PRIORITY_MIN:,}.')
         on_floor = sum(1 for word in laddered_words if ladder[word] == floor)
         if args.priority_step and on_floor > 1:
             # Distinct rungs only collide once the ladder clamps, so a tie here

@@ -1558,6 +1558,91 @@ class TestClaimNext(_TmpQueue):
             "DELETE FROM worker_heartbeat WHERE worker_id = 'worker-0'")
 
 
+class TestReladderUnfinishedOpenerPriorities(_TmpQueue):
+    """max_unfinished_opener_priority / shift_unfinished_opener_priorities.
+
+    These back erd_search's fix for issue #276: an append with no room below
+    the incumbent shifts every unfinished request up instead of clamping."""
+
+    def test_max_is_none_on_an_empty_queue(self):
+        self.assertIsNone(self.q.max_unfinished_opener_priority())
+
+    def test_max_ignores_completed_requests(self):
+        self.q.add_pending_many([(self.key, len(WORDS), 5, "crane", 0)])
+        opener_work_id = self.q.opener_work_rows()[0]["opener_work_id"]
+        self.q.claim_next("worker-0", opener_work_id)
+        self.q.mark_done(self.key)
+        self.assertIsNone(self.q.max_unfinished_opener_priority())
+
+    def test_shift_raises_every_unfinished_requested_priority(self):
+        other_key = ScoreCache.encode_subset(WORDS[:4])
+        self.q.add_pending_many([
+            (self.key, len(WORDS), 5, "crane", 0),
+            (other_key, 4, 0, "slate", 0),
+        ])
+        shifted = self.q.shift_unfinished_opener_priorities(10)
+        self.assertEqual(shifted, 2)
+        priorities = {row["opener"]: row["requested_priority"]
+                     for row in self.q.opener_work_rows()}
+        self.assertEqual(priorities, {"crane": 15, "slate": 10})
+        self.assertEqual(self.q.max_unfinished_opener_priority(), 15)
+        self.assertEqual(self.q.lowest_unfinished_opener_priority(), 10)
+
+    def test_shift_propagates_to_pending_and_active_branches(self):
+        self.q.add_pending_many([(self.key, len(WORDS), 5, "crane", 0)])
+        claimed = self.q.claim_next("worker-0")
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES,
+                             priority=claimed["priority"],
+                             opener_work_id=claimed["opener_work_id"])
+
+        self.q.shift_unfinished_opener_priorities(10)
+
+        self.assertEqual(self.q.get_branch(self.key)["priority"], 15)
+        self.assertEqual(self.q.get_pending_branch(self.key)["priority"], 15)
+
+    def test_shift_leaves_completed_work_untouched(self):
+        other_key = ScoreCache.encode_subset(WORDS[:4])
+        self.q.add_pending_many([(self.key, len(WORDS), 5, "crane", 0)])
+        opener_work_id = self.q.opener_work_rows()[0]["opener_work_id"]
+        self.q.claim_next("worker-0", opener_work_id)
+        self.q.mark_done(self.key)
+        self.q.add_pending_many([(other_key, 4, 0, "slate", 0)])
+
+        self.q.shift_unfinished_opener_priorities(10)
+
+        priorities = {row["opener"]: row["requested_priority"]
+                     for row in self.q.opener_work_rows()}
+        self.assertEqual(priorities, {"crane": 5, "slate": 10})
+
+    def test_shift_preserves_relative_order_and_ties(self):
+        other_key = ScoreCache.encode_subset(WORDS[:4])
+        self.q.add_pending_many([
+            (self.key, len(WORDS), 5, "crane", 0),
+            (other_key, 4, 5, "slate", 0),
+        ])
+        self.q.shift_unfinished_opener_priorities(7)
+        priorities = {row["opener"]: row["requested_priority"]
+                     for row in self.q.opener_work_rows()}
+        self.assertEqual(priorities, {"crane": 12, "slate": 12})
+
+    def test_shift_rejects_non_positive_amounts(self):
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            self.q.shift_unfinished_opener_priorities(0)
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            self.q.shift_unfinished_opener_priorities(-1)
+
+    def test_shift_refuses_and_touches_nothing_past_the_maximum(self):
+        self.q.add_pending_many([
+            (self.key, len(WORDS), OPENER_PRIORITY_MAX - 2, "crane", 0)])
+
+        with self.assertRaisesRegex(ValueError, "past the maximum"):
+            self.q.shift_unfinished_opener_priorities(3)
+
+        self.assertEqual(
+            self.q.opener_work_rows()[0]["requested_priority"],
+            OPENER_PRIORITY_MAX - 2)
+
+
 class TestOpenerWorkConcurrency(_TmpQueue):
     def test_interleaved_opener_lifecycle_preserves_invariants(self):
         worker_count = 4
