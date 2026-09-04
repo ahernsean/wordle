@@ -506,18 +506,24 @@ python3.13 erd_search.py queue add --word salet crane raise --priority-step 0
 
 Ladders run downward from the top of the range rather than upward from its
 floor; that is what leaves room beneath each batch for the next one to append
-into.  `queue add` reports the rungs it took and the priority it queued behind.
+into.  `queue add` reports the rungs it took and the headroom left below them.
 
-The append ceiling is `lowest_unfinished_source_priority() - 1`, so it
-**ratchets downward** as batches accumulate and only returns to the top of the
-range once the queue fully drains.  A long-running sweep therefore works from
-whatever the last batch left, not from 999,999 — `queue add` reports the
-priority it queued behind, so check that line before queueing a large batch.
+The append ceiling is `lowest_unfinished_opener_priority() - 1`.  On its own
+that would **ratchet downward** as batches accumulate, only returning to the
+top of the range once the queue fully drains — a long-running sweep never
+drains, so successive appends would eventually clamp onto the priority
+minimum and start tying (issue #276).  Instead, when a batch would not fit on
+distinct rungs below the incumbent, `queue add` first shifts every unfinished
+opener-work request upward by the shortfall — preserving their relative order
+and every tie — and only then seats the new batch beneath the raised floor.
+This reclaims exactly the room the batch needs instead of losing it, so a
+non-draining queue does not lose rungs to repeated appends.  If shifting every
+unfinished request up to the maximum still cannot make room (the range is
+already fully occupied), `queue add` refuses before queuing anything and names
+the step and ceiling it would have needed.
 
 Naming `--priority` opts out of appending: it fixes the *last* word's rung, so
-the batch is placed wherever you ask — including ahead of queued work.  To jump
-a word to the front, name a priority above whatever the current top rung is
-(there is no headroom above a batch that took `SOURCE_PRIORITY_MAX` itself):
+the batch is placed wherever you ask — including ahead of queued work:
 
 ```bash
 # With queued work topping out at 999,983, this runs ahead of all of it:
@@ -530,11 +536,11 @@ naming the rung it would have needed, not a silent demotion.
 
 A list too long to seat on distinct rungs above 0 gives them to the leading
 words and ties the remainder on the minimum; `queue add` says so when that
-happens.  The tail is undifferentiated but still ranks below every seated
-word, and can be re-laddered later with `queue opener-priority`.  Appending
-onto queued work that already sits at priority 0 has nowhere to go at all: the
-batch ties with it, and `queue add` reports the tie rather than claiming to
-rank below it.
+happens.  This can only occur on an empty queue with `--priority` unset (the
+batch itself is wider than the whole range), since an append into a
+non-empty queue reladders instead of clamping.  The tied tail is
+undifferentiated but still ranks below every seated word, and can be
+re-laddered later with `queue opener-priority`.
 
 Pattern syntax: `g`=green, `y`=yellow, `-` or `.`=gray.  Use dots (not
 dashes) for patterns that start with a gray position to avoid the shell/argparse
