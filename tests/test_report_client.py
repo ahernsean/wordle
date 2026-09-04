@@ -3071,17 +3071,46 @@ class ReportClientBrowserTest(unittest.TestCase):
         # alignment, so at least one must actually have unequal content.
         self.assertTrue(any(row["contentDiffers"] for row in rows))
 
-    def test_section_pairs_collapse_to_one_column_on_a_phone(self):
+    def test_section_pairs_stay_two_columns_on_a_phone(self):
+        """This client is read mostly on a phone, so the pairing has to hold
+        at phone widths or it does nothing where it is actually looked at."""
         self.page.set_viewport_size({"width": 390, "height": 800})
         try:
             self.apply_branch_target("RAISE .....")
             self.page.wait_for_selector("text=Bundles")
             columns = self.page.evaluate("""() => [...document.querySelectorAll('#report .section-pair')]
               .map(node=>getComputedStyle(node).gridTemplateColumns.split(' ').filter(Boolean).length)""")
+            measured = self.page.evaluate(
+                "() => ({scroll: document.documentElement.scrollWidth,"
+                " client: document.documentElement.clientWidth})")
         finally:
             self.page.set_viewport_size({"width": 1200, "height": 800})
         self.assertTrue(columns)
-        self.assertEqual(set(columns), {1})
+        self.assertEqual(set(columns), {2})
+        self.assertLessEqual(measured["scroll"], measured["client"])
+
+    def test_a_deep_spine_stacks_inside_its_half_width_panel(self):
+        """A spine too wide for half a phone must stack its guesses into a
+        column, not clip them: .tiles is nowrap with overflow hidden, so a
+        row that does not fit loses guesses off the end silently."""
+        self.page.set_viewport_size({"width": 390, "height": 800})
+        try:
+            result = self.page.evaluate("""async () => {
+              const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
+              branch.data.branch.spine=[{word:'salet',pattern:'-----'},
+                                       {word:'crane',pattern:'y----'},
+                                       {word:'lubes',pattern:'--g--'}];
+              applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
+              const tiles=document.querySelector('.section-pair .tiles');
+              return {stacked:tiles.classList.contains('stacked'),
+                      guesses:tiles.querySelectorAll('.word').length,
+                      clipped:tiles.scrollWidth>tiles.clientWidth};
+            }""")
+        finally:
+            self.page.set_viewport_size({"width": 1200, "height": 800})
+        self.assertEqual(result["guesses"], 3)
+        self.assertTrue(result["stacked"])
+        self.assertFalse(result["clipped"])
 
     def test_live_workers_sits_between_candidates_and_bundles(self):
         """The two panels that change every poll are kept adjacent."""

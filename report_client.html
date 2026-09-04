@@ -120,12 +120,11 @@
     .card, .section { min-width:0; background:var(--panel); border:1px solid var(--border); border-radius:6px; padding:.4rem .55rem; overflow-wrap:anywhere; }
     .section { margin:.45rem 0; }
     /* Two sections that each use little horizontal space, shown side by
-       side.  Both halves stretch to the taller one's height, so the row
-       has one top and one bottom edge rather than a ragged pair.
-       Collapses to one column where half a viewport is too narrow for a
-       spine's word tiles. */
+       side at every width, phones included.  Both halves stretch to the
+       taller one's height, so the row has one top and one bottom edge
+       rather than a ragged pair.  A spine too wide for its half stacks its
+       guesses into a column (layoutSpines) rather than overflowing. */
     .section-pair { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:0 .45rem; }
-    @media (max-width:700px) { .section-pair { grid-template-columns:minmax(0,1fr); } }
     .card.active, .card.filtered { border-color:var(--green); }
     .card.filtered { background:var(--hover-tint); }
     .card.recently-completed { border:3px solid var(--blue); background:var(--completed-bg); }
