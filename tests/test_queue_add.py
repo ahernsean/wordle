@@ -935,6 +935,49 @@ class TestQueueAddPriorityLadder(unittest.TestCase):
         self.assertNotIn('crane', priorities)
         self.assertNotIn('irate', priorities)
 
+    def test_a_fully_cached_word_does_not_reladder_the_incumbent(self):
+        # PR #327 review: a batch that ends up entirely already-solved must
+        # not shift already-queued opener-work priorities -- it adds nothing,
+        # so it must leave the live queue's priorities untouched, and must
+        # never be refused at the ceiling for what is ultimately a no-op.
+        incumbent = _make_args(self._tmp.name, pattern='-----', priority=0,
+                               word=[SECOND_WORD])
+        with redirect_stdout(StringIO()):
+            erd_search.cmd_queue_add(incumbent)
+
+        all_answers = load_word_list(erd_search.ANSWER_FILE)
+        probe_cache = ScoreCache(
+            os.path.join(self._tmp.name, 'probe.sqlite3'), all_answers)
+        rcache = ResponseCache(all_answers, probe_cache)
+        groups = rcache.group_words(LARGE_BRANCH_WORD, all_answers)
+        branch = groups[0]
+        branch_key = encode_subset(branch)
+        probe_cache.close()
+
+        score_cache = ScoreCache(incumbent.cache, all_answers)
+        score_cache.write(branch_key, ERD_ALL, 'salet', 3.5,
+                          max_depth=GAME_GUESSES - 2, solve_budget=None)
+        score_cache.checkpoint()
+        score_cache.close()
+
+        cached_only = _make_args(self._tmp.name, pattern='-----',
+                                 word=[LARGE_BRANCH_WORD],
+                                 cache=incumbent.cache, queue=incumbent.queue)
+        output = StringIO()
+        with redirect_stdout(output):
+            erd_search.cmd_queue_add(cached_only)
+
+        text = output.getvalue()
+        self.assertIn('already solved', text)
+        self.assertNotIn('Raised every unfinished opener-work request', text)
+
+        queue = ERDQueue(incumbent.queue)
+        self.addCleanup(queue.close)
+        rows = queue.opener_work_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['opener'], SECOND_WORD)
+        self.assertEqual(rows[0]['requested_priority'], 0)
+
     def test_repeated_appends_do_not_shrink_the_rungs_available(self):
         # Issue #276 acceptance: repeated appends against a non-draining
         # queue must not reduce the rungs a fixed-size batch can seat on.

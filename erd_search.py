@@ -345,6 +345,10 @@ def cmd_queue_add(args):
     continuously (never fully draining) therefore does not lose rungs to
     successive appends.  Reports the headroom left below the batch it seats,
     and raises before queuing anything if even that shift cannot make room.
+    A batch that ends up with nothing to queue (every branch already cached,
+    or none large enough) never reladders: already-queued priorities are
+    left untouched, and the request cannot be refused at the ceiling for
+    what is ultimately a no-op.
 
     Already-queued branches are never duplicated; their priority is upgraded
     if the new request is higher.  Branches with reusable cached results are
@@ -399,47 +403,6 @@ def cmd_queue_add(args):
         print(f'Warning: priority words not in the word list: '
               f'{", ".join(sorted(unknown))}')
 
-    laddered_words = [word for word in words_to_process
-                      if not priority_words or word in priority_words]
-    lowest_queued = queue.lowest_unfinished_opener_priority()
-    shift = 0
-    if args.priority is None and lowest_queued is not None and laddered_words:
-        lowest_queued, shift = _make_room_for_append(
-            queue, lowest_queued, args.priority_step, len(laddered_words))
-    top_priority = ladder_top_priority(
-        lowest_queued, args.priority, args.priority_step, len(laddered_words))
-    ladder = priority_ladder(laddered_words, top_priority, args.priority_step)
-    if laddered_words:
-        if shift:
-            print(f'Raised every unfinished opener-work request by '
-                  f'{shift:,} to make room for this batch below priority '
-                  f'{lowest_queued:,}.')
-        # _make_room_for_append guarantees room below lowest_queued (or
-        # raises before we get here), so an append never ties the incumbent.
-        appended = args.priority is None and lowest_queued is not None
-        placement = (f', behind queued work down to priority {lowest_queued:,}'
-                     if appended else '')
-        print(f'{laddered_words[0].upper()} first at priority '
-              f'{ladder[laddered_words[0]]:,}, '
-              f'{laddered_words[-1].upper()} last at '
-              f'{ladder[laddered_words[-1]]:,}{placement}.')
-        floor = min(ladder.values())
-        headroom = floor - OPENER_PRIORITY_MIN
-        print(f'{headroom:,} priority value(s) of headroom remain below it, '
-              f'down to {OPENER_PRIORITY_MIN:,}.')
-        on_floor = sum(1 for word in laddered_words if ladder[word] == floor)
-        if args.priority_step and on_floor > 1:
-            # Distinct rungs only collide once the ladder clamps, so a tie here
-            # always sits on OPENER_PRIORITY_MIN with nothing beneath it.  A
-            # smaller step cannot divide headroom that does not exist; raising
-            # the incumbent or naming a priority is what actually works.
-            print(f'Warning: {len(laddered_words):,} words do not fit on a '
-                  f'ladder of step {args.priority_step:,} below priority '
-                  f'{top_priority:,}; the last {on_floor:,} share priority '
-                  f'{floor:,} and will start together.  Raise the queued work '
-                  f'with queue opener-priority, or pass --priority to place '
-                  f'this batch deliberately.')
-
     # A branch reached by --word has guess_depth 1 (one guess played), so it
     # is solved at ROOT_BUDGET - 1 == GAME_GUESSES - 1.
     branch_budget = GAME_GUESSES - 1
@@ -450,78 +413,156 @@ def cmd_queue_add(args):
     n_reset = 0
     n_busy = 0
     try:
+        # First pass: work out what each word actually needs queuing --
+        # cache state, and (under --delete-erd-cache) invalidation -- none of
+        # which depends on priority.  This decides whether the batch has any
+        # real work *before* the ladder is seated, so a batch that is fully
+        # cached (nothing to queue) never shifts already-queued opener-work
+        # priorities, and can't be refused at the ceiling for a no-op.
+        word_plans = {}
+        skip_message_by_word = {}
         for word in words_to_process:
-            priority = ladder.get(word, OPENER_PRIORITY_MIN)
             if args.pattern:
                 code = parse_pattern(args.pattern)
                 groups = rcache.group_words(word, all_answers)
                 branch = groups.get(code, [])
                 if len(branch) < 2:
-                    print(f'{word.upper()} {fmt_pattern(code)}: '
-                          f'{len(branch)} answer word(s) — nothing to queue.')
-                    continue
-                if (args.max_branch_size is not None
-                        and len(branch) > args.max_branch_size):
-                    print(f'{word.upper()} {fmt_pattern(code)}: '
-                          f'{len(branch)} words exceeds --max-branch-size '
-                          f'{args.max_branch_size}, skipping.')
-                    continue
-                rows = [(encode_subset(branch), len(branch), priority,
-                         word, code)]
+                    skip_message_by_word[word] = (
+                        f'{word.upper()} {fmt_pattern(code)}: '
+                        f'{len(branch)} answer word(s) — nothing to queue.')
+                    rows = []
+                elif (args.max_branch_size is not None
+                      and len(branch) > args.max_branch_size):
+                    skip_message_by_word[word] = (
+                        f'{word.upper()} {fmt_pattern(code)}: '
+                        f'{len(branch)} words exceeds --max-branch-size '
+                        f'{args.max_branch_size}, skipping.')
+                    rows = []
+                else:
+                    rows = [(encode_subset(branch), len(branch), code)]
             else:
                 groups = rcache.group_words(word, all_answers)
                 rows = [
-                    (encode_subset(branch), len(branch), priority, word, code)
+                    (encode_subset(branch), len(branch), code)
                     for code, branch in groups.items()
                     if len(branch) >= 2
                     and (args.max_branch_size is None
                          or len(branch) <= args.max_branch_size)
                 ]
-            if rows:
-                branch_keys = [branch_key for branch_key, *_rest in rows]
-                cache_states = score_cache.report_branch_states(
-                    branch_keys, ERD_ALL, budget=branch_budget)
-                already_cached_keys = {
-                    key for key, state in cache_states.items()
-                    if state['cache_state'] in ('exact', 'loss')}
 
-                if args.delete_erd_cache:
-                    word_reset, word_busy = invalidate_branches_for_recompute(
-                        queue, score_cache, branch_keys)
-                    n_reset += word_reset
-                    n_busy += word_busy
-                    rows_to_queue = rows
-                    already_solved_keys = set()
-                else:
-                    rows_to_queue = [
-                        row for row in rows
-                        if row[0] not in already_cached_keys]
-                    already_solved_keys = already_cached_keys
+            if not rows:
+                word_plans[word] = None
+                continue
 
-                already_queued_keys = set(
-                    queue.status_by_branch_keys(
-                        [branch_key for branch_key, *_rest in rows_to_queue]))
-                if rows_to_queue:
-                    queue.add_pending_many(rows_to_queue)
+            branch_keys = [branch_key for branch_key, _count, _code in rows]
+            cache_states = score_cache.report_branch_states(
+                branch_keys, ERD_ALL, budget=branch_budget)
+            already_cached_keys = {
+                key for key, state in cache_states.items()
+                if state['cache_state'] in ('exact', 'loss')}
 
-                word_already_queued = len(already_queued_keys)
-                word_new = len(rows_to_queue) - word_already_queued
-                word_already_solved = len(already_solved_keys)
-                n_new += word_new
-                n_already_queued += word_already_queued
-                n_already_solved += word_already_solved
-                if not rows_to_queue:
-                    response_group_label = (
-                        'response group' if word_already_solved == 1
-                        else 'response groups')
-                    print(f'{word.upper()}: already solved — '
-                          f'{word_already_solved:,} {response_group_label} already '
-                          f'cached; nothing queued.')
-                else:
-                    print(f'{word.upper()}: {len(rows_to_queue):,} branch(es) '
-                          f'— {word_new:,} new, '
-                          f'{word_already_queued:,} already queued, '
-                          f'{word_already_solved:,} already solved.')
+            if args.delete_erd_cache:
+                word_reset, word_busy = invalidate_branches_for_recompute(
+                    queue, score_cache, branch_keys)
+                n_reset += word_reset
+                n_busy += word_busy
+                rows_to_queue = rows
+                already_solved_keys = set()
+            else:
+                rows_to_queue = [
+                    row for row in rows if row[0] not in already_cached_keys]
+                already_solved_keys = already_cached_keys
+
+            already_queued_keys = set(
+                queue.status_by_branch_keys(
+                    [branch_key for branch_key, _count, _code
+                     in rows_to_queue]))
+            word_plans[word] = (rows_to_queue, already_queued_keys,
+                               already_solved_keys)
+
+        any_rows_to_queue = any(
+            plan is not None and plan[0] for plan in word_plans.values())
+
+        laddered_words = [word for word in words_to_process
+                          if not priority_words or word in priority_words]
+        lowest_queued = queue.lowest_unfinished_opener_priority()
+        shift = 0
+        if (args.priority is None and lowest_queued is not None
+                and laddered_words and any_rows_to_queue):
+            lowest_queued, shift = _make_room_for_append(
+                queue, lowest_queued, args.priority_step, len(laddered_words))
+        top_priority = ladder_top_priority(
+            lowest_queued, args.priority, args.priority_step,
+            len(laddered_words))
+        ladder = priority_ladder(laddered_words, top_priority,
+                                 args.priority_step)
+        if laddered_words:
+            if shift:
+                print(f'Raised every unfinished opener-work request by '
+                      f'{shift:,} to make room for this batch below priority '
+                      f'{lowest_queued:,}.')
+            # _make_room_for_append guarantees room below lowest_queued (or
+            # raises before we get here), so an append never ties the incumbent.
+            appended = args.priority is None and lowest_queued is not None
+            placement = (f', behind queued work down to priority {lowest_queued:,}'
+                         if appended else '')
+            print(f'{laddered_words[0].upper()} first at priority '
+                  f'{ladder[laddered_words[0]]:,}, '
+                  f'{laddered_words[-1].upper()} last at '
+                  f'{ladder[laddered_words[-1]]:,}{placement}.')
+            floor = min(ladder.values())
+            headroom = floor - OPENER_PRIORITY_MIN
+            print(f'{headroom:,} priority value(s) of headroom remain below it, '
+                  f'down to {OPENER_PRIORITY_MIN:,}.')
+            on_floor = sum(1 for word in laddered_words if ladder[word] == floor)
+            if args.priority_step and on_floor > 1:
+                # Distinct rungs only collide once the ladder clamps, so a tie here
+                # always sits on OPENER_PRIORITY_MIN with nothing beneath it.  A
+                # smaller step cannot divide headroom that does not exist; raising
+                # the incumbent or naming a priority is what actually works.
+                print(f'Warning: {len(laddered_words):,} words do not fit on a '
+                      f'ladder of step {args.priority_step:,} below priority '
+                      f'{top_priority:,}; the last {on_floor:,} share priority '
+                      f'{floor:,} and will start together.  Raise the queued work '
+                      f'with queue opener-priority, or pass --priority to place '
+                      f'this batch deliberately.')
+
+        # Second pass: assign each word's rung and write it, now that the
+        # ladder (and any reladdering) has been decided.
+        for word in words_to_process:
+            plan = word_plans[word]
+            if plan is None:
+                message = skip_message_by_word.get(word)
+                if message is not None:
+                    print(message)
+                continue
+
+            rows_to_queue, already_queued_keys, already_solved_keys = plan
+            priority = ladder.get(word, OPENER_PRIORITY_MIN)
+            rows_with_priority = [
+                (branch_key, count, priority, word, code)
+                for branch_key, count, code in rows_to_queue]
+            if rows_with_priority:
+                queue.add_pending_many(rows_with_priority)
+
+            word_already_queued = len(already_queued_keys)
+            word_new = len(rows_to_queue) - word_already_queued
+            word_already_solved = len(already_solved_keys)
+            n_new += word_new
+            n_already_queued += word_already_queued
+            n_already_solved += word_already_solved
+            if not rows_to_queue:
+                response_group_label = (
+                    'response group' if word_already_solved == 1
+                    else 'response groups')
+                print(f'{word.upper()}: already solved — '
+                      f'{word_already_solved:,} {response_group_label} already '
+                      f'cached; nothing queued.')
+            else:
+                print(f'{word.upper()}: {len(rows_to_queue):,} branch(es) '
+                      f'— {word_new:,} new, '
+                      f'{word_already_queued:,} already queued, '
+                      f'{word_already_solved:,} already solved.')
 
         total = queue.total_branches()
         n_added = n_new + n_already_queued
