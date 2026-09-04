@@ -3016,9 +3016,14 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def test_reached_via_climbs_to_the_word_report_for_its_last_guess(self):
         self.apply_branch_target("RAISE .....")
-        self.page.wait_for_selector("section:has-text('Reached via') button:has-text('Up to RAISE')")
-        self.page.locator(
-            "section:has-text('Reached via') button:has-text('Up to RAISE')").click()
+        button = "section:has-text('Reached via') button:has-text('Up to')"
+        self.page.wait_for_selector(button + " .word")
+        # The word is drawn as tiles, the way a word is drawn everywhere else,
+        # rather than spelled out in the button's text.
+        tiles = self.page.locator(button + " .word").first
+        self.assertEqual(tiles.get_attribute("data-spine"), "RAISE")
+        self.assertEqual(self.page.locator(button + " .word .letter.blank").count(), 5)
+        self.page.locator(button).click()
         self.page.wait_for_selector("text=word report")
         self.assertEqual(
             self.page.locator("#branch-target-input").input_value(), "RAISE")
@@ -3034,11 +3039,19 @@ class ReportClientBrowserTest(unittest.TestCase):
           applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
           const button=[...document.querySelectorAll("section button")]
             .find(node=>node.textContent.startsWith('Up to'));
+          const tiles=button.querySelector('.word');
+          const result={spine:tiles&&tiles.dataset.spine,
+                        blankTiles:tiles?tiles.querySelectorAll('.letter.blank').length:0,
+                        colouredTiles:tiles?tiles.querySelectorAll('.letter.g,.letter.y').length:0};
           button.click();
-          return {label:button.textContent,
-                  value:document.querySelector('#branch-target-input').value};
+          result.value=document.querySelector('#branch-target-input').value;
+          return result;
         }""")
-        self.assertEqual(target["label"], "Up to BEGAN")
+        # The climbed-to guess is drawn unpatterned: it names a word, not a
+        # branch, so no response colours belong on it.
+        self.assertEqual(target["spine"], "BEGAN")
+        self.assertEqual(target["blankTiles"], 5)
+        self.assertEqual(target["colouredTiles"], 0)
         self.assertEqual(target["value"], "SALET ----- CRANE y---- BEGAN")
 
     def test_spine_and_identity_share_one_two_column_row(self):

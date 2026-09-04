@@ -28,6 +28,9 @@
     body { overflow-x:hidden; }
     button, input, select { min-height:30px; border:1px solid var(--border); border-radius:5px; background:var(--bg); color:var(--text); font:inherit; padding:.25rem .5rem; }
     button { cursor:pointer; }
+    /* A button naming a word draws it as tiles, like the word is drawn
+       everywhere else, so the label and the spine above it read alike. */
+    .word-button { display:inline-flex; align-items:center; gap:.35rem; }
     button:disabled { cursor:default; opacity:.45; }
     button:hover, button[aria-current="page"], button[aria-pressed="true"] { border-color:var(--green); background:var(--hover-tint); }
     .layout-toggle { display:inline-flex; align-items:center; gap:.35rem; margin-left:.25rem; padding-left:.6rem; border-left:1px solid var(--border); }
@@ -1390,7 +1393,9 @@
         // of everything above it.
         const lastStep=branch.spine[branch.spine.length-1];
         const upTarget=spineText([...branch.spine.slice(0,-1),{word:lastStep.word,pattern:null}]);
-        const upButton=element("button","","Up to "+String(lastStep.word||"").toUpperCase());
+        const upButton=element("button","word-button");
+        upButton.append(element("span","","Up to"),
+                        wordTiles(lastStep.word,null,lastStep.word_is_answer));
         upButton.addEventListener("click",()=>setState({...currentState,kind:"auto",branch_target:upTarget,tree:false,claims:false,answers:false,finalization_cursor:""}));
         const copyButton=element("button","","Copy spine"),spineTargetText=spineText(branch.spine);
         copyButton.addEventListener("click",()=>copyText(spineTargetText).then(copied=>{copyButton.textContent=copied?"Copied":"Copy failed";}));
