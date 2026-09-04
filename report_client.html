@@ -1300,7 +1300,19 @@
       identityMetrics.append(metric("branch","@"+shortReference(valueOrDash(branch.branch_reference))),metric("words",branch.answer_count));
       const identitySection=section("Identity",identityMetrics);
       let spineSection=null;
-      if(branch.spine?.length){spineSection=section("Reached via",renderSpine(branch.spine));const copyButton=element("button","","Copy spine"),spineTargetText=spineText(branch.spine);copyButton.addEventListener("click",()=>copyText(spineTargetText).then(copied=>{copyButton.textContent=copied?"Copied":"Copy failed";}));spineSection.append(copyButton);}
+      if(branch.spine?.length){
+        spineSection=section("Reached via",renderSpine(branch.spine));
+        // Dropping the last step's pattern leaves the guess that reached this
+        // branch, which parses as a word report for that guess in the context
+        // of everything above it.
+        const lastStep=branch.spine[branch.spine.length-1];
+        const upTarget=spineText([...branch.spine.slice(0,-1),{word:lastStep.word,pattern:null}]);
+        const upButton=element("button","","Up to "+String(lastStep.word||"").toUpperCase());
+        upButton.addEventListener("click",()=>setState({...currentState,kind:"auto",branch_target:upTarget,tree:false,claims:false,answers:false,finalization_cursor:""}));
+        const copyButton=element("button","","Copy spine"),spineTargetText=spineText(branch.spine);
+        copyButton.addEventListener("click",()=>copyText(spineTargetText).then(copied=>{copyButton.textContent=copied?"Copied":"Copy failed";}));
+        spineSection.append(upButton,copyButton);
+      }
       fragment.append(spineSection?sectionPair(spineSection,identitySection):identitySection);
       const bundleSummary=data.bundle_summary||{};
       const queueFacts=data.queue?[["status",data.queue.branch_status],["worker",data.queue.branch_worker_status],["priority",data.queue.priority],["budget",data.queue.budget],["best",bestGuessCell(data.queue,branch.answer_count)||"none yet"],["ERD ceiling",erdValue(data.queue.ceiling,branch.answer_count,{ceiling:true})],["nodes",data.queue.search_node_count],...(bundleSummary.wall_millis?[['wall time',formatDuration(bundleSummary.wall_millis/1000)]]:[])]:null;

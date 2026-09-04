@@ -3014,6 +3014,33 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertGreater(len(result["moved"]), 1)
         self.assertEqual(result["after"], list(reversed(result["before"])))
 
+    def test_reached_via_climbs_to_the_word_report_for_its_last_guess(self):
+        self.apply_branch_target("RAISE .....")
+        self.page.wait_for_selector("section:has-text('Reached via') button:has-text('Up to RAISE')")
+        self.page.locator(
+            "section:has-text('Reached via') button:has-text('Up to RAISE')").click()
+        self.page.wait_for_selector("text=word report")
+        self.assertEqual(
+            self.page.locator("#branch-target-input").input_value(), "RAISE")
+
+    def test_climbing_a_deeper_spine_keeps_the_guesses_above_it(self):
+        """Only the last pattern is dropped; the steps that reached it stay,
+        so the word report opens in the context it was reached from."""
+        target = self.page.evaluate("""async () => {
+          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
+          branch.data.branch.spine=[{word:'salet',pattern:'-----'},
+                                   {word:'crane',pattern:'y----'},
+                                   {word:'began',pattern:'-y---'}];
+          applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
+          const button=[...document.querySelectorAll("section button")]
+            .find(node=>node.textContent.startsWith('Up to'));
+          button.click();
+          return {label:button.textContent,
+                  value:document.querySelector('#branch-target-input').value};
+        }""")
+        self.assertEqual(target["label"], "Up to BEGAN")
+        self.assertEqual(target["value"], "SALET ----- CRANE y---- BEGAN")
+
     def test_spine_and_identity_share_one_two_column_row(self):
         """The spine reads first, so it takes the left half."""
         self.apply_branch_target("RAISE .....")
