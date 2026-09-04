@@ -1394,6 +1394,12 @@
         const lastStep=branch.spine[branch.spine.length-1];
         const upTarget=spineText([...branch.spine.slice(0,-1),{word:lastStep.word,pattern:null}]);
         const upButton=element("button","word-button");
+        // The space between the label and the tiles is drawn by the flex gap
+        // rather than spelled, and the tiles are per-letter elements, so the
+        // accessible name is stated outright instead of being left to the
+        // subtree.  It names the destination the way a response button does.
+        upButton.setAttribute(
+          "aria-label","Up to "+String(lastStep.word||"").toUpperCase()+" word report");
         upButton.append(element("span","","Up to"),
                         wordTiles(lastStep.word,null,lastStep.word_is_answer));
         upButton.addEventListener("click",()=>setState({...currentState,kind:"auto",branch_target:upTarget,tree:false,claims:false,answers:false,finalization_cursor:""}));

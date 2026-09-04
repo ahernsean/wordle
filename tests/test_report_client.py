@@ -3023,7 +3023,13 @@ class ReportClientBrowserTest(unittest.TestCase):
         tiles = self.page.locator(button + " .word").first
         self.assertEqual(tiles.get_attribute("data-spine"), "RAISE")
         self.assertEqual(self.page.locator(button + " .word .letter.blank").count(), 5)
-        self.page.locator(button).click()
+        # The visible label is "Up to" plus tiles separated by a drawn gap, so
+        # the accessible name is stated rather than derived from the text.
+        # Resolving by role and name proves the computed name, not merely that
+        # the attribute is present.
+        by_name = self.page.get_by_role("button", name="Up to RAISE word report")
+        self.assertEqual(by_name.count(), 1)
+        by_name.click()
         self.page.wait_for_selector("text=word report")
         self.assertEqual(
             self.page.locator("#branch-target-input").input_value(), "RAISE")
