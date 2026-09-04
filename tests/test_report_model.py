@@ -307,6 +307,41 @@ class ReportModelTest(unittest.TestCase):
         self.assertIn("cache", report["data"])
         self.assertIn("branch_reference", report["data"])
 
+    def test_branch_report_places_a_worker_inside_its_bundle(self):
+        now = int(time.time())
+        branch_key = ScoreCache.encode_subset(ANSWERS[:3])
+        queue = self._open_queue()
+        queue.create_branch(
+            branch_key, 3, 10, priority=9, opener="SALET",
+            opener_pattern=0, budget=4, spine="SALET -----",
+        )
+        branch_id = queue._intern_branch(branch_key)
+        # Best-first order disagrees with candidate-index order here, so the
+        # reported position pins which one the report walks.
+        for candidate_index, position in ((7, 30), (2, 31), (5, 32)):
+            queue._conn.execute(
+                "INSERT INTO candidate_claims (branch_id, idx, claimed_by, "
+                "claimed_at, done, bundle_id, best_first_position) "
+                "VALUES (?, ?, 'worker-2', ?, 0, 'worker-2:42:1', ?)",
+                (branch_id, candidate_index, now, position),
+            )
+        queue.heartbeat(
+            "worker-2", pid=42, current_branch_key=branch_key, n_words=3,
+            started_at=now, claims_done=0, claim_idx=2, claim_started_at=now,
+        )
+        queue.close()
+        request = ReportRequest(
+            report_kind="branch",
+            branch_target=parse_report_branch_target(
+                "@" + branch_reference(branch_key)),
+        )
+        with patch("report_model.time.time", return_value=now):
+            report = report_model.collect_branch_report(self.sources, request)
+        progress = report["data"]["workers"][0]["bundle_progress"]
+        self.assertEqual(progress["reported_position"], 2)
+        self.assertEqual(progress["candidate_count"], 3)
+        self.assertEqual(progress["completed_candidate_count"], 0)
+
     def test_branch_report_collects_an_unqueued_spine_without_creating_work(self):
         request = ReportRequest(
             report_kind="branch", branch_target=parse_report_branch_target("RAISE -----"),
@@ -3505,3 +3540,104 @@ class TreePageCursorTest(unittest.TestCase):
         self.assertEqual(
             self._words(after_spineless), ["crane", "nurdy", "salet"]
         )
+
+
+class WorkerBundleProgressTest(unittest.TestCase):
+    """A worker's position within the bundle it currently holds.
+
+    The branch's completed-candidate count advances once per bundle, so this
+    position is the only per-poll progress signal a bundle offers.
+    """
+
+    @staticmethod
+    def _claim(candidate_index, rank, bundle_id, worker_id, done=False):
+        return {
+            "candidate_index": candidate_index,
+            "state": "done" if done else "in_flight",
+            "completion_kind": "evaluated" if done else None,
+            "worker_id": worker_id,
+            "bundle_id": bundle_id,
+            "best_first_rank": rank,
+            "republish_count": 0,
+        }
+
+    @staticmethod
+    def _worker(worker_id, candidate_index):
+        return {"worker_id": worker_id, "candidate_index": candidate_index}
+
+    def test_position_follows_best_first_order_not_candidate_index(self):
+        # The packer hands a bundle out in best-first order, which is scattered
+        # across the candidate index space; the worker walks that order.
+        claims = [
+            self._claim(9483, 1215, "worker-4:1:1", "worker-4"),
+            self._claim(13891, 1213, "worker-4:1:1", "worker-4"),
+            self._claim(3115, 1220, "worker-4:1:1", "worker-4"),
+            self._claim(4395, 1218, "worker-4:1:1", "worker-4"),
+        ]
+        workers = [self._worker("worker-4", 9483)]
+        report_model._attach_worker_bundle_progress(workers, claims)
+        progress = workers[0]["bundle_progress"]
+        self.assertEqual(progress["reported_position"], 2)
+        self.assertEqual(progress["candidate_count"], 4)
+        self.assertEqual(progress["completed_candidate_count"], 0)
+        self.assertEqual(progress["bundle_id"], "worker-4:1:1")
+
+    def test_position_is_unknown_at_a_bundle_boundary(self):
+        # The heartbeat still names the previous bundle's candidate: that
+        # bundle committed (its rows lost their bundle_id) and the next was
+        # claimed, both before the worker heartbeated again.
+        claims = [
+            self._claim(500, 40, "worker-2:1:9", "worker-2"),
+            self._claim(700, 41, "worker-2:1:9", "worker-2"),
+            self._claim(120, None, None, None, done=True),
+        ]
+        workers = [self._worker("worker-2", 120)]
+        report_model._attach_worker_bundle_progress(workers, claims)
+        progress = workers[0]["bundle_progress"]
+        self.assertIsNone(progress["reported_position"])
+        self.assertEqual(progress["candidate_count"], 2)
+
+    def test_evaluated_members_stay_in_the_bundle_and_are_counted_done(self):
+        # complete_candidate leaves bundle_id in place, so an evaluation-phase
+        # bundle keeps a stable size while its members finish one at a time.
+        claims = [
+            self._claim(30, 1, "worker-0:1:3", "worker-0", done=True),
+            self._claim(20, 2, "worker-0:1:3", "worker-0", done=True),
+            self._claim(10, 3, "worker-0:1:3", "worker-0"),
+        ]
+        workers = [self._worker("worker-0", 10)]
+        report_model._attach_worker_bundle_progress(workers, claims)
+        progress = workers[0]["bundle_progress"]
+        self.assertEqual(progress["candidate_count"], 3)
+        self.assertEqual(progress["completed_candidate_count"], 2)
+        self.assertEqual(progress["reported_position"], 3)
+
+    def test_a_worker_holding_no_bundle_reports_none(self):
+        claims = [self._claim(10, 1, "worker-1:1:1", "worker-1")]
+        workers = [self._worker("worker-3", 10)]
+        report_model._attach_worker_bundle_progress(workers, claims)
+        self.assertIsNone(workers[0]["bundle_progress"])
+
+    def test_each_worker_gets_its_own_bundle(self):
+        claims = [
+            self._claim(11, 1, "worker-0:1:1", "worker-0"),
+            self._claim(10, 2, "worker-0:1:1", "worker-0"),
+            self._claim(80, 7, "worker-1:1:1", "worker-1"),
+        ]
+        workers = [self._worker("worker-0", 10), self._worker("worker-1", 80)]
+        report_model._attach_worker_bundle_progress(workers, claims)
+        self.assertEqual(workers[0]["bundle_progress"]["reported_position"], 2)
+        self.assertEqual(workers[0]["bundle_progress"]["candidate_count"], 2)
+        self.assertEqual(workers[1]["bundle_progress"]["reported_position"], 1)
+        self.assertEqual(workers[1]["bundle_progress"]["candidate_count"], 1)
+
+    def test_unranked_members_sort_last_without_raising(self):
+        # A claim written outside the packer carries no best_first_position.
+        claims = [
+            self._claim(60, None, "worker-5:1:1", "worker-5"),
+            self._claim(50, None, "worker-5:1:1", "worker-5"),
+            self._claim(70, 3, "worker-5:1:1", "worker-5"),
+        ]
+        workers = [self._worker("worker-5", 50)]
+        report_model._attach_worker_bundle_progress(workers, claims)
+        self.assertEqual(workers[0]["bundle_progress"]["reported_position"], 2)

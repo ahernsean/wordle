@@ -3014,6 +3014,117 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertGreater(len(result["moved"]), 1)
         self.assertEqual(result["after"], list(reversed(result["before"])))
 
+    def test_identity_and_spine_share_one_two_column_row(self):
+        self.apply_branch_target("RAISE .....")
+        self.page.wait_for_selector("section:has-text('Reached via')")
+        result = self.page.evaluate("""() => {
+          const pair=[...document.querySelectorAll('#report .section-pair')]
+            .find(node=>node.innerText.includes('Identity'));
+          if(!pair)return {found:false};
+          return {found:true,
+                  titles:[...pair.querySelectorAll(':scope > section > h2')].map(node=>node.textContent),
+                  columns:getComputedStyle(pair).gridTemplateColumns.split(' ').filter(Boolean).length};
+        }""")
+        self.assertTrue(result["found"])
+        self.assertEqual(result["titles"], ["Identity", "Reached via"])
+        self.assertEqual(result["columns"], 2)
+        # The pair wrapper is a div, so a section-scoped selector still lands on
+        # the one section it names rather than on both halves of the row.
+        self.assertNotIn(
+            "Reached via",
+            self.page.locator("section:has-text('Identity')").first.inner_text())
+
+    def test_bundles_and_cache_share_one_two_column_row(self):
+        self.apply_branch_target("RAISE .....")
+        self.page.wait_for_selector("text=Bundles")
+        result = self.page.evaluate("""() => {
+          const pair=[...document.querySelectorAll('#report .section-pair')]
+            .find(node=>node.innerText.includes('Bundles'));
+          if(!pair)return {found:false};
+          return {found:true,
+                  titles:[...pair.querySelectorAll(':scope > section > h2')].map(node=>node.textContent),
+                  columns:getComputedStyle(pair).gridTemplateColumns.split(' ').filter(Boolean).length};
+        }""")
+        self.assertTrue(result["found"])
+        self.assertEqual(result["titles"], ["Bundles", "Cache"])
+        self.assertEqual(result["columns"], 2)
+
+    def test_paired_sections_share_one_top_and_bottom_edge(self):
+        """Side-by-side panels of unequal content must still box up equally."""
+        self.apply_branch_target("RAISE .....")
+        self.page.wait_for_selector("text=Bundles")
+        rows = self.page.evaluate("""() => [...document.querySelectorAll('#report .section-pair')].map(pair => {
+          const boxes=[...pair.querySelectorAll(':scope > section')].map(node=>node.getBoundingClientRect());
+          return {tops:boxes.map(box=>Math.round(box.top)),
+                  bottoms:boxes.map(box=>Math.round(box.bottom)),
+                  contentDiffers:new Set([...pair.querySelectorAll(':scope > section')].map(node=>{
+                    const children=[...node.children];
+                    return Math.round(children[children.length-1].getBoundingClientRect().bottom
+                                      -children[0].getBoundingClientRect().top);
+                  })).size>1};
+        })""")
+        self.assertTrue(rows)
+        for row in rows:
+            self.assertEqual(len(set(row["tops"])), 1)
+            self.assertEqual(len(set(row["bottoms"])), 1)
+        # A row whose two halves hold the same amount would pass on any
+        # alignment, so at least one must actually have unequal content.
+        self.assertTrue(any(row["contentDiffers"] for row in rows))
+
+    def test_section_pairs_collapse_to_one_column_on_a_phone(self):
+        self.page.set_viewport_size({"width": 390, "height": 800})
+        try:
+            self.apply_branch_target("RAISE .....")
+            self.page.wait_for_selector("text=Bundles")
+            columns = self.page.evaluate("""() => [...document.querySelectorAll('#report .section-pair')]
+              .map(node=>getComputedStyle(node).gridTemplateColumns.split(' ').filter(Boolean).length)""")
+        finally:
+            self.page.set_viewport_size({"width": 1200, "height": 800})
+        self.assertTrue(columns)
+        self.assertEqual(set(columns), {1})
+
+    def test_live_workers_sits_between_candidates_and_bundles(self):
+        """The two panels that change every poll are kept adjacent."""
+        titles = self.page.evaluate("""async () => {
+          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
+          branch.data.workers=[{worker_id:'worker-5',state:'working',is_live:true,updated_at:branch.generated_at,current_candidate:'crane',current_candidate_is_answer:false,current_node_count:900,nodes_per_second:12,branch_reference:'eb81eb81eb81',bundle_progress:null}];
+          applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
+          return [...document.querySelectorAll('#report section.section > h2')].map(node=>node.textContent);
+        }""")
+        for name in ("Candidates", "Live workers", "Bundles"):
+            self.assertIn(name, titles)
+        self.assertLess(titles.index("Candidates"), titles.index("Live workers"))
+        self.assertLess(titles.index("Live workers"), titles.index("Bundles"))
+
+    def test_worker_card_reports_its_position_within_the_bundle(self):
+        text = self.page.evaluate("""async () => {
+          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
+          branch.data.workers=[{worker_id:'worker-5',state:'working',is_live:true,updated_at:branch.generated_at,current_candidate:'crane',current_candidate_is_answer:false,current_node_count:900,nodes_per_second:12,branch_reference:'eb81eb81eb81',bundle_progress:{bundle_id:'worker-5:1:1',candidate_count:8,completed_candidate_count:0,reported_position:3}}];
+          applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
+          return document.querySelector('.card.worker').innerText;
+        }""")
+        self.assertIn("bundle 3/8", text)
+
+    def test_worker_card_dashes_a_bundle_position_it_cannot_place(self):
+        """A bundle boundary between two polls leaves the heartbeat naming the
+        previous bundle's candidate; the size is still known."""
+        text = self.page.evaluate("""async () => {
+          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
+          branch.data.workers=[{worker_id:'worker-5',state:'working',is_live:true,updated_at:branch.generated_at,current_candidate:'crane',current_candidate_is_answer:false,current_node_count:900,nodes_per_second:12,branch_reference:'eb81eb81eb81',bundle_progress:{bundle_id:'worker-5:1:1',candidate_count:8,completed_candidate_count:0,reported_position:null}}];
+          applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
+          return document.querySelector('.card.worker').innerText;
+        }""")
+        self.assertIn("bundle \u2014/8", text)
+
+    def test_worker_card_omits_bundle_progress_when_the_worker_holds_none(self):
+        text = self.page.evaluate("""async () => {
+          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
+          branch.data.workers=[{worker_id:'worker-5',state:'working',is_live:true,updated_at:branch.generated_at,current_candidate:'crane',current_candidate_is_answer:false,current_node_count:900,nodes_per_second:12,branch_reference:'eb81eb81eb81',bundle_progress:null}];
+          applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
+          return document.querySelector('.card.worker').innerText;
+        }""")
+        self.assertNotIn("bundle", text)
+
     def test_republished_candidates_render_as_summary_not_raw_list(self):
         self.apply_branch_target("RAISE .....")
         self.page.wait_for_selector("text=Bundles")
