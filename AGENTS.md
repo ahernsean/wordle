@@ -628,9 +628,11 @@ in the first moments of a session means the install is still in flight — wait
 and retry rather than installing by hand. It skips the reinstall on a compact
 or a clear, which keep the same container.
 
-- **WebKit** cannot run locally on rocky at all — its bundled build needs a
-  glibc newer than the box has, and there is no pre-installed fallback the way
-  there is for Chromium. `tests/webkit_container.py` runs it inside the
+- **WebKit** launches two ways, tried in order by `_launch_webkit` in
+  `tests/test_report_client.py`. First, Playwright's bundled native build
+  (`playwright install webkit`) — this is what CI uses, and what any
+  environment with a current-enough glibc can use. When that raises,
+  `tests/webkit_container.py` falls back to running WebKit inside the
   official `mcr.microsoft.com/playwright` container instead, in `run-server`
   mode: only the browser process lives in the container, started with
   `--network host` so it can reach the fixture server's `127.0.0.1` binding.
@@ -643,15 +645,21 @@ or a clear, which keep the same container.
   same version, so the tag is derived from the installed version at run time,
   never pinned.
 
-  **WebKit runs by default, and a container that will not start fails the
-  suite.** This client is used overwhelmingly from WebKit — Safari and iOS
-  Chrome — so a green run that covered only Chromium would leave the primary
-  engine untested. Rocky has `podman` (not `docker`) and the image pulled;
+  **Rocky's bundled WebKit build needs a glibc newer than the box has**, so
+  native launch always fails there and every run falls through to the
+  container — there is no pre-installed native fallback the way there is for
+  Chromium. Rocky has `podman` (not `docker`) and the image pulled;
   `tests/webkit_container.py` tries `podman` first and falls back to `docker`.
 
-  `SKIP_WEBKIT_CONTAINER_TESTS=1` opts out for a machine with no container
-  runtime, and `SKIP_BROWSER_TESTS=1` opts out of both engines. Setting either
-  is a deliberate statement that the run does not cover that engine — reach for
+  **WebKit runs by default, and a browser that will not start (natively or
+  via the container) fails the suite.** This client is used overwhelmingly
+  from WebKit — Safari and iOS Chrome — so a green run that covered only
+  Chromium would leave the primary engine untested.
+
+  `SKIP_WEBKIT_CONTAINER_TESTS=1` opts out for a machine that can start
+  neither the native build nor the container fallback, and
+  `SKIP_BROWSER_TESTS=1` opts out of both engines. Setting either is a
+  deliberate statement that the run does not cover that engine — reach for
   them only when the environment genuinely cannot host the browser, never to
   get a red suite green.
 
