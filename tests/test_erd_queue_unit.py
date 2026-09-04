@@ -1288,6 +1288,37 @@ class TestClaimNext(_TmpQueue):
             _ZERO_LOWER_BOUND, small_count=1, count_cap=1,
             expected_opener_work_id=claimed["opener_work_id"]))
 
+    def test_opener_work_candidates_continue_after_a_bounded_scan(self):
+        other_key = ScoreCache.encode_subset(WORDS[:4])
+        self.q.add_pending_many([
+            (self.key, len(WORDS), 9, "crane", 0),
+            (other_key, len(WORDS) - 1, 4, "slate", 1),
+        ])
+
+        first = self.q.opener_work_candidates(limit=1)
+        second = self.q.opener_work_candidates(limit=1, after=first[0])
+
+        self.assertEqual([row["opener"] for row in first + second],
+                         ["crane", "slate"])
+
+    def test_opener_work_ids_for_branches_includes_every_shared_owner(self):
+        self.q.add_pending_many([
+            (self.key, len(WORDS), 1, "crane", 7),
+            (self.key, len(WORDS), 9, "slate", 42),
+        ])
+        owners = {row["opener"]: row["opener_work_id"]
+                  for row in self.q.opener_work_rows()}
+        claimed = self.q.claim_next("worker-0", owners["slate"])
+        self.q.create_branch(
+            self.key, len(WORDS), N_CANDIDATES, budget=5,
+            priority=claimed["priority"], opener=claimed["opener"],
+            opener_pattern=claimed["opener_pattern"],
+            opener_work_id=claimed["opener_work_id"])
+
+        self.assertEqual(
+            self.q.opener_work_ids_for_branches([self.key]),
+            {owners["crane"], owners["slate"]})
+
     def test_opener_priority_rejects_invalid_and_completed_requests(self):
         self.q.add_pending_many([(self.key, len(WORDS), 1, "crane", 0)])
         opener_work_id = self.q.opener_work_rows()[0]["opener_work_id"]

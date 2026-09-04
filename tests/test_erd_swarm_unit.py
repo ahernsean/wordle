@@ -1478,6 +1478,31 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
         self.assertEqual(branch['branch_key'], key_b)
         self.assertTrue(indices)
 
+    def test_claim_one_reads_only_the_top_opener_from_a_large_ladder(self):
+        """A claimable top rung must not scan the lower queued openers."""
+        from erd_queue import ERDQueue
+        ScoreCache(self.cache_path, BRANCH).close()
+        branch_key = ScoreCache.encode_subset(BRANCH)
+        q = ERDQueue(self.queue_path)
+        q.add_pending_many([
+            (branch_key, len(BRANCH), 512 - number,
+             f"opener-{number}", number)
+            for number in range(512)
+        ])
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        try:
+            with mock.patch.object(w.queue, "opener_work_candidates",
+                                   wraps=w.queue.opener_work_candidates) as rows:
+                result = w.claim_one()
+        finally:
+            w.close()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(rows.call_args_list,
+                         [mock.call(limit=1, after=None)])
+
     def test_claim_one_records_scan_time_net_of_the_queue_phases(self):
         # The work-selection scan must be charged to scheduling_millis rather
         # than falling into idle_millis, and must exclude the lock wait and
@@ -2022,6 +2047,70 @@ class TestHelpOtherBranch(unittest.TestCase):
 
         # Should have evaluated a candidate and returned True.
         self.assertTrue(result)
+
+    def test_help_other_branch_reads_active_branches_once(self):
+        """Helping must not issue one active-branch query per opener."""
+        from erd_queue import ERDQueue
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        excluded_key = ScoreCache.encode_subset(BRANCH)
+        other_key = ScoreCache.encode_subset(BRANCH[:4])
+        q.create_branch(excluded_key, len(BRANCH), len(CANDIDATES),
+                        budget=ROOT_BUDGET, priority=0)
+        q.create_branch(other_key, len(BRANCH) - 1, len(CANDIDATES),
+                        budget=ROOT_BUDGET, priority=1)
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        try:
+            with mock.patch.object(w.queue, "branches_in_progress",
+                                   wraps=w.queue.branches_in_progress) as branches:
+                with mock.patch.object(w.queue, "direct_branches_in_progress",
+                                       wraps=w.queue.direct_branches_in_progress) as direct:
+                    result = w._help_other_branch(excluded_key)
+        finally:
+            w.close()
+
+        self.assertTrue(result)
+        branches.assert_called_once_with()
+        direct.assert_not_called()
+
+    def test_help_other_branch_does_not_promote_a_shared_owner_with_a_joinable_branch(self):
+        """A shared unoccupied branch covers each of its live opener owners."""
+        from erd_queue import ERDQueue
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        shared_key = ScoreCache.encode_subset(BRANCH[:4])
+        pending_key = ScoreCache.encode_subset(BRANCH[1:])
+        q.add_pending_many([
+            (shared_key, len(BRANCH[:4]), 9, "high", 10),
+            (shared_key, len(BRANCH[:4]), 1, "low", 20),
+            (pending_key, len(BRANCH[1:]), 1, "low", 30),
+        ])
+        owners = {row["opener"]: row["opener_work_id"]
+                  for row in q.opener_work_rows()}
+        claimed = q.claim_next("setup", owners["high"])
+        q.create_branch(
+            shared_key, len(BRANCH[:4]), len(CANDIDATES), budget=ROOT_BUDGET,
+            priority=claimed["priority"], opener=claimed["opener"],
+            opener_pattern=claimed["opener_pattern"],
+            opener_work_id=claimed["opener_work_id"])
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        served = []
+        w.evaluate_bundle = mock.MagicMock(
+            side_effect=lambda branch_key, *_args, **_kwargs:
+                served.append(bytes(branch_key)) or False)
+        try:
+            result = w._help_other_branch(b"unrelated-exclude")
+            pending = w.queue.get_pending_branch(pending_key)
+        finally:
+            w.close()
+
+        self.assertTrue(result)
+        self.assertEqual(served, [shared_key])
+        self.assertEqual(pending["status"], "pending")
 
     def test_returns_true_without_finalizing_when_evaluate_bundle_reports_cancellation(self):
         # _help_other_branch reports True (a bundle WAS claimed) even when
