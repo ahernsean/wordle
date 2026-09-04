@@ -260,7 +260,11 @@
        pixels.  The marker has no fill of its own — the digit carries a light
        halo (drawn in the SVG) so it reads over both green and gray while the
        cell's own fill stays visible straight through it. */
-    .sweep-marker { position:absolute; top:0; height:100%; min-width:.85rem; z-index:1; background-position:center; background-repeat:no-repeat; transition:left .4s ease, opacity .4s ease; }
+    .sweep-marker { position:absolute; top:0; height:100%; min-width:.85rem; z-index:1; transition:left .4s ease, opacity .4s ease; }
+    /* The pointer says where the worker is and never moves off its candidate;
+       the digit says which worker it is and may slide to clear a neighbour, so
+       the two are separate boxes.  --digit-shift is the only thing that moves. */
+    .sweep-digit { position:absolute; top:0; height:100%; width:.85rem; left:50%; transform:translateX(calc(-50% + var(--digit-shift,0px))); background-position:center; background-repeat:no-repeat; transition:transform .4s ease; }
     /* A small solid pointer in the strip of white space under the ramp, apex
        almost touching the worker's cell.  It is part of the marker, so it
        rides the same slide and fade as the digit. */
@@ -1012,6 +1016,7 @@
     function sweepStrip(candidateCount,completedCandidateIndexes,workers,previousWorkersById){
       const cellCount=Math.max(1,Math.min(50,candidateCount));
       const strip=element("div","sweep"),done=new Set(completedCandidateIndexes||[]);
+      strip.dataset.cellCount=cellCount;
       for(let cell=0;cell<cellCount;cell++){
         const start=Math.floor(cell*candidateCount/cellCount),end=Math.max(start+1,Math.floor((cell+1)*candidateCount/cellCount));
         let doneCount=0;for(let index=start;index<end;index++)if(done.has(index))doneCount++;
@@ -1030,8 +1035,9 @@
       // marker to cells discards every bit of position the strip can express
       // and leaves it with cellCount distinct places to stand.  The integer
       // term counts the 1px gaps closed before this point.
+      const stripPositionOf=index=>Math.max(0,Math.min(cellCount,cellCount*index/candidateCount));
       const stripOffset=index=>{
-        const position=Math.max(0,Math.min(cellCount,cellCount*index/candidateCount));
+        const position=stripPositionOf(index);
         const gaps=Math.min(cellCount-1,Math.floor(position));
         return `calc((100% - ${cellCount-1}px) * ${position} / ${cellCount} + ${gaps}px)`;
       };
@@ -1045,12 +1051,15 @@
         if(position===null)continue;
         const offset=stripOffset(position.candidate_index),workerNumber=workerName(worker).replace(/^w/,"");
         const marker=element("span","sweep-marker"+(position.state==="last_reported"?" last-reported":""));
-        marker.dataset.workerNumber=workerNumber;
+        marker.dataset.stripPosition=stripPositionOf(position.candidate_index);
         marker.style.width=`calc((100% - ${cellCount-1}px) / ${cellCount})`;
+        const digit=element("span","sweep-digit");
+        digit.dataset.workerNumber=workerNumber;
+        marker.append(digit);
         // Centred on the candidate's point, so the pointer beneath -- itself
         // centred in the marker -- lands on that point at any box width.
         marker.style.transform="translateX(-50%)";
-        marker.style.backgroundImage=workerMarkerImage(workerNumber,markerHalo,markerInk);
+        digit.style.backgroundImage=workerMarkerImage(workerNumber,markerHalo,markerInk);
         const previous=previousWorkersById?.get(String(worker.worker_id));
         const previousPosition=previous&&previous.branch_key_hex===worker.branch_key_hex?workerMarkerPosition(previous):null;
         const previousIndex=previousPosition&&previousPosition.candidate_index;
@@ -1067,6 +1076,51 @@
         strip.append(marker);
       }
       return strip;
+    }
+    // The pointer encodes position and never moves; the digit encodes identity
+    // and may.  Two workers a few candidates apart put their digits on the same
+    // pixels, so any that would overlap are spread just far enough to read.
+    //
+    // Target centres are computed from the position each marker was drawn at
+    // rather than measured, because a marker mid-slide reports where it is
+    // rather than where it is going, and the digits must settle at the
+    // destination geometry.
+    function layoutSweepMarkerDigits(root){
+      for(const strip of root.querySelectorAll(".sweep")){
+        const digits=[...strip.querySelectorAll(".sweep-digit")];
+        if(!digits.length)continue;
+        if(digits.length<2){digits[0].style.setProperty("--digit-shift","0px");continue;}
+        const stripWidth=strip.getBoundingClientRect().width;
+        const cellCount=Number(strip.dataset.cellCount||0);
+        const digitWidth=digits[0].getBoundingClientRect().width;
+        if(!stripWidth||!cellCount||!digitWidth)continue;
+        const track=stripWidth-(cellCount-1);
+        const items=digits.map(digit=>{
+          const position=Number(digit.parentElement.dataset.stripPosition);
+          return {digit,centre:track*position/cellCount+Math.min(cellCount-1,Math.floor(position))};
+        }).sort((first,second)=>first.centre-second.centre);
+        // Push each digit right only as far as it takes to clear the previous
+        // one, then slide the whole run back by its mean displacement so a
+        // colliding pair separates symmetrically instead of the left one
+        // holding still while the right one is shoved away.
+        let previousRight=-Infinity,displacement=0;
+        for(const item of items){
+          item.left=Math.max(item.centre-digitWidth/2,previousRight);
+          previousRight=item.left+digitWidth;
+          displacement+=item.left+digitWidth/2-item.centre;
+        }
+        const recentre=displacement/items.length;
+        // Slide the run as a whole to stay on the strip, which preserves every
+        // separation the pass just established.
+        const runLeft=items[0].left-recentre;
+        const runRight=items[items.length-1].left-recentre+digitWidth;
+        const slide=runLeft<0?-runLeft:(runRight>stripWidth?stripWidth-runRight:0);
+        for(const item of items){
+          const left=item.left-recentre+slide;
+          item.digit.style.setProperty(
+            "--digit-shift",(left+digitWidth/2-item.centre).toFixed(2)+"px");
+        }
+      }
     }
     function animateSweepMarkers(root){
       const pending=root.querySelectorAll("[data-move-to],[data-fade-in]");
@@ -2090,7 +2144,7 @@
       // A render the guard let through takes the menu's node with the old
       // report, so the handle to it goes too rather than being left dangling.
       openGroupMenuNode=null;
-      centerLetters();root.replaceChildren(content);layoutSpines(root);animateSweepMarkers(root);recordGridColumnCounts(root,state);if(report.report_kind==="leaderboard")leaderboardReportWidth=root.clientWidth;if(readingPosition)requestAnimationFrame(()=>restoreReadingPosition(root,readingPosition));if(report.report_kind!=="leaderboard")animateGridTransitions(root,beforeCards,sameView);setTimeout(()=>document.querySelectorAll(".flash-added,.flash-improved,.flash-changed").forEach(node=>node.classList.remove("flash-added","flash-improved","flash-changed")),1500);return root;
+      centerLetters();root.replaceChildren(content);layoutSpines(root);layoutSweepMarkerDigits(root);animateSweepMarkers(root);recordGridColumnCounts(root,state);if(report.report_kind==="leaderboard")leaderboardReportWidth=root.clientWidth;if(readingPosition)requestAnimationFrame(()=>restoreReadingPosition(root,readingPosition));if(report.report_kind!=="leaderboard")animateGridTransitions(root,beforeCards,sameView);setTimeout(()=>document.querySelectorAll(".flash-added,.flash-improved,.flash-changed").forEach(node=>node.classList.remove("flash-added","flash-improved","flash-changed")),1500);return root;
     }
     function workerMarkerImage(workerNumber,halo,ink){
       const svg='<svg xmlns="http://www.w3.org/2000/svg"><text x="50%" y="50%" text-anchor="middle" dominant-baseline="central" font-family="ui-monospace,SFMono-Regular,Consolas,monospace" font-size="8.45" font-weight="bold" paint-order="stroke" stroke="'+halo+'" stroke-width="2.5" stroke-linejoin="round" fill="'+ink+'">'+workerNumber+'</text></svg>';
@@ -2103,10 +2157,10 @@
     // until the next report replaces them.  Refresh every marker currently in
     // the document whenever the preference changes, independent of polling.
     function refreshWorkerMarkerColors(){
-      const markers=document.querySelectorAll(".sweep-marker");
-      if(!markers.length)return;
+      const digits=document.querySelectorAll(".sweep-digit");
+      if(!digits.length)return;
       const style=getComputedStyle(document.documentElement),halo=style.getPropertyValue("--panel").trim(),ink=style.getPropertyValue("--text").trim();
-      for(const marker of markers)marker.style.backgroundImage=workerMarkerImage(marker.dataset.workerNumber,halo,ink);
+      for(const digit of digits)digit.style.backgroundImage=workerMarkerImage(digit.dataset.workerNumber,halo,ink);
     }
     function connection(ok,message,disconnected=!ok){const chip=byId("connection");chip.classList.toggle("disconnected",disconnected);chip.textContent=ok?"●":"● "+message;const status=ok?"connected":message;chip.title=status;chip.setAttribute("aria-label",status+"; opens refresh interval");}
     async function fetchReport(){
@@ -2192,7 +2246,7 @@
       document.querySelectorAll("[data-kind]").forEach(button=>button.addEventListener("click",()=>{const overview=button.dataset.overview;setState({...readControls(),kind:button.dataset.kind,branch_target:overview?"":currentState.branch_target,tree:false,branch_status:overview?[...overviewBranchStatusNames]:currentState.branch_status,branch_worker_status:overview?[...overviewBranchWorkerStatusNames]:currentState.branch_worker_status,minimum_answer_count:overview?null:currentState.minimum_answer_count,maximum_answer_count:overview?null:currentState.maximum_answer_count,budget:overview?null:currentState.budget,priority:overview?null:currentState.priority,sort:overview?"":currentState.sort,limit:overview?null:currentState.limit,answers:false,claims:false,finalization_cursor:""});}));
       installSpineCopy();
       matchMedia("(prefers-color-scheme: dark)").addEventListener("change",refreshWorkerMarkerColors);
-      addEventListener("resize",()=>{const root=byId("report");layoutSpines(root);for(const strip of root.querySelectorAll(".answer-strip"))measureAnswerStrip(strip);if(openGroupMenuNode)positionGroupMenu(openGroupMenuNode.node,openGroupMenuNode.opener);if(currentState?.kind==="leaderboard"&&lastReport&&root.clientWidth!==leaderboardReportWidth&&!reportHasFocusedControl()&&!reportHasActiveSelection())applyReport(lastReport,lastReport,currentState);});
+      addEventListener("resize",()=>{const root=byId("report");layoutSpines(root);layoutSweepMarkerDigits(root);for(const strip of root.querySelectorAll(".answer-strip"))measureAnswerStrip(strip);if(openGroupMenuNode)positionGroupMenu(openGroupMenuNode.node,openGroupMenuNode.opener);if(currentState?.kind==="leaderboard"&&lastReport&&root.clientWidth!==leaderboardReportWidth&&!reportHasFocusedControl()&&!reportHasActiveSelection())applyReport(lastReport,lastReport,currentState);});
       addEventListener("popstate",()=>{abortActiveRequest();currentState=parsePageState(location);syncControls();fetchReport();schedulePoll();});document.addEventListener("visibilitychange",()=>{if(!document.hidden){fetchReport();schedulePoll();}});fetchReport();schedulePoll();
     }
     window.parsePageState=parsePageState;window.buildAPIURL=buildAPIURL;window.rootProgressURL=rootProgressURL;window.renderRootProgressHeadline=renderRootProgressHeadline;window.applyReport=applyReport;window.spineTextFromSelection=spineTextFromSelection;window.__reportClient={setState:state=>setState(state),getState:()=>({...currentState}),fetchReport};
