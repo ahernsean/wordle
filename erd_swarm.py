@@ -2054,7 +2054,8 @@ class _BranchWorker:
         # branches promoted to absorb another worker, and treating it as
         # covered is what leaves an opener running one branch at a time with
         # dozens of response groups still waiting.
-        joinable_opener_ids = {b['opener_work_id'] for b in unoccupied}
+        joinable_opener_ids = self.queue.opener_work_ids_for_branches(
+            bytes(branch['branch_key']) for branch in unoccupied)
 
         for opener_work in self._opener_work_candidates():
             opener_work_id = opener_work['opener_work_id']

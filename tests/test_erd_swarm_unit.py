@@ -2075,6 +2075,43 @@ class TestHelpOtherBranch(unittest.TestCase):
         branches.assert_called_once_with()
         direct.assert_not_called()
 
+    def test_help_other_branch_does_not_promote_a_shared_owner_with_a_joinable_branch(self):
+        """A shared unoccupied branch covers each of its live opener owners."""
+        from erd_queue import ERDQueue
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        shared_key = ScoreCache.encode_subset(BRANCH[:4])
+        pending_key = ScoreCache.encode_subset(BRANCH[1:])
+        q.add_pending_many([
+            (shared_key, len(BRANCH[:4]), 9, "high", 10),
+            (shared_key, len(BRANCH[:4]), 1, "low", 20),
+            (pending_key, len(BRANCH[1:]), 1, "low", 30),
+        ])
+        owners = {row["opener"]: row["opener_work_id"]
+                  for row in q.opener_work_rows()}
+        claimed = q.claim_next("setup", owners["high"])
+        q.create_branch(
+            shared_key, len(BRANCH[:4]), len(CANDIDATES), budget=ROOT_BUDGET,
+            priority=claimed["priority"], opener=claimed["opener"],
+            opener_pattern=claimed["opener_pattern"],
+            opener_work_id=claimed["opener_work_id"])
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        served = []
+        w.evaluate_bundle = mock.MagicMock(
+            side_effect=lambda branch_key, *_args, **_kwargs:
+                served.append(bytes(branch_key)) or False)
+        try:
+            result = w._help_other_branch(b"unrelated-exclude")
+            pending = w.queue.get_pending_branch(pending_key)
+        finally:
+            w.close()
+
+        self.assertTrue(result)
+        self.assertEqual(served, [shared_key])
+        self.assertEqual(pending["status"], "pending")
+
     def test_returns_true_without_finalizing_when_evaluate_bundle_reports_cancellation(self):
         # _help_other_branch reports True (a bundle WAS claimed) even when
         # evaluation itself was cancelled — it never finalizes in that case.

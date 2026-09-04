@@ -3885,6 +3885,28 @@ class ERDQueue:
             ORDER BY owner_priority DESC, n_words DESC
         """, (opener_work_id,)).fetchall()
 
+    def opener_work_ids_for_branches(self, branch_keys):
+        """Return every live opener-work owner for the given open branches."""
+        branch_keys = [bytes(branch_key) for branch_key in branch_keys]
+        if not branch_keys:
+            return set()
+        opener_work_ids = set()
+        # SQLite permits a finite number of bound parameters.  Scheduler
+        # reports may expose more active branches than one statement can name.
+        for start in range(0, len(branch_keys), 900):
+            keys = branch_keys[start:start + 900]
+            placeholders = ",".join("?" for _key in keys)
+            rows = self._conn.execute(f"""
+                SELECT DISTINCT owner.opener_work_id
+                FROM active_branches AS active
+                JOIN branches AS branch USING (branch_id)
+                JOIN live_branch_opener_rows AS owner USING (branch_id)
+                WHERE active.status = 'open'
+                  AND branch.branch_key IN ({placeholders})
+            """, keys).fetchall()
+            opener_work_ids.update(row["opener_work_id"] for row in rows)
+        return opener_work_ids
+
     def owner_row_for_branch(self, branch_key):
         """Return the canonical owner row selected for one open branch."""
         branch_id = self._intern_branch(branch_key)
