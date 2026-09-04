@@ -2115,6 +2115,60 @@ def _normalize_claim(row, republish_count):
     }
 
 
+def _attach_worker_bundle_progress(workers, normalized_claims):
+    """Record each worker's position within the bundle it currently holds.
+
+    A bundle's candidates are claimed together, and on the two-level ERD
+    prune path they are completed together in one write, so the branch's
+    completed-candidate count stands still for a whole bundle while the
+    worker walks it.  This position moves at heartbeat cadence instead.
+
+    `reported_position` is 1-based over the bundle's best-first order, which
+    is the order the packer hands the candidates out in and therefore the
+    order the worker inspects them.  It is None when the worker's latest
+    heartbeat names a candidate outside the bundle, which is what a bundle
+    boundary looks like: the previous bundle's completion and the next
+    bundle's claim both land before the worker heartbeats again.
+    """
+    members_by_bundle = {}
+    for claim in normalized_claims:
+        if claim["bundle_id"] is not None:
+            members_by_bundle.setdefault(claim["bundle_id"], []).append(claim)
+    # A worker's unfinished claims name the bundle it is on now.  Done claims
+    # cannot: the two-level prune path clears bundle_id as it completes them.
+    current_bundle_by_worker = {}
+    for claim in normalized_claims:
+        if (claim["state"] != "done" and claim["bundle_id"] is not None
+                and claim["worker_id"] is not None):
+            current_bundle_by_worker[claim["worker_id"]] = claim["bundle_id"]
+    for worker in workers:
+        bundle_id = current_bundle_by_worker.get(worker["worker_id"])
+        if bundle_id is None:
+            worker["bundle_progress"] = None
+            continue
+        members = sorted(
+            members_by_bundle[bundle_id],
+            key=lambda claim: (
+                claim["best_first_rank"] is None,
+                claim["best_first_rank"],
+                claim["candidate_index"],
+            ),
+        )
+        candidate_indexes = [claim["candidate_index"] for claim in members]
+        candidate_index = worker["candidate_index"]
+        worker["bundle_progress"] = {
+            "bundle_id": bundle_id,
+            "candidate_count": len(members),
+            "completed_candidate_count": sum(
+                claim["state"] == "done" for claim in members
+            ),
+            "reported_position": (
+                candidate_indexes.index(candidate_index) + 1
+                if candidate_index in candidate_indexes else None
+            ),
+        }
+
+
 def collect_branch_report(sources: ReportOpeners, request: ReportRequest) -> dict:
     generated_at = int(time.time())
     all_answers = load_word_list(sources.answer_list_path)
@@ -2294,6 +2348,7 @@ def collect_branch_report(sources: ReportOpeners, request: ReportRequest) -> dic
         _normalize_claim(row, republish_by_index.get(row["idx"], 0))
         for row in claim_rows
     ]
+    _attach_worker_bundle_progress(workers, normalized_claims)
     all_workers = [
         _normalize_worker(row, generated_at, answer_set)
         for row in all_heartbeat_rows
