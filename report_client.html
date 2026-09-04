@@ -265,6 +265,13 @@
        almost touching the worker's cell.  It is part of the marker, so it
        rides the same slide and fade as the digit. */
     .sweep-marker::after { content:""; position:absolute; top:calc(100% + 1px); left:50%; transform:translateX(-50%); width:0; height:0; border-left:.2rem solid transparent; border-right:.2rem solid transparent; border-bottom:.26rem solid var(--text); }
+    /* A worker between bundles holds no claim to point at, so its position is
+       an area rather than a point: the pointer becomes a bar as wide as the
+       marker.  The digit keeps full strength -- which worker it is was never
+       the uncertain part.  Behind precise markers in the stack, so a worker
+       whose position is known is never hidden by one whose is not. */
+    .sweep-marker.last-reported { z-index:0; }
+    .sweep-marker.last-reported::after { left:0; transform:none; width:100%; height:.16rem; border:0; border-radius:1px; background:var(--dim); }
     .labeled-facts { display:flex; flex-wrap:wrap; gap:.05rem .9rem; }
     .labeled-facts .fact { display:inline-block; min-width:0; overflow-wrap:anywhere; }
     .labeled-facts .fact-label { color:var(--dim); }
@@ -732,7 +739,7 @@
       if(row.cache_state==="exact"&&previous.cache_state!=="exact")return "flash-improved";
       return JSON.stringify(semanticProjection(row))!==JSON.stringify(semanticProjection(previous))?"flash-changed":"";
     }
-    function workerProjection(worker){return {worker_id:worker.worker_id,is_live:worker.is_live,branch_key_hex:worker.branch_key_hex??null,current_candidate:worker.current_candidate??null,candidate_index:worker.candidate_index??null};}
+    function workerProjection(worker){return {worker_id:worker.worker_id,is_live:worker.is_live,branch_key_hex:worker.branch_key_hex??null,current_candidate:worker.current_candidate??null,candidate_index:worker.candidate_index??null,work_position:worker.work_position??null};}
     function workerChangeClass(worker,previous){
       if(!previous)return comparisonAvailable?"flash-added":"";
       // Red is reserved for a worker that just went not-live — the only worker
@@ -993,6 +1000,15 @@
       card.classList.add("clickable");card.addEventListener("click",()=>navigateWorker(worker));
       return card;
     }
+    // Where to draw a worker on the strip.  work_position is derived against
+    // the same completed set the cells are filled from; the raw heartbeat
+    // index is the fallback for a payload that predates it.
+    function workerMarkerPosition(worker){
+      const position=worker.work_position;
+      if(position&&position.candidate_index!==null&&position.candidate_index!==undefined)return position;
+      if(worker.candidate_index===null||worker.candidate_index===undefined)return null;
+      return {candidate_index:worker.candidate_index,state:"working"};
+    }
     function sweepStrip(candidateCount,completedCandidateIndexes,workers,previousWorkersById){
       const cellCount=Math.max(1,Math.min(50,candidateCount));
       const strip=element("div","sweep"),done=new Set(completedCandidateIndexes||[]);
@@ -1017,14 +1033,16 @@
       const rootStyle=workers?.length?getComputedStyle(document.documentElement):null;
       const markerHalo=rootStyle?.getPropertyValue("--panel").trim(),markerInk=rootStyle?.getPropertyValue("--text").trim();
       for(const worker of workers||[]){
-        if(worker.candidate_index===null||worker.candidate_index===undefined)continue;
-        const cell=cellFor(worker.candidate_index),workerNumber=workerName(worker).replace(/^w/,"");
-        const marker=element("span","sweep-marker");
+        const position=workerMarkerPosition(worker);
+        if(position===null)continue;
+        const cell=cellFor(position.candidate_index),workerNumber=workerName(worker).replace(/^w/,"");
+        const marker=element("span","sweep-marker"+(position.state==="last_reported"?" last-reported":""));
         marker.dataset.workerNumber=workerNumber;
         marker.style.width=`calc((100% - ${cellCount-1}px) / ${cellCount})`;
         marker.style.backgroundImage=workerMarkerImage(workerNumber,markerHalo,markerInk);
         const previous=previousWorkersById?.get(String(worker.worker_id));
-        const previousIndex=previous&&previous.branch_key_hex===worker.branch_key_hex?previous.candidate_index:null;
+        const previousPosition=previous&&previous.branch_key_hex===worker.branch_key_hex?workerMarkerPosition(previous):null;
+        const previousIndex=previousPosition&&previousPosition.candidate_index;
         if(animate&&previousIndex!==null&&previousIndex!==undefined){
           // FLIP: start at the previous poll's cell; applyReport slides the
           // marker to its current cell once the strip is in the document.

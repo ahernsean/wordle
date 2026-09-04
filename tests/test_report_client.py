@@ -3182,6 +3182,73 @@ class ReportClientBrowserTest(unittest.TestCase):
         }""")
         self.assertNotIn("bundle", text)
 
+    def _sweep_markers(self, workers_js):
+        """Render a 100-candidate strip whose first half is complete, and
+        report how each worker's marker was drawn."""
+        return self.page.evaluate("""async (workersJs) => {
+          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
+          branch.data.queue.candidate_count=100;
+          branch.data.completed_candidate_indexes=Array.from({length:50},(_,i)=>i);
+          branch.data.workers=JSON.parse(workersJs).map(worker=>({
+            state:'working',is_live:true,updated_at:branch.generated_at,
+            current_candidate:'crane',branch_reference:'eb81eb81eb81',...worker}));
+          applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
+          const cells=[...document.querySelectorAll('.sweep-cell')]
+            .map(node=>node.getBoundingClientRect());
+          const nearestCell=rect=>{
+            const centre=rect.left+rect.width/2;
+            let best=0;
+            cells.forEach((cell,index)=>{
+              if(Math.abs(cell.left+cell.width/2-centre)
+                 <Math.abs(cells[best].left+cells[best].width/2-centre))best=index;});
+            return best;};
+          return [...document.querySelectorAll('.sweep-marker')].map(node=>({
+            classes:node.className,
+            zIndex:getComputedStyle(node).zIndex,
+            cell:nearestCell(node.getBoundingClientRect()),
+            barWidth:getComputedStyle(node,'::after').width,
+            barHeight:getComputedStyle(node,'::after').height}));
+        }""", json.dumps(workers_js))
+
+    def test_a_last_reported_marker_draws_a_bar_not_a_pointer(self):
+        """A worker between bundles has an area, not a point, so its pointer
+        becomes a bar as wide as the marker."""
+        markers = self._sweep_markers([
+            {"worker_id": "worker-1", "candidate_index": 20,
+             "work_position": {"candidate_index": 20, "state": "last_reported"}}])
+        self.assertEqual(len(markers), 1)
+        self.assertIn("last-reported", markers[0]["classes"])
+        # The pointer is a zero-width border triangle; the bar has real width.
+        self.assertNotEqual(markers[0]["barWidth"], "0px")
+        self.assertNotEqual(markers[0]["barHeight"], "0px")
+
+    def test_a_working_marker_keeps_its_pointer(self):
+        markers = self._sweep_markers([
+            {"worker_id": "worker-1", "candidate_index": 70,
+             "work_position": {"candidate_index": 70, "state": "working"}}])
+        self.assertNotIn("last-reported", markers[0]["classes"])
+        self.assertEqual(markers[0]["barWidth"], "0px")
+
+    def test_a_last_reported_marker_sits_behind_a_working_one(self):
+        """An uncertain position must never hide a known one."""
+        markers = self._sweep_markers([
+            {"worker_id": "worker-1", "candidate_index": 20,
+             "work_position": {"candidate_index": 20, "state": "last_reported"}},
+            {"worker_id": "worker-2", "candidate_index": 21,
+             "work_position": {"candidate_index": 21, "state": "working"}}])
+        behind = next(m for m in markers if "last-reported" in m["classes"])
+        in_front = next(m for m in markers if "last-reported" not in m["classes"])
+        self.assertLess(int(behind["zIndex"]), int(in_front["zIndex"]))
+
+    def test_the_marker_follows_work_position_not_the_heartbeat_index(self):
+        """The heartbeat names a candidate in the completed first half; the
+        derived position is in the second half, and that is where it draws."""
+        markers = self._sweep_markers([
+            {"worker_id": "worker-1", "candidate_index": 10,
+             "work_position": {"candidate_index": 80, "state": "working"}}])
+        # Candidate 80 of 100 falls in cell 40 of 50; candidate 10 in cell 5.
+        self.assertEqual(markers[0]["cell"], 40)
+
     def test_republished_candidates_render_as_summary_not_raw_list(self):
         self.apply_branch_target("RAISE .....")
         self.page.wait_for_selector("text=Bundles")

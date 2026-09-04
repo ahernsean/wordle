@@ -939,6 +939,7 @@ class CandidateSweepBarTest(unittest.TestCase):
                     "updated_at": 999, "is_live": True,
                     "branch_reference": "0123456789ab", "branch_key_hex": "010203",
                     "candidate_index": 60, "current_candidate": "slate",
+                    "work_position": {"candidate_index": 60, "state": "working"},
                     "current_candidate_is_answer": True,
                     "current_max_guess_depth": 2, "nodes_per_second": 10.0,
                 }],
@@ -955,6 +956,19 @@ class CandidateSweepBarTest(unittest.TestCase):
         )
         self.assertIn("2", sweep_line)
         self.assertLessEqual(len(sweep_line), 80)
+
+        # The bar is filled from completed_candidate_indexes, so it must place
+        # the worker from the position derived against that same set rather
+        # than from the raw heartbeat index, which may name a done candidate.
+        moved = deepcopy(report)
+        moved["data"]["workers"][0]["work_position"] = {
+            "candidate_index": 5, "state": "working",
+        }
+        moved_line = next(
+            line for line in render_report(moved, width=80).splitlines()
+            if line.strip().startswith("[") and "█" in line
+        )
+        self.assertLess(moved_line.index("2"), sweep_line.index("2"))
 
         unswept = deepcopy(report)
         unswept["data"]["completed_candidate_indexes"] = []
