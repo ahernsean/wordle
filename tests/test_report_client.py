@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 from threading import Event, Thread
 import unittest
+from unittest import mock
 from urllib.parse import unquote
 
 from report_model import ReportOpeners
@@ -36,8 +37,9 @@ CLIENT_PATH = os.path.join(ROOT, "report_client.html")
 # report green while leaving the primary engine untested.
 #
 # The opt-outs exist for an environment that genuinely cannot host a browser —
-# no playwright, or no container runtime for WebKit.  Setting one is a
-# deliberate statement that this run does not cover that engine.
+# no playwright, or neither a native WebKit build nor a container runtime to
+# fall back to.  Setting one is a deliberate statement that this run does not
+# cover that engine.
 SKIP_BROWSER_TESTS = os.environ.get("SKIP_BROWSER_TESTS") == "1"
 SKIP_WEBKIT_CONTAINER_TESTS = (
     SKIP_BROWSER_TESTS
@@ -147,6 +149,27 @@ def _launch_chromium(playwright):
         )
 
 
+def _launch_webkit(playwright):
+    """Launch WebKit, preferring Playwright's bundled native build and
+    falling back to the containerized run-server when that fails.
+
+    Native launch is what every environment with a current-enough glibc and
+    `playwright install webkit` supports directly -- no network dependency
+    beyond the one-time browser download. The container fallback (see
+    tests/webkit_container.py) exists for rocky, whose glibc is too old for
+    Playwright's bundled WebKit build to run at all.
+
+    Returns (browser, container); container is None on the native path and
+    must be stopped by the caller once the browser is closed.
+    """
+    try:
+        return playwright.webkit.launch(headless=True), None
+    except Exception:
+        pass
+    container = start_webkit_server()
+    return playwright.webkit.connect(container.ws_endpoint), container
+
+
 class _ResourceParser(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -181,6 +204,50 @@ class ReportClientStaticTest(unittest.TestCase):
             capture_output=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class LaunchWebKitTest(unittest.TestCase):
+    """_launch_webkit's native-first, container-fallback dispatch, exercised
+    against a fake playwright object so it needs neither a real browser nor
+    a container runtime."""
+
+    def test_native_launch_succeeds_container_is_not_consulted(self):
+        playwright = mock.Mock()
+        native_browser = object()
+        playwright.webkit.launch.return_value = native_browser
+        with mock.patch(
+                "tests.test_report_client.start_webkit_server") as start:
+            browser, container = _launch_webkit(playwright)
+        self.assertIs(browser, native_browser)
+        self.assertIsNone(container)
+        playwright.webkit.launch.assert_called_once_with(headless=True)
+        start.assert_not_called()
+
+    def test_native_launch_fails_falls_back_to_container(self):
+        playwright = mock.Mock()
+        playwright.webkit.launch.side_effect = Exception("no native build")
+        container_browser = object()
+        fake_container = mock.Mock(ws_endpoint="ws://127.0.0.1:1/")
+        playwright.webkit.connect.return_value = container_browser
+        with mock.patch(
+                "tests.test_report_client.start_webkit_server",
+                return_value=fake_container) as start:
+            browser, container = _launch_webkit(playwright)
+        self.assertIs(browser, container_browser)
+        self.assertIs(container, fake_container)
+        start.assert_called_once_with()
+        playwright.webkit.connect.assert_called_once_with(
+            fake_container.ws_endpoint)
+
+    def test_native_launch_fails_and_container_unavailable_propagates(self):
+        playwright = mock.Mock()
+        playwright.webkit.launch.side_effect = Exception("no native build")
+        with mock.patch(
+                "tests.test_report_client.start_webkit_server",
+                side_effect=WebKitContainerUnavailable("no runtime")):
+            with self.assertRaises(WebKitContainerUnavailable):
+                _launch_webkit(playwright)
+
 
 @contextmanager
 def fixture_server():
@@ -4444,8 +4511,11 @@ class ReportClientBrowserTest(unittest.TestCase):
 class ReportClientWebKitBrowserTest(ReportClientBrowserTest):
     """The Chromium suite's test bodies, replayed against real WebKit.
 
-    The browser itself runs inside the Microsoft Playwright container (see
-    tests/webkit_container.py); only setUpClass/tearDownClass differ from the
+    _launch_webkit tries Playwright's bundled native build first and only
+    falls back to running the browser inside the Microsoft Playwright
+    container (see tests/webkit_container.py) when that fails -- rocky's
+    glibc can't run the native build at all, but most other environments,
+    including CI, can. Only setUpClass/tearDownClass differ from the
     Chromium base class.
     """
 
@@ -4460,30 +4530,26 @@ class ReportClientWebKitBrowserTest(ReportClientBrowserTest):
         cls.server_context = fixture_server()
         cls.base_url = cls.server_context.__enter__()
         cls.playwright = sync_playwright().start()
-        cls.webkit_container = None
         try:
-            cls.webkit_container = start_webkit_server()
-            cls.browser = cls.playwright.webkit.connect(
-                cls.webkit_container.ws_endpoint
-            )
+            cls.browser, cls.webkit_container = _launch_webkit(cls.playwright)
         except (WebKitContainerUnavailable, Exception) as error:
-            if cls.webkit_container is not None:
-                cls.webkit_container.stop()
             cls.playwright.stop()
             cls.server_context.__exit__(None, None, None)
             raise RuntimeError(
-                "WebKit container failed to start.  WebKit cannot run natively "
-                "here, so it needs podman or docker and the "
-                "mcr.microsoft.com/playwright image at the installed "
-                "playwright's version.  Set SKIP_WEBKIT_CONTAINER_TESTS=1 to "
-                "run without WebKit coverage."
+                "WebKit failed to start natively and its container fallback "
+                "also failed.  Native WebKit needs `playwright install "
+                "--with-deps webkit`; the container fallback needs podman or "
+                "docker and the mcr.microsoft.com/playwright image at the "
+                "installed playwright's version.  Set "
+                "SKIP_WEBKIT_CONTAINER_TESTS=1 to run without WebKit coverage."
             ) from error
 
     @classmethod
     def tearDownClass(cls):
         cls.browser.close()
         cls.playwright.stop()
-        cls.webkit_container.stop()
+        if cls.webkit_container is not None:
+            cls.webkit_container.stop()
         cls.server_context.__exit__(None, None, None)
 
 

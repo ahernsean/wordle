@@ -87,9 +87,13 @@ jobs:
       - name: Install dependencies
         run: python -m pip install coverage numpy playwright
 
-      # The browser itself runs inside the Microsoft Playwright container
-      # (tests/webkit_container.py), image tag matched to the installed
-      # playwright package's version, so no local WebKit install is needed.
+      - name: Install Playwright WebKit
+        run: python -m playwright install --with-deps webkit
+
+      # _launch_webkit (tests/test_report_client.py) launches this native
+      # build directly; the Microsoft Playwright container
+      # (tests/webkit_container.py) is only a fallback for an environment
+      # whose glibc can't run it, which this runner's isn't.
       - name: Run WebKit browser suite with coverage
         run: coverage run --parallel-mode -m unittest tests.test_report_client.ReportClientWebKitBrowserTest
 
