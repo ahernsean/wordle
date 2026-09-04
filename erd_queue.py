@@ -2068,9 +2068,33 @@ class ERDQueue:
     # Worker claim loop
     # ------------------------------------------------------------------
 
-    def opener_work_candidates(self):
-        """Return unfinished opener work in opener-first admission order."""
-        return self._conn.execute("""
+    def opener_work_candidates(self, limit=None, after=None):
+        """Return unfinished opener work in opener-first admission order.
+
+        limit bounds a scheduler scan.  after is the last row from an earlier
+        scan and continues strictly below it in the same ordering.  Operator
+        commands omit both arguments when they need every matching request.
+        """
+        if limit is not None and limit < 1:
+            raise ValueError("limit must be positive or None")
+        where_after = ""
+        parameters = []
+        if after is not None:
+            state_rank = 0 if after["state"] == "active" else 1
+            where_after = """
+              AND (s.requested_priority < ?
+                   OR (s.requested_priority = ?
+                       AND CASE s.state WHEN 'active' THEN 0 ELSE 1 END > ?)
+                   OR (s.requested_priority = ?
+                       AND CASE s.state WHEN 'active' THEN 0 ELSE 1 END = ?
+                       AND s.opener_work_id > ?))
+            """
+            parameters.extend((after["requested_priority"],
+                               after["requested_priority"], state_rank,
+                               after["requested_priority"], state_rank,
+                               after["opener_work_id"]))
+        parameters.append(-1 if limit is None else limit)
+        return self._conn.execute(f"""
             SELECT s.* FROM opener_work s
             WHERE s.state != 'complete'
               AND EXISTS (
@@ -2081,10 +2105,12 @@ class ERDQueue:
                   AND m.resolved_at IS NULL
                   AND (p.status IN ('pending', 'in_progress') OR a.status = 'open')
             )
+            {where_after}
             ORDER BY s.requested_priority DESC,
                      CASE s.state WHEN 'active' THEN 0 ELSE 1 END,
                      s.opener_work_id
-        """).fetchall()
+            LIMIT ?
+        """, parameters).fetchall()
 
     def has_opener_work(self) -> bool:
         """Whether this queue has opener-aware scheduling provenance."""
@@ -2212,7 +2238,7 @@ class ERDQueue:
         self._begin_immediate_timed()
         try:
             if opener_work_id is None:
-                opener_work_rows = self.opener_work_candidates()
+                opener_work_rows = self.opener_work_candidates(limit=1)
                 opener_work_id = (opener_work_rows[0]["opener_work_id"]
                                   if opener_work_rows else None)
             if opener_work_id is None:
@@ -3927,6 +3953,28 @@ class ERDQueue:
             WHERE opener_work_id = ?
             ORDER BY owner_priority DESC, n_words DESC
         """, (opener_work_id,)).fetchall()
+
+    def opener_work_ids_for_branches(self, branch_keys):
+        """Return every live opener-work owner for the given open branches."""
+        branch_keys = [bytes(branch_key) for branch_key in branch_keys]
+        if not branch_keys:
+            return set()
+        opener_work_ids = set()
+        # SQLite permits a finite number of bound parameters.  Scheduler
+        # reports may expose more active branches than one statement can name.
+        for start in range(0, len(branch_keys), 900):
+            keys = branch_keys[start:start + 900]
+            placeholders = ",".join("?" for _key in keys)
+            rows = self._conn.execute(f"""
+                SELECT DISTINCT owner.opener_work_id
+                FROM active_branches AS active
+                JOIN branches AS branch USING (branch_id)
+                JOIN live_branch_opener_rows AS owner USING (branch_id)
+                WHERE active.status = 'open'
+                  AND branch.branch_key IN ({placeholders})
+            """, keys).fetchall()
+            opener_work_ids.update(row["opener_work_id"] for row in rows)
+        return opener_work_ids
 
     def owner_row_for_branch(self, branch_key):
         """Return the canonical owner row selected for one open branch."""

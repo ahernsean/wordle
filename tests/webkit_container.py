@@ -15,6 +15,7 @@ from a page running inside the container if the container shares the host's
 network namespace rather than getting a port forwarded into an isolated one.
 """
 
+from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
 import shutil
 import socket
@@ -24,6 +25,9 @@ import time
 
 IMAGE_REPOSITORY = "mcr.microsoft.com/playwright"
 READY_TIMEOUT_SECONDS = 60
+# No real test session needs anywhere near this long, so a container from
+# this image still running past it is left over from an interrupted one.
+STALE_CONTAINER_SECONDS = 900
 
 
 def installed_playwright_version():
@@ -75,6 +79,42 @@ class WebKitContainerServer:
         self.stop()
 
 
+def _reap_stale_containers(runtime):
+    """Stop any run-server container left running by an interrupted prior
+    session.
+
+    A crash, a killed CI job, or a Ctrl-C during setUpClass/tearDownClass
+    skips this module's own cleanup entirely -- nothing else ever revisits
+    a container once its session ends -- leaving a `--rm -d --network host`
+    container running indefinitely. Every start_webkit_server call sweeps
+    first, so a leak self-heals on the next test run instead of
+    accumulating; four were found still running on rocky, one as old as
+    47 hours, before this existed.
+    """
+    listed = subprocess.run(
+        [runtime, "ps", "--filter", f"ancestor={IMAGE_REPOSITORY}",
+         "--format", "{{.ID}}"],
+        capture_output=True, text=True, check=False,
+    )
+    now = datetime.now(timezone.utc)
+    for container_id in listed.stdout.split():
+        inspected = subprocess.run(
+            [runtime, "inspect", container_id, "--format",
+             '{{.State.StartedAt.Format "2006-01-02T15:04:05Z07:00"}}'],
+            capture_output=True, text=True, check=False,
+        )
+        started_at = inspected.stdout.strip()
+        if not started_at:
+            continue
+        try:
+            age_seconds = (now - datetime.fromisoformat(started_at)).total_seconds()
+        except ValueError:
+            continue
+        if age_seconds > STALE_CONTAINER_SECONDS:
+            subprocess.run([runtime, "stop", container_id],
+                            capture_output=True, check=False)
+
+
 def start_webkit_server(timeout=READY_TIMEOUT_SECONDS):
     """Start a containerized `playwright run-server` exposing WebKit.
 
@@ -86,6 +126,7 @@ def start_webkit_server(timeout=READY_TIMEOUT_SECONDS):
     runtime = _container_runtime()
     if runtime is None:
         raise WebKitContainerUnavailable("neither podman nor docker is on PATH")
+    _reap_stale_containers(runtime)
 
     pw_version = installed_playwright_version()
     if pw_version is None:
