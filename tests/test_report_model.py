@@ -3641,3 +3641,83 @@ class WorkerBundleProgressTest(unittest.TestCase):
         workers = [self._worker("worker-5", 50)]
         report_model._attach_worker_bundle_progress(workers, claims)
         self.assertEqual(workers[0]["bundle_progress"]["reported_position"], 2)
+
+
+class WorkerWorkPositionTest(unittest.TestCase):
+    """Where a worker's marker is drawn on the candidate sweep.
+
+    The position must be resolved against the same completed set the strip is
+    filled from, so a marker can never be drawn inside a fully completed cell.
+    """
+
+    @staticmethod
+    def _claim(candidate_index, rank, worker_id, done=False):
+        return {
+            "candidate_index": candidate_index,
+            "state": "done" if done else "in_flight",
+            "completion_kind": "evaluated" if done else None,
+            "worker_id": worker_id,
+            "bundle_id": None if done else "%s:1:1" % worker_id,
+            "best_first_rank": rank,
+            "republish_count": 0,
+        }
+
+    @staticmethod
+    def _worker(worker_id, candidate_index):
+        return {"worker_id": worker_id, "candidate_index": candidate_index}
+
+    def test_an_unfinished_heartbeat_candidate_is_used_unchanged(self):
+        claims = [self._claim(40, 7, "worker-1"), self._claim(41, 8, "worker-1")]
+        workers = [self._worker("worker-1", 41)]
+        report_model._attach_worker_work_positions(workers, claims)
+        self.assertEqual(workers[0]["work_position"],
+                         {"candidate_index": 41, "state": "working"})
+
+    def test_a_finished_heartbeat_candidate_falls_back_to_the_held_claim(self):
+        # The worker completed 40 and moved on; 55 is where the work now is.
+        claims = [self._claim(40, 7, "worker-1", done=True),
+                  self._claim(55, 8, "worker-1"),
+                  self._claim(70, 9, "worker-1")]
+        workers = [self._worker("worker-1", 40)]
+        report_model._attach_worker_work_positions(workers, claims)
+        self.assertEqual(workers[0]["work_position"],
+                         {"candidate_index": 55, "state": "working"})
+
+    def test_the_fallback_takes_the_lowest_ranked_claim_not_the_lowest_index(self):
+        claims = [self._claim(90, 3, "worker-1"), self._claim(20, 9, "worker-1")]
+        workers = [self._worker("worker-1", 12345)]
+        report_model._attach_worker_work_positions(workers, claims)
+        self.assertEqual(workers[0]["work_position"]["candidate_index"], 90)
+
+    def test_a_worker_between_bundles_reports_its_last_position(self):
+        claims = [self._claim(40, 7, "worker-1", done=True)]
+        workers = [self._worker("worker-1", 40)]
+        report_model._attach_worker_work_positions(workers, claims)
+        self.assertEqual(workers[0]["work_position"],
+                         {"candidate_index": 40, "state": "last_reported"})
+
+    def test_a_worker_with_no_position_at_all_gets_none(self):
+        workers = [self._worker("worker-1", None)]
+        report_model._attach_worker_work_positions(workers, [])
+        self.assertIsNone(workers[0]["work_position"])
+
+    def test_another_workers_claims_never_place_this_worker(self):
+        claims = [self._claim(55, 8, "worker-2")]
+        workers = [self._worker("worker-1", 40)]
+        report_model._attach_worker_work_positions(workers, claims)
+        self.assertEqual(workers[0]["work_position"],
+                         {"candidate_index": 40, "state": "last_reported"})
+
+    def test_a_working_position_is_never_a_completed_candidate(self):
+        """The guarantee the display rests on, stated directly."""
+        claims = [self._claim(index, index, "worker-1", done=index < 8)
+                  for index in range(10)]
+        done = {claim["candidate_index"] for claim in claims
+                if claim["state"] == "done"}
+        for reported in list(done) + [8, 9, None]:
+            with self.subTest(reported=reported):
+                workers = [self._worker("worker-1", reported)]
+                report_model._attach_worker_work_positions(workers, claims)
+                position = workers[0]["work_position"]
+                if position["state"] == "working":
+                    self.assertNotIn(position["candidate_index"], done)

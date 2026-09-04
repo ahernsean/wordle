@@ -1243,10 +1243,12 @@ def _render_branch_sections(report, previous_report, color, width, display_order
             candidate_lines.extend(_inline_section("  ", candidate_status_fields, width))
         for candidate_eta_field in candidate_eta_fields:
             candidate_lines.extend(_inline_section("  ", [candidate_eta_field], width))
+        # The derived position, not the raw heartbeat index: it is resolved
+        # against the same completed set this bar is filled from.
         worker_positions = [
-            (worker.get("candidate_index"), worker["worker_number"])
+            (worker["work_position"]["candidate_index"], worker["worker_number"])
             for worker in data["workers"]
-            if worker["is_live"] and worker.get("candidate_index") is not None
+            if worker["is_live"] and worker.get("work_position") is not None
         ]
         sweep = candidate_sweep_bar(
             candidate_count,

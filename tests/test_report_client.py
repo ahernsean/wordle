@@ -3182,6 +3182,152 @@ class ReportClientBrowserTest(unittest.TestCase):
         }""")
         self.assertNotIn("bundle", text)
 
+    def _sweep(self, workers_js, candidate_count=100):
+        """Render a strip whose first half is complete, and report how each
+        worker's marker was drawn against the cell geometry."""
+        return self.page.evaluate("""async ([workersJs,candidateCount]) => {
+          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
+          branch.data.queue.candidate_count=candidateCount;
+          branch.data.completed_candidate_indexes=
+            Array.from({length:candidateCount/2},(_,i)=>i);
+          branch.data.workers=JSON.parse(workersJs).map(worker=>({
+            state:'working',is_live:true,updated_at:branch.generated_at,
+            current_candidate:'crane',branch_reference:'eb81eb81eb81',...worker}));
+          applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
+          // The digit shift is a transitioned transform, so a rect read now
+          // reports where a digit started rather than where it settles.
+          await new Promise(resolve=>setTimeout(resolve,500));
+          const cells=[...document.querySelectorAll('.sweep-cell')]
+            .map(node=>{const box=node.getBoundingClientRect();
+                        return {left:box.left,width:box.width};});
+          return {cells, markers:[...document.querySelectorAll('.sweep-marker')].map(node=>{
+            const box=node.getBoundingClientRect();
+            const digit=node.querySelector('.sweep-digit');
+            const digitBox=digit.getBoundingClientRect();
+            return {classes:node.className,
+                    zIndex:getComputedStyle(node).zIndex,
+                    centre:box.left+box.width/2,
+                    digitCentre:digitBox.left+digitBox.width/2,
+                    digitWidth:digitBox.width,
+                    barWidth:getComputedStyle(node,'::after').width,
+                    barHeight:getComputedStyle(node,'::after').height};})};
+        }""", [json.dumps(workers_js), candidate_count])
+
+    def _colliding_pair(self):
+        # 1,000 candidates over 50 cells puts 20 in a cell, so two adjacent
+        # candidates land about a pixel apart and their digits must overlap.
+        return self._sweep([
+            {"worker_id": "worker-1", "candidate_index": 500,
+             "work_position": {"candidate_index": 500, "state": "working"}},
+            {"worker_id": "worker-2", "candidate_index": 501,
+             "work_position": {"candidate_index": 501, "state": "working"}}],
+            candidate_count=1000)
+
+    def test_colliding_digits_separate_while_their_pointers_hold_position(self):
+        """Position is the pointer's claim and identity is the digit's; only
+        the digit may move to resolve a collision."""
+        sweep = self._colliding_pair()
+        first, second = sweep["markers"]
+        # The pointers stay about a pixel apart: proportional placement is
+        # untouched by the spread.
+        self.assertLess(abs(second["centre"] - first["centre"]),
+                        first["digitWidth"] / 2)
+        # The digits are pushed apart far enough not to overlap.
+        self.assertGreaterEqual(
+            abs(second["digitCentre"] - first["digitCentre"]),
+            first["digitWidth"] - 0.5)
+
+    def test_digits_separate_symmetrically_around_the_collision(self):
+        """Both digits give ground, rather than one holding still while the
+        other is shoved away."""
+        first, second = self._colliding_pair()["markers"]
+        self.assertLess(first["digitCentre"], first["centre"] - 1)
+        self.assertGreater(second["digitCentre"], second["centre"] + 1)
+
+    def test_a_lone_digit_is_never_shifted(self):
+        sweep = self._sweep([
+            {"worker_id": "worker-1", "candidate_index": 50,
+             "work_position": {"candidate_index": 50, "state": "working"}}])
+        marker = sweep["markers"][0]
+        self.assertAlmostEqual(marker["digitCentre"], marker["centre"], delta=0.5)
+
+    def test_widely_spaced_digits_are_left_alone(self):
+        sweep = self._sweep([
+            {"worker_id": "worker-1", "candidate_index": 10,
+             "work_position": {"candidate_index": 10, "state": "working"}},
+            {"worker_id": "worker-2", "candidate_index": 90,
+             "work_position": {"candidate_index": 90, "state": "working"}}])
+        for marker in sweep["markers"]:
+            self.assertAlmostEqual(
+                marker["digitCentre"], marker["centre"], delta=0.5)
+
+    def test_a_marker_lands_proportionally_inside_its_cell(self):
+        """A cell spans many candidates, so a marker must show where in the
+        cell its candidate falls rather than snapping to the cell."""
+        # 100 candidates over 50 cells: cell 40 holds candidates 80 and 81.
+        sweep = self._sweep([
+            {"worker_id": "worker-1", "candidate_index": 80,
+             "work_position": {"candidate_index": 80, "state": "working"}},
+            {"worker_id": "worker-2", "candidate_index": 81,
+             "work_position": {"candidate_index": 81, "state": "working"}}])
+        cell = sweep["cells"][40]
+        opening, halfway = (marker["centre"] for marker in sweep["markers"])
+        self.assertAlmostEqual(opening, cell["left"], delta=1.0)
+        self.assertAlmostEqual(halfway, cell["left"] + cell["width"] / 2, delta=1.0)
+        # And the two must actually be apart, or nothing above is proved.
+        self.assertGreater(halfway - opening, 1.0)
+
+    def test_markers_across_the_strip_stay_in_candidate_order(self):
+        """Proportional placement must be monotone: a later candidate never
+        draws left of an earlier one."""
+        sweep = self._sweep([
+            {"worker_id": "worker-%d" % number, "candidate_index": index,
+             "work_position": {"candidate_index": index, "state": "working"}}
+            for number, index in enumerate((0, 25, 51, 80, 81, 99))])
+        centres = [marker["centre"] for marker in sweep["markers"]]
+        self.assertEqual(centres, sorted(centres))
+        self.assertEqual(len(set(centres)), len(centres))
+
+    def test_a_last_reported_marker_draws_a_bar_not_a_pointer(self):
+        """A worker between bundles has an area, not a point, so its pointer
+        becomes a bar as wide as the marker."""
+        markers = self._sweep([
+            {"worker_id": "worker-1", "candidate_index": 20,
+             "work_position": {"candidate_index": 20, "state": "last_reported"}}])["markers"]
+        self.assertEqual(len(markers), 1)
+        self.assertIn("last-reported", markers[0]["classes"])
+        # The pointer is a zero-width border triangle; the bar has real width.
+        self.assertNotEqual(markers[0]["barWidth"], "0px")
+        self.assertNotEqual(markers[0]["barHeight"], "0px")
+
+    def test_a_working_marker_keeps_its_pointer(self):
+        markers = self._sweep([
+            {"worker_id": "worker-1", "candidate_index": 70,
+             "work_position": {"candidate_index": 70, "state": "working"}}])["markers"]
+        self.assertNotIn("last-reported", markers[0]["classes"])
+        self.assertEqual(markers[0]["barWidth"], "0px")
+
+    def test_a_last_reported_marker_sits_behind_a_working_one(self):
+        """An uncertain position must never hide a known one."""
+        markers = self._sweep([
+            {"worker_id": "worker-1", "candidate_index": 20,
+             "work_position": {"candidate_index": 20, "state": "last_reported"}},
+            {"worker_id": "worker-2", "candidate_index": 21,
+             "work_position": {"candidate_index": 21, "state": "working"}}])["markers"]
+        behind = next(m for m in markers if "last-reported" in m["classes"])
+        in_front = next(m for m in markers if "last-reported" not in m["classes"])
+        self.assertLess(int(behind["zIndex"]), int(in_front["zIndex"]))
+
+    def test_the_marker_follows_work_position_not_the_heartbeat_index(self):
+        """The heartbeat names a candidate in the completed first half; the
+        derived position is in the second half, and that is where it draws."""
+        sweep = self._sweep([
+            {"worker_id": "worker-1", "candidate_index": 10,
+             "work_position": {"candidate_index": 80, "state": "working"}}])
+        # Candidate 80 of 100 opens cell 40 of 50; the heartbeat's 10 is cell 5.
+        self.assertAlmostEqual(
+            sweep["markers"][0]["centre"], sweep["cells"][40]["left"], delta=1.0)
+
     def test_republished_candidates_render_as_summary_not_raw_list(self):
         self.apply_branch_target("RAISE .....")
         self.page.wait_for_selector("text=Bundles")
@@ -3424,9 +3570,9 @@ class ReportClientBrowserTest(unittest.TestCase):
         }""")
 
     def sweep_marker_background_image(self):
-        """The decoded SVG data URI currently behind the .sweep-marker."""
+        """The decoded SVG data URI currently behind the .sweep-digit."""
         return self.page.evaluate("""() => {
-          const marker=document.querySelector('.sweep-marker');
+          const marker=document.querySelector('.sweep-digit');
           const raw=marker.style.backgroundImage;
           const uri=raw.slice('url("'.length,-'")'.length);
           return decodeURIComponent(uri);
@@ -3453,7 +3599,7 @@ class ReportClientBrowserTest(unittest.TestCase):
 
         self.page.emulate_media(color_scheme="dark")
         self.page.wait_for_function(
-            "document.querySelector('.sweep-marker').style.backgroundImage.includes('%231c1c1e')"
+            "document.querySelector('.sweep-digit').style.backgroundImage.includes('%231c1c1e')"
         )
         dark_svg = self.sweep_marker_background_image()
         self.assertIn('stroke="#1c1c1e"', dark_svg)
@@ -3985,7 +4131,7 @@ class ReportClientBrowserTest(unittest.TestCase):
           branch.data.workers=[{worker_id:'worker-3',worker_number:'3',updated_at:999,is_live:true,branch_key_hex:'01',branch_reference:'111111111111',candidate_index:75,current_candidate:'crane',current_candidate_is_answer:true}];
           applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
           const cells=[...document.querySelectorAll('.sweep-cell')];
-          return {cellCount:cells.length,firstFill:cells[0].style.getPropertyValue('--fill'),lastFill:cells[cells.length-1].style.getPropertyValue('--fill'),fills:cells.map(cell=>Number.parseInt(cell.style.getPropertyValue('--fill'),10)),markers:[...document.querySelectorAll('.sweep-marker')].map(marker=>marker.dataset.workerNumber)};
+          return {cellCount:cells.length,firstFill:cells[0].style.getPropertyValue('--fill'),lastFill:cells[cells.length-1].style.getPropertyValue('--fill'),fills:cells.map(cell=>Number.parseInt(cell.style.getPropertyValue('--fill'),10)),markers:[...document.querySelectorAll('.sweep-digit')].map(digit=>digit.dataset.workerNumber)};
         }""")
         self.assertEqual(result["cellCount"], 50)
         self.assertEqual(result["firstFill"], "100%")
@@ -4026,7 +4172,7 @@ class ReportClientBrowserTest(unittest.TestCase):
           const cards=[...document.querySelectorAll('#report .grid article.card.clickable')];
           const first=cards.find(card=>card.dataset.identity==='01');
           const cells=[...first.querySelectorAll('.sweep-cell')];
-          return {sweepCount:document.querySelectorAll('#report .sweep').length,cellCount:cells.length,workerNumbers:[...first.querySelectorAll('.sweep-marker')].map(marker=>marker.dataset.workerNumber),fullCells:cells.filter(cell=>cell.style.getPropertyValue('--fill')==='100%').length};
+          return {sweepCount:document.querySelectorAll('#report .sweep').length,cellCount:cells.length,workerNumbers:[...first.querySelectorAll('.sweep-digit')].map(digit=>digit.dataset.workerNumber),fullCells:cells.filter(cell=>cell.style.getPropertyValue('--fill')==='100%').length};
         }""")
         self.assertEqual(result["sweepCount"], 3)
         self.assertEqual(result["cellCount"], 50)

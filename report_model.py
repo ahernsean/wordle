@@ -2169,6 +2169,59 @@ def _attach_worker_bundle_progress(workers, normalized_claims):
         }
 
 
+def _attach_worker_work_positions(workers, normalized_claims):
+    """Place each worker's marker on a candidate this same report calls unfinished.
+
+    The heartbeat names the candidate a worker was about to inspect and is
+    written at most HB_SECONDS ago; the completed set is written the instant
+    a candidate finishes.  Rendering the two together draws a worker onto
+    ground the same payload reports as done.  Preferring an unfinished claim
+    the worker still holds keeps both halves of the picture on one clock: a
+    `working` position has `done = 0` in this payload, so it cannot fall
+    inside a fully completed cell.
+
+    It is also the more accurate position.  In the evaluation phase a worker
+    completes one candidate at a time, so once its heartbeat candidate is
+    done, its lowest-ranked unfinished claim is where the work has moved to.
+    In the prune phase nothing completes until the bundle commits, so the
+    heartbeat candidate is itself still unfinished and is used unchanged.
+
+    A worker between bundles holds no unfinished claim at all.  Its last
+    heartbeat is then the only position there is, reported as
+    `last_reported` so a renderer can draw it as an area rather than a point
+    instead of asserting a precision it does not have.
+    """
+    unfinished_by_worker = {}
+    for claim in normalized_claims:
+        if claim["state"] == "done" or claim["worker_id"] is None:
+            continue
+        unfinished_by_worker.setdefault(claim["worker_id"], []).append(claim)
+    for claims in unfinished_by_worker.values():
+        claims.sort(key=lambda claim: (
+            claim["best_first_rank"] is None,
+            claim["best_first_rank"],
+            claim["candidate_index"],
+        ))
+    for worker in workers:
+        reported_index = worker["candidate_index"]
+        unfinished = unfinished_by_worker.get(worker["worker_id"], ())
+        held_indexes = {claim["candidate_index"] for claim in unfinished}
+        if reported_index is not None and reported_index in held_indexes:
+            position = {"candidate_index": reported_index, "state": "working"}
+        elif unfinished:
+            position = {
+                "candidate_index": unfinished[0]["candidate_index"],
+                "state": "working",
+            }
+        elif reported_index is not None:
+            position = {
+                "candidate_index": reported_index, "state": "last_reported",
+            }
+        else:
+            position = None
+        worker["work_position"] = position
+
+
 def collect_branch_report(sources: ReportOpeners, request: ReportRequest) -> dict:
     generated_at = int(time.time())
     all_answers = load_word_list(sources.answer_list_path)
@@ -2349,6 +2402,7 @@ def collect_branch_report(sources: ReportOpeners, request: ReportRequest) -> dic
         for row in claim_rows
     ]
     _attach_worker_bundle_progress(workers, normalized_claims)
+    _attach_worker_work_positions(workers, normalized_claims)
     all_workers = [
         _normalize_worker(row, generated_at, answer_set)
         for row in all_heartbeat_rows

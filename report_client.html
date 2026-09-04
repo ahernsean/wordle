@@ -260,11 +260,22 @@
        pixels.  The marker has no fill of its own — the digit carries a light
        halo (drawn in the SVG) so it reads over both green and gray while the
        cell's own fill stays visible straight through it. */
-    .sweep-marker { position:absolute; top:0; height:100%; min-width:.85rem; z-index:1; background-position:center; background-repeat:no-repeat; transition:left .4s ease, opacity .4s ease; }
+    .sweep-marker { position:absolute; top:0; height:100%; min-width:.85rem; z-index:1; transition:left .4s ease, opacity .4s ease; }
+    /* The pointer says where the worker is and never moves off its candidate;
+       the digit says which worker it is and may slide to clear a neighbour, so
+       the two are separate boxes.  --digit-shift is the only thing that moves. */
+    .sweep-digit { position:absolute; top:0; height:100%; width:.85rem; left:50%; transform:translateX(calc(-50% + var(--digit-shift,0px))); background-position:center; background-repeat:no-repeat; transition:transform .4s ease; }
     /* A small solid pointer in the strip of white space under the ramp, apex
        almost touching the worker's cell.  It is part of the marker, so it
        rides the same slide and fade as the digit. */
     .sweep-marker::after { content:""; position:absolute; top:calc(100% + 1px); left:50%; transform:translateX(-50%); width:0; height:0; border-left:.2rem solid transparent; border-right:.2rem solid transparent; border-bottom:.26rem solid var(--text); }
+    /* A worker between bundles holds no claim to point at, so its position is
+       an area rather than a point: the pointer becomes a bar as wide as the
+       marker.  The digit keeps full strength -- which worker it is was never
+       the uncertain part.  Behind precise markers in the stack, so a worker
+       whose position is known is never hidden by one whose is not. */
+    .sweep-marker.last-reported { z-index:0; }
+    .sweep-marker.last-reported::after { left:0; transform:none; width:100%; height:.16rem; border:0; border-radius:1px; background:var(--dim); }
     .labeled-facts { display:flex; flex-wrap:wrap; gap:.05rem .9rem; }
     .labeled-facts .fact { display:inline-block; min-width:0; overflow-wrap:anywhere; }
     .labeled-facts .fact-label { color:var(--dim); }
@@ -732,7 +743,7 @@
       if(row.cache_state==="exact"&&previous.cache_state!=="exact")return "flash-improved";
       return JSON.stringify(semanticProjection(row))!==JSON.stringify(semanticProjection(previous))?"flash-changed":"";
     }
-    function workerProjection(worker){return {worker_id:worker.worker_id,is_live:worker.is_live,branch_key_hex:worker.branch_key_hex??null,current_candidate:worker.current_candidate??null,candidate_index:worker.candidate_index??null};}
+    function workerProjection(worker){return {worker_id:worker.worker_id,is_live:worker.is_live,branch_key_hex:worker.branch_key_hex??null,current_candidate:worker.current_candidate??null,candidate_index:worker.candidate_index??null,work_position:worker.work_position??null};}
     function workerChangeClass(worker,previous){
       if(!previous)return comparisonAvailable?"flash-added":"";
       // Red is reserved for a worker that just went not-live — the only worker
@@ -993,9 +1004,19 @@
       card.classList.add("clickable");card.addEventListener("click",()=>navigateWorker(worker));
       return card;
     }
+    // Where to draw a worker on the strip.  work_position is derived against
+    // the same completed set the cells are filled from; the raw heartbeat
+    // index is the fallback for a payload that predates it.
+    function workerMarkerPosition(worker){
+      const position=worker.work_position;
+      if(position&&position.candidate_index!==null&&position.candidate_index!==undefined)return position;
+      if(worker.candidate_index===null||worker.candidate_index===undefined)return null;
+      return {candidate_index:worker.candidate_index,state:"working"};
+    }
     function sweepStrip(candidateCount,completedCandidateIndexes,workers,previousWorkersById){
       const cellCount=Math.max(1,Math.min(50,candidateCount));
       const strip=element("div","sweep"),done=new Set(completedCandidateIndexes||[]);
+      strip.dataset.cellCount=cellCount;
       for(let cell=0;cell<cellCount;cell++){
         const start=Math.floor(cell*candidateCount/cellCount),end=Math.max(start+1,Math.floor((cell+1)*candidateCount/cellCount));
         let doneCount=0;for(let index=start;index<end;index++)if(done.has(index))doneCount++;
@@ -1009,35 +1030,97 @@
         if(complete)cellNode.classList.add("complete");
         strip.append(cellNode);
       }
-      const cellFor=index=>Math.min(cellCount-1,Math.floor(cellCount*index/candidateCount));
-      const cellLeft=cell=>`calc((100% - ${cellCount-1}px) * ${cell} / ${cellCount} + ${cell}px)`;
+      // A candidate's own place along the strip, not its cell's centre.  A
+      // cell spans hundreds of candidates at production sizes, so snapping a
+      // marker to cells discards every bit of position the strip can express
+      // and leaves it with cellCount distinct places to stand.  The integer
+      // term counts the 1px gaps closed before this point.
+      const stripPositionOf=index=>Math.max(0,Math.min(cellCount,cellCount*index/candidateCount));
+      const stripOffset=index=>{
+        const position=stripPositionOf(index);
+        const gaps=Math.min(cellCount-1,Math.floor(position));
+        return `calc((100% - ${cellCount-1}px) * ${position} / ${cellCount} + ${gaps}px)`;
+      };
       const animate=comparisonAvailable&&!matchMedia("(prefers-reduced-motion: reduce)").matches;
       // Read once per strip, not once per worker: the halo/fill colors are the
       // same for every marker in this render pass.
       const rootStyle=workers?.length?getComputedStyle(document.documentElement):null;
       const markerHalo=rootStyle?.getPropertyValue("--panel").trim(),markerInk=rootStyle?.getPropertyValue("--text").trim();
       for(const worker of workers||[]){
-        if(worker.candidate_index===null||worker.candidate_index===undefined)continue;
-        const cell=cellFor(worker.candidate_index),workerNumber=workerName(worker).replace(/^w/,"");
-        const marker=element("span","sweep-marker");
-        marker.dataset.workerNumber=workerNumber;
+        const position=workerMarkerPosition(worker);
+        if(position===null)continue;
+        const offset=stripOffset(position.candidate_index),workerNumber=workerName(worker).replace(/^w/,"");
+        const marker=element("span","sweep-marker"+(position.state==="last_reported"?" last-reported":""));
+        marker.dataset.stripPosition=stripPositionOf(position.candidate_index);
         marker.style.width=`calc((100% - ${cellCount-1}px) / ${cellCount})`;
-        marker.style.backgroundImage=workerMarkerImage(workerNumber,markerHalo,markerInk);
+        const digit=element("span","sweep-digit");
+        digit.dataset.workerNumber=workerNumber;
+        marker.append(digit);
+        // Centred on the candidate's point, so the pointer beneath -- itself
+        // centred in the marker -- lands on that point at any box width.
+        marker.style.transform="translateX(-50%)";
+        digit.style.backgroundImage=workerMarkerImage(workerNumber,markerHalo,markerInk);
         const previous=previousWorkersById?.get(String(worker.worker_id));
-        const previousIndex=previous&&previous.branch_key_hex===worker.branch_key_hex?previous.candidate_index:null;
+        const previousPosition=previous&&previous.branch_key_hex===worker.branch_key_hex?workerMarkerPosition(previous):null;
+        const previousIndex=previousPosition&&previousPosition.candidate_index;
         if(animate&&previousIndex!==null&&previousIndex!==undefined){
-          // FLIP: start at the previous poll's cell; applyReport slides the
-          // marker to its current cell once the strip is in the document.
-          const previousCell=cellFor(previousIndex);
-          marker.style.left=cellLeft(previousCell);
-          if(previousCell!==cell)marker.dataset.moveTo=cellLeft(cell);
+          // FLIP: start at the previous poll's point; applyReport slides the
+          // marker to its current one once the strip is in the document.
+          const previousOffset=stripOffset(previousIndex);
+          marker.style.left=previousOffset;
+          if(previousOffset!==offset)marker.dataset.moveTo=offset;
         }else{
-          marker.style.left=cellLeft(cell);
+          marker.style.left=offset;
           if(animate){marker.style.opacity="0";marker.dataset.fadeIn="1";}
         }
         strip.append(marker);
       }
       return strip;
+    }
+    // The pointer encodes position and never moves; the digit encodes identity
+    // and may.  Two workers a few candidates apart put their digits on the same
+    // pixels, so any that would overlap are spread just far enough to read.
+    //
+    // Target centres are computed from the position each marker was drawn at
+    // rather than measured, because a marker mid-slide reports where it is
+    // rather than where it is going, and the digits must settle at the
+    // destination geometry.
+    function layoutSweepMarkerDigits(root){
+      for(const strip of root.querySelectorAll(".sweep")){
+        const digits=[...strip.querySelectorAll(".sweep-digit")];
+        if(!digits.length)continue;
+        if(digits.length<2){digits[0].style.setProperty("--digit-shift","0px");continue;}
+        const stripWidth=strip.getBoundingClientRect().width;
+        const cellCount=Number(strip.dataset.cellCount||0);
+        const digitWidth=digits[0].getBoundingClientRect().width;
+        if(!stripWidth||!cellCount||!digitWidth)continue;
+        const track=stripWidth-(cellCount-1);
+        const items=digits.map(digit=>{
+          const position=Number(digit.parentElement.dataset.stripPosition);
+          return {digit,centre:track*position/cellCount+Math.min(cellCount-1,Math.floor(position))};
+        }).sort((first,second)=>first.centre-second.centre);
+        // Push each digit right only as far as it takes to clear the previous
+        // one, then slide the whole run back by its mean displacement so a
+        // colliding pair separates symmetrically instead of the left one
+        // holding still while the right one is shoved away.
+        let previousRight=-Infinity,displacement=0;
+        for(const item of items){
+          item.left=Math.max(item.centre-digitWidth/2,previousRight);
+          previousRight=item.left+digitWidth;
+          displacement+=item.left+digitWidth/2-item.centre;
+        }
+        const recentre=displacement/items.length;
+        // Slide the run as a whole to stay on the strip, which preserves every
+        // separation the pass just established.
+        const runLeft=items[0].left-recentre;
+        const runRight=items[items.length-1].left-recentre+digitWidth;
+        const slide=runLeft<0?-runLeft:(runRight>stripWidth?stripWidth-runRight:0);
+        for(const item of items){
+          const left=item.left-recentre+slide;
+          item.digit.style.setProperty(
+            "--digit-shift",(left+digitWidth/2-item.centre).toFixed(2)+"px");
+        }
+      }
     }
     function animateSweepMarkers(root){
       const pending=root.querySelectorAll("[data-move-to],[data-fade-in]");
@@ -2061,7 +2144,7 @@
       // A render the guard let through takes the menu's node with the old
       // report, so the handle to it goes too rather than being left dangling.
       openGroupMenuNode=null;
-      centerLetters();root.replaceChildren(content);layoutSpines(root);animateSweepMarkers(root);recordGridColumnCounts(root,state);if(report.report_kind==="leaderboard")leaderboardReportWidth=root.clientWidth;if(readingPosition)requestAnimationFrame(()=>restoreReadingPosition(root,readingPosition));if(report.report_kind!=="leaderboard")animateGridTransitions(root,beforeCards,sameView);setTimeout(()=>document.querySelectorAll(".flash-added,.flash-improved,.flash-changed").forEach(node=>node.classList.remove("flash-added","flash-improved","flash-changed")),1500);return root;
+      centerLetters();root.replaceChildren(content);layoutSpines(root);layoutSweepMarkerDigits(root);animateSweepMarkers(root);recordGridColumnCounts(root,state);if(report.report_kind==="leaderboard")leaderboardReportWidth=root.clientWidth;if(readingPosition)requestAnimationFrame(()=>restoreReadingPosition(root,readingPosition));if(report.report_kind!=="leaderboard")animateGridTransitions(root,beforeCards,sameView);setTimeout(()=>document.querySelectorAll(".flash-added,.flash-improved,.flash-changed").forEach(node=>node.classList.remove("flash-added","flash-improved","flash-changed")),1500);return root;
     }
     function workerMarkerImage(workerNumber,halo,ink){
       const svg='<svg xmlns="http://www.w3.org/2000/svg"><text x="50%" y="50%" text-anchor="middle" dominant-baseline="central" font-family="ui-monospace,SFMono-Regular,Consolas,monospace" font-size="8.45" font-weight="bold" paint-order="stroke" stroke="'+halo+'" stroke-width="2.5" stroke-linejoin="round" fill="'+ink+'">'+workerNumber+'</text></svg>';
@@ -2074,10 +2157,10 @@
     // until the next report replaces them.  Refresh every marker currently in
     // the document whenever the preference changes, independent of polling.
     function refreshWorkerMarkerColors(){
-      const markers=document.querySelectorAll(".sweep-marker");
-      if(!markers.length)return;
+      const digits=document.querySelectorAll(".sweep-digit");
+      if(!digits.length)return;
       const style=getComputedStyle(document.documentElement),halo=style.getPropertyValue("--panel").trim(),ink=style.getPropertyValue("--text").trim();
-      for(const marker of markers)marker.style.backgroundImage=workerMarkerImage(marker.dataset.workerNumber,halo,ink);
+      for(const digit of digits)digit.style.backgroundImage=workerMarkerImage(digit.dataset.workerNumber,halo,ink);
     }
     function connection(ok,message,disconnected=!ok){const chip=byId("connection");chip.classList.toggle("disconnected",disconnected);chip.textContent=ok?"●":"● "+message;const status=ok?"connected":message;chip.title=status;chip.setAttribute("aria-label",status+"; opens refresh interval");}
     async function fetchReport(){
@@ -2163,7 +2246,7 @@
       document.querySelectorAll("[data-kind]").forEach(button=>button.addEventListener("click",()=>{const overview=button.dataset.overview;setState({...readControls(),kind:button.dataset.kind,branch_target:overview?"":currentState.branch_target,tree:false,branch_status:overview?[...overviewBranchStatusNames]:currentState.branch_status,branch_worker_status:overview?[...overviewBranchWorkerStatusNames]:currentState.branch_worker_status,minimum_answer_count:overview?null:currentState.minimum_answer_count,maximum_answer_count:overview?null:currentState.maximum_answer_count,budget:overview?null:currentState.budget,priority:overview?null:currentState.priority,sort:overview?"":currentState.sort,limit:overview?null:currentState.limit,answers:false,claims:false,finalization_cursor:""});}));
       installSpineCopy();
       matchMedia("(prefers-color-scheme: dark)").addEventListener("change",refreshWorkerMarkerColors);
-      addEventListener("resize",()=>{const root=byId("report");layoutSpines(root);for(const strip of root.querySelectorAll(".answer-strip"))measureAnswerStrip(strip);if(openGroupMenuNode)positionGroupMenu(openGroupMenuNode.node,openGroupMenuNode.opener);if(currentState?.kind==="leaderboard"&&lastReport&&root.clientWidth!==leaderboardReportWidth&&!reportHasFocusedControl()&&!reportHasActiveSelection())applyReport(lastReport,lastReport,currentState);});
+      addEventListener("resize",()=>{const root=byId("report");layoutSpines(root);layoutSweepMarkerDigits(root);for(const strip of root.querySelectorAll(".answer-strip"))measureAnswerStrip(strip);if(openGroupMenuNode)positionGroupMenu(openGroupMenuNode.node,openGroupMenuNode.opener);if(currentState?.kind==="leaderboard"&&lastReport&&root.clientWidth!==leaderboardReportWidth&&!reportHasFocusedControl()&&!reportHasActiveSelection())applyReport(lastReport,lastReport,currentState);});
       addEventListener("popstate",()=>{abortActiveRequest();currentState=parsePageState(location);syncControls();fetchReport();schedulePoll();});document.addEventListener("visibilitychange",()=>{if(!document.hidden){fetchReport();schedulePoll();}});fetchReport();schedulePoll();
     }
     window.parsePageState=parsePageState;window.buildAPIURL=buildAPIURL;window.rootProgressURL=rootProgressURL;window.renderRootProgressHeadline=renderRootProgressHeadline;window.applyReport=applyReport;window.spineTextFromSelection=spineTextFromSelection;window.__reportClient={setState:state=>setState(state),getState:()=>({...currentState}),fetchReport};
