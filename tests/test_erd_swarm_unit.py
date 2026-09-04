@@ -1478,6 +1478,31 @@ class TestClaimOneJoinsInProgressBranch(unittest.TestCase):
         self.assertEqual(branch['branch_key'], key_b)
         self.assertTrue(indices)
 
+    def test_claim_one_reads_only_the_top_opener_from_a_large_ladder(self):
+        """A claimable top rung must not scan the lower queued openers."""
+        from erd_queue import ERDQueue
+        ScoreCache(self.cache_path, BRANCH).close()
+        branch_key = ScoreCache.encode_subset(BRANCH)
+        q = ERDQueue(self.queue_path)
+        q.add_pending_many([
+            (branch_key, len(BRANCH), 512 - number,
+             f"opener-{number}", number)
+            for number in range(512)
+        ])
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        try:
+            with mock.patch.object(w.queue, "opener_work_candidates",
+                                   wraps=w.queue.opener_work_candidates) as rows:
+                result = w.claim_one()
+        finally:
+            w.close()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(rows.call_args_list,
+                         [mock.call(limit=1, after=None)])
+
     def test_claim_one_records_scan_time_net_of_the_queue_phases(self):
         # The work-selection scan must be charged to scheduling_millis rather
         # than falling into idle_millis, and must exclude the lock wait and
@@ -2022,6 +2047,33 @@ class TestHelpOtherBranch(unittest.TestCase):
 
         # Should have evaluated a candidate and returned True.
         self.assertTrue(result)
+
+    def test_help_other_branch_reads_active_branches_once(self):
+        """Helping must not issue one active-branch query per opener."""
+        from erd_queue import ERDQueue
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        excluded_key = ScoreCache.encode_subset(BRANCH)
+        other_key = ScoreCache.encode_subset(BRANCH[:4])
+        q.create_branch(excluded_key, len(BRANCH), len(CANDIDATES),
+                        budget=ROOT_BUDGET, priority=0)
+        q.create_branch(other_key, len(BRANCH) - 1, len(CANDIDATES),
+                        budget=ROOT_BUDGET, priority=1)
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        try:
+            with mock.patch.object(w.queue, "branches_in_progress",
+                                   wraps=w.queue.branches_in_progress) as branches:
+                with mock.patch.object(w.queue, "direct_branches_in_progress",
+                                       wraps=w.queue.direct_branches_in_progress) as direct:
+                    result = w._help_other_branch(excluded_key)
+        finally:
+            w.close()
+
+        self.assertTrue(result)
+        branches.assert_called_once_with()
+        direct.assert_not_called()
 
     def test_returns_true_without_finalizing_when_evaluate_bundle_reports_cancellation(self):
         # _help_other_branch reports True (a bundle WAS claimed) even when

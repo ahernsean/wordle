@@ -2032,13 +2032,8 @@ class _BranchWorker:
         if self._help_recursion_depth >= MAX_HELP_RECURSION_DEPTH:
             return False
         exclude_branch_key = bytes(exclude_branch_key)
-        opener_work_rows = self.queue.opener_work_candidates()  # priority DESC
-        owned_branches = []
-        for opener_work in opener_work_rows:
-            owned_branches.extend(
-                self.queue.branches_in_progress(opener_work['opener_work_id']))
         branches = [
-            b for b in owned_branches + list(self.queue.direct_branches_in_progress())
+            b for b in self.queue.branches_in_progress()
             if bytes(b['branch_key']) != exclude_branch_key]
         fallback_priority = self._work_context.opener_priority
         if branches and branches[0]['owner_priority'] > fallback_priority:
@@ -2061,7 +2056,7 @@ class _BranchWorker:
         # dozens of response groups still waiting.
         joinable_opener_ids = {b['opener_work_id'] for b in unoccupied}
 
-        for opener_work in opener_work_rows:
+        for opener_work in self._opener_work_candidates():
             opener_work_id = opener_work['opener_work_id']
             priority = opener_work['requested_priority']
             if priority < fallback_priority:
@@ -2620,11 +2615,14 @@ class _BranchWorker:
             if direct_work is not None:
                 return direct_work
             self._opener_work_enabled = self.queue.has_opener_work()
-        opener_work_rows = (self.queue.opener_work_candidates()
-                            if self._opener_work_enabled else ())
-        top_priority = (opener_work_rows[0]['requested_priority']
-                        if opener_work_rows else None)
-        for opener_work in opener_work_rows:
+        opener_work_rows = []
+        top_priority = None
+        candidate_rows = (self._opener_work_candidates()
+                          if self._opener_work_enabled else ())
+        for opener_work in candidate_rows:
+            opener_work_rows.append(opener_work)
+            if top_priority is None:
+                top_priority = opener_work['requested_priority']
             opener_work_id = opener_work['opener_work_id']
             # opener_work_candidates() is opener-first admission order
             # (requested_priority DESC), so every entry tied with the top
@@ -2653,6 +2651,22 @@ class _BranchWorker:
             return direct_work
         return self._claim_paired_branch(opener_work_rows, top_priority,
                                          occupancy)
+
+    def _opener_work_candidates(self):
+        """Yield opener work one priority-ordered row at a time.
+
+        The common claim takes the highest-priority opener immediately.  A
+        blocked opener advances this cursor only when it yields no bundle,
+        rather than materializing every unfinished request at each boundary.
+        """
+        after = None
+        while True:
+            rows = self.queue.opener_work_candidates(limit=1, after=after)
+            if not rows:
+                return
+            opener_work = rows[0]
+            yield opener_work
+            after = opener_work
 
     def _claim_paired_branch(self, opener_work_rows, top_priority, occupancy):
         """Join a branch already held by exactly one other worker, or None.
