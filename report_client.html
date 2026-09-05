@@ -405,7 +405,7 @@
     let currentState, lastReport=null, lastContext=null, displayedState=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,shownBranchTarget=null,sourcePathsOpen=false,rootProgressOpen=true,rootProgressSort="tree_nodes",leaderboardReportWidth=null;
     // The root-progress scan takes seconds, so a result is held per target and
     // reused across the poll cycle's re-renders; refreshing is explicit.
-    const rootProgressCache=new Map(), rootProgressPending=new Set(), rootProgressScroll=new Map(), rootProgressFailure=new Map();
+    const rootProgressCache=new Map(), rootProgressGeneration=new Map(), rootProgressPending=new Set(), rootProgressScroll=new Map(), rootProgressFailure=new Map();
     const byId=id=>document.getElementById(id);
     const element=(tag,className,text)=>{const node=document.createElement(tag);if(className)node.className=className;if(text!==undefined)node.textContent=String(text);return node;};
     const formatInteger=value=>value===null||value===undefined?"—":Number(value).toLocaleString("en-US");
@@ -1363,7 +1363,7 @@
     }
     function renderRootProgressInto(headlineHost,host,url,data,solvedGroupCount,state){
       const refresh=element("button","refresh","Refresh");
-      refresh.addEventListener("click",()=>{rootProgressCache.delete(url);rootProgressFailure.delete(url);rootProgressFailure.delete(rootProgressURL(state,true));attachRootProgress(headlineHost,host,url,solvedGroupCount,state);});
+      refresh.addEventListener("click",()=>{invalidateRootProgress(url);attachRootProgress(headlineHost,host,url,solvedGroupCount,state);});
       headlineHost.replaceChildren(renderRootProgressHeadline(data,solvedGroupCount));
       host.replaceChildren(renderRootProgressPanel(data,url,state,headlineHost,host,solvedGroupCount),refresh);
       // The panel is built before the report is mounted, and scroll offsets do
@@ -1380,7 +1380,7 @@
     // the whole page below the panel would shift each time.  Refresh retries.
     function renderRootProgressFailure(headlineHost,host,url,message,solvedGroupCount,state){
       const refresh=element("button","refresh","Refresh");
-      refresh.addEventListener("click",()=>{rootProgressFailure.delete(url);attachRootProgress(headlineHost,host,url,solvedGroupCount,state);});
+      refresh.addEventListener("click",()=>{invalidateRootProgress(url);attachRootProgress(headlineHost,host,url,solvedGroupCount,state);});
       headlineHost.replaceChildren();
       host.replaceChildren(element("p","error",message),refresh);
     }
@@ -1398,17 +1398,41 @@
     // `wanted` reads the rendered data and decides whether the second stage
     // has anything to add, so a report with nothing to enrich never pays for
     // the request.
+    // Refresh means "discard what is displayed and ask again", and a request
+    // already in flight predates that instruction.  Without a generation, the
+    // in-flight request keeps its place in rootProgressPending, so the fresh
+    // first stage finds the enrichment "already running" and starts none --
+    // and when the old one lands it writes its pre-refresh response under the
+    // shared cache key.  The panel then sits on stale data that an explicit
+    // Refresh was supposed to replace.
+    //
+    // Bumping the generation both frees the slot for a replacement request
+    // and marks every response issued before the refresh as superseded, so a
+    // late arrival is dropped rather than rendered.
+    function rootProgressGenerationOf(cacheKey){
+      return rootProgressGeneration.get(cacheKey)||0;
+    }
+    function invalidateRootProgress(cacheKey){
+      rootProgressGeneration.set(cacheKey,rootProgressGenerationOf(cacheKey)+1);
+      rootProgressCache.delete(cacheKey);
+      rootProgressFailure.delete(cacheKey);
+    }
     function attachProgressiveStage({cacheKey,stageURL,host,data,wanted,render}){
       if(!wanted(data))return;
-      if(rootProgressPending.has(stageURL)||rootProgressFailure.has(stageURL))return;
-      rootProgressPending.add(stageURL);
+      const generation=rootProgressGenerationOf(cacheKey);
+      const stageKey=stageURL+"#"+generation;
+      if(rootProgressPending.has(stageKey)||rootProgressFailure.has(stageKey))return;
+      rootProgressPending.add(stageKey);
       fetch(stageURL,{headers:{Accept:"application/json"}})
         .then(response=>{if(!response.ok)throw new Error("Progressive stage request failed ("+response.status+")");return response.json();})
         .then(enriched=>{
+          if(rootProgressGenerationOf(cacheKey)!==generation)return;
           rootProgressCache.set(cacheKey,enriched.data);
           if(host.isConnected)render(enriched.data);})
-        .catch(error=>{rootProgressFailure.set(stageURL,error.message);})
-        .finally(()=>rootProgressPending.delete(stageURL));
+        .catch(error=>{
+          if(rootProgressGenerationOf(cacheKey)===generation)
+            rootProgressFailure.set(stageKey,error.message);})
+        .finally(()=>rootProgressPending.delete(stageKey));
     }
     // Inherited cost is root progress's second stage: the first names which
     // groups another opener paid for, this one measures what they cost.
@@ -1432,16 +1456,21 @@
         return;
       }
       host.replaceChildren(element("p","dim","Computing root progress… (a full telemetry scan, usually a few seconds)"));
-      if(rootProgressPending.has(url))return;
-      rootProgressPending.add(url);
+      const generation=rootProgressGenerationOf(url),stageKey=url+"#"+generation;
+      if(rootProgressPending.has(stageKey))return;
+      rootProgressPending.add(stageKey);
       fetch(url,{headers:{Accept:"application/json"}})
         .then(response=>{if(!response.ok)throw new Error("Root progress request failed ("+response.status+")");return response.json();})
         .then(progress=>{
+          if(rootProgressGenerationOf(url)!==generation)return;
           rootProgressCache.set(url,progress.data);
           if(host.isConnected)renderRootProgressInto(headlineHost,host,url,progress.data,solvedGroupCount,state);
           attachInheritedCost(headlineHost,host,url,state,solvedGroupCount,progress.data);})
-        .catch(error=>{rootProgressFailure.set(url,error.message);if(host.isConnected)renderRootProgressFailure(headlineHost,host,url,error.message,solvedGroupCount,state);})
-        .finally(()=>rootProgressPending.delete(url));
+        .catch(error=>{
+          if(rootProgressGenerationOf(url)!==generation)return;
+          rootProgressFailure.set(url,error.message);
+          if(host.isConnected)renderRootProgressFailure(headlineHost,host,url,error.message,solvedGroupCount,state);})
+        .finally(()=>rootProgressPending.delete(stageKey));
     }
     function renderWord(report,previous,state){
       const fragment=document.createDocumentFragment(),data=report.data;const heading=element("h2","");heading.append(wordTiles(data.word,null,data.word_is_answer,"word-lg"));fragment.append(heading);

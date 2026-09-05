@@ -908,6 +908,51 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(
             self.page.locator("table.root-progress").count(), 1)
 
+    def test_refresh_replaces_an_inherited_cost_request_left_in_flight(self):
+        """Refresh must not be satisfied by a response that predates it.
+
+        The enrichment is slow by design, so Refresh lands while one is often
+        still in flight.  That request holds the pending slot a replacement
+        would need, and its response is written under the shared cache key —
+        so without a generation the panel answers an explicit Refresh with
+        pre-refresh figures and issues no new request at all.
+        """
+        # The first enrichment is held and doctored so a stale render is
+        # visible; later ones are served normally.
+        self.page.evaluate("""() => {
+          const original = window.fetch;
+          window.__stage = {calls: 0, held: []};
+          window.fetch = (input, init) => {
+            if (!String(input).includes("inherited_cost=1")) return original(input, init);
+            window.__stage.calls++;
+            if (window.__stage.calls > 1) return original(input, init);
+            return new Promise(resolve => window.__stage.held.push(async () => {
+              const payload = await (await original(input, init)).json();
+              payload.data.totals.inherited_search_node_count = 987654321;
+              resolve(new Response(JSON.stringify(payload),
+                                   {headers: {"Content-Type": "application/json"}}));
+            }));
+          };
+        }""")
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("table.root-progress")
+        self.page.wait_for_function("() => window.__stage.calls === 1")
+
+        self.page.locator("details.root-progress-panel button.refresh").click()
+        # Release the pre-refresh response only after the refresh is under way,
+        # so it arrives exactly as it would in the race.
+        self.page.evaluate("() => window.__stage.held.splice(0).forEach(r => r())")
+
+        # A replacement enrichment is issued rather than skipped as pending...
+        self.page.wait_for_function("() => window.__stage.calls === 2")
+        self.page.wait_for_function(
+            "() => document.querySelector('details.root-progress-panel')"
+            "        .innerText.includes('tree total nodes')")
+        text = self.page.locator("details.root-progress-panel").inner_text()
+        # ...and the superseded response never reaches the panel.
+        self.assertNotIn("987.7M", text)
+        self.assertIn("5.0M", text)
+
     def test_root_progress_skips_the_rollup_when_nothing_was_inherited(self):
         """An opener that paid for its own tree must not pay for the scan.
 
