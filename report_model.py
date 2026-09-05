@@ -1950,6 +1950,30 @@ def collect_root_progress_report(sources: ReportOpeners,
         row["inherited_search_node_count"] = (
             rollup["search_node_count"] if rollup else 0)
         row["inherited_wall_millis"] = rollup["wall_millis"] if rollup else 0
+        row["inherited_elapsed_millis"] = (
+            (rollup["last_finalized_at"] - rollup["first_created_at"]) * 1000
+            if rollup and rollup["first_created_at"] is not None
+            and rollup["last_finalized_at"] is not None else None)
+        # A group is worked or inherited, never both: an inherited group has
+        # no work of this opener's to report, so the cost cells are empty
+        # rather than occupied.  Filling them with the payer's figures
+        # therefore displaces nothing, and `paid_by` says whose they are.
+        # Derived here so the terminal and the web client cannot disagree
+        # about which number belongs in a cell.
+        inherited = row["provenance"] == "inherited"
+        row["shown_cost_is_inherited"] = inherited
+        row["shown_cost_known"] = (
+            row["inherited_cost_known"] if inherited else row["started"])
+        row["shown_branch_count"] = (
+            row["inherited_branch_count"] if inherited else row["branch_count"])
+        row["shown_search_node_count"] = (
+            row["inherited_search_node_count"] if inherited
+            else row["search_node_count"])
+        row["shown_wall_millis"] = (
+            row["inherited_wall_millis"] if inherited else row["wall_millis"])
+        row["shown_elapsed_millis"] = (
+            row["inherited_elapsed_millis"] if inherited
+            else row["elapsed_millis"])
         rows.append(row)
     # Default to the tree's cost.  Ranking on this opener's own nodes sinks
     # every inherited group to the bottom on zero, which hides exactly the
@@ -1958,10 +1982,18 @@ def collect_root_progress_report(sources: ReportOpeners,
     # no rollup requested the two orders coincide.
     rows.sort(key=_ROOT_PROGRESS_SORT_KEYS[
         request.filters.sort or ROOT_PROGRESS_DEFAULT_SORT])
+    # Two totals, deliberately: `node_total` is this opener's own measured
+    # work and is what the totals report, while the share is a fraction of
+    # what the table shows, so it still sums to one across the visible rows
+    # once an inherited group's cost is displayed in them.  Folding the
+    # inherited nodes into `node_total` would make the reported total mean
+    # neither quantity.  With nothing inherited the two coincide.
     node_total = sum(row["search_node_count"] for row in rows)
+    shown_node_total = sum(row["shown_search_node_count"] for row in rows)
     for row in rows:
-        row["search_node_share"] = (row["search_node_count"] / node_total
-                                    if node_total else 0.0)
+        row["search_node_share"] = (
+            row["shown_search_node_count"] / shown_node_total
+            if shown_node_total else 0.0)
     data["response_groups"] = rows
     data["epoch"] = active_epoch
     data["telemetry_epochs"] = sorted({

@@ -1243,6 +1243,11 @@
     }
     const ROOT_PROGRESS_GROUP_STATES=["waiting","working","solved","inherited","trivial","loss"];
     const PROVENANCE_MARK={worked:"\u2014",trivial:"\u00b7",unattributed:"?",none:"\u2014"};
+    // A cost cell reads as measured, awaited, or absent — three states, and
+    // collapsing the middle one into a dash would report an unfetched rollup
+    // as "this cost nothing".
+    const costText=(row,render)=>row.shown_cost_known?render()
+      :(row.shown_cost_is_inherited?"\u2026":"\u2014");
     // Only groups still waiting hold work the estimate cannot see.  A group the
     // swarm never opened because it needed no search is not missing work.
     function excludedText(totals,estimate){
@@ -1336,7 +1341,7 @@
       sortField.append(sortSelect);
       fragment.append(sortField);
       const table=element("table","root-progress"),head=element("thead",""),headRow=element("tr","");
-      for(const columnName of ["Response","State","Answers","Done","Evaluating","Nodes","Share","Elapsed","Worker-time","Paid by","Inherited"])headRow.append(element("th","",columnName));
+      for(const columnName of ["Response","State","Answers","Done","Evaluating","Nodes","Share","Elapsed","Worker-time","Paid by"])headRow.append(element("th","",columnName));
       head.append(headRow);
       table.append(head);
       const body=element("tbody","");
@@ -1353,14 +1358,18 @@
           response,
           element("td","state-"+row.display_state.replace(/ /g,"-"),row.display_state),
           element("td","",numText(row.answer_count)),
-          element("td","",row.started?numText(row.branch_count):"—"),
-          element("td","",row.started?numText(row.open_branch_count):"—"),
-          element("td","",row.started?formatNodeCount(row.search_node_count):"—"),
-          element("td","",row.started?(100*row.search_node_share).toFixed(1)+"%":"—"),
-          element("td","",row.elapsed_millis===null?"—":formatDuration(row.elapsed_millis/1000)),
-          element("td","",row.started&&row.branch_count?formatDuration(row.wall_millis/1000):"—"),
-          element("td","paid-by-"+row.provenance,row.paid_by?row.paid_by:PROVENANCE_MARK[row.provenance]||"—"),
-          element("td","",row.provenance!=="inherited"?"—":(row.inherited_cost_known?formatNodeCount(row.inherited_search_node_count):"\u2026")));
+          // An inherited group's cells hold the payer's figures — which is
+          // what Paid by on the same row says.  "…" is a rollup still in
+          // flight, and is not a measured zero.
+          element("td","",costText(row,()=>numText(row.shown_branch_count))),
+          // Open branches are this opener's own, so an inherited group has
+          // none to report rather than zero of them.
+          element("td","",row.shown_cost_is_inherited||!row.started?"—":numText(row.open_branch_count)),
+          element("td","",costText(row,()=>formatNodeCount(row.shown_search_node_count))),
+          element("td","",costText(row,()=>(100*row.search_node_share).toFixed(1)+"%")),
+          element("td","",costText(row,()=>row.shown_elapsed_millis===null?"—":formatDuration(row.shown_elapsed_millis/1000))),
+          element("td","",costText(row,()=>row.shown_branch_count?formatDuration(row.shown_wall_millis/1000):"—")),
+          element("td","paid-by-"+row.provenance,row.paid_by?row.paid_by:PROVENANCE_MARK[row.provenance]||"—"));
         body.append(line);
       }
       table.append(body);
@@ -1384,13 +1393,12 @@
           "loss: proven unsolvable within the remaining budget."],
         ["Answers","Answer words remaining in the group after this guess and response."],
         ["Done","Branches finalized beneath the group, at any depth — not answers or candidates. A group carved into many sub-branches counts every one."],
-        ["Evaluating","Branches beneath the group open right now."],
-        ["Nodes","Search nodes this opener spent on the group."],
-        ["Share","The group's nodes as a fraction of this opener's total."],
+        ["Evaluating","Branches beneath the group open right now. Always blank on an inherited group: open branches are this opener's own, and it has none."],
+        ["Nodes","Search nodes spent on the group."],
+        ["Share","The group's nodes as a fraction of every row shown here."],
         ["Elapsed","Wall-clock from first work to last, shared with whatever else the swarm was running."],
         ["Worker-time","Summed worker time, so six workers for an hour counts as six hours."],
-        ["Paid by","The opener whose spine first finalized the branch. Blank when this opener did the work itself."],
-        ["Inherited","Search nodes that opener spent on the group's whole subtree — the same unit as Nodes, and work this opener never had to repeat."],
+        ["Paid by","The opener whose spine first finalized the branch. Blank when this opener did the work itself — and when it names another opener, every cost on that row is that opener's, not this one's. \u2026 means the rollup is still being fetched, which is not the same as nothing."],
       ]){
         legend.append(element("dt","",term),element("dd","",definition));
       }

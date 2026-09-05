@@ -5096,12 +5096,16 @@ class ERDQueue:
         if not requested:
             return {}
         rows = self._conn.execute("""
-            SELECT spine, nodes_spent, total_bundle_wall_millis
+            SELECT spine, nodes_spent, total_bundle_wall_millis,
+                   created_at, finalized_at
             FROM telemetry.branch_finalize_log
             ORDER BY spine
         """).fetchall()
         ordered = [row["spine"] or "" for row in rows]
-        # Running totals so a range costs a subtraction rather than a walk.
+        # Running totals so a summed range costs a subtraction rather than a
+        # walk.  The two timestamps are a min and a max, which do not
+        # subtract, so they are read by walking the range -- the ranges are
+        # disjoint subtrees, so that stays linear in the log overall.
         node_totals, wall_totals = [0], [0]
         for row in rows:
             node_totals.append(node_totals[-1] + (row["nodes_spent"] or 0))
@@ -5113,10 +5117,16 @@ class ERDQueue:
             # A spine's descendants all begin with it followed by a space, so
             # they end below the same prefix carrying the highest code point.
             stop = bisect.bisect_left(ordered, spine + " " + chr(0x10FFFF))
+            created = [rows[index]["created_at"] for index in range(start, stop)
+                       if rows[index]["created_at"] is not None]
+            finalized = [rows[index]["finalized_at"] for index in range(start, stop)
+                         if rows[index]["finalized_at"] is not None]
             rollups[spine] = {
                 "branch_count": stop - start,
                 "search_node_count": node_totals[stop] - node_totals[start],
                 "wall_millis": wall_totals[stop] - wall_totals[start],
+                "first_created_at": min(created) if created else None,
+                "last_finalized_at": max(finalized) if finalized else None,
             }
         return rollups
 

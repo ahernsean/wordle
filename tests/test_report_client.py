@@ -612,7 +612,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(
             headers,
             ["Response", "State", "Answers", "Done", "Evaluating", "Nodes",
-             "Share", "Elapsed", "Worker-time", "Paid by", "Inherited"])
+             "Share", "Elapsed", "Worker-time", "Paid by"])
 
     def test_root_progress_table_keeps_its_scroll_position_across_polls(self):
         # Every poll rebuilds the word report, so the scroller is a fresh
@@ -925,7 +925,51 @@ class ReportClientBrowserTest(unittest.TestCase):
             "node => node.open = true")
         legend = self.page.locator("dl.root-progress-legend").inner_text()
         self.assertIn("Branches finalized beneath the group", legend)
-        self.assertIn("Search nodes that opener spent", legend)
+        # An inherited row's costs are the payer's, which only Paid by says.
+        self.assertIn("every cost on that row is that opener's", legend)
+
+    def test_inherited_row_carries_the_payer_figures_in_its_own_cells(self):
+        """A group is worked or inherited, never both.
+
+        An inherited group has no work of this opener's to report, so its
+        cost cells are empty rather than occupied — filling them with the
+        payer's branches, nodes and times displaces nothing, and `Paid by` on
+        the same row says whose they are.  `Evaluating` is the exception: open
+        branches are this opener's own, and the rollup counts only finalized
+        ones, so the payer's in-flight state is not something we know.
+        """
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("table.root-progress")
+        self.page.wait_for_function(
+            "() => document.querySelector('details.root-progress-panel')"
+            "        .innerText.includes('tree total nodes')")
+        with open(os.path.join(FIXTURE_DIRECTORY,
+                               "root_progress-inherited.json")) as fixture_file:
+            rows = {row["pattern"]: row for row
+                    in json.load(fixture_file)["data"]["response_groups"]}
+        cells = self.page.eval_on_selector_all(
+            "table.root-progress tbody tr",
+            "rows => rows.map(r => [...r.querySelectorAll('td')]"
+            "                        .map(c => c.textContent))")
+        patterns = self.page.eval_on_selector_all(
+            "table.root-progress tbody tr .tile-button",
+            "buttons => buttons.map(b => b.getAttribute('aria-label').split(' ')[2])")
+        by_pattern = dict(zip(patterns, cells))
+        inherited = [p for p in patterns if rows[p]["provenance"] == "inherited"]
+        self.assertTrue(inherited)
+        for pattern in inherited:
+            row, cell = rows[pattern], by_pattern[pattern]
+            with self.subTest(pattern=pattern):
+                self.assertEqual(cell[3], f"{row['inherited_branch_count']:,}")
+                self.assertNotIn(cell[5], ("—", "…", "0"))
+                self.assertEqual(cell[9], row["paid_by"])
+                # Open branches stay this opener's, so there are none here.
+                self.assertEqual(cell[4], "—")
+        worked = next(p for p in patterns
+                      if rows[p]["provenance"] == "worked" and rows[p]["started"])
+        self.assertEqual(by_pattern[worked][3],
+                         f"{rows[worked]['branch_count']:,}")
+        self.assertEqual(by_pattern[worked][9], "—")
 
     def test_root_progress_names_who_paid_for_an_inherited_group(self):
         # A branch is its answer set, so the opener that reaches it first pays
@@ -972,10 +1016,11 @@ class ReportClientBrowserTest(unittest.TestCase):
             first = self.page.locator("details.root-progress-panel").inner_text()
             self.assertIn("Measuring what other openers spent", first)
             self.assertNotIn("tree total nodes", first)
-            inherited_cells = self.page.eval_on_selector_all(
-                "table.root-progress tbody tr td:nth-child(11)",
+            # Nodes on an inherited row: awaited, not zero and not absent.
+            awaited = self.page.eval_on_selector_all(
+                "table.root-progress tbody tr td:nth-child(6)",
                 "cells => cells.map(c => c.textContent)")
-            self.assertIn("…", inherited_cells)
+            self.assertIn("…", awaited)
         finally:
             released.set()
         # Second stage: the same panel, filled in.

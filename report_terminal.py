@@ -1899,41 +1899,40 @@ def _render_root_progress_sections(report, width, display_order):
                                 width))
     rows = [f"{'Pattern':<7} {'State':>9} {'Answers':>7} {'Done':>8}"
             f" {'Evaluating':>10} {'Nodes':>9} {'Share':>5} {'Elapsed':>8}"
-            f" {'WorkerTime':>10} {'Paid by':>9} {'Inherited':>9}"]
+            f" {'WorkerTime':>10} {'Paid by':>9}"]
     for row in data["response_groups"]:
         # A group the swarm has not opened has no cost to report.  Printing
         # zeros would read as a measurement rather than an absence.  A group
         # that is open but has finalized nothing is the opposite case: its
         # zeros are measured, and only the finalize-only figures stay unknown.
-        if row["started"]:
-            branch_text = f"{row['branch_count']:,}"
-            open_text = f"{row['open_branch_count']:,}"
-            node_text = _format_node_count(row["search_node_count"])
+        # An inherited group's cells hold the payer's figures, which is what
+        # `Paid by` on the same row says.  "?" is a rollup that was not asked
+        # for, and is not the same as a measured zero.
+        if row["shown_cost_known"]:
+            branch_text = f"{row['shown_branch_count']:,}"
+            node_text = _format_node_count(row["shown_search_node_count"])
             share_text = f"{100.0 * row['search_node_share']:.1f}%"
             elapsed_text = _abbreviate_duration(
-                row["elapsed_millis"] / 1000
-                if row["elapsed_millis"] is not None else None)
-            worker_text = (_abbreviate_duration(row["wall_millis"] / 1000)
-                           if row["branch_count"] else "—")
+                row["shown_elapsed_millis"] / 1000
+                if row["shown_elapsed_millis"] is not None else None)
+            worker_text = (_abbreviate_duration(row["shown_wall_millis"] / 1000)
+                           if row["shown_branch_count"] else "—")
+        elif row["shown_cost_is_inherited"]:
+            branch_text = node_text = share_text = "?"
+            elapsed_text = worker_text = "?"
         else:
-            branch_text = open_text = node_text = share_text = "—"
+            branch_text = node_text = share_text = "—"
             elapsed_text = worker_text = "—"
-        # An inherited group's cost belongs to whoever solved the branch
-        # first, so it is reported in its own column rather than added to
-        # this opener's nodes.  "?" distinguishes a rollup that was not asked
-        # for from one that measured nothing.
+        # Open branches are this opener's own, so an inherited group has none
+        # to report rather than zero of them.
+        open_text = ("—" if row["shown_cost_is_inherited"] or not row["started"]
+                     else f"{row['open_branch_count']:,}")
         payer_text = row["paid_by"] or _PROVENANCE_MARK.get(row["provenance"], "—")
-        if row["provenance"] != "inherited":
-            inherited_text = "—"
-        elif row["inherited_cost_known"]:
-            inherited_text = _format_node_count(row["inherited_search_node_count"])
-        else:
-            inherited_text = "?"
         rows.append(_fit(
             f"{row['pattern']:<7} {row['display_state']:>9} {row['answer_count']:>7}"
             f" {branch_text:>8} {open_text:>10} {node_text:>9}"
             f" {share_text:>5} {elapsed_text:>8} {worker_text:>10}"
-            f" {payer_text:>9} {inherited_text:>9}",
+            f" {payer_text:>9}",
             width,
         ))
     return [("header", header), ("summary", summary),

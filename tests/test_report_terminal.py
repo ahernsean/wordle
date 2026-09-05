@@ -2293,6 +2293,22 @@ def root_progress_report(estimate=None, requested_at=1_798_000_000,
         row["inherited_wall_millis"] = nodes * 2 if row["inherited_cost_known"] else 0
         row["display_state"] = report_model._root_progress_display_state(
             row["state"], row["provenance"])
+        row["inherited_elapsed_millis"] = (
+            row["inherited_wall_millis"] // 2
+            if row["inherited_cost_known"] else None)
+        is_inherited = row["provenance"] == "inherited"
+        row["shown_cost_is_inherited"] = is_inherited
+        row["shown_cost_known"] = (row["inherited_cost_known"] if is_inherited
+                                   else row["started"])
+        for shown, own, borrowed in (
+            ("shown_branch_count", "branch_count", "inherited_branch_count"),
+            ("shown_search_node_count", "search_node_count",
+             "inherited_search_node_count"),
+            ("shown_wall_millis", "wall_millis", "inherited_wall_millis"),
+            ("shown_elapsed_millis", "elapsed_millis",
+             "inherited_elapsed_millis"),
+        ):
+            row[shown] = row[borrowed] if is_inherited else row[own]
     totals = report["data"]["totals"]
     totals["provenance_counts"] = collections.Counter(
         row["provenance"] for row in rows)
@@ -2348,15 +2364,30 @@ class RootProgressInheritanceRendererTest(unittest.TestCase):
         self.assertIn("tree total 131.4G nodes", output)
         self.assertNotIn("inherited cost not measured", output)
 
-    def test_inherited_cost_column_marks_an_unmeasured_rollup(self):
+    def test_unmeasured_rollup_reads_as_unknown_rather_than_zero(self):
+        # Without the rollup the payer's figures are simply not known yet.
+        # Dashes would read as "this group cost nothing", which is the one
+        # thing an inherited group certainly did not do.
         rows = render_report(
             root_progress_report(inherited=self.INHERITED),
             width=130).splitlines()
         inherited_row = next(line for line in rows if line.startswith("--y--"))
         self.assertIn("TARSE", inherited_row)
-        self.assertTrue(inherited_row.rstrip().endswith("?"), inherited_row)
-        worked_row = next(line for line in rows if line.startswith("-y---"))
-        self.assertTrue(worked_row.rstrip().endswith("—"), worked_row)
+        self.assertIn("?", inherited_row)
+        self.assertNotIn("—", inherited_row.replace("—", "", 1))
+
+    def test_measured_rollup_fills_the_row_own_cost_cells(self):
+        # A group is worked or inherited, never both, so the payer's branches,
+        # nodes and times occupy cells this opener left empty.
+        rows = render_report(
+            root_progress_report(inherited=self.INHERITED,
+                                 inherited_cost_known=True),
+            width=130).splitlines()
+        inherited_row = next(line for line in rows if line.startswith("--y--"))
+        self.assertIn("TARSE", inherited_row)
+        self.assertIn("5.0M", inherited_row)      # nodes
+        self.assertIn("2", inherited_row)         # branches
+        self.assertNotIn("?", inherited_row)
 
 
 class RootProgressRendererTest(unittest.TestCase):
@@ -2770,6 +2801,13 @@ class TerminalUtilityTest(unittest.TestCase):
                                  "answer_count": 2, "started": False,
                                  "provenance": "none", "paid_by": None,
                                  "display_state": "waiting",
+                                 "shown_cost_is_inherited": False,
+                                 "shown_cost_known": False,
+                                 "shown_branch_count": 0,
+                                 "shown_search_node_count": 0,
+                                 "shown_wall_millis": 0,
+                                 "shown_elapsed_millis": None,
+                                 "inherited_elapsed_millis": None,
                                  "inherited_cost_known": False,
                                  "inherited_branch_count": 0,
                                  "inherited_search_node_count": 0,
