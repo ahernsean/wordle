@@ -4855,7 +4855,10 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def test_sources_ownership_row_draws_its_lineage_as_a_spine_step(self):
         self.open_named_source()
-        root_step = self.page.locator('[data-identity="1:02"] .word')
+        # Scoped to the lineage the card draws as a spine.  The opener fact
+        # beneath it names that same word unpatterned, so a card-wide count is
+        # no longer a count of lineage steps.
+        root_step = self.page.locator('[data-identity="1:02"] .tiles .word')
         self.assertEqual(root_step.count(), 1)
         self.assertEqual(root_step.get_attribute("data-spine"), "SALET -y---")
 
