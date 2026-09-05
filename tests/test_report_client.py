@@ -2116,20 +2116,57 @@ class ReportClientBrowserTest(unittest.TestCase):
         }""")
         self.assertTrue(self.page.locator("details.filters").is_hidden())
 
+    def test_matching_branches_draw_their_answer_preview_as_words(self):
+        """The preview names answer words, and a word is drawn rather than
+        spelled -- unpatterned, since none of them was ever played."""
+        result = self.page.evaluate("""async () => {
+          const report=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
+          applyReport({
+            ...report,
+            report_kind:'branch_reference_matches',
+            data:{branch_reference:'aaaa',candidates:[
+              {branch_reference:'aaaa3c008711',answer_count:9,
+               answer_preview:['audio','avoid','among'],
+               spine:[{word:'raise',pattern:'-----'}]},
+            ]},
+          },null,{...__reportClient.getState(),branch_target:'@aaaa'});
+          const card=document.querySelector('#report .card');
+          const marks=node=>{const text=node.cloneNode(true);
+            text.querySelectorAll('.word').forEach(word=>word.remove());
+            return text.textContent;};
+          return {words:[...card.querySelectorAll('.stat-line .word')]
+                          .map(node=>node.dataset.spine),
+                  blankTiles:card.querySelectorAll('.stat-line .letter.blank').length,
+                  notched:card.querySelectorAll('.stat-line .word.is-answer').length,
+                  marks:[...card.querySelectorAll('.word-list > span')].map(marks)};
+        }""")
+        # Drawn rather than spelled: each previewed word is a tile element,
+        # which is what a text list would have none of.
+        self.assertEqual(result["words"], ["AUDIO", "AVOID", "AMONG"])
+        self.assertEqual(result["blankTiles"], 15)
+        # Every word a preview names is one of the branch's own answers, so
+        # every one of them carries the answer notch.
+        self.assertEqual(result["notched"], 3)
+        # Punctuated as a list: a gap alone is how a spine separates its
+        # guesses, and these words are a set, not a line of play.  Three shown
+        # of nine, so the last one trails the ellipsis that says so.
+        self.assertEqual(result["marks"], [",", ",", "\u2026"])
+
     def test_branch_target_subtitle_returns_in_tree_layout(self):
         self.apply_branch_target("RAISE .....")
         self.page.wait_for_selector("section:has-text('Identity')")
         # Flat branch view: the Identity section names the branch, so the meta
         # subtitle omits the spine.
-        meta_spans = self.page.locator(".report-meta > span").all_inner_texts()
-        self.assertFalse(any("RAISE" in text for text in meta_spans))
+        self.assertEqual(self.page.locator(".report-meta .word").count(), 0)
         # Tree layout routes to renderTree and never renders the Identity /
         # "Reached via" sections, so the meta subtitle must name the branch
         # target again — otherwise nothing on the page identifies the branch.
         self.page.locator("#layout-tree").click()
         self.page.wait_for_selector("ul.tree > li")
-        meta_spans = self.page.locator(".report-meta > span").all_inner_texts()
-        self.assertTrue(any("RAISE" in text for text in meta_spans))
+        self.assertEqual(
+            self.page.locator(".report-meta .tiles .word").first.get_attribute(
+                "data-spine"),
+            "RAISE -----")
 
     def test_finalization_spines_and_pager_range_render(self):
         self.apply_branch_target("RAISE .....")
@@ -3059,6 +3096,61 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(target["blankTiles"], 5)
         self.assertEqual(target["colouredTiles"], 0)
         self.assertEqual(target["value"], "SALET ----- CRANE y---- BEGAN")
+
+    # A word report reached through a spine.  Two steps and a trailing word
+    # cover the whole target shape: the responses that were played, and the
+    # word that was named but never played.
+    DEEPER_WORD_REPORT = """async () => {
+      const report=await (await fetch('/api/view?branch_target=QUEUE')).json();
+      report.branch_target={kind:'word',
+        steps:[{word:'booby',pattern:'-y-g-'},{word:'crane',pattern:'-----'}],
+        trailing_word:'reist',branch_reference:null,
+        input_text:'BOOBY -y-g- CRANE ----- REIST'};
+      report.data.word='reist';
+      report.data.context.spine=[{word:'booby',pattern:'-y-g-',word_is_answer:true},
+                                 {word:'crane',pattern:'-----',word_is_answer:false}];
+      applyReport(report,null,{...__reportClient.getState(),
+        branch_target:'BOOBY -y-g- CRANE ----- REIST'});
+    }"""
+
+    def test_report_header_draws_its_target_as_tiles(self):
+        """The header names the target the report answered, and a word is
+        drawn rather than spelled.  A response has no spelling at all: the
+        pattern text belongs in the box it is typed into, not on the page."""
+        self.page.evaluate(self.DEEPER_WORD_REPORT)
+        meta = self.page.locator(".report-meta")
+        self.assertNotIn("-y-g-", meta.inner_text())
+        words = meta.locator(".tiles .word")
+        self.assertEqual(
+            [words.nth(index).get_attribute("data-spine")
+             for index in range(words.count())],
+            ["BOOBY -y-g-", "CRANE -----", "REIST"])
+        # The responses are drawn as colours, and the trailing word gets the
+        # blank tiles a word with no response is drawn with everywhere else.
+        self.assertEqual(meta.locator(".word").nth(0).locator(".letter.y").count(), 1)
+        self.assertEqual(meta.locator(".word").nth(0).locator(".letter.g").count(), 1)
+        self.assertEqual(meta.locator(".word").nth(2).locator(".letter.blank").count(), 5)
+
+    def test_header_keeps_a_reference_and_the_root_as_text(self):
+        """A target that names no word has no tiles to draw: a queue reference
+        is a digest, and the root names the whole answer list."""
+        result = self.page.evaluate("""async () => {
+          const report=await (await fetch('/api/view?branch_target=QUEUE')).json();
+          report.branch_target={kind:'branch_reference',steps:[],trailing_word:null,
+                                branch_reference:'abcd1234',input_text:'@abcd1234'};
+          applyReport(report,null,{...__reportClient.getState(),
+                                   branch_target:'@abcd1234'});
+          const read=()=>({text:document.querySelector('.report-meta').innerText,
+                           tiles:document.querySelectorAll('.report-meta .word').length});
+          const reference=read();
+          const overview=await (await fetch('/api/view')).json();
+          applyReport(overview,null,{...__reportClient.getState(),branch_target:''});
+          return {reference,root:read()};
+        }""")
+        self.assertIn("@abcd1234", result["reference"]["text"])
+        self.assertEqual(result["reference"]["tiles"], 0)
+        self.assertIn("root", result["root"]["text"])
+        self.assertEqual(result["root"]["tiles"], 0)
 
     def test_spine_and_identity_share_one_two_column_row(self):
         """The spine reads first, so it takes the left half."""
@@ -4654,6 +4746,25 @@ class ReportClientBrowserTest(unittest.TestCase):
         )
         self.assertIn("Shown 4 of 4 matched", ownership_text)
         self.assertIn("1 shared branch", ownership_text)
+
+    def test_a_membership_names_its_opener_in_tiles(self):
+        """A membership's opener is a work id and a word.  The id is a number
+        and stays text; the word is drawn, like the root step above it."""
+        self.open_named_source()
+        result = self.page.evaluate("""() => {
+          const fact=[...document.querySelectorAll(
+            '[data-grid-key=source-memberships] > .card .fact')]
+            .find(node=>node.querySelector('.fact-label').textContent==='opener');
+          const cell=fact.lastElementChild,text=cell.cloneNode(true);
+          text.querySelectorAll('.word').forEach(node=>node.remove());
+          return {text:text.textContent,
+                  words:[...cell.querySelectorAll('.word')]
+                          .map(node=>node.dataset.spine)};
+        }""")
+        # Whatever separates the two is layout, not content: the only text in
+        # the fact is the id.
+        self.assertEqual(result["text"].strip(), "#1")
+        self.assertEqual(result["words"], ["SALET"])
 
     def open_named_source(self):
         self.open_sources()
