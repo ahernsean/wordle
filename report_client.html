@@ -155,6 +155,14 @@
     .tiles { display:flex; flex-wrap:nowrap; overflow:hidden; gap:.3rem 1rem; align-items:center; margin:.2rem 0; }
     .tiles.stacked { flex-direction:column; align-items:flex-start; overflow:visible; }
     .step-group { display:inline-flex; gap:.3rem; align-items:center; white-space:nowrap; }
+    /* A set of words rather than a spine: their order carries no meaning, so
+       the row wraps into as many lines as it needs instead of dropping to a
+       column whole the way a spine does.  Its entries are punctuated as a list
+       -- a gap alone is how a spine separates its guesses, and a set of
+       unrelated words must not read as a line of play.  Aligned on the
+       baseline the tiles carry, so the punctuation sits on the letters' line
+       rather than centred against the tile boxes. */
+    .word-list { display:flex; flex-wrap:wrap; gap:.3rem .6rem; align-items:baseline; }
     /* A guess is drawn as its five letters over the colors of its response:
        one square tile per letter, no corner radius, gap and letter size both
        proportional to the tile.  Sizes are held on whole pixels -- a fractional
@@ -882,6 +890,19 @@
     }
     function renderSpine(spine,sizeClass="word-md"){const node=element("div","tiles");for(const step of spine||[]){node.append(wordTiles(step.word,step.pattern,step.word_is_answer,sizeClass));}return node;}
     function spineFromText(text){const parts=String(text||"").trim().split(/\s+/).filter(Boolean);const steps=[];for(let i=0;i+1<parts.length;i+=2)steps.push({word:parts[i],pattern:parts[i+1]});return steps;}
+    // The target a report answered, drawn the way every other word in the
+    // report is drawn.  Its steps come from the server's own parse rather than
+    // the text in the branch target box, so the header names what was actually
+    // asked for.  A target that names no word -- a queue reference, or the
+    // root -- has nothing to draw and stays as the text it was asked as.  A
+    // target carries no answer-set membership either, so these tiles take no
+    // notch; the report body draws that where it knows it.
+    function branchTargetLabel(report,state){
+      const target=report.branch_target;
+      const steps=[...(target&&target.steps||[])];
+      if(target&&target.trailing_word)steps.push({word:target.trailing_word,pattern:null});
+      return steps.length?renderSpine(steps,"word-sm"):element("span","dim",state.branch_target||"root");
+    }
     function branchContextSummary(worker){
       if(Array.isArray(worker.branch_context)&&worker.branch_context.length){
         return renderSpine(worker.branch_context);
@@ -929,7 +950,7 @@
     function reportHeader(report,state){
       const meta=element("section","report-meta");
       meta.append(element("h1","",report.report_kind+" report"));
-      if(report.report_kind!=="branch"||report.tree)meta.append(element("span","dim",state.branch_target||"root"));
+      if(report.report_kind!=="branch"||report.tree)meta.append(branchTargetLabel(report,state));
       meta.append(element("span","dim","sorted by "+activeSortLabel(state)));
       if(report.tree){meta.append(element("span","dim","snapshot "+absoluteTime(report.generated_at)));const refreshButton=element("button","","Refresh tree");refreshButton.addEventListener("click",refreshTreeSnapshot);meta.append(refreshButton);}
       if(!(report.tree&&report.report_kind==="queue")){const details=element("details","source-paths dim"),summary=element("summary","","Sources and filters");details.open=sourcePathsOpen;details.addEventListener("toggle",()=>{sourcePathsOpen=details.open;});details.append(summary);for(const [name,source] of Object.entries(report.sources||{})){const line=element("div","source",name+": "+valueOrDash(source.path));if(source.error)line.append(element("div","error",source.error));details.append(line);}if(report.sources?.queue?.epoch!==null)details.append(element("div","source","epoch "+report.sources.queue.epoch+" · "+valueOrDash(report.sources.queue.label)+" · "+valueOrDash(report.sources.queue.git_sha)));details.append(element("div","source","filters: "+JSON.stringify(report.filters||{})));meta.append(details);}return meta;
@@ -1312,7 +1333,20 @@
         .finally(()=>rootProgressPending.delete(url));
     }
     function renderWord(report,previous,state){
-      const fragment=document.createDocumentFragment(),data=report.data;const heading=element("h2","");heading.append(wordTiles(data.word,null,data.word_is_answer,"word-lg"));fragment.append(heading,renderSpine(data.context?.spine));
+      const fragment=document.createDocumentFragment(),data=report.data;const heading=element("h2","");heading.append(wordTiles(data.word,null,data.word_is_answer,"word-lg"));fragment.append(heading);
+      const contextSpine=data.context?.spine||[];
+      // The spine that reached this word is also the branch it was guessed in,
+      // so it is the destination one level up rather than a caption: the whole
+      // spine is the button, and the branch it opens climbs to the word report
+      // for its own last guess, and so on up to the opener.
+      if(contextSpine.length){
+        const upButton=element("button","word-button");
+        upButton.setAttribute(
+          "aria-label","Up to "+spineText(contextSpine)+" branch report");
+        upButton.append(element("span","","Up to"),renderSpine(contextSpine));
+        upButton.addEventListener("click",()=>setState({...currentState,kind:"auto",branch_target:spineText(contextSpine),tree:false,claims:false,answers:false,finalization_cursor:""}));
+        fragment.append(upButton);
+      }
       const erd=data.erd_summary;if(erd){if(erd.state==="complete"){const erdMetrics=element("div","metrics");erdMetrics.append(metric("ERD",fixed(erd.erd,3)),metric("max remaining depth",erd.max_remaining_depth));fragment.append(erdMetrics);}else if(erd.state==="infeasible"){fragment.append(element("p","dim","ERD ∞: "+numText(erd.infeasible_group_count)+" of "+numText(erd.response_group_count)+" response groups unsolvable within budget"));}else{fragment.append(element("p","dim","ERD pending: "+numText(erd.resolved_group_count)+" of "+numText(erd.response_group_count)+" response groups solved"));}}
       const breakdown=data.response_group_breakdown;
       if(breakdown?.length){
@@ -1523,7 +1557,7 @@
       const answers=element("details","section");answers.open=state.answers;answers.append(element("summary","","Answer words ("+numText(branch.answer_count)+")"));if(branch.answer_words)answers.append(element("p","",branch.answer_words.join(" ")));answers.addEventListener("toggle",()=>{if(answers.open!==currentState.answers)setState({...currentState,answers:answers.open},false);});fragment.append(answers);
       return fragment;
     }
-    function renderBranchReferenceMatches(report){const data=report.data,fragment=document.createDocumentFragment();fragment.append(element("h1","","Matching branches"),element("p","empty","@"+data.branch_reference+" matches "+data.candidates.length+" branches"));const rows=gridElement("branch-reference-matches");for(const candidate of data.candidates){const card=element("article","card clickable"),preview=(candidate.answer_preview||[]).map(word=>String(word).toUpperCase()).join(", ");card.append(element("h2","","@"+candidate.branch_reference),statLine([numText(candidate.answer_count)+(candidate.answer_count===1?" word":" words"),preview+(candidate.answer_count>candidate.answer_preview.length?"…":"")]));if(candidate.spine?.length)card.append(renderSpine(Array.isArray(candidate.spine)?candidate.spine:spineFromText(candidate.spine)));card.addEventListener("click",()=>setState({...currentState,kind:"auto",branch_target:"@"+candidate.branch_reference,tree:false}));rows.append(card);}fragment.append(rows);return fragment;}
+    function renderBranchReferenceMatches(report){const data=report.data,fragment=document.createDocumentFragment();fragment.append(element("h1","","Matching branches"),element("p","empty","@"+data.branch_reference+" matches "+data.candidates.length+" branches"));const rows=gridElement("branch-reference-matches");for(const candidate of data.candidates){const card=element("article","card clickable"),preview=element("span","word-list"),previewWords=candidate.answer_preview||[];previewWords.forEach((word,index)=>{const entry=element("span","");entry.append(wordTiles(word,null,true));const mark=index<previewWords.length-1?",":candidate.answer_count>previewWords.length?"…":"";if(mark)entry.append(mark);preview.append(entry);});card.append(element("h2","","@"+candidate.branch_reference),statLine([numText(candidate.answer_count)+(candidate.answer_count===1?" word":" words"),preview]));if(candidate.spine?.length)card.append(renderSpine(Array.isArray(candidate.spine)?candidate.spine:spineFromText(candidate.spine)));card.addEventListener("click",()=>setState({...currentState,kind:"auto",branch_target:"@"+candidate.branch_reference,tree:false}));rows.append(card);}fragment.append(rows);return fragment;}
     /* Sibling nodes in payload order, gathered under the word that was played.
        A node with no recorded guess has no word to gather under and stands
        alone under a null key. */
@@ -1662,8 +1696,14 @@
       // The root (word, response) the membership descends from is a spine step,
       // so it is drawn as one rather than spelled out as a bare pattern.
       if(row.root_pattern)card.append(renderSpine([{word:row.opener,pattern:row.root_pattern}],"word-sm"));
+      // The opener is a work id and the word that was queued under it.  The id
+      // is text because it is a number; the word is drawn, like the root step
+      // above it.  The two sit in one inline run rather than a flex group, so
+      // the tiles keep the baseline they were built to share with text.
+      const openerFact=element("span","");
+      openerFact.append("#"+row.opener_work_id+" ",wordTiles(row.opener,null,false));
       card.append(labeledFacts([
-        ["opener","#"+row.opener_work_id+" "+String(row.opener||"-").toUpperCase()],
+        ["opener",openerFact],
         ["requested priority",row.requested_priority],
         ["effective priority",row.branch_effective_priority],
         ["owners",row.owner_count],
