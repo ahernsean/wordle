@@ -16,6 +16,7 @@ import unittest
 from unittest import mock
 from urllib.parse import unquote
 
+import report_model
 from report_model import ReportOpeners
 from report_server import ServerConfiguration, load_fixtures, make_handler
 from tests.webkit_container import WebKitContainerUnavailable, start_webkit_server
@@ -193,6 +194,52 @@ class ReportClientStaticTest(unittest.TestCase):
         self.assertEqual(parser.resources, [])
         for export in ("window.parsePageState", "window.buildAPIURL", "window.applyReport"):
             self.assertIn(export, self.html)
+
+    def _menu_values(self, name):
+        """The option values of one of the client's `const NAME=[[value,label]…]`
+        menus, as a list."""
+        match = re.search(
+            re.escape("const " + name + "=") + r"(\[.*?\]);", self.html, re.DOTALL)
+        self.assertIsNotNone(match, f"{name} is not a literal menu table")
+        return [value for value, _label in json.loads(match.group(1))]
+
+    def test_every_opener_sort_option_names_a_server_sort(self):
+        # An unrecognized sort raises nothing: `_sorted_openers` reads the
+        # dispatch table with `.get`, and `collect_opener_report` turns a
+        # falsy sort into "completed".  A menu value the server does not know
+        # therefore renders a successful report in some other order, with
+        # nothing anywhere to say the choice was dropped — so the menu's
+        # agreement with the dispatch table has to be asserted directly.
+        values = self._menu_values("SORT_OPTIONS_OPENERS")
+        self.assertEqual([value for value in values if not value], [])
+        self.assertLessEqual(set(values), set(report_model._OPENER_SORT_KEYS))
+        self.assertLessEqual(set(values), set(report_model.OPENER_SORT_FIELDS))
+
+    def test_every_opener_group_by_option_names_a_server_strategy(self):
+        values = self._menu_values("GROUP_BY_OPTIONS_OPENERS")
+        self.assertEqual([value for value in values if not value], [])
+        self.assertLessEqual(
+            set(values), set(report_model.OPENER_GROUP_BY_STRATEGIES))
+
+    def test_word_report_sort_options_name_server_sorts(self):
+        # validate_report_request rejects any other value for a word report,
+        # so an unlisted option here is a 4xx the reader cannot act on.
+        self.assertLessEqual(
+            set(self._menu_values("SORT_OPTIONS_WORD")),
+            {"default", "size", "workers", "priority"})
+
+    def test_every_server_opener_sort_is_reachable_from_the_menu(self):
+        # The converse direction: a sort the server implements and no menu
+        # can request is dead code that no client test would ever exercise.
+        # "default" is the server's own fallback spelling, never a menu value.
+        reachable = set(self._menu_values("SORT_OPTIONS_OPENERS"))
+        self.assertEqual(
+            set(report_model._OPENER_SORT_KEYS) - reachable - {"default"}, set())
+
+    def test_every_server_opener_group_by_is_reachable_from_the_menu(self):
+        reachable = set(self._menu_values("GROUP_BY_OPTIONS_OPENERS"))
+        self.assertEqual(
+            set(report_model.OPENER_GROUP_BY_STRATEGIES) - reachable, set())
 
     def test_inline_javascript_parses(self):
         node_path = shutil.which("node")
@@ -2572,6 +2619,86 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(labels[0], "worked first, then priority (default)")
         self.assertNotIn("default", labels[1:])
 
+    def test_every_opener_sort_option_reaches_the_request(self):
+        """Picking a sort must ask the server for that sort.
+
+        Menu values and server sort keys are separate lists, and every step
+        between them absorbs a mismatch: an empty value is dropped from the
+        query string, `collect_opener_report` substitutes "completed" for a
+        falsy sort, and `_sorted_openers` reads its dispatch table with `.get`
+        and leaves the rows alone when the lookup misses.  A menu option the
+        request never carries therefore renders a successful report in some
+        other order, which is what "ERD (lowest first)" did while spelled "".
+
+        Asserting the option values against the server's tables catches a
+        renamed key but not a dropped one, so this drives each option through
+        the control a reader actually uses and reads the URL the client builds
+        from it.
+        """
+        self.page.locator("[data-kind=openers]").click()
+        self.page.wait_for_function(
+            "() => __reportClient.getState().kind === 'openers'"
+        )
+        self.page.locator("details.filters").evaluate("node => node.open = true")
+        values = self.page.eval_on_selector_all(
+            "#sort option", "options => options.map(o => o.value)"
+        )
+        self.assertIn("erd", values)
+        for value in values:
+            with self.subTest(sort=value):
+                self.page.select_option("#sort", value)
+                self.page.wait_for_function(
+                    "value => __reportClient.getState().sort === value",
+                    arg=value,
+                )
+                request_url = self.page.evaluate(
+                    "() => buildAPIURL(parsePageState({search: location.search}))"
+                )
+                self.assertIn(f"sort={value}", request_url)
+                self.assertIn(f"sort={value}", self.page.url)
+
+    def test_every_opener_group_by_option_reaches_the_request(self):
+        self.page.locator("[data-kind=openers]").click()
+        self.page.wait_for_function(
+            "() => __reportClient.getState().kind === 'openers'"
+        )
+        self.page.locator("details.filters").evaluate("node => node.open = true")
+        values = self.page.eval_on_selector_all(
+            "#group-by option", "options => options.map(o => o.value)"
+        )
+        for value in values:
+            with self.subTest(group_by=value):
+                self.page.select_option("#group-by", value)
+                self.page.wait_for_function(
+                    "value => __reportClient.getState().group_by === value",
+                    arg=value,
+                )
+                request_url = self.page.evaluate(
+                    "() => buildAPIURL(parsePageState({search: location.search}))"
+                )
+                self.assertIn(f"group_by={value}", request_url)
+
+    def test_opener_erd_sort_is_dropped_by_views_that_reject_it(self):
+        # `erd` is an opener-only sort, so it must join the set line 500's
+        # normalization clears on the way to another view.  The empty-string
+        # spelling was filtered out of that set by its own falsiness, which
+        # left the reset with nothing to do.
+        self.page.locator("[data-kind=openers]").click()
+        self.page.wait_for_function(
+            "() => __reportClient.getState().kind === 'openers'"
+        )
+        self.page.locator("details.filters").evaluate("node => node.open = true")
+        self.page.select_option("#sort", "erd")
+        self.page.wait_for_function(
+            "() => __reportClient.getState().sort === 'erd'"
+        )
+        self.page.locator("[data-kind=queue]").click()
+        self.page.wait_for_function(
+            "() => __reportClient.getState().kind === 'queue'"
+        )
+        self.assertEqual(self.page.evaluate("__reportClient.getState().sort"), "")
+        self.assertNotIn("sort=erd", self.page.url)
+
     def test_refresh_popover_toggles_open_and_closed(self):
         self.assertEqual(self.page.locator(".conn-wrap.open").count(), 0)
         self.page.locator("#connection").click()
@@ -4548,7 +4675,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(
             self.page.eval_on_selector_all(
                 "#sort option", "options => options.map(o => o.value)"),
-            ["completed", "", "elapsed", "worker_time", "priority",
+            ["completed", "erd", "elapsed", "worker_time", "priority",
              "requested", "age", "word", "branches", "open", "done", "workers"])
 
     def test_sources_state_filter_and_sort_reach_the_request(self):

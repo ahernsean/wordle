@@ -2660,6 +2660,68 @@ class OpenerReportTest(unittest.TestCase):
              self._openers(sort="age")["summary"]],
             ["salet", "nurdy", "crane"])
 
+    def test_every_opener_sort_orders_by_the_column_it_names(self):
+        """Every sort the server implements orders rows by its own field.
+
+        The expected orders are declared as a table whose keys are checked
+        against `_OPENER_SORT_KEYS`, so a sort added to the dispatch table
+        without an ordering declared here fails rather than shipping
+        unexercised.  `_sorted_openers` returns the rows untouched when its
+        lookup misses, so an unimplemented sort leaves them in queue order —
+        which none of these expectations match.
+        """
+        self._queue_words(("salet", 5, 3), ("crane", 9, 1), ("nurdy", 1, 2))
+        queue = self._open_queue()
+        queue._conn.execute(
+            "UPDATE opener_work SET requested_at = CASE opener "
+            "WHEN 'salet' THEN 100 WHEN 'crane' THEN 300 "
+            "WHEN 'nurdy' THEN 200 END"
+        )
+        queue._conn.commit()
+        branch_keys = {
+            word: [ScoreCache.encode_subset(ANSWERS[:2] + [f"{word}{item:04d}"])
+                   for item in range(count)]
+            for word, count in (("salet", 3), ("crane", 1), ("nurdy", 2))
+        }
+        # NURDY finishes entirely, SALET partly, CRANE not at all, which
+        # separates done from open and leaves one word complete.
+        queue.mark_done(branch_keys["salet"][0])
+        for key in branch_keys["nurdy"]:
+            queue.mark_done(key)
+        queue.close()
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        cache.write_completed_opener_summary("nurdy", ERD_ALL, 30, 10_000, 5_000)
+        cache.write_completed_opener_summary("salet", ERD_ALL, 40, 30_000, 2_000)
+        cache.close()
+
+        expected = {
+            "default": ["crane", "salet", "nurdy"],
+            "erd": ["crane", "salet", "nurdy"],
+            "age": ["salet", "nurdy", "crane"],
+            "word": ["crane", "nurdy", "salet"],
+            "priority": ["crane", "salet", "nurdy"],
+            "branches": ["salet", "nurdy", "crane"],
+            "open": ["salet", "crane", "nurdy"],
+            "done": ["nurdy", "salet", "crane"],
+            # No word holds a worker here, so this is the tie-break by word.
+            # It still separates the sort from an unimplemented one, but it
+            # does not distinguish worker counts.
+            "workers": ["crane", "nurdy", "salet"],
+            "completed": ["nurdy", "crane", "salet"],
+            "requested": ["crane", "nurdy", "salet"],
+            "elapsed": ["nurdy", "crane", "salet"],
+            "worker_time": ["nurdy", "crane", "salet"],
+        }
+        self.assertEqual(sorted(expected), sorted(report_model._OPENER_SORT_KEYS))
+        # ERD and the report's fallback disagree on this data, so a sort that
+        # reached the server empty could not pass as ERD order.
+        self.assertNotEqual(expected["erd"], expected["completed"])
+        for sort, order in expected.items():
+            with self.subTest(sort=sort):
+                self.assertEqual(
+                    [row["opener"] for row in self._openers(sort=sort)["summary"]],
+                    order)
+
     def test_opener_timing_fields_and_sorts_roll_up_finalized_branches(self):
         self._queue_words(("salet", 5, 1), ("crane", 3, 1), ("nurdy", 1, 1))
         queue = self._open_queue()
