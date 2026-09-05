@@ -2619,27 +2619,64 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(labels[0], "worked first, then priority (default)")
         self.assertNotIn("default", labels[1:])
 
-    def test_opener_erd_sort_sends_a_sort_the_server_reads(self):
-        # The empty string is this client's "no sort selected" sentinel, and
-        # the server falls back to `completed` when it arrives.  An ERD option
-        # carrying it would therefore reproduce the first option's order
-        # exactly, with nothing to tell the reader the choice was dropped.
+    def test_every_opener_sort_option_reaches_the_request(self):
+        """Picking a sort must ask the server for that sort.
+
+        Menu values and server sort keys are separate lists, and every step
+        between them absorbs a mismatch: an empty value is dropped from the
+        query string, `collect_opener_report` substitutes "completed" for a
+        falsy sort, and `_sorted_openers` reads its dispatch table with `.get`
+        and leaves the rows alone when the lookup misses.  A menu option the
+        request never carries therefore renders a successful report in some
+        other order, which is what "ERD (lowest first)" did while spelled "".
+
+        Asserting the option values against the server's tables catches a
+        renamed key but not a dropped one, so this drives each option through
+        the control a reader actually uses and reads the URL the client builds
+        from it.
+        """
         self.page.locator("[data-kind=openers]").click()
         self.page.wait_for_function(
             "() => __reportClient.getState().kind === 'openers'"
         )
         self.page.locator("details.filters").evaluate("node => node.open = true")
-        erd_values = self.page.eval_on_selector_all(
-            "#sort option",
-            "options => options.filter(o => o.textContent.startsWith('ERD'))"
-            "                 .map(o => o.value)",
+        values = self.page.eval_on_selector_all(
+            "#sort option", "options => options.map(o => o.value)"
         )
-        self.assertEqual(erd_values, ["erd"])
-        self.page.select_option("#sort", "erd")
+        self.assertIn("erd", values)
+        for value in values:
+            with self.subTest(sort=value):
+                self.page.select_option("#sort", value)
+                self.page.wait_for_function(
+                    "value => __reportClient.getState().sort === value",
+                    arg=value,
+                )
+                request_url = self.page.evaluate(
+                    "() => buildAPIURL(parsePageState({search: location.search}))"
+                )
+                self.assertIn(f"sort={value}", request_url)
+                self.assertIn(f"sort={value}", self.page.url)
+
+    def test_every_opener_group_by_option_reaches_the_request(self):
+        self.page.locator("[data-kind=openers]").click()
         self.page.wait_for_function(
-            "() => __reportClient.getState().sort === 'erd'"
+            "() => __reportClient.getState().kind === 'openers'"
         )
-        self.assertIn("sort=erd", self.page.url)
+        self.page.locator("details.filters").evaluate("node => node.open = true")
+        values = self.page.eval_on_selector_all(
+            "#group-by option", "options => options.map(o => o.value)"
+        )
+        for value in values:
+            with self.subTest(group_by=value):
+                self.page.select_option("#group-by", value)
+                self.page.wait_for_function(
+                    "value => __reportClient.getState().group_by === value",
+                    arg=value,
+                )
+                request_url = self.page.evaluate(
+                    "() => buildAPIURL(parsePageState({search: location.search}))"
+                )
+                self.assertIn(f"group_by={value}", request_url)
 
     def test_opener_erd_sort_is_dropped_by_views_that_reject_it(self):
         # `erd` is an opener-only sort, so it must join the set line 500's
