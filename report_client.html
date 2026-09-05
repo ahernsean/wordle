@@ -57,10 +57,27 @@
        under the header row is drawn as an inset shadow. */
     table.root-progress thead th { position:sticky; top:0; z-index:1; background:var(--panel); box-shadow:inset 0 -1px 0 var(--border); }
     table.root-progress th:first-child, table.root-progress td:first-child { text-align:left; }
+    /* The tiles name the row, so they stay put while the measurements scroll
+       under them.  An opaque background is required, not decoration: without
+       it the scrolled cells show through.  The header's own sticky rule wins
+       on the top-left cell, so it carries the higher z-index. */
+    table.root-progress th:first-child, table.root-progress td:first-child {
+      position:sticky; left:0; background:var(--panel); z-index:1;
+      box-shadow:inset -1px 0 0 var(--border); }
+    table.root-progress thead th:first-child { z-index:2; }
     table.root-progress tr.dim td { color:var(--dim); }
     table.root-progress td.state-solved { color:var(--green); }
     table.root-progress td.state-loss { color:var(--red); }
     table.root-progress td.state-waiting { color:var(--dim); }
+    table.root-progress td.state-inherited { color:var(--accent, var(--green)); }
+    table.root-progress td.state-trivial { color:var(--dim); }
+    details.root-progress-legend-panel { margin-top:.4rem; }
+    details.root-progress-legend-panel > summary { cursor:pointer; color:var(--dim); font-size:.9em; }
+    dl.root-progress-legend { margin:.4rem 0 0; display:grid; grid-template-columns:max-content 1fr; gap:.15rem .6rem; font-size:.9em; }
+    dl.root-progress-legend dt { font-weight:bold; }
+    dl.root-progress-legend dd { margin:0; color:var(--dim); }
+    @media (max-width:560px) { dl.root-progress-legend { grid-template-columns:1fr; }
+      dl.root-progress-legend dd { margin:0 0 .35rem; } }
     details.filters { margin-top:.35rem; color:var(--dim); }
     details.filters > summary { cursor:pointer; padding:.1rem 0; }
     .control-group { border:1px solid var(--border); border-radius:6px; background:var(--panel); padding:.4rem .5rem; margin-top:.4rem; }
@@ -1224,7 +1241,7 @@
         return 0;
       }).map(entry=>entry[1]);
     }
-    const ROOT_PROGRESS_GROUP_STATES=["waiting","working","solved","loss"];
+    const ROOT_PROGRESS_GROUP_STATES=["waiting","working","solved","inherited","trivial","loss"];
     const PROVENANCE_MARK={worked:"\u2014",trivial:"\u00b7",unattributed:"?",none:"\u2014"};
     // Only groups still waiting hold work the estimate cannot see.  A group the
     // swarm never opened because it needed no search is not missing work.
@@ -1255,8 +1272,8 @@
       const fragment=document.createDocumentFragment(),totals=data.totals||{};
       const metrics=element("div","metrics");
       metrics.append(
-        ...ROOT_PROGRESS_GROUP_STATES.filter(state=>(totals.state_counts||{})[state])
-            .map(state=>metric(state,(totals.state_counts||{})[state])),
+        ...ROOT_PROGRESS_GROUP_STATES.filter(state=>(totals.display_state_counts||{})[state])
+            .map(state=>metric(state,(totals.display_state_counts||{})[state])),
         metric("branches evaluating",totals.open_branch_count),
         metric("nodes",formatNodeCount(totals.search_node_count)),
         metric("worker-time",formatDuration((totals.wall_millis||0)/1000)));
@@ -1267,10 +1284,6 @@
       // is a third quantity again.
       const provenance=totals.provenance_counts||{},inheritedGroups=provenance.inherited||0;
       if(inheritedGroups){
-        const counts=element("div","metrics");
-        counts.append(...ROOT_PROGRESS_GROUP_PROVENANCES.filter(name=>provenance[name])
-            .map(name=>metric(name,provenance[name])));
-        fragment.append(counts);
         if(totals.inherited_cost_known){
           const inheritedMetrics=element("div","metrics");
           inheritedMetrics.append(
@@ -1338,7 +1351,7 @@
         response.append(responseButton);
         line.append(
           response,
-          element("td","state-"+row.state.replace(/ /g,"-"),row.state),
+          element("td","state-"+row.display_state.replace(/ /g,"-"),row.display_state),
           element("td","",numText(row.answer_count)),
           element("td","",row.started?numText(row.branch_count):"—"),
           element("td","",row.started?numText(row.open_branch_count):"—"),
@@ -1358,7 +1371,33 @@
       // top-left mid-read.
       scroller.addEventListener("scroll",()=>rootProgressScroll.set(url,{left:scroller.scrollLeft,top:scroller.scrollTop}));
       fragment.append(scroller);
-      fragment.append(element("p","dim","Share is the pattern's nodes as a fraction of this root's. Elapsed is wall-clock. Counts cover "+telemetryEpochText+"."));
+      // A legend rather than a sentence: the columns count four different
+      // things (branches, nodes, wall-clock, worker-time) and which one a
+      // column holds is not recoverable from its header.
+      const legend=element("dl","root-progress-legend");
+      for(const [term,definition] of [
+        ["State","Where the group stands. "+
+          "solved: this opener's own search finished it. "+
+          "inherited: another opener reached the same branch first and this one read the result — see Paid by. "+
+          "trivial: one answer left, never searched. "+
+          "working / waiting: in flight, or not yet opened. "+
+          "loss: proven unsolvable within the remaining budget."],
+        ["Answers","Answer words remaining in the group after this guess and response."],
+        ["Done","Branches finalized beneath the group, at any depth — not answers or candidates. A group carved into many sub-branches counts every one."],
+        ["Evaluating","Branches beneath the group open right now."],
+        ["Nodes","Search nodes this opener spent on the group."],
+        ["Share","The group's nodes as a fraction of this opener's total."],
+        ["Elapsed","Wall-clock from first work to last, shared with whatever else the swarm was running."],
+        ["Worker-time","Summed worker time, so six workers for an hour counts as six hours."],
+        ["Paid by","The opener whose spine first finalized the branch. Blank when this opener did the work itself."],
+        ["Inherited","Search nodes that opener spent on the group's whole subtree — the same unit as Nodes, and work this opener never had to repeat."],
+      ]){
+        legend.append(element("dt","",term),element("dd","",definition));
+      }
+      const legendDetails=element("details","root-progress-legend-panel");
+      legendDetails.append(element("summary","clickable","What these columns mean"),legend);
+      fragment.append(legendDetails);
+      fragment.append(element("p","dim","Counts cover "+telemetryEpochText+"."));
       return fragment;
     }
     function renderRootProgressInto(headlineHost,host,url,data,solvedGroupCount,state){

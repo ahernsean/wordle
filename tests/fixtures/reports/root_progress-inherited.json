@@ -38,6 +38,7 @@
    {
     "answer_count": 502,
     "branch_count": 538391,
+    "display_state": "working",
     "elapsed_millis": 972187000,
     "first_created_at": 1785575213,
     "inherited_branch_count": 0,
@@ -58,6 +59,7 @@
    {
     "answer_count": 420,
     "branch_count": 1335,
+    "display_state": "solved",
     "elapsed_millis": 16904000,
     "first_created_at": 1786284634,
     "inherited_branch_count": 0,
@@ -78,6 +80,7 @@
    {
     "answer_count": 235,
     "branch_count": 21340,
+    "display_state": "solved",
     "elapsed_millis": 8879000,
     "first_created_at": 1786283911,
     "inherited_branch_count": 0,
@@ -98,6 +101,7 @@
    {
     "answer_count": 147,
     "branch_count": 0,
+    "display_state": "loss",
     "elapsed_millis": null,
     "first_created_at": null,
     "inherited_branch_count": 147,
@@ -118,6 +122,7 @@
    {
     "answer_count": 22,
     "branch_count": 0,
+    "display_state": "inherited",
     "elapsed_millis": null,
     "first_created_at": null,
     "inherited_branch_count": 49,
@@ -138,6 +143,7 @@
    {
     "answer_count": 21,
     "branch_count": 0,
+    "display_state": "inherited",
     "elapsed_millis": null,
     "first_created_at": null,
     "inherited_branch_count": 32,
@@ -158,6 +164,7 @@
    {
     "answer_count": 19,
     "branch_count": 0,
+    "display_state": "inherited",
     "elapsed_millis": null,
     "first_created_at": null,
     "inherited_branch_count": 17,
@@ -178,6 +185,7 @@
    {
     "answer_count": 18,
     "branch_count": 0,
+    "display_state": "inherited",
     "elapsed_millis": null,
     "first_created_at": null,
     "inherited_branch_count": 1,
@@ -198,6 +206,7 @@
    {
     "answer_count": 174,
     "branch_count": 0,
+    "display_state": "working",
     "elapsed_millis": null,
     "first_created_at": 1786291043,
     "inherited_branch_count": 0,
@@ -218,6 +227,7 @@
    {
     "answer_count": 131,
     "branch_count": 0,
+    "display_state": "waiting",
     "elapsed_millis": null,
     "first_created_at": null,
     "inherited_branch_count": 0,
@@ -238,6 +248,7 @@
    {
     "answer_count": 131,
     "branch_count": 0,
+    "display_state": "waiting",
     "elapsed_millis": null,
     "first_created_at": null,
     "inherited_branch_count": 0,
@@ -258,6 +269,7 @@
    {
     "answer_count": 96,
     "branch_count": 0,
+    "display_state": "waiting",
     "elapsed_millis": null,
     "first_created_at": null,
     "inherited_branch_count": 0,
@@ -278,6 +290,7 @@
    {
     "answer_count": 96,
     "branch_count": 0,
+    "display_state": "waiting",
     "elapsed_millis": null,
     "first_created_at": null,
     "inherited_branch_count": 0,
@@ -298,6 +311,7 @@
    {
     "answer_count": 93,
     "branch_count": 0,
+    "display_state": "waiting",
     "elapsed_millis": null,
     "first_created_at": null,
     "inherited_branch_count": 0,
@@ -318,6 +332,7 @@
    {
     "answer_count": 81,
     "branch_count": 0,
+    "display_state": "waiting",
     "elapsed_millis": null,
     "first_created_at": null,
     "inherited_branch_count": 0,
@@ -338,6 +353,7 @@
    {
     "answer_count": 68,
     "branch_count": 0,
+    "display_state": "waiting",
     "elapsed_millis": null,
     "first_created_at": null,
     "inherited_branch_count": 0,
@@ -358,6 +374,7 @@
    {
     "answer_count": 63,
     "branch_count": 0,
+    "display_state": "waiting",
     "elapsed_millis": null,
     "first_created_at": null,
     "inherited_branch_count": 0,
@@ -378,6 +395,7 @@
    {
     "answer_count": 61,
     "branch_count": 0,
+    "display_state": "waiting",
     "elapsed_millis": null,
     "first_created_at": null,
     "inherited_branch_count": 0,
@@ -398,6 +416,7 @@
    {
     "answer_count": 58,
     "branch_count": 0,
+    "display_state": "waiting",
     "elapsed_millis": null,
     "first_created_at": null,
     "inherited_branch_count": 0,
@@ -418,6 +437,7 @@
    {
     "answer_count": 49,
     "branch_count": 0,
+    "display_state": "waiting",
     "elapsed_millis": null,
     "first_created_at": null,
     "inherited_branch_count": 0,
@@ -438,6 +458,7 @@
    {
     "answer_count": 46,
     "branch_count": 0,
+    "display_state": "waiting",
     "elapsed_millis": null,
     "first_created_at": null,
     "inherited_branch_count": 0,
@@ -458,6 +479,7 @@
    {
     "answer_count": 36,
     "branch_count": 0,
+    "display_state": "waiting",
     "elapsed_millis": null,
     "first_created_at": null,
     "inherited_branch_count": 0,
@@ -478,6 +500,7 @@
    {
     "answer_count": 34,
     "branch_count": 0,
+    "display_state": "waiting",
     "elapsed_millis": null,
     "first_created_at": null,
     "inherited_branch_count": 0,
@@ -498,6 +521,7 @@
    {
     "answer_count": 32,
     "branch_count": 0,
+    "display_state": "waiting",
     "elapsed_millis": null,
     "first_created_at": null,
     "inherited_branch_count": 0,
@@ -518,6 +542,7 @@
    {
     "answer_count": 29,
     "branch_count": 0,
+    "display_state": "waiting",
     "elapsed_millis": null,
     "first_created_at": null,
     "inherited_branch_count": 0,
@@ -538,6 +563,7 @@
    {
     "answer_count": 28,
     "branch_count": 0,
+    "display_state": "waiting",
     "elapsed_millis": null,
     "first_created_at": null,
     "inherited_branch_count": 0,
@@ -558,6 +584,7 @@
    {
     "answer_count": 28,
     "branch_count": 0,
+    "display_state": "waiting",
     "elapsed_millis": null,
     "first_created_at": null,
     "inherited_branch_count": 0,
@@ -578,6 +605,7 @@
    {
     "answer_count": 27,
     "branch_count": 0,
+    "display_state": "waiting",
     "elapsed_millis": null,
     "first_created_at": null,
     "inherited_branch_count": 0,
@@ -598,6 +626,7 @@
    {
     "answer_count": 27,
     "branch_count": 0,
+    "display_state": "waiting",
     "elapsed_millis": null,
     "first_created_at": null,
     "inherited_branch_count": 0,
@@ -618,6 +647,7 @@
    {
     "answer_count": 26,
     "branch_count": 0,
+    "display_state": "waiting",
     "elapsed_millis": null,
     "first_created_at": null,
     "inherited_branch_count": 0,
@@ -638,6 +668,7 @@
    {
     "answer_count": 25,
     "branch_count": 0,
+    "display_state": "waiting",
     "elapsed_millis": null,
     "first_created_at": null,
     "inherited_branch_count": 0,
@@ -658,6 +689,7 @@
    {
     "answer_count": 24,
     "branch_count": 0,
+    "display_state": "waiting",
     "elapsed_millis": null,
     "first_created_at": null,
     "inherited_branch_count": 0,
@@ -681,6 +713,13 @@
    "answer_count": 2847,
    "branch_count": 564186,
    "counted_branch_count": 10,
+   "display_state_counts": {
+    "inherited": 4,
+    "loss": 1,
+    "solved": 2,
+    "waiting": 23,
+    "working": 2
+   },
    "inherited_branch_count": 246,
    "inherited_cost_known": true,
    "inherited_search_node_count": 4965466,

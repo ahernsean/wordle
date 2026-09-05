@@ -13,6 +13,7 @@ import termios
 import time
 
 from report_model import (
+    ROOT_PROGRESS_DISPLAY_STATES,
     ROOT_PROGRESS_GROUP_PROVENANCES,
     ROOT_PROGRESS_GROUP_STATES,
     ReportRequest,
@@ -1776,11 +1777,15 @@ _PROVENANCE_MARK = {"worked": "—", "trivial": "·", "unattributed": "?",
 def _state_counts(totals):
     """Response-group state counts in lifecycle order, zeros omitted.
 
+    Reads the display states, so the summary line and the table's State column
+    use one vocabulary: a group counted as `inherited` here reads `inherited`
+    in the table rather than `solved`.
+
     A zero count is noise on a line that has to fit a terminal, and its absence
     already says the state is empty.
     """
-    counts = totals.get("state_counts") or {}
-    return {state: counts[state] for state in ROOT_PROGRESS_GROUP_STATES
+    counts = totals.get("display_state_counts") or totals.get("state_counts") or {}
+    return {state: counts[state] for state in ROOT_PROGRESS_DISPLAY_STATES
             if counts.get(state)}
 
 
@@ -1834,14 +1839,6 @@ def _render_root_progress_sections(report, width, display_order):
     provenance = totals.get("provenance_counts") or {}
     inherited_group_count = provenance.get("inherited", 0)
     if inherited_group_count:
-        summary.append(_fit(
-            "  " + "   ".join(
-                f"{name} {provenance[name]:,}"
-                for name in ROOT_PROGRESS_GROUP_PROVENANCES
-                if provenance.get(name)
-            ),
-            width,
-        ))
         # The tree's cost and this opener's cost are different numbers
         # whenever another opener reached a branch first, so both are named
         # rather than summed into one figure that means neither.
@@ -1900,7 +1897,7 @@ def _render_root_progress_sections(report, width, display_order):
         if excluded:
             summary.append(_fit("    excludes " + " and ".join(excluded),
                                 width))
-    rows = [f"{'Pattern':<7} {'State':>7} {'Answers':>7} {'Done':>8}"
+    rows = [f"{'Pattern':<7} {'State':>9} {'Answers':>7} {'Done':>8}"
             f" {'Evaluating':>10} {'Nodes':>9} {'Share':>5} {'Elapsed':>8}"
             f" {'WorkerTime':>10} {'Paid by':>9} {'Inherited':>9}"]
     for row in data["response_groups"]:
@@ -1933,7 +1930,7 @@ def _render_root_progress_sections(report, width, display_order):
         else:
             inherited_text = "?"
         rows.append(_fit(
-            f"{row['pattern']:<7} {row['state']:>7} {row['answer_count']:>7}"
+            f"{row['pattern']:<7} {row['display_state']:>9} {row['answer_count']:>7}"
             f" {branch_text:>8} {open_text:>10} {node_text:>9}"
             f" {share_text:>5} {elapsed_text:>8} {worker_text:>10}"
             f" {payer_text:>9} {inherited_text:>9}",

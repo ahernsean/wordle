@@ -16,6 +16,7 @@ from unittest.mock import Mock, patch
 from cache_sqlite import ScoreCache, branch_reference
 import erd_search
 from erd_queue import ERDQueue, encode_subset
+import report_model
 import report_terminal
 from report_model import ReportFilters, parse_report_branch_target
 from report_terminal import DisplayOrder, WatchSession, render_overview, render_report
@@ -2278,6 +2279,11 @@ def root_progress_report(estimate=None, requested_at=1_798_000_000,
     inherited = inherited or {}
     for row in rows:
         payer, nodes = inherited.get(row["pattern"], (None, 0))
+        if payer:
+            # An inherited group is solved with no work of its own recorded.
+            # Leaving it `waiting` would name a payer for a group nobody has
+            # finished, which production cannot produce.
+            row["state"], row["started"] = "solved", False
         row["provenance"] = ("inherited" if payer
                              else ("worked" if row["started"] else "none"))
         row["paid_by"] = payer
@@ -2285,9 +2291,20 @@ def root_progress_report(estimate=None, requested_at=1_798_000_000,
         row["inherited_branch_count"] = 2 if row["inherited_cost_known"] else 0
         row["inherited_search_node_count"] = nodes if row["inherited_cost_known"] else 0
         row["inherited_wall_millis"] = nodes * 2 if row["inherited_cost_known"] else 0
+        row["display_state"] = report_model._root_progress_display_state(
+            row["state"], row["provenance"])
     totals = report["data"]["totals"]
     totals["provenance_counts"] = collections.Counter(
         row["provenance"] for row in rows)
+    # The listed rows are a sample of the declared totals, so the display
+    # counts are the declared states with the inherited groups moved out of
+    # `solved` -- deriving them from the sample would contradict the totals
+    # every other assertion reads.
+    display_counts = collections.Counter(totals["state_counts"])
+    display_counts["solved"] -= len(inherited)
+    display_counts["inherited"] = len(inherited)
+    totals["display_state_counts"] = {
+        state: count for state, count in display_counts.items() if count}
     totals["inherited_cost_known"] = inherited_cost_known
     totals["inherited_branch_count"] = sum(r["inherited_branch_count"] for r in rows)
     totals["inherited_search_node_count"] = sum(
@@ -2310,7 +2327,10 @@ class RootProgressInheritanceRendererTest(unittest.TestCase):
         output = render_report(
             root_progress_report(inherited=self.INHERITED), width=130)
         self.assertIn("TARSE", output)
-        self.assertIn("worked 2   inherited 1", output)
+        self.assertIn("inherited 1", output)
+        # The State column and the summary line use one vocabulary, so a group
+        # counted as inherited above reads `inherited` in the table too.
+        self.assertNotIn("worked", output)
         # The rollup was not asked for, so the cost is unknown rather than
         # zero -- a zero would read as "this group cost nothing".
         self.assertIn("inherited cost not measured", output)
@@ -2749,6 +2769,7 @@ class TerminalUtilityTest(unittest.TestCase):
             "response_groups": [{"pattern": "-----", "state": "waiting",
                                  "answer_count": 2, "started": False,
                                  "provenance": "none", "paid_by": None,
+                                 "display_state": "waiting",
                                  "inherited_cost_known": False,
                                  "inherited_branch_count": 0,
                                  "inherited_search_node_count": 0,

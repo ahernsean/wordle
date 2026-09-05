@@ -1718,6 +1718,30 @@ ROOT_PROGRESS_GROUP_PROVENANCES = (
     "worked", "inherited", "trivial", "unattributed", "none",
 )
 
+# The table shows one word per group, and "solved" is the least informative
+# thing to say about a group another opener solved or one that was never
+# searched.  State and provenance stay separate facts -- the cache's verdict
+# and who reached the branch first -- and this is the single column derived
+# from them, so the terminal and the web client cannot disagree about it.
+ROOT_PROGRESS_DISPLAY_STATES = (
+    "waiting", "working", "solved", "inherited", "trivial", "loss",
+)
+
+
+def _root_progress_display_state(state, provenance):
+    """The one word the table shows for a response group.
+
+    A proven loss outranks its provenance: a dead end matters more than how it
+    was reached, and a one-answer group with no budget left is a loss rather
+    than a triviality.  `unattributed` reads as plain `solved` -- it is solved,
+    and naming a payer nobody recorded would be an invention.
+    """
+    if state != "solved":
+        return state
+    if provenance in ("inherited", "trivial"):
+        return provenance
+    return "solved"
+
 # What a group cost and what this opener spent on it are different questions
 # once another opener has paid for part of the tree, so each gets an ordering
 # rather than one standing in for both.  Both names say whose nodes they
@@ -1917,6 +1941,8 @@ def collect_root_progress_report(sources: ReportOpeners,
             branch_keys_by_pattern[pattern])
         row["provenance"], row["paid_by"] = _root_progress_group_provenance(
             row, row["state"], finalizing_spine, word)
+        row["display_state"] = _root_progress_display_state(
+            row["state"], row["provenance"])
         rollup = (subtree_rollups.get(finalizing_spine)
                   if row["provenance"] == "inherited" else None)
         row["inherited_cost_known"] = rollup is not None
@@ -1989,6 +2015,8 @@ def collect_root_progress_report(sources: ReportOpeners,
         "recent_window_seconds": progress["recent_window_seconds"],
         "provenance_counts": collections.Counter(
             row["provenance"] for row in rows),
+        "display_state_counts": collections.Counter(
+            row["display_state"] for row in rows),
         # Measured work and inherited work are separate sums, never added into
         # `search_node_count`: that figure is what this opener's own request
         # cost, and the reports read it as such.  Their total is the tree's

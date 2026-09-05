@@ -128,6 +128,28 @@ class ReportModelTest(unittest.TestCase):
             {"best_erd": None, "max_remaining_depth": None, "cache_state": "loss"}, 2), "loss")
         self.assertEqual(report_model.branch_status_and_worker_status(None, "finalized", 0), ("finalizing", "waiting"))
 
+    def test_display_state_folds_provenance_into_one_word_without_losing_a_loss(self):
+        display = report_model._root_progress_display_state
+        # A group solved by this opener's own search is just solved; the two
+        # cases where "solved" says least are named instead.
+        self.assertEqual(display("solved", "worked"), "solved")
+        self.assertEqual(display("solved", "inherited"), "inherited")
+        self.assertEqual(display("solved", "trivial"), "trivial")
+        # Nothing was recorded, so no payer is invented -- it is solved.
+        self.assertEqual(display("solved", "unattributed"), "solved")
+        # A proven dead end outranks how it was reached.  A one-answer group
+        # with no budget left is a loss, not a triviality.
+        self.assertEqual(display("loss", "trivial"), "loss")
+        self.assertEqual(display("loss", "inherited"), "loss")
+        # In-flight states pass through untouched.
+        self.assertEqual(display("working", "worked"), "working")
+        self.assertEqual(display("waiting", "none"), "waiting")
+        self.assertLessEqual(
+            {display(state, provenance)
+             for state in report_model.ROOT_PROGRESS_GROUP_STATES
+             for provenance in report_model.ROOT_PROGRESS_GROUP_PROVENANCES},
+            set(report_model.ROOT_PROGRESS_DISPLAY_STATES))
+
     def test_group_provenance_separates_who_solved_a_branch_from_whether_it_is_solved(self):
         provenance = report_model._root_progress_group_provenance
         worked = {"answer_count": 40, "started": True}
@@ -3325,7 +3347,10 @@ class RootProgressReportTest(unittest.TestCase):
         self.assertFalse(row["started"])
         self.assertEqual(row["provenance"], "inherited")
         self.assertEqual(row["paid_by"], "TARSE")
+        # The table shows one word, and for this group it is not "solved".
+        self.assertEqual(row["display_state"], "inherited")
         self.assertEqual(data["totals"]["provenance_counts"]["inherited"], 1)
+        self.assertEqual(data["totals"]["display_state_counts"]["inherited"], 1)
         # Without the rollup the cost is unmeasured, and says so rather than
         # reporting a zero that would read as "cost nothing".
         self.assertFalse(row["inherited_cost_known"])

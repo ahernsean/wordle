@@ -736,7 +736,11 @@ class ReportClientBrowserTest(unittest.TestCase):
         states = self.page.eval_on_selector_all(
             "table.root-progress tbody tr td:nth-child(2)",
             "cells => cells.map(c => c.textContent)")
-        self.assertEqual(set(states), {"waiting", "working", "solved", "loss"})
+        # Anchored to the server's vocabulary rather than a transcribed
+        # literal, so a state added there cannot pass unnoticed here.
+        self.assertLessEqual(
+            set(states), set(report_model.ROOT_PROGRESS_DISPLAY_STATES))
+        self.assertLessEqual({"waiting", "working", "loss"}, set(states))
 
     def test_root_progress_table_renders_each_response_as_letter_tiles(self):
         self.apply_branch_target("SALET")
@@ -846,6 +850,82 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("538,391", text)
         self.assertNotIn("538391", text)
         self.assertIn("8,671", text)
+
+    def test_root_progress_response_column_stays_put_while_the_rest_scrolls(self):
+        """The tiles name the row, so they must not scroll away from it.
+
+        The table is wider than the panel by design — eleven columns of
+        measurements — so a reader scrolling right to reach `Inherited` would
+        otherwise lose which branch the numbers belong to.
+        """
+        # A phone-width viewport, because the sticky column only matters once
+        # the table is wider than the panel holding it.
+        self.page.set_viewport_size({"width": 480, "height": 800})
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("table.root-progress")
+        overflow = self.page.eval_on_selector(
+            ".root-progress-scroll",
+            "node => [node.scrollWidth, node.clientWidth]")
+        self.assertGreater(overflow[0], overflow[1],
+                           "table does not overflow, so nothing is pinned")
+        sticky = self.page.eval_on_selector(
+            "table.root-progress tbody tr td:first-child",
+            "cell => {const s = getComputedStyle(cell);"
+            " return {position: s.position, left: s.left,"
+            "         opaque: s.backgroundColor};}")
+        self.assertEqual(sticky["position"], "sticky")
+        self.assertEqual(sticky["left"], "0px")
+        # A transparent sticky cell lets the scrolled columns show through it.
+        self.assertNotIn(sticky["opaque"], ("transparent", "rgba(0, 0, 0, 0)"))
+        # It has to actually hold position: scroll the container and check the
+        # cell has not moved relative to the viewport.
+        scroller = self.page.locator(".root-progress-scroll")
+        before = self.page.eval_on_selector(
+            "table.root-progress tbody tr td:first-child",
+            "cell => cell.getBoundingClientRect().left")
+        scroller.evaluate("node => node.scrollLeft = node.scrollWidth")
+        self.page.wait_for_function(
+            "() => document.querySelector('.root-progress-scroll').scrollLeft > 0")
+        after = self.page.eval_on_selector(
+            "table.root-progress tbody tr td:first-child",
+            "cell => cell.getBoundingClientRect().left")
+        self.assertAlmostEqual(before, after, delta=1)
+
+    def test_root_progress_state_column_names_inherited_and_trivial_groups(self):
+        # "solved" says least about the two cases a reader most wants to pick
+        # out, so the column carries the folded state rather than the cache's.
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("table.root-progress")
+        states = self.page.eval_on_selector_all(
+            "table.root-progress tbody tr td:nth-child(2)",
+            "cells => cells.map(c => c.textContent)")
+        self.assertIn("inherited", states)
+        self.assertLessEqual(
+            set(states),
+            {"waiting", "working", "solved", "inherited", "trivial", "loss"})
+        # The summary above the table uses the same vocabulary.
+        metrics = "\n".join(self.page.locator(
+            "details.root-progress-panel .metrics").all_inner_texts())
+        self.assertIn("inherited", metrics)
+        self.assertNotIn("worked", metrics)
+
+    def test_root_progress_legend_defines_the_columns_it_shows(self):
+        # Four different units live in this table — branches, search nodes,
+        # wall-clock and worker-time — and no header says which is which.
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("table.root-progress")
+        terms = self.page.eval_on_selector_all(
+            "dl.root-progress-legend dt", "nodes => nodes.map(n => n.textContent)")
+        headers = self.page.eval_on_selector_all(
+            "table.root-progress th", "cells => cells.map(c => c.textContent)")
+        # Every column a reader can see is defined, Response aside: its tiles
+        # are the row's name rather than a measurement.
+        self.assertEqual(set(headers) - set(terms), {"Response"})
+        self.page.locator("details.root-progress-legend-panel").evaluate(
+            "node => node.open = true")
+        legend = self.page.locator("dl.root-progress-legend").inner_text()
+        self.assertIn("Branches finalized beneath the group", legend)
+        self.assertIn("Search nodes that opener spent", legend)
 
     def test_root_progress_names_who_paid_for_an_inherited_group(self):
         # A branch is its answer set, so the opener that reaches it first pays
