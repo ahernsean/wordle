@@ -9,6 +9,7 @@ import random
 import shlex
 import tempfile
 from types import SimpleNamespace
+import collections
 import unittest
 from unittest.mock import Mock, patch
 
@@ -2200,8 +2201,15 @@ class ViewParserTest(unittest.TestCase):
         self.assertTrue(request.include_answers)
 
 
-def root_progress_report(estimate=None, requested_at=1_798_000_000):
-    return {
+def root_progress_report(estimate=None, requested_at=1_798_000_000,
+                         inherited=None, inherited_cost_known=False):
+    """A root progress report.
+
+    `inherited` names response groups another opener paid for, as
+    {pattern: (payer, nodes)}; by default nothing is inherited, which is the
+    first-mover case every other assertion here is written against.
+    """
+    report = {
         "report_kind": "root_progress",
         "schema_version": 3,
         "generated_at": 1_800_000_000,
@@ -2266,6 +2274,69 @@ def root_progress_report(estimate=None, requested_at=1_798_000_000):
             },
         },
     }
+    rows = report["data"]["response_groups"]
+    inherited = inherited or {}
+    for row in rows:
+        payer, nodes = inherited.get(row["pattern"], (None, 0))
+        row["provenance"] = ("inherited" if payer
+                             else ("worked" if row["started"] else "none"))
+        row["paid_by"] = payer
+        row["inherited_cost_known"] = bool(payer) and inherited_cost_known
+        row["inherited_branch_count"] = 2 if row["inherited_cost_known"] else 0
+        row["inherited_search_node_count"] = nodes if row["inherited_cost_known"] else 0
+        row["inherited_wall_millis"] = nodes * 2 if row["inherited_cost_known"] else 0
+    totals = report["data"]["totals"]
+    totals["provenance_counts"] = collections.Counter(
+        row["provenance"] for row in rows)
+    totals["inherited_cost_known"] = inherited_cost_known
+    totals["inherited_branch_count"] = sum(r["inherited_branch_count"] for r in rows)
+    totals["inherited_search_node_count"] = sum(
+        r["inherited_search_node_count"] for r in rows)
+    totals["inherited_wall_millis"] = sum(r["inherited_wall_millis"] for r in rows)
+    return report
+
+
+class RootProgressInheritanceRendererTest(unittest.TestCase):
+    INHERITED = {"--y--": ("TARSE", 4_991_722)}
+
+    def test_first_mover_says_nothing_about_inheritance(self):
+        # Every group this opener worked itself: naming a payer column full of
+        # dashes is noise, and the summary must not imply work was inherited.
+        output = render_report(root_progress_report(), width=130)
+        self.assertNotIn("inherited", output)
+        self.assertNotIn("tree total", output)
+
+    def test_inherited_group_names_its_payer_without_claiming_its_cost(self):
+        output = render_report(
+            root_progress_report(inherited=self.INHERITED), width=130)
+        self.assertIn("TARSE", output)
+        self.assertIn("worked 2   inherited 1", output)
+        # The rollup was not asked for, so the cost is unknown rather than
+        # zero -- a zero would read as "this group cost nothing".
+        self.assertIn("inherited cost not measured", output)
+        self.assertNotIn("tree total", output)
+
+    def test_measured_inheritance_reports_the_tree_total_apart_from_its_own(self):
+        output = render_report(
+            root_progress_report(inherited=self.INHERITED,
+                                 inherited_cost_known=True),
+            width=130)
+        self.assertIn("inherited 5.0M nodes", output)
+        # This opener's own total is untouched by what it inherited, and the
+        # tree's total is stated separately rather than replacing either.
+        self.assertIn("nodes 131.4G", output)
+        self.assertIn("tree total 131.4G nodes", output)
+        self.assertNotIn("inherited cost not measured", output)
+
+    def test_inherited_cost_column_marks_an_unmeasured_rollup(self):
+        rows = render_report(
+            root_progress_report(inherited=self.INHERITED),
+            width=130).splitlines()
+        inherited_row = next(line for line in rows if line.startswith("--y--"))
+        self.assertIn("TARSE", inherited_row)
+        self.assertTrue(inherited_row.rstrip().endswith("?"), inherited_row)
+        worked_row = next(line for line in rows if line.startswith("-y---"))
+        self.assertTrue(worked_row.rstrip().endswith("—"), worked_row)
 
 
 class RootProgressRendererTest(unittest.TestCase):
@@ -2676,7 +2747,12 @@ class TerminalUtilityTest(unittest.TestCase):
                          "candidates_per_day": 10, "stalled_branch_count": 1,
                          "stalled_remaining_candidate_count": 2},
             "response_groups": [{"pattern": "-----", "state": "waiting",
-                                 "answer_count": 2, "started": False}],
+                                 "answer_count": 2, "started": False,
+                                 "provenance": "none", "paid_by": None,
+                                 "inherited_cost_known": False,
+                                 "inherited_branch_count": 0,
+                                 "inherited_search_node_count": 0,
+                                 "inherited_wall_millis": 0}],
         }
         output = report_terminal.render_report(report, width=120)
         self.assertIn("estimate ~2m", output)

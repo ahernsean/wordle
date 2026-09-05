@@ -251,6 +251,7 @@ class ReportRequest:
     sample_size: int | None = None
     opener: str | None = None
     raw_row_offset: int = 0
+    inherited_cost: bool = False
 
 
 def validate_report_request(request: ReportRequest) -> None:
@@ -287,6 +288,18 @@ def validate_report_request(request: ReportRequest) -> None:
     ):
         raise ValueError(
             "--sort for word reports must be default, size, workers, or priority"
+        )
+    # Refused rather than substituted: a root progress report reads its sort
+    # through a dispatch table, and quietly falling back would render a
+    # successful report in an order nobody asked for.
+    if (
+        report_kind == "root_progress"
+        and request.filters.sort is not None
+        and request.filters.sort not in ROOT_PROGRESS_SORT_FIELDS
+    ):
+        raise ValueError(
+            "--sort for root progress reports must be "
+            + " or ".join(ROOT_PROGRESS_SORT_FIELDS)
         )
     if request.filters.group_by is not None and report_kind == "openers":
         if request.filters.group_by not in OPENER_GROUP_BY_STRATEGIES:
@@ -1701,6 +1714,63 @@ def _root_progress_group_state(row, cache_state, group_budget):
     return "working" if row["started"] else "waiting"
 
 
+ROOT_PROGRESS_GROUP_PROVENANCES = (
+    "worked", "inherited", "trivial", "unattributed", "none",
+)
+
+# What a group cost and what this opener spent on it are different questions
+# once another opener has paid for part of the tree, so each gets an ordering
+# rather than one standing in for both.  Both names say whose nodes they
+# count: "nodes" alone would not distinguish them.
+ROOT_PROGRESS_SORT_FIELDS = ("tree_nodes", "own_nodes")
+ROOT_PROGRESS_DEFAULT_SORT = "tree_nodes"
+_ROOT_PROGRESS_SORT_KEYS = {
+    # The tree's cost, whoever paid: what the group was worth solving.
+    "tree_nodes": lambda row: (
+        -(row["search_node_count"] + row["inherited_search_node_count"]),
+        -row["answer_count"], row["pattern"]),
+    # This opener's own measured work: what its request cost.  Every inherited
+    # group ties at zero here and falls to the answer-count tie-break.
+    "own_nodes": lambda row: (
+        -row["search_node_count"], -row["answer_count"], row["pattern"]),
+}
+
+
+def _root_progress_group_provenance(row, state, finalizing_spine, opener):
+    """Who paid for a response group, which `state` cannot say.
+
+    `state` reads the cache and answers whether a group is finished.  A group
+    can be finished because this opener's swarm solved it, or because some
+    other opener reached the same branch first and this one read the
+    certificate — the cache keys results by the answer set alone, so nothing
+    in it records which.  The two are the same fact to a solver and opposite
+    facts to anyone asking what an opener cost.
+
+    Selection is by spine, never by timestamp: a repair or a reverification
+    rewrites `updated_at`, and comparing it against the request time would
+    silently reclassify a group that had not moved.  A branch reached twice
+    from the same opener still reads `worked`, because attribution names the
+    opener rather than the path.
+    """
+    if row["started"]:
+        return "worked", None
+    if row["answer_count"] < 2:
+        # One answer left is played, not searched, so there was never work to
+        # attribute.  Reporting it as inherited would credit an opener that
+        # did nothing.
+        return "trivial", None
+    if state not in ("solved", "loss"):
+        return "none", None
+    if finalizing_spine is None:
+        # Solved with no finalization on record anywhere: an imported cache,
+        # or telemetry aged out.  Naming no payer is the honest answer.
+        return "unattributed", None
+    payer = finalizing_spine.split()[0]
+    if payer.lower() == opener.lower():
+        return "worked", None
+    return "inherited", payer
+
+
 def collect_root_progress_report(sources: ReportOpeners,
                                  request: ReportRequest) -> dict:
     """Work totals and a completion estimate for one opener.
@@ -1752,6 +1822,10 @@ def collect_root_progress_report(sources: ReportOpeners,
         "root_progress", sources, request.branch_target, generated_at, data,
         request
     )
+    branch_keys_by_pattern = {
+        pattern: ScoreCache.encode_subset(answer_words)
+        for pattern, answer_words in group_answer_words.items()
+    }
     queue = None
     try:
         queue = _open_report_queue(sources)
@@ -1763,6 +1837,18 @@ def collect_root_progress_report(sources: ReportOpeners,
         # request time is the root's however deep the target sits.
         requests = queue.opener_work_requests_for_word(
             resolved.steps[0].word if resolved.steps else word)
+        finalizing_spines = queue.first_finalizing_spines(
+            list(branch_keys_by_pattern.values()))
+        # A spine under another opener is the whole inherited set: a group
+        # this opener worked names its own spine, and one with no work
+        # anywhere names none.  Neither needs the cache to be recognized, so
+        # the rollup runs while the queue is still open.
+        foreign_spines = sorted({
+            spine for spine in finalizing_spines.values()
+            if spine.split()[0].lower() != word.lower()
+        })
+        subtree_rollups = (queue.roll_up_spine_subtrees(foreign_spines)
+                           if request.inherited_cost else {})
         _mark_queue_opener_ok(report)
     except (sqlite3.Error, OSError) as error:
         _mark_queue_opener_error(report, error)
@@ -1770,11 +1856,6 @@ def collect_root_progress_report(sources: ReportOpeners,
     finally:
         if queue is not None:
             queue.close()
-
-    branch_keys_by_pattern = {
-        pattern: ScoreCache.encode_subset(answer_words)
-        for pattern, answer_words in group_answer_words.items()
-    }
     cache = None
     cache_states = {}
     try:
@@ -1832,8 +1913,25 @@ def collect_root_progress_report(sources: ReportOpeners,
         row["state"] = _root_progress_group_state(
             row, cache_states.get(branch_keys_by_pattern[pattern]),
             group_budget)
+        finalizing_spine = finalizing_spines.get(
+            branch_keys_by_pattern[pattern])
+        row["provenance"], row["paid_by"] = _root_progress_group_provenance(
+            row, row["state"], finalizing_spine, word)
+        rollup = (subtree_rollups.get(finalizing_spine)
+                  if row["provenance"] == "inherited" else None)
+        row["inherited_cost_known"] = rollup is not None
+        row["inherited_branch_count"] = rollup["branch_count"] if rollup else 0
+        row["inherited_search_node_count"] = (
+            rollup["search_node_count"] if rollup else 0)
+        row["inherited_wall_millis"] = rollup["wall_millis"] if rollup else 0
         rows.append(row)
-    rows.sort(key=lambda row: (-row["search_node_count"], -row["answer_count"]))
+    # Default to the tree's cost.  Ranking on this opener's own nodes sinks
+    # every inherited group to the bottom on zero, which hides exactly the
+    # groups the attribution exists to surface -- but that ranking is the
+    # right one for "what did my request cost", so it stays available.  With
+    # no rollup requested the two orders coincide.
+    rows.sort(key=_ROOT_PROGRESS_SORT_KEYS[
+        request.filters.sort or ROOT_PROGRESS_DEFAULT_SORT])
     node_total = sum(row["search_node_count"] for row in rows)
     for row in rows:
         row["search_node_share"] = (row["search_node_count"] / node_total
@@ -1889,6 +1987,19 @@ def collect_root_progress_report(sources: ReportOpeners,
         "counted_branch_count": progress["counted_branch_count"],
         "requested_at": earliest_request,
         "recent_window_seconds": progress["recent_window_seconds"],
+        "provenance_counts": collections.Counter(
+            row["provenance"] for row in rows),
+        # Measured work and inherited work are separate sums, never added into
+        # `search_node_count`: that figure is what this opener's own request
+        # cost, and the reports read it as such.  Their total is the tree's
+        # cost, which is a third quantity.
+        "inherited_cost_known": request.inherited_cost,
+        "inherited_branch_count": sum(
+            row["inherited_branch_count"] for row in rows),
+        "inherited_search_node_count": sum(
+            row["inherited_search_node_count"] for row in rows),
+        "inherited_wall_millis": sum(
+            row["inherited_wall_millis"] for row in rows),
     }
     return report
 

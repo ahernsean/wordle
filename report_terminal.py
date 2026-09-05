@@ -13,6 +13,7 @@ import termios
 import time
 
 from report_model import (
+    ROOT_PROGRESS_GROUP_PROVENANCES,
     ROOT_PROGRESS_GROUP_STATES,
     ReportRequest,
     ReportOpeners,
@@ -1768,6 +1769,10 @@ def _format_node_count(node_count):
     return str(node_count)
 
 
+_PROVENANCE_MARK = {"worked": "—", "trivial": "·", "unattributed": "?",
+                    "none": "—"}
+
+
 def _state_counts(totals):
     """Response-group state counts in lifecycle order, zeros omitted.
 
@@ -1826,6 +1831,42 @@ def _render_root_progress_sections(report, width, display_order):
             width,
         ),
     ]
+    provenance = totals.get("provenance_counts") or {}
+    inherited_group_count = provenance.get("inherited", 0)
+    if inherited_group_count:
+        summary.append(_fit(
+            "  " + "   ".join(
+                f"{name} {provenance[name]:,}"
+                for name in ROOT_PROGRESS_GROUP_PROVENANCES
+                if provenance.get(name)
+            ),
+            width,
+        ))
+        # The tree's cost and this opener's cost are different numbers
+        # whenever another opener reached a branch first, so both are named
+        # rather than summed into one figure that means neither.
+        if totals.get("inherited_cost_known"):
+            inherited_nodes = totals["inherited_search_node_count"]
+            inherited_millis = totals["inherited_wall_millis"]
+            summary.append(_fit(
+                f"  inherited {_format_node_count(inherited_nodes)} nodes"
+                f"   worker-time {_abbreviate_duration(inherited_millis / 1000)}"
+                f"   from {inherited_group_count:,} groups",
+                width,
+            ))
+            summary.append(_fit(
+                "  tree total "
+                f"{_format_node_count(totals['search_node_count'] + inherited_nodes)}"
+                " nodes   worker-time "
+                f"{_abbreviate_duration((totals['wall_millis'] + inherited_millis) / 1000)}",
+                width,
+            ))
+        else:
+            summary.append(_fit(
+                "  inherited cost not measured"
+                " (--inherited-cost rolls up the subtrees other openers paid for)",
+                width,
+            ))
     estimate = data["estimate"]
     if estimate is None:
         summary.append(_fit(
@@ -1861,7 +1902,7 @@ def _render_root_progress_sections(report, width, display_order):
                                 width))
     rows = [f"{'Pattern':<7} {'State':>7} {'Answers':>7} {'Done':>8}"
             f" {'Evaluating':>10} {'Nodes':>9} {'Share':>5} {'Elapsed':>8}"
-            f" {'WorkerTime':>10}"]
+            f" {'WorkerTime':>10} {'Paid by':>9} {'Inherited':>9}"]
     for row in data["response_groups"]:
         # A group the swarm has not opened has no cost to report.  Printing
         # zeros would read as a measurement rather than an absence.  A group
@@ -1880,10 +1921,22 @@ def _render_root_progress_sections(report, width, display_order):
         else:
             branch_text = open_text = node_text = share_text = "—"
             elapsed_text = worker_text = "—"
+        # An inherited group's cost belongs to whoever solved the branch
+        # first, so it is reported in its own column rather than added to
+        # this opener's nodes.  "?" distinguishes a rollup that was not asked
+        # for from one that measured nothing.
+        payer_text = row["paid_by"] or _PROVENANCE_MARK.get(row["provenance"], "—")
+        if row["provenance"] != "inherited":
+            inherited_text = "—"
+        elif row["inherited_cost_known"]:
+            inherited_text = _format_node_count(row["inherited_search_node_count"])
+        else:
+            inherited_text = "?"
         rows.append(_fit(
             f"{row['pattern']:<7} {row['state']:>7} {row['answer_count']:>7}"
             f" {branch_text:>8} {open_text:>10} {node_text:>9}"
-            f" {share_text:>5} {elapsed_text:>8} {worker_text:>10}",
+            f" {share_text:>5} {elapsed_text:>8} {worker_text:>10}"
+            f" {payer_text:>9} {inherited_text:>9}",
             width,
         ))
     return [("header", header), ("summary", summary),
@@ -2033,6 +2086,7 @@ class WatchSession:
             epoch=getattr(self.args, "epoch", None),
             since_seconds=getattr(self.args, "since_seconds", None),
             sample_size=getattr(self.args, "sample_size", None),
+            inherited_cost=getattr(self.args, "inherited_cost", False),
             opener=getattr(self.args, "opener", None),
             raw_row_offset=getattr(self.args, "accuracy_offset", 0),
         )

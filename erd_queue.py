@@ -15,6 +15,7 @@ version violation — check the target version by hand, or on the box itself.
 
 from __future__ import annotations
 
+import bisect
 import collections
 import json
 import logging
@@ -5053,6 +5054,71 @@ class ERDQueue:
             "epoch": epoch,
             "telemetry_epochs": sorted(telemetry_epochs),
         }
+
+    def first_finalizing_spines(self, branch_keys) -> dict:
+        """The spine that first finalized each branch, keyed by branch key.
+
+        A branch is its remaining answer set, and the cache keys results by
+        that set alone, so the same branch is reached from every opener whose
+        tree arrives at it.  Whichever opener got there first paid for it, and
+        the rest read the certificate -- solved, with no work of their own to
+        show.  Naming the earliest finalizer is what separates a group this
+        opener worked from one it inherited.
+
+        One indexed lookup per branch, so a root's whole response-group set
+        costs single-digit milliseconds.
+        """
+        spines = {}
+        for branch_key in branch_keys:
+            row = self._conn.execute("""
+                SELECT spine FROM telemetry.branch_finalize_log
+                WHERE branch_key = ?
+                ORDER BY finalized_at, id LIMIT 1
+            """, (branch_key,)).fetchone()
+            if row is not None and row["spine"]:
+                spines[branch_key] = row["spine"]
+        return spines
+
+    def roll_up_spine_subtrees(self, spines) -> dict:
+        """Finalized branches, nodes and worker-time under each spine.
+
+        The cost of an inherited group is its whole subtree, not the one
+        branch that names it: everything the first opener finalized beneath
+        that spine is work this opener did not repeat.
+
+        `branch_finalize_log` carries no spine index, so a `LIKE` scan is
+        linear in the log -- and a root has up to 243 response groups to
+        attribute.  One pass sorted into prefix ranges answers all of them
+        instead, since the descendants of a spine are contiguous once spines
+        are ordered.  Cost is therefore the single scan, not a multiple of it.
+        """
+        requested = [spine for spine in dict.fromkeys(spines) if spine]
+        if not requested:
+            return {}
+        rows = self._conn.execute("""
+            SELECT spine, nodes_spent, total_bundle_wall_millis
+            FROM telemetry.branch_finalize_log
+            ORDER BY spine
+        """).fetchall()
+        ordered = [row["spine"] or "" for row in rows]
+        # Running totals so a range costs a subtraction rather than a walk.
+        node_totals, wall_totals = [0], [0]
+        for row in rows:
+            node_totals.append(node_totals[-1] + (row["nodes_spent"] or 0))
+            wall_totals.append(
+                wall_totals[-1] + (row["total_bundle_wall_millis"] or 0))
+        rollups = {}
+        for spine in requested:
+            start = bisect.bisect_left(ordered, spine)
+            # A spine's descendants all begin with it followed by a space, so
+            # they end below the same prefix carrying the highest code point.
+            stop = bisect.bisect_left(ordered, spine + " " + chr(0x10FFFF))
+            rollups[spine] = {
+                "branch_count": stop - start,
+                "search_node_count": node_totals[stop] - node_totals[start],
+                "wall_millis": wall_totals[stop] - wall_totals[start],
+            }
+        return rollups
 
     def opener_work_requests_for_word(self, word) -> list:
         """Every opener-work request naming `word`, oldest request first.

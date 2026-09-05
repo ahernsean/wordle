@@ -241,6 +241,19 @@ class ReportClientStaticTest(unittest.TestCase):
         self.assertEqual(
             set(report_model.OPENER_GROUP_BY_STRATEGIES) - reachable, set())
 
+    def test_root_progress_sort_options_name_server_sorts(self):
+        # The panel reorders rows it already holds rather than refetching, so
+        # the comparators live in both languages.  Nothing at runtime compares
+        # them, which makes the option values the one place the two halves can
+        # be held to the same vocabulary.
+        values = self._menu_values("ROOT_PROGRESS_SORT_OPTIONS")
+        self.assertEqual(values, list(report_model.ROOT_PROGRESS_SORT_FIELDS))
+        self.assertEqual(values[0], report_model.ROOT_PROGRESS_DEFAULT_SORT)
+        keys = re.search(r"const ROOT_PROGRESS_SORT_KEYS=\{(.*?)\};",
+                         self.html, re.DOTALL).group(1)
+        for field in report_model.ROOT_PROGRESS_SORT_FIELDS:
+            self.assertIn(field + ":", keys)
+
     def test_inline_javascript_parses(self):
         node_path = shutil.which("node")
         if node_path is None:
@@ -564,27 +577,30 @@ class ReportClientBrowserTest(unittest.TestCase):
         # report must render without waiting on it: hold the panel's response
         # open and assert the groups are already on screen behind a
         # progress notice.
-        released = Event()
-
-        def hold(route):
-            # Long enough that only the release below can end the hold.  A
-            # timeout short enough to expire while the page is still loading
-            # lets the response through before the assertion runs, which reads
-            # as "the notice was never shown" on a loaded machine.
-            released.wait(timeout=120)
-            route.continue_()
-
-        self.page.route("**/api/view/root-progress**", hold)
+        # Held in the page rather than by a Playwright route handler: a
+        # handler that blocks holds the dispatcher, so the page's own waits
+        # queue behind it and the assertion runs only once the response has
+        # already landed and the panel has rendered.
+        self.page.evaluate("""() => {
+          const original = window.fetch;
+          window.__heldRootProgress = [];
+          window.fetch = (input, init) => String(input).includes("/api/view/root-progress")
+            ? new Promise(resolve => window.__heldRootProgress.push(
+                () => resolve(original(input, init))))
+            : original(input, init);
+        }""")
         try:
             self.apply_branch_target("SALET")
             self.page.wait_for_selector("text=word report")
             self.page.wait_for_selector("article.card.clickable")
+            self.page.wait_for_function(
+                "() => window.__heldRootProgress.length > 0")
             self.assertIn("Computing root progress",
                           self.page.locator("#report").inner_text())
         finally:
-            released.set()
+            self.page.evaluate(
+                "() => window.__heldRootProgress.splice(0).forEach(r => r())")
         self.page.wait_for_selector("table.root-progress")
-        self.page.unroute("**/api/view/root-progress**")
 
     def test_root_progress_panel_separates_elapsed_from_worker_time(self):
         self.apply_branch_target("SALET")
@@ -596,7 +612,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(
             headers,
             ["Response", "State", "Answers", "Done", "Evaluating", "Nodes",
-             "Share", "Elapsed", "Worker-time"])
+             "Share", "Elapsed", "Worker-time", "Paid by", "Inherited"])
 
     def test_root_progress_table_keeps_its_scroll_position_across_polls(self):
         # Every poll rebuilds the word report, so the scroller is a fresh
@@ -815,8 +831,8 @@ class ReportClientBrowserTest(unittest.TestCase):
         # between patterns is the point.
         self.apply_branch_target("SALET")
         self.page.wait_for_selector("table.root-progress")
-        metrics = self.page.locator(
-            "details.root-progress-panel .metrics").inner_text()
+        metrics = "\n".join(self.page.locator(
+            "details.root-progress-panel .metrics").all_inner_texts())
         self.assertNotIn("564,186", metrics)
         cells = self.page.eval_on_selector_all(
             "table.root-progress tbody tr td:nth-child(4)",
@@ -830,6 +846,191 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("538,391", text)
         self.assertNotIn("538391", text)
         self.assertIn("8,671", text)
+
+    def test_root_progress_names_who_paid_for_an_inherited_group(self):
+        # A branch is its answer set, so the opener that reaches it first pays
+        # and every later one reads the certificate.  Those groups are solved
+        # with no work of their own recorded, which the table showed as an
+        # empty row indistinguishable from one nobody has touched.
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("table.root-progress")
+        payers = self.page.eval_on_selector_all(
+            "table.root-progress tbody tr td:nth-child(10)",
+            "cells => cells.map(c => c.textContent)")
+        self.assertIn("TARSE", payers)
+        text = self.page.locator("details.root-progress-panel").inner_text()
+        self.assertIn("inherited", text)
+        # An inherited row is not dimmed: it is finished work, not absent work.
+        self.assertEqual(
+            self.page.locator("table.root-progress tbody tr.dim td.paid-by-inherited").count(),
+            0)
+
+    def test_root_progress_fills_in_inherited_cost_after_the_first_render(self):
+        """The panel renders before the expensive rollup, then fills in.
+
+        Attributing an inherited group's whole subtree is a scan of the
+        finalize log, so it is answered by a second request.  The first render
+        must stand on its own — every measured figure present, the inherited
+        cost marked as still coming — and the enriched response must replace
+        it in place rather than arriving as a separate view.
+        """
+        pending = Event()
+        released = Event()
+
+        def hold_second_stage(route):
+            pending.set()
+            released.wait(10)
+            route.continue_()
+
+        self.page.route("**/api/view/root-progress?*inherited_cost=1*",
+                        hold_second_stage)
+        try:
+            self.apply_branch_target("SALET")
+            self.page.wait_for_selector("table.root-progress")
+            # First stage: groups are named as inherited, cost is not known.
+            self.assertTrue(pending.wait(10), "second stage was never requested")
+            first = self.page.locator("details.root-progress-panel").inner_text()
+            self.assertIn("Measuring what other openers spent", first)
+            self.assertNotIn("tree total nodes", first)
+            inherited_cells = self.page.eval_on_selector_all(
+                "table.root-progress tbody tr td:nth-child(11)",
+                "cells => cells.map(c => c.textContent)")
+            self.assertIn("…", inherited_cells)
+        finally:
+            released.set()
+        # Second stage: the same panel, filled in.
+        self.page.wait_for_function(
+            "() => document.querySelector('details.root-progress-panel')"
+            "        .innerText.includes('tree total nodes')")
+        filled = self.page.locator("details.root-progress-panel").inner_text()
+        self.assertNotIn("Measuring what other openers spent", filled)
+        self.assertIn("inherited nodes", filled)
+        self.assertEqual(
+            self.page.locator("table.root-progress").count(), 1)
+
+    def test_root_progress_skips_the_rollup_when_nothing_was_inherited(self):
+        """An opener that paid for its own tree must not pay for the scan.
+
+        The first-mover case — every group worked or trivial — has nothing for
+        the second stage to add, and the rollup is a scan of the whole finalize
+        log.  Firing it anyway is invisible in the rendering, so only the
+        absence of the request can be asserted.
+        """
+        second_stage_requests = []
+
+        # One handler, because Playwright matches routes in reverse
+        # registration order: a second pattern covering the same URLs would
+        # swallow the requests this one exists to count, and the assertion
+        # would hold no matter what the client did.
+        def serve_without_inherited_groups(route):
+            if "inherited_cost=1" in route.request.url:
+                second_stage_requests.append(route.request.url)
+                route.continue_()
+                return
+            payload = route.fetch().json()
+            totals = payload["data"]["totals"]
+            totals["provenance_counts"] = {
+                name: count
+                for name, count in totals["provenance_counts"].items()
+                if name != "inherited"
+            }
+            for row in payload["data"]["response_groups"]:
+                if row["provenance"] == "inherited":
+                    row["provenance"], row["paid_by"] = "worked", None
+            route.fulfill(json=payload)
+
+        self.page.route("**/api/view/root-progress**",
+                        serve_without_inherited_groups)
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("table.root-progress")
+        text = self.page.locator("details.root-progress-panel").inner_text()
+        self.assertNotIn("Measuring what other openers spent", text)
+        self.page.wait_for_timeout(500)
+        self.assertEqual(second_stage_requests, [])
+
+    def _root_progress_patterns(self):
+        """Row order, read as response patterns.
+
+        The Response cell renders word tiles rather than text, so the pattern
+        is taken from the button's label — the same string the branch link
+        navigates to.
+        """
+        return self.page.eval_on_selector_all(
+            "table.root-progress tbody tr .tile-button",
+            "buttons => buttons.map(b => b.getAttribute('aria-label').split(' ')[2])")
+
+    def test_root_progress_sorts_by_tree_cost_or_by_this_opener_alone(self):
+        """Both orders are needed and they are not the same question.
+
+        Ranking on the tree's cost surfaces the groups worth the most work,
+        whoever paid.  Ranking on this opener's own nodes answers what its
+        request cost — and ties every inherited group at zero, which is why it
+        cannot be the only order offered.
+        """
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("table.root-progress")
+        self.page.wait_for_function(
+            "() => document.querySelector('details.root-progress-panel')"
+            "        .innerText.includes('tree total nodes')")
+        self.assertEqual(
+            self.page.eval_on_selector_all(
+                "#root-progress-sort option", "options => options.map(o => o.value)"),
+            ["tree_nodes", "own_nodes"])
+
+        by_tree = self._root_progress_patterns()
+        self.page.select_option("#root-progress-sort", "own_nodes")
+        self.page.wait_for_function(
+            "() => document.querySelector('#root-progress-sort').value === 'own_nodes'")
+        by_own = self._root_progress_patterns()
+
+        self.assertNotEqual(by_tree, by_own)
+        self.assertEqual(sorted(by_tree), sorted(by_own))
+        with open(os.path.join(FIXTURE_DIRECTORY,
+                               "root_progress-inherited.json")) as fixture_file:
+            fixture = json.load(fixture_file)
+        rows = {row["pattern"]: row
+                for row in fixture["data"]["response_groups"]}
+        def tree_cost(pattern):
+            row = rows[pattern]
+            return row["search_node_count"] + row["inherited_search_node_count"]
+        self.assertEqual([tree_cost(p) for p in by_tree],
+                         sorted((tree_cost(p) for p in by_tree), reverse=True))
+        self.assertEqual([rows[p]["search_node_count"] for p in by_own],
+                         sorted((rows[p]["search_node_count"] for p in by_own),
+                                reverse=True))
+        # The point of the second order: an inherited group carries real cost
+        # under the tree ranking and none of its own, so it rises when the
+        # tree is ranked and sits with the untouched groups when this opener's
+        # work is.  Every inherited group ties at zero own nodes, so under
+        # `own_nodes` none of them can outrank a group that was worked.
+        inherited = [pattern for pattern in by_tree
+                     if rows[pattern]["provenance"] == "inherited"]
+        self.assertTrue(inherited)
+        for pattern in inherited:
+            self.assertLess(by_tree.index(pattern), by_own.index(pattern), pattern)
+        worked_with_nodes = [pattern for pattern in by_own
+                             if rows[pattern]["search_node_count"]]
+        self.assertTrue(worked_with_nodes)
+        self.assertLess(max(by_own.index(p) for p in worked_with_nodes),
+                        min(by_own.index(p) for p in inherited))
+
+    def test_root_progress_sort_does_not_refetch_the_expensive_rollup(self):
+        # The rollup is a scan of the finalize log.  Reordering rows already
+        # rendered must not pay for it again.
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("table.root-progress")
+        self.page.wait_for_function(
+            "() => document.querySelector('details.root-progress-panel')"
+            "        .innerText.includes('tree total nodes')")
+        requests = []
+        self.page.on("request", lambda request: (
+            requests.append(request.url)
+            if "/api/view/root-progress" in request.url else None))
+        self.page.select_option("#root-progress-sort", "own_nodes")
+        self.page.wait_for_function(
+            "() => document.querySelector('#root-progress-sort').value === 'own_nodes'")
+        self.page.wait_for_timeout(300)
+        self.assertEqual(requests, [])
 
     def test_root_progress_omits_a_request_time_the_queue_cannot_vouch_for(self):
         # The fixture carries no request time: the queue rebuild that restamped
@@ -886,10 +1087,11 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("—", dimmed)
         self.assertNotIn("0.0%", dimmed)
 
-    def test_root_progress_scan_runs_once_across_poll_cycles(self):
+    def test_root_progress_scan_runs_once_per_stage_across_poll_cycles(self):
         # The word report polls every couple of seconds; re-running a
         # multi-second telemetry scan on each cycle would pin a worker's
-        # database.  One fetch per target, refreshed only on request.
+        # database.  One fetch per stage per target, refreshed only on
+        # request — the count must not grow with the number of polls.
         self.page.evaluate("window.__rootProgressCalls = 0;")
         self.page.route("**/api/view/root-progress**", lambda route: (
             self.page.evaluate("window.__rootProgressCalls++;"),
@@ -897,9 +1099,15 @@ class ReportClientBrowserTest(unittest.TestCase):
         try:
             self.apply_branch_target("SALET")
             self.page.wait_for_selector("table.root-progress")
-            self.page.wait_for_timeout(2 * CLIENT_POLL_MILLIS)
+            self.page.wait_for_function(
+                "() => document.querySelector('details.root-progress-panel')"
+                "        .innerText.includes('tree total nodes')")
+            settled = self.page.evaluate("window.__rootProgressCalls")
+            # The cheap first stage and the inherited-cost rollup, once each.
+            self.assertEqual(settled, 2)
+            self.page.wait_for_timeout(3 * CLIENT_POLL_MILLIS)
             self.assertEqual(
-                self.page.evaluate("window.__rootProgressCalls"), 1)
+                self.page.evaluate("window.__rootProgressCalls"), settled)
         finally:
             self.page.unroute("**/api/view/root-progress**")
 

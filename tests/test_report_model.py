@@ -39,6 +39,7 @@ from report_model import (
     resolve_branch_reference,
 )
 from wordle_engine import ERD_ALL, GAME_GUESSES, ResponseCache
+from wordle_ui import fmt_pattern
 
 
 ANSWERS = ["salet", "crane", "nurdy", "khaki"]
@@ -126,6 +127,38 @@ class ReportModelTest(unittest.TestCase):
             {"answer_count": 3, "started": False},
             {"best_erd": None, "max_remaining_depth": None, "cache_state": "loss"}, 2), "loss")
         self.assertEqual(report_model.branch_status_and_worker_status(None, "finalized", 0), ("finalizing", "waiting"))
+
+    def test_group_provenance_separates_who_solved_a_branch_from_whether_it_is_solved(self):
+        provenance = report_model._root_progress_group_provenance
+        worked = {"answer_count": 40, "started": True}
+        idle = {"answer_count": 40, "started": False}
+        # Work of this opener's own is `worked` whatever the log says, and a
+        # branch reached twice from the same opener stays `worked`: attribution
+        # names the opener, not the path that got there.
+        self.assertEqual(provenance(worked, "solved", "TARSE ----- BLAND", "sater"),
+                         ("worked", None))
+        self.assertEqual(provenance(idle, "solved", "SATER -y--- LUBES", "sater"),
+                         ("worked", None))
+        self.assertEqual(provenance(idle, "solved", "SATER", "SaTeR"),
+                         ("worked", None))
+        # Another opener's spine names the payer.
+        self.assertEqual(provenance(idle, "solved", "TARSE -----", "sater"),
+                         ("inherited", "TARSE"))
+        self.assertEqual(provenance(idle, "loss", "TASER --y-y", "sater"),
+                         ("inherited", "TASER"))
+        # One answer is played, not searched, so there was never work to
+        # attribute — crediting an opener would invent a payer.
+        self.assertEqual(provenance({"answer_count": 1, "started": False},
+                                    "solved", "TARSE -----", "sater"),
+                         ("trivial", None))
+        # Solved with no finalization on record names no payer rather than
+        # guessing one, and an unsolved group is not inherited at all.
+        self.assertEqual(provenance(idle, "solved", None, "sater"),
+                         ("unattributed", None))
+        self.assertEqual(provenance(idle, "waiting", None, "sater"),
+                         ("none", None))
+        self.assertEqual(provenance(idle, "working", "TARSE -----", "sater"),
+                         ("none", None))
 
     def test_branch_reference_resolution_and_ambiguity_report(self):
         key = ScoreCache.encode_subset(["salet", "crane"])
@@ -3210,9 +3243,11 @@ class RootProgressReportTest(unittest.TestCase):
     NOW = 1_800_000_000
 
     def _finalize(self, queue, spine, n_words, nodes, wall_millis,
-                  created_at, finalized_at, epoch=0):
+                  created_at, finalized_at, epoch=0, branch_key=None):
         queue.add_branch_finalize_log(
-            ScoreCache.encode_subset(ANSWERS[:1]), spine, n_words, 3,
+            ScoreCache.encode_subset(ANSWERS[:1]) if branch_key is None
+            else branch_key,
+            spine, n_words, 3,
             created_at, finalized_at, nodes, 1,
             total_bundle_wall_millis=wall_millis)
         queue._conn.execute(
@@ -3233,6 +3268,142 @@ class RootProgressReportTest(unittest.TestCase):
             report_kind="root_progress",
             branch_target=parse_report_branch_target(list(branch_target)),
             epoch=epoch)
+
+    # Every SALET response group over the shared four-word list holds a single
+    # answer, which is `trivial` by construction and can never be inherited.
+    # Two more answers that share the all-grey group give the attribution
+    # something real to attach to.
+    WIDER_ANSWERS = ANSWERS + ["humid", "vodou"]
+    INHERITED_PATTERN = "-----"
+
+    def _widen_answer_list(self):
+        with open(self.answer_list_path, "w") as answer_file:
+            answer_file.write("\n".join(self.WIDER_ANSWERS) + "\n")
+
+    def _group_branch_key(self, pattern):
+        """The branch key of one of SALET's response groups."""
+        groups = ResponseCache(self.WIDER_ANSWERS, score_cache=None).group_words(
+            "salet", list(self.WIDER_ANSWERS))
+        for pattern_code, answer_words in groups.items():
+            if answer_words and fmt_pattern(pattern_code) == pattern:
+                return ScoreCache.encode_subset(answer_words), answer_words
+        raise AssertionError(f"SALET has no response group {pattern}")
+
+    def _inherit_group(self, pattern, payer_spine="TARSE -y-g-"):
+        """Leave a group solved by another opener, as production would.
+
+        The branch carries a finalize log under the other opener's spine and an
+        exact result in the cache; nothing at all is recorded under SALET, which
+        is exactly how a group reads when someone else got to the branch first.
+        """
+        self._widen_answer_list()
+        branch_key, answer_words = self._group_branch_key(pattern)
+        queue = self._open_queue()
+        self._finalize(queue, payer_spine, len(answer_words), 400, 4_000,
+                       10, 20, branch_key=branch_key)
+        # A descendant of the payer's spine: its cost is part of what that
+        # opener spent reaching a solved branch, so the rollup must include it.
+        self._finalize(queue, payer_spine + " CRANE -----", 1, 600, 6_000,
+                       12, 30, branch_key=ScoreCache.encode_subset(ANSWERS[:1]))
+        queue.close()
+        cache = ScoreCache(self.cache_path, self.WIDER_ANSWERS,
+                           checkpoint_on_close=False)
+        cache.write(branch_key, ERD_ALL, "crane", 1.5, max_depth=2)
+        cache.close()
+        return branch_key
+
+    def test_group_solved_by_another_opener_is_reported_as_inherited(self):
+        pattern = self.INHERITED_PATTERN
+        self._inherit_group(pattern)
+
+        data = collect_report(self.sources, self._request())["data"]
+
+        row = next(row for row in data["response_groups"]
+                   if row["pattern"] == pattern)
+        # Solved, but by someone else, and with no work of SALET's to show.
+        self.assertEqual(row["state"], "solved")
+        self.assertFalse(row["started"])
+        self.assertEqual(row["provenance"], "inherited")
+        self.assertEqual(row["paid_by"], "TARSE")
+        self.assertEqual(data["totals"]["provenance_counts"]["inherited"], 1)
+        # Without the rollup the cost is unmeasured, and says so rather than
+        # reporting a zero that would read as "cost nothing".
+        self.assertFalse(row["inherited_cost_known"])
+        self.assertEqual(row["inherited_search_node_count"], 0)
+        self.assertFalse(data["totals"]["inherited_cost_known"])
+
+    def test_inherited_cost_rolls_up_the_payer_whole_subtree(self):
+        pattern = self.INHERITED_PATTERN
+        self._inherit_group(pattern)
+
+        data = collect_report(self.sources, replace(
+            self._request(), inherited_cost=True))["data"]
+
+        row = next(row for row in data["response_groups"]
+                   if row["pattern"] == pattern)
+        self.assertTrue(row["inherited_cost_known"])
+        # The payer's own branch plus its descendant, not the branch alone.
+        self.assertEqual(row["inherited_search_node_count"], 1_000)
+        self.assertEqual(row["inherited_wall_millis"], 10_000)
+        self.assertEqual(row["inherited_branch_count"], 2)
+        totals = data["totals"]
+        self.assertEqual(totals["inherited_search_node_count"], 1_000)
+        self.assertTrue(totals["inherited_cost_known"])
+        # Inherited work is never folded into this opener's measured total:
+        # the two answer different questions and their sum is a third.
+        self.assertEqual(totals["search_node_count"], 0)
+
+    def test_every_root_progress_sort_orders_by_the_nodes_it_names(self):
+        """Both orders are declared, and the dispatch table is checked.
+
+        "What did this group cost" and "what did my request cost" are the same
+        number only until another opener pays for part of the tree.  Defaulting
+        to the tree's cost puts every inherited group last on zero under the
+        other ranking, which is correct for that question and useless for the
+        first — so neither can stand in for both.
+        """
+        self._inherit_group(self.INHERITED_PATTERN)
+        queue = self._open_queue()
+        self._finalize(queue, "SALET -y---", 1, 10, 100, 10, 20)
+        queue.close()
+
+        expected = {
+            # The inherited group cost 1,000 nodes; SALET's own work cost 10.
+            "tree_nodes": [self.INHERITED_PATTERN, "-y---"],
+            # SALET spent nothing on the inherited group, so it ranks below
+            # the one group SALET actually worked.
+            "own_nodes": ["-y---", self.INHERITED_PATTERN],
+        }
+        self.assertEqual(sorted(expected),
+                         sorted(report_model._ROOT_PROGRESS_SORT_KEYS))
+        self.assertEqual(sorted(expected),
+                         sorted(report_model.ROOT_PROGRESS_SORT_FIELDS))
+        for sort, order in expected.items():
+            with self.subTest(sort=sort):
+                data = collect_report(self.sources, replace(
+                    self._request(), inherited_cost=True,
+                    filters=replace(ReportFilters(), sort=sort)))["data"]
+                self.assertEqual(
+                    [row["pattern"] for row in data["response_groups"]][:2],
+                    order)
+        # The default is the tree's cost.
+        data = collect_report(self.sources, replace(
+            self._request(), inherited_cost=True))["data"]
+        self.assertEqual(
+            [row["pattern"] for row in data["response_groups"]][:2],
+            expected[report_model.ROOT_PROGRESS_DEFAULT_SORT])
+
+    def test_root_progress_refuses_a_sort_it_cannot_serve(self):
+        # Substituting a default here would render a successful report in an
+        # order nobody asked for, which is the failure the openers ERD sort
+        # shipped with.
+        with self.assertRaises(ValueError) as raised:
+            validate_report_request(replace(
+                self._request(), filters=replace(ReportFilters(), sort="erd")))
+        self.assertIn("tree_nodes", str(raised.exception))
+        for sort in report_model.ROOT_PROGRESS_SORT_FIELDS:
+            validate_report_request(replace(
+                self._request(), filters=replace(ReportFilters(), sort=sort)))
 
     def test_rollup_attributes_descendant_cost_to_its_top_level_group(self):
         queue = self._open_queue()

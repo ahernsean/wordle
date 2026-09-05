@@ -134,6 +134,8 @@ python3.13 erd_search.py view --openers
 python3.13 erd_search.py view --openers CRANE
 python3.13 erd_search.py view --root-progress CRANE
 python3.13 erd_search.py view --root-progress CRANE --epoch 10
+python3.13 erd_search.py view --root-progress CRANE --inherited-cost
+python3.13 erd_search.py view --root-progress CRANE --inherited-cost --sort own_nodes
 ```
 
 `--root-progress` reports one opener's work: every response group with the
@@ -158,6 +160,38 @@ This matters for reading the estimate. The estimate excludes groups still
 opened, and every one of them is already solved (29 hold a single answer). They
 are not a backlog, and counting them as one would invent work that does not
 exist.
+
+### Work this opener did, and work it inherited
+
+A branch is its remaining answer set, and the cache keys results by that set
+alone — so the first opener whose tree reaches a branch pays for it, and every
+later one reads the certificate. Those groups are `solved` with no work of
+their own recorded, which is indistinguishable from untouched work if only the
+`State` column is read.
+
+The `Paid by` column names the opener whose spine first finalized the branch,
+and the summary counts groups by provenance: `worked` (this opener's own
+branches), `inherited` (someone else got there first), `trivial` (one answer,
+never searched), and `unattributed` (solved with no finalization on record).
+Selection is by spine, never by timestamp — a repair rewrites `updated_at` and
+would silently reclassify a group that had not moved.
+
+`--inherited-cost` adds what those groups cost the opener that paid, rolled up
+over its whole subtree. It is a scan of the finalize log rather than a lookup
+per group, so it is a second request the web client fills in after the panel has
+already rendered. Without it the column reads `?`, which is not the same as
+zero.
+
+This is why an opener can appear to finish in a minute. SATER's 151 groups are
+63 worked, 53 inherited and 35 trivial: it measured 6.1K nodes of its own
+against 5.0M inherited from TARSE, TASER and TARES — anagrams, which share the
+same letter multiset and therefore many of the same branches.
+
+`--sort` chooses which cost orders the table. `tree_nodes` (the default) ranks
+by what each group cost to solve, whoever paid, so the expensive parts of the
+tree surface. `own_nodes` ranks by this opener's own measured nodes, which
+answers what its request cost and ties every inherited group at zero. Both are
+needed; neither answers the other's question.
 
 A group counts as started once any branch has opened on it, finalized or not,
 so a group being worked right now never reads as untouched. The two branch
