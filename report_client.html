@@ -1333,7 +1333,20 @@
         .finally(()=>rootProgressPending.delete(url));
     }
     function renderWord(report,previous,state){
-      const fragment=document.createDocumentFragment(),data=report.data;const heading=element("h2","");heading.append(wordTiles(data.word,null,data.word_is_answer,"word-lg"));fragment.append(heading,renderSpine(data.context?.spine));
+      const fragment=document.createDocumentFragment(),data=report.data;const heading=element("h2","");heading.append(wordTiles(data.word,null,data.word_is_answer,"word-lg"));fragment.append(heading);
+      const contextSpine=data.context?.spine||[];
+      // The spine that reached this word is also the branch it was guessed in,
+      // so it is the destination one level up rather than a caption: the whole
+      // spine is the button, and the branch it opens climbs to the word report
+      // for its own last guess, and so on up to the opener.
+      if(contextSpine.length){
+        const upButton=element("button","word-button");
+        upButton.setAttribute(
+          "aria-label","Up to "+spineText(contextSpine)+" branch report");
+        upButton.append(element("span","","Up to"),renderSpine(contextSpine));
+        upButton.addEventListener("click",()=>setState({...currentState,kind:"auto",branch_target:spineText(contextSpine),tree:false,claims:false,answers:false,finalization_cursor:""}));
+        fragment.append(upButton);
+      }
       const erd=data.erd_summary;if(erd){if(erd.state==="complete"){const erdMetrics=element("div","metrics");erdMetrics.append(metric("ERD",fixed(erd.erd,3)),metric("max remaining depth",erd.max_remaining_depth));fragment.append(erdMetrics);}else if(erd.state==="infeasible"){fragment.append(element("p","dim","ERD ∞: "+numText(erd.infeasible_group_count)+" of "+numText(erd.response_group_count)+" response groups unsolvable within budget"));}else{fragment.append(element("p","dim","ERD pending: "+numText(erd.resolved_group_count)+" of "+numText(erd.response_group_count)+" response groups solved"));}}
       const breakdown=data.response_group_breakdown;
       if(breakdown?.length){

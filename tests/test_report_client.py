@@ -3152,6 +3152,35 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("root", result["root"]["text"])
         self.assertEqual(result["root"]["tiles"], 0)
 
+    def test_word_report_climbs_to_the_branch_it_was_guessed_in(self):
+        """One level up from a word report is the branch that word was guessed
+        in.  The branch report climbs to the word above it in turn, so the two
+        buttons alternate all the way up to the opener."""
+        self.page.evaluate(self.DEEPER_WORD_REPORT)
+        button = self.page.get_by_role(
+            "button", name="Up to BOOBY -y-g- CRANE ----- branch report")
+        self.assertEqual(button.count(), 1)
+        # The spine is the button rather than a caption above one: every guess
+        # that reached this word is drawn with the response it drew.
+        words = button.locator(".word")
+        self.assertEqual(
+            [words.nth(index).get_attribute("data-spine")
+             for index in range(words.count())],
+            ["BOOBY -y-g-", "CRANE -----"])
+        button.click()
+        self.page.wait_for_selector("text=branch report")
+        self.assertEqual(self.page.locator("#branch-target-input").input_value(),
+                         "BOOBY -y-g- CRANE -----")
+
+    def test_an_opener_word_report_has_no_level_above_it(self):
+        """A word report with no spine is an opener's own: nothing was played
+        to reach it, so there is neither a climb nor an empty block where the
+        spine that would carry one belongs."""
+        self.apply_branch_target("QUEUE")
+        self.page.wait_for_selector("text=word report")
+        self.assertEqual(self.page.locator("#report button.word-button").count(), 0)
+        self.assertEqual(self.page.locator("#report > .tiles").count(), 0)
+
     def test_spine_and_identity_share_one_two_column_row(self):
         """The spine reads first, so it takes the left half."""
         self.apply_branch_target("RAISE .....")
