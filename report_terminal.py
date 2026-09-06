@@ -1770,7 +1770,13 @@ def _format_node_count(node_count):
     return str(node_count)
 
 
-_PROVENANCE_MARK = {"worked": "—", "trivial": "·", "unattributed": "?",
+# What the payer cell says when no other opener paid.  `worked` is an
+# affirmative answer -- this opener did the search -- and needs to read as one:
+# a dash there is the same mark an unstarted group carries, which turns "I paid
+# for this" and "nobody has paid for this yet" into the same cell.  The two
+# that genuinely have no payer keep the dash, and the State column separates
+# them.
+_PROVENANCE_MARK = {"worked": "self", "trivial": "—", "unattributed": "?",
                     "none": "—"}
 
 

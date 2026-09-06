@@ -1248,7 +1248,12 @@
       }).map(entry=>entry[1]);
     }
     const ROOT_PROGRESS_GROUP_STATES=["waiting","working","solved","inherited","trivial","loss"];
-    const PROVENANCE_MARK={worked:"\u2014",trivial:"\u00b7",unattributed:"?",none:"\u2014"};
+    // `worked` is an affirmative answer -- this opener did the search -- and
+    // needs to read as one: a dash there is the same mark an unstarted group
+    // carries, which turns "I paid for this" and "nobody has paid for this
+    // yet" into the same cell.  The two that genuinely have no payer keep the
+    // dash, and the State column separates them.
+    const PROVENANCE_MARK={worked:"self",trivial:"\u2014",unattributed:"?",none:"\u2014"};
     // A cost cell reads as measured, awaited, or absent — three states, and
     // collapsing the middle one into a dash would report an unfetched rollup
     // as "this cost nothing".
@@ -1436,7 +1441,7 @@
         ["Share","The group's nodes as a fraction of every row shown here."],
         ["Elapsed","Wall-clock from first work to last, shared with whatever else the swarm was running."],
         ["Worker-time","Summed worker time, so six workers for an hour counts as six hours."],
-        ["Paid by","The opener that first finalized this branch, and so paid for it. Blank when this opener did the work itself — and when it names another, every cost on that row is that opener's, not this one's. \u2026 means the rollup is still being fetched, which is not the same as nothing. A payer that reached the branch with its opening guess is drawn with that response; one that needed more carries ·2 or ·3 for how many guesses it took, with the full spine on the tooltip. Either way the cell opens the branch where the work was done."],
+        ["Paid by","The opener that first finalized this branch, and so paid for it. \u201cself\u201d when this opener did the work itself — and when it names another, every cost on that row is that opener's, not this one's. \u2026 means the rollup is still being fetched, which is not the same as nothing. A payer that reached the branch with its opening guess is drawn with that response; one that needed more carries ·2 or ·3 for how many guesses it took, with the full spine on the tooltip. Either way the cell opens the branch where the work was done."],
       ]){
         legend.append(element("dt","",term),element("dd","",definition));
       }

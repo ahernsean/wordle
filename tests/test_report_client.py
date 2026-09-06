@@ -1,6 +1,7 @@
 """Browser contract tests for the self-contained report client."""
 
 from contextlib import contextmanager
+import collections
 import copy
 import itertools
 import json
@@ -971,7 +972,8 @@ class ReportClientBrowserTest(unittest.TestCase):
                       if rows[p]["provenance"] == "worked" and rows[p]["started"])
         self.assertEqual(by_pattern[worked][3],
                          f"{rows[worked]['branch_count']:,}")
-        self.assertEqual(by_pattern[worked][9], "—")
+        # An affirmative answer, not the dash an unstarted group carries.
+        self.assertEqual(by_pattern[worked][9], "self")
 
     def _paid_by_rows(self):
         with open(os.path.join(FIXTURE_DIRECTORY,
@@ -989,6 +991,23 @@ class ReportClientBrowserTest(unittest.TestCase):
             f"table.root-progress td.paid-by-inherited"
             f" .word[data-spine='{spine_text}']").first.locator(
                 "xpath=ancestor::button")
+
+    def test_a_group_this_opener_solved_says_so_rather_than_showing_a_dash(self):
+        # A dash is what an unstarted group carries, so a dash on a group this
+        # opener searched itself makes "I paid for this" and "nobody has paid
+        # for this yet" the same cell.
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("table.root-progress")
+        cells = self.page.eval_on_selector_all(
+            "table.root-progress tbody tr",
+            "rows => rows.map(r => [r.querySelectorAll('td')[1].textContent,"
+            "                       r.querySelectorAll('td')[9].textContent])")
+        by_state = collections.defaultdict(set)
+        for state, payer in cells:
+            by_state[state].add(payer)
+        self.assertEqual(by_state["solved"], {"self"})
+        self.assertNotIn("self", by_state["waiting"])
+        self.assertEqual(by_state["waiting"], {"—"})
 
     def test_a_payer_that_opened_onto_the_branch_is_drawn_with_its_response(self):
         """A one-guess payer is named by the pair.
