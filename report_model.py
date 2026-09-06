@@ -1795,6 +1795,33 @@ def _root_progress_group_provenance(row, state, finalizing_spine, opener):
     return "inherited", payer
 
 
+def _payer_response_pattern(response_cache, payer, answer_words,
+                            group_sizes_for):
+    """The response taking `payer` to the branch holding `answer_words`.
+
+    `None` unless the branch *is* one of that opener's response groups, which
+    takes two things.  Every answer here must give the payer the same
+    response -- otherwise the payer's guess splits them and no single response
+    reaches this branch at all.  That alone only proves the branch sits
+    somewhere inside that response group, so the group must also hold no other
+    answer: a payer that arrived several guesses deep still sends all of these
+    to one response, and naming that pair would point at a branch many times
+    the size of this one.
+
+    `group_sizes_for` returns a payer's response-group sizes over the whole
+    answer list, memoized because one payer usually pays for many groups.
+    """
+    if not payer or not answer_words:
+        return None
+    counts = response_cache.group_counts(payer.lower(), answer_words)
+    if len(counts) != 1:
+        return None
+    pattern_code = next(iter(counts))
+    if group_sizes_for(payer).get(pattern_code) != len(answer_words):
+        return None
+    return fmt_pattern(pattern_code)
+
+
 def collect_root_progress_report(sources: ReportOpeners,
                                  request: ReportRequest) -> dict:
     """Work totals and a completion estimate for one opener.
@@ -1915,6 +1942,16 @@ def collect_root_progress_report(sources: ReportOpeners,
             cache.close()
 
     worked = progress["groups"]
+    # One payer usually pays for many of a root's response groups, so its
+    # response-group sizes over the whole answer list are computed once.
+    payer_group_sizes = {}
+
+    def group_sizes_for(payer):
+        key = payer.lower()
+        if key not in payer_group_sizes:
+            payer_group_sizes[key] = response_cache.group_counts(key, all_answers)
+        return payer_group_sizes[key]
+
     rows = []
     for pattern, answer_count in sorted(answer_counts.items()):
         totals = worked.get(pattern)
@@ -1941,6 +1978,23 @@ def collect_root_progress_report(sources: ReportOpeners,
             branch_keys_by_pattern[pattern])
         row["provenance"], row["paid_by"] = _root_progress_group_provenance(
             row, row["state"], finalizing_spine, word)
+        # Derived from the payer and this branch, never read off the spine.
+        # The spine records one route to the answer set and which route was
+        # recorded is finalize order, but the response that takes the payer to
+        # this branch is a property of the pair: if the payer's guess sends
+        # every answer here to the same response, this branch is that
+        # opener's response group and the pattern is that response.  So a
+        # payer first recorded three guesses deep still names the one-guess
+        # pair, which reading the spine could not.
+        #
+        # A payer whose guess splits these answers reaches the branch only
+        # deeper, and then no single response names it -- the opener stands
+        # alone.
+        row["paid_by_pattern"] = _payer_response_pattern(
+            response_cache, row["paid_by"], group_answer_words.get(pattern),
+            group_sizes_for)
+        row["paid_by_is_answer"] = (
+            row["paid_by"].lower() in answer_set if row["paid_by"] else False)
         row["display_state"] = _root_progress_display_state(
             row["state"], row["provenance"])
         rollup = (subtree_rollups.get(finalizing_spine)

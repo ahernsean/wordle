@@ -952,7 +952,7 @@ class ReportClientBrowserTest(unittest.TestCase):
             "rows => rows.map(r => [...r.querySelectorAll('td')]"
             "                        .map(c => c.textContent))")
         patterns = self.page.eval_on_selector_all(
-            "table.root-progress tbody tr .tile-button",
+            "table.root-progress tbody tr td:first-child .tile-button",
             "buttons => buttons.map(b => b.getAttribute('aria-label').split(' ')[2])")
         by_pattern = dict(zip(patterns, cells))
         inherited = [p for p in patterns if rows[p]["provenance"] == "inherited"]
@@ -971,6 +971,71 @@ class ReportClientBrowserTest(unittest.TestCase):
                          f"{rows[worked]['branch_count']:,}")
         self.assertEqual(by_pattern[worked][9], "—")
 
+    def _paid_by_rows(self):
+        with open(os.path.join(FIXTURE_DIRECTORY,
+                               "root_progress-inherited.json")) as fixture_file:
+            rows = [row for row in
+                    json.load(fixture_file)["data"]["response_groups"]
+                    if row["provenance"] == "inherited"]
+        drawn = self.page.eval_on_selector_all(
+            "table.root-progress td.paid-by-inherited .word",
+            "nodes => nodes.map(n => n.dataset.spine)")
+        return rows, drawn
+
+    def test_a_payer_reached_in_one_guess_is_drawn_with_that_response(self):
+        """An opener partitions the answer set, so exactly one of its
+        responses yields this branch — the pair is determined by the payer and
+        the branch, not by which finalize row happened to be first, and is
+        worth drawing in full."""
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("table.root-progress")
+        rows, drawn = self._paid_by_rows()
+        row = next(r for r in rows if r["paid_by_pattern"])
+        expected = f"{row['paid_by']} {row['paid_by_pattern']}"
+        self.assertIn(expected, drawn)
+        coloured = self.page.eval_on_selector(
+            f"table.root-progress td.paid-by-inherited"
+            f" .word[data-spine='{expected}']",
+            "node => node.querySelectorAll('.letter.g, .letter.y').length")
+        self.assertGreater(coloured, 0)
+        button = self.page.locator(
+            f"table.root-progress td.paid-by-inherited"
+            f" .word[data-spine='{expected}']").first.locator(
+                "xpath=ancestor::button")
+        self.assertIn(expected, button.get_attribute("aria-label"))
+        # Tapping opens exactly what is drawn.
+        button.click()
+        self.page.wait_for_function(
+            "target => __reportClient.getState().branch_target === target",
+            arg=expected)
+
+    def test_a_payer_that_arrived_deeper_is_drawn_as_its_opener_alone(self):
+        """A deeper payer took one route among many to the same answer set,
+        and which route was recorded is finalize order rather than a fact
+        about the branch — so only the opener survives, and an opener on its
+        own is a word rather than a guess, so nothing colours it."""
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("table.root-progress")
+        rows, drawn = self._paid_by_rows()
+        row = next(r for r in rows if not r["paid_by_pattern"])
+        self.assertIn(row["paid_by"], drawn)
+        letters = self.page.eval_on_selector(
+            f"table.root-progress td.paid-by-inherited"
+            f" .word[data-spine='{row['paid_by']}']",
+            "node => [...node.querySelectorAll('.letter')]"
+            "          .map(n => [n.textContent, n.className])")
+        self.assertEqual([text for text, _ in letters], list(row["paid_by"]))
+        for _, classes in letters:
+            self.assertNotIn("g", classes.split())
+            self.assertNotIn("y", classes.split())
+        button = self.page.locator(
+            f"table.root-progress td.paid-by-inherited"
+            f" .word[data-spine='{row['paid_by']}']").first.locator(
+                "xpath=ancestor::button")
+        button.click()
+        self.page.wait_for_function(
+            "payer => __reportClient.getState().branch_target === payer",
+            arg=row["paid_by"])
     def test_root_progress_names_who_paid_for_an_inherited_group(self):
         # A branch is its answer set, so the opener that reaches it first pays
         # and every later one reads the certificate.  Those groups are solved
@@ -1126,7 +1191,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         navigates to.
         """
         return self.page.eval_on_selector_all(
-            "table.root-progress tbody tr .tile-button",
+            "table.root-progress tbody tr td:first-child .tile-button",
             "buttons => buttons.map(b => b.getAttribute('aria-label').split(' ')[2])")
 
     def test_root_progress_sorts_by_tree_cost_or_by_this_opener_alone(self):

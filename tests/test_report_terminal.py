@@ -2203,12 +2203,15 @@ class ViewParserTest(unittest.TestCase):
 
 
 def root_progress_report(estimate=None, requested_at=1_798_000_000,
-                         inherited=None, inherited_cost_known=False):
+                         inherited=None, inherited_cost_known=False,
+                         payer_pattern="-y-y-"):
     """A root progress report.
 
     `inherited` names response groups another opener paid for, as
     {pattern: (payer, nodes)}; by default nothing is inherited, which is the
     first-mover case every other assertion here is written against.
+    `payer_pattern` is the response that reached the branch in one guess, or
+    None for a payer that arrived deeper and so is named by its opener alone.
     """
     report = {
         "report_kind": "root_progress",
@@ -2287,6 +2290,8 @@ def root_progress_report(estimate=None, requested_at=1_798_000_000,
         row["provenance"] = ("inherited" if payer
                              else ("worked" if row["started"] else "none"))
         row["paid_by"] = payer
+        row["paid_by_is_answer"] = False
+        row["paid_by_pattern"] = payer_pattern if payer else None
         row["inherited_cost_known"] = bool(payer) and inherited_cost_known
         row["inherited_branch_count"] = 2 if row["inherited_cost_known"] else 0
         row["inherited_search_node_count"] = nodes if row["inherited_cost_known"] else 0
@@ -2808,6 +2813,8 @@ class TerminalUtilityTest(unittest.TestCase):
                                  "shown_wall_millis": 0,
                                  "shown_elapsed_millis": None,
                                  "inherited_elapsed_millis": None,
+                                 "paid_by_is_answer": False,
+                                 "paid_by_pattern": None,
                                  "inherited_cost_known": False,
                                  "inherited_branch_count": 0,
                                  "inherited_search_node_count": 0,

@@ -1899,7 +1899,7 @@ def _render_root_progress_sections(report, width, display_order):
                                 width))
     rows = [f"{'Pattern':<7} {'State':>9} {'Answers':>7} {'Done':>8}"
             f" {'Evaluating':>10} {'Nodes':>9} {'Share':>5} {'Elapsed':>8}"
-            f" {'WorkerTime':>10} {'Paid by':>9}"]
+            f" {'WorkerTime':>10} {'Paid by':>11}"]
     for row in data["response_groups"]:
         # A group the swarm has not opened has no cost to report.  Printing
         # zeros would read as a measurement rather than an absence.  A group
@@ -1927,12 +1927,18 @@ def _render_root_progress_sections(report, width, display_order):
         # to report rather than zero of them.
         open_text = ("—" if row["shown_cost_is_inherited"] or not row["started"]
                      else f"{row['open_branch_count']:,}")
-        payer_text = row["paid_by"] or _PROVENANCE_MARK.get(row["provenance"], "—")
+        # A payer that reached this branch in one guess is named by the pair;
+        # a deeper one by its opener alone, since which route was recorded is
+        # finalize order rather than a fact about the branch.
+        payer_text = (
+            f"{row['paid_by']} {row['paid_by_pattern']}"
+            if row["paid_by"] and row["paid_by_pattern"]
+            else (row["paid_by"] or _PROVENANCE_MARK.get(row["provenance"], "—")))
         rows.append(_fit(
             f"{row['pattern']:<7} {row['display_state']:>9} {row['answer_count']:>7}"
             f" {branch_text:>8} {open_text:>10} {node_text:>9}"
             f" {share_text:>5} {elapsed_text:>8} {worker_text:>10}"
-            f" {payer_text:>9}",
+            f" {payer_text:>11}",
             width,
         ))
     return [("header", header), ("summary", summary),
