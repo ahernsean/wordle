@@ -3453,6 +3453,26 @@ class RootProgressReportTest(unittest.TestCase):
             [row["pattern"] for row in data["response_groups"]][:2],
             expected[report_model.ROOT_PROGRESS_DEFAULT_SORT])
 
+    def test_inherited_cost_is_refused_by_reports_that_cannot_price_it(self):
+        """An option only one report honours must be refused by the rest.
+
+        Only root progress attributes inherited work, so only it can price it.
+        Accepted elsewhere the flag would answer a question the report never
+        asks — and answer it silently, which is how a request reaches the
+        server, changes nothing, and reports success.
+        """
+        for report_kind in ("openers", "queue", "cache", "leaderboard",
+                            "hotspots", "workers"):
+            with self.subTest(report_kind=report_kind):
+                with self.assertRaises(ValueError) as raised:
+                    validate_report_request(ReportRequest(
+                        report_kind=report_kind, inherited_cost=True))
+                self.assertIn("root progress", str(raised.exception))
+        # The report that does attribute inherited work accepts it, and every
+        # report accepts its absence.
+        validate_report_request(replace(self._request(), inherited_cost=True))
+        validate_report_request(ReportRequest(report_kind="openers"))
+
     def test_root_progress_refuses_a_sort_it_cannot_serve(self):
         # Substituting a default here would render a successful report in an
         # order nobody asked for, which is the failure the openers ERD sort

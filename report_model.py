@@ -264,6 +264,11 @@ def validate_report_request(request: ReportRequest) -> None:
         raise ValueError("tree_parent and tree_cursor require tree")
     if request.raw_row_offset and report_kind != "accuracy":
         raise ValueError("raw_row_offset requires an accuracy report")
+    # Only root progress attributes inherited work, so only it can price it.
+    # Accepting the flag elsewhere would answer a question the report does not
+    # ask, and answer it silently.
+    if request.inherited_cost and report_kind != "root_progress":
+        raise ValueError("--inherited-cost requires a root progress report")
     if request.raw_row_offset < 0:
         raise ValueError("raw_row_offset cannot be negative")
     if request.include_claims and (

@@ -5091,6 +5091,13 @@ class ERDQueue:
         attribute.  One pass sorted into prefix ranges answers all of them
         instead, since the descendants of a spine are contiguous once spines
         are ordered.  Cost is therefore the single scan, not a multiple of it.
+
+        The summed figures come from running totals, so a range costs a
+        subtraction.  The timestamps do not subtract and are read by walking
+        the range, which stays bounded by the log only while the requested
+        spines name disjoint subtrees; one that is an ancestor of another
+        re-traverses the overlap.  That has not been observed, and an index on
+        `spine` would retire the whole arrangement -- see the open issue.
         """
         requested = [spine for spine in dict.fromkeys(spines) if spine]
         if not requested:
@@ -5104,8 +5111,7 @@ class ERDQueue:
         ordered = [row["spine"] or "" for row in rows]
         # Running totals so a summed range costs a subtraction rather than a
         # walk.  The two timestamps are a min and a max, which do not
-        # subtract, so they are read by walking the range -- the ranges are
-        # disjoint subtrees, so that stays linear in the log overall.
+        # subtract, so they are read by walking the range.
         node_totals, wall_totals = [0], [0]
         for row in rows:
             node_totals.append(node_totals[-1] + (row["nodes_spent"] or 0))

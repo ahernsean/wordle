@@ -1224,7 +1224,6 @@
       if(inheritedCost)query.set("inherited_cost","1");
       return "/api/view/root-progress"+(query.size?"?"+query.toString():"");
     }
-    const ROOT_PROGRESS_GROUP_PROVENANCES=["worked","inherited","trivial","unattributed"];
     // What a group cost and what this opener spent on it stop being the same
     // number once another opener has paid for part of the tree.  Ordering is a
     // display choice over data already fetched -- re-requesting would re-run
@@ -1294,7 +1293,7 @@
     // Only groups still waiting hold work the estimate cannot see.  A group the
     // swarm never opened because it needed no search is not missing work.
     function excludedText(totals,estimate){
-      const waiting=(totals.state_counts||{}).waiting||0,parts=[];
+      const waiting=(totals.display_state_counts||totals.state_counts||{}).waiting||0,parts=[];
       if(waiting)parts.push(numText(waiting)+" waiting groups");
       if(estimate.stalled_branch_count)parts.push(numText(estimate.stalled_branch_count)+" stalled branches");
       return parts.length?"excludes "+parts.join(" and "):"";
@@ -1309,7 +1308,7 @@
     // reporting the remainder here leaves neither line restating the other.
     function renderRootProgressHeadline(data,solvedGroupCount){
       const totals=data.totals||{},estimate=data.estimate,parts=[];
-      const counts=totals.state_counts||{};
+      const counts=totals.display_state_counts||totals.state_counts||{};
       if(estimate)parts.push("~"+formatDuration(estimate.estimated_seconds)+" remaining"+(estimate.provisional?" (provisional)":""));
       if(counts.working)parts.push(numText(counts.working)+" groups working");
       if(counts.waiting)parts.push(numText(counts.waiting)+" waiting");

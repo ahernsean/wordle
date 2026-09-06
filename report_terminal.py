@@ -14,7 +14,6 @@ import time
 
 from report_model import (
     ROOT_PROGRESS_DISPLAY_STATES,
-    ROOT_PROGRESS_GROUP_PROVENANCES,
     ROOT_PROGRESS_GROUP_STATES,
     ReportRequest,
     ReportOpeners,
