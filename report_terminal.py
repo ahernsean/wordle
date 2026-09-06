@@ -13,6 +13,7 @@ import termios
 import time
 
 from report_model import (
+    ROOT_PROGRESS_DISPLAY_STATES,
     ROOT_PROGRESS_GROUP_STATES,
     ReportRequest,
     ReportOpeners,
@@ -1768,14 +1769,28 @@ def _format_node_count(node_count):
     return str(node_count)
 
 
+# What the payer cell says when no other opener paid.  `worked` is an
+# affirmative answer -- this opener did the search -- and needs to read as one:
+# a dash there is the same mark an unstarted group carries, which turns "I paid
+# for this" and "nobody has paid for this yet" into the same cell.  The two
+# that genuinely have no payer keep the dash, and the State column separates
+# them.
+_PROVENANCE_MARK = {"worked": "self", "trivial": "—", "unattributed": "?",
+                    "none": "—"}
+
+
 def _state_counts(totals):
     """Response-group state counts in lifecycle order, zeros omitted.
+
+    Reads the display states, so the summary line and the table's State column
+    use one vocabulary: a group counted as `inherited` here reads `inherited`
+    in the table rather than `solved`.
 
     A zero count is noise on a line that has to fit a terminal, and its absence
     already says the state is empty.
     """
-    counts = totals.get("state_counts") or {}
-    return {state: counts[state] for state in ROOT_PROGRESS_GROUP_STATES
+    counts = totals.get("display_state_counts") or totals.get("state_counts") or {}
+    return {state: counts[state] for state in ROOT_PROGRESS_DISPLAY_STATES
             if counts.get(state)}
 
 
@@ -1826,6 +1841,34 @@ def _render_root_progress_sections(report, width, display_order):
             width,
         ),
     ]
+    provenance = totals.get("provenance_counts") or {}
+    inherited_group_count = provenance.get("inherited", 0)
+    if inherited_group_count:
+        # The tree's cost and this opener's cost are different numbers
+        # whenever another opener reached a branch first, so both are named
+        # rather than summed into one figure that means neither.
+        if totals.get("inherited_cost_known"):
+            inherited_nodes = totals["inherited_search_node_count"]
+            inherited_millis = totals["inherited_wall_millis"]
+            summary.append(_fit(
+                f"  inherited {_format_node_count(inherited_nodes)} nodes"
+                f"   worker-time {_abbreviate_duration(inherited_millis / 1000)}"
+                f"   from {inherited_group_count:,} groups",
+                width,
+            ))
+            summary.append(_fit(
+                "  tree total "
+                f"{_format_node_count(totals['search_node_count'] + inherited_nodes)}"
+                " nodes   worker-time "
+                f"{_abbreviate_duration((totals['wall_millis'] + inherited_millis) / 1000)}",
+                width,
+            ))
+        else:
+            summary.append(_fit(
+                "  inherited cost not measured"
+                " (--inherited-cost rolls up the subtrees other openers paid for)",
+                width,
+            ))
     estimate = data["estimate"]
     if estimate is None:
         summary.append(_fit(
@@ -1859,31 +1902,52 @@ def _render_root_progress_sections(report, width, display_order):
         if excluded:
             summary.append(_fit("    excludes " + " and ".join(excluded),
                                 width))
-    rows = [f"{'Pattern':<7} {'State':>7} {'Answers':>7} {'Done':>8}"
+    rows = [f"{'Pattern':<7} {'State':>9} {'Answers':>7} {'Done':>8}"
             f" {'Evaluating':>10} {'Nodes':>9} {'Share':>5} {'Elapsed':>8}"
-            f" {'WorkerTime':>10}"]
+            f" {'WorkerTime':>10} {'Paid by':>11}"]
     for row in data["response_groups"]:
         # A group the swarm has not opened has no cost to report.  Printing
         # zeros would read as a measurement rather than an absence.  A group
         # that is open but has finalized nothing is the opposite case: its
         # zeros are measured, and only the finalize-only figures stay unknown.
-        if row["started"]:
-            branch_text = f"{row['branch_count']:,}"
-            open_text = f"{row['open_branch_count']:,}"
-            node_text = _format_node_count(row["search_node_count"])
+        # An inherited group's cells hold the payer's figures, which is what
+        # `Paid by` on the same row says.  "?" is a rollup that was not asked
+        # for, and is not the same as a measured zero.
+        if row["shown_cost_known"]:
+            branch_text = f"{row['shown_branch_count']:,}"
+            node_text = _format_node_count(row["shown_search_node_count"])
             share_text = f"{100.0 * row['search_node_share']:.1f}%"
             elapsed_text = _abbreviate_duration(
-                row["elapsed_millis"] / 1000
-                if row["elapsed_millis"] is not None else None)
-            worker_text = (_abbreviate_duration(row["wall_millis"] / 1000)
-                           if row["branch_count"] else "—")
+                row["shown_elapsed_millis"] / 1000
+                if row["shown_elapsed_millis"] is not None else None)
+            worker_text = (_abbreviate_duration(row["shown_wall_millis"] / 1000)
+                           if row["shown_branch_count"] else "—")
+        elif row["shown_cost_is_inherited"]:
+            branch_text = node_text = share_text = "?"
+            elapsed_text = worker_text = "?"
         else:
-            branch_text = open_text = node_text = share_text = "—"
+            branch_text = node_text = share_text = "—"
             elapsed_text = worker_text = "—"
+        # Open branches are this opener's own, so an inherited group has none
+        # to report rather than zero of them.
+        open_text = ("—" if row["shown_cost_is_inherited"] or not row["started"]
+                     else f"{row['open_branch_count']:,}")
+        # A payer that reached this branch with its opening guess is named by
+        # the pair.  One that needed more carries how many it took, rather
+        # than the whole spine: an opener alone would read as having isolated
+        # the branch outright, and a spine of three guesses is wider than the
+        # rest of the row.
+        if not row["paid_by"]:
+            payer_text = _PROVENANCE_MARK.get(row["provenance"], "—")
+        elif row["paid_by_pattern"]:
+            payer_text = f"{row['paid_by']} {row['paid_by_pattern']}"
+        else:
+            payer_text = f"{row['paid_by']} ·{row['paid_by_guess_depth']}"
         rows.append(_fit(
-            f"{row['pattern']:<7} {row['state']:>7} {row['answer_count']:>7}"
+            f"{row['pattern']:<7} {row['display_state']:>9} {row['answer_count']:>7}"
             f" {branch_text:>8} {open_text:>10} {node_text:>9}"
-            f" {share_text:>5} {elapsed_text:>8} {worker_text:>10}",
+            f" {share_text:>5} {elapsed_text:>8} {worker_text:>10}"
+            f" {payer_text:>11}",
             width,
         ))
     return [("header", header), ("summary", summary),
@@ -2033,6 +2097,7 @@ class WatchSession:
             epoch=getattr(self.args, "epoch", None),
             since_seconds=getattr(self.args, "since_seconds", None),
             sample_size=getattr(self.args, "sample_size", None),
+            inherited_cost=getattr(self.args, "inherited_cost", False),
             opener=getattr(self.args, "opener", None),
             raw_row_offset=getattr(self.args, "accuracy_offset", 0),
         )

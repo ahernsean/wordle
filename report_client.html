@@ -57,10 +57,33 @@
        under the header row is drawn as an inset shadow. */
     table.root-progress thead th { position:sticky; top:0; z-index:1; background:var(--panel); box-shadow:inset 0 -1px 0 var(--border); }
     table.root-progress th:first-child, table.root-progress td:first-child { text-align:left; }
+    /* The tiles name the row, so they stay put while the measurements scroll
+       under them.  An opaque background is required, not decoration: without
+       it the scrolled cells show through.  The header's own sticky rule wins
+       on the top-left cell, so it carries the higher z-index. */
+    table.root-progress th:first-child, table.root-progress td:first-child {
+      position:sticky; left:0; background:var(--panel); z-index:1;
+      box-shadow:inset -1px 0 0 var(--border); }
+    table.root-progress thead th:first-child { z-index:2; }
+    /* The payer is drawn as a word, so its cell is word-width like the
+       response column rather than number-width like the measurements. */
+    table.root-progress td.paid-by-inherited { text-align:left; }
+    /* How many guesses that opener needed to reach this branch.  Without it a
+       bare opener reads as having isolated the branch with its first guess. */
+    .payer-depth { margin-left:.25rem; color:var(--dim); font-size:.85em; }
     table.root-progress tr.dim td { color:var(--dim); }
     table.root-progress td.state-solved { color:var(--green); }
     table.root-progress td.state-loss { color:var(--red); }
     table.root-progress td.state-waiting { color:var(--dim); }
+    table.root-progress td.state-inherited { color:var(--accent, var(--green)); }
+    table.root-progress td.state-trivial { color:var(--dim); }
+    details.root-progress-legend-panel { margin-top:.4rem; }
+    details.root-progress-legend-panel > summary { cursor:pointer; color:var(--dim); font-size:.9em; }
+    dl.root-progress-legend { margin:.4rem 0 0; display:grid; grid-template-columns:max-content 1fr; gap:.15rem .6rem; font-size:.9em; }
+    dl.root-progress-legend dt { font-weight:bold; }
+    dl.root-progress-legend dd { margin:0; color:var(--dim); }
+    @media (max-width:560px) { dl.root-progress-legend { grid-template-columns:1fr; }
+      dl.root-progress-legend dd { margin:0 0 .35rem; } }
     details.filters { margin-top:.35rem; color:var(--dim); }
     details.filters > summary { cursor:pointer; padding:.1rem 0; }
     .control-group { border:1px solid var(--border); border-radius:6px; background:var(--panel); padding:.4rem .5rem; margin-top:.4rem; }
@@ -402,10 +425,10 @@
     const COMPLETED_BRANCH_HOLD_MILLIS=5000;
     const recentOverviewCompletionRows=new Map();
     let completionExpiryTimer=null;
-    let currentState, lastReport=null, lastContext=null, displayedState=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,shownBranchTarget=null,sourcePathsOpen=false,rootProgressOpen=true,leaderboardReportWidth=null;
+    let currentState, lastReport=null, lastContext=null, displayedState=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,shownBranchTarget=null,sourcePathsOpen=false,rootProgressOpen=true,rootProgressSort="tree_nodes",leaderboardReportWidth=null;
     // The root-progress scan takes seconds, so a result is held per target and
     // reused across the poll cycle's re-renders; refreshing is explicit.
-    const rootProgressCache=new Map(), rootProgressPending=new Set(), rootProgressScroll=new Map(), rootProgressFailure=new Map();
+    const rootProgressCache=new Map(), rootProgressGeneration=new Map(), rootProgressPending=new Set(), rootProgressScroll=new Map(), rootProgressFailure=new Map();
     const byId=id=>document.getElementById(id);
     const element=(tag,className,text)=>{const node=document.createElement(tag);if(className)node.className=className;if(text!==undefined)node.textContent=String(text);return node;};
     const formatInteger=value=>value===null||value===undefined?"—":Number(value).toLocaleString("en-US");
@@ -1191,17 +1214,86 @@
     // than ignores, so it is built from a whitelist, not by subtraction.
     // Keeping it minimal also means changing sort or grouping reuses the
     // cached result instead of re-running the scan.
-    function rootProgressURL(state){
+    function rootProgressURL(state,inheritedCost){
       const query=new URLSearchParams();
       if(state.branch_target)query.set("branch_target",state.branch_target);
       if(state.epoch!==null&&state.epoch!=="")query.set("epoch",String(state.epoch));
+      // The second stage rolls up whole subtrees other openers finalized, which
+      // is a scan of the finalize log rather than a lookup per group.  It is a
+      // separate URL so the panel can render without it and fill it in.
+      if(inheritedCost)query.set("inherited_cost","1");
       return "/api/view/root-progress"+(query.size?"?"+query.toString():"");
     }
-    const ROOT_PROGRESS_GROUP_STATES=["waiting","working","solved","loss"];
+    // What a group cost and what this opener spent on it stop being the same
+    // number once another opener has paid for part of the tree.  Ordering is a
+    // display choice over data already fetched -- re-requesting would re-run
+    // the rollup just to reorder rows -- so these comparators mirror
+    // `_ROOT_PROGRESS_SORT_KEYS`, and the option values are pinned against
+    // ROOT_PROGRESS_SORT_FIELDS by a contract test.
+    const ROOT_PROGRESS_SORT_OPTIONS=[
+      ["tree_nodes","nodes: whole tree (default)"],
+      ["own_nodes","nodes: this opener only"]];
+    const ROOT_PROGRESS_SORT_KEYS={
+      tree_nodes:row=>[-((row.search_node_count||0)+(row.inherited_search_node_count||0)),-row.answer_count,row.pattern],
+      own_nodes:row=>[-(row.search_node_count||0),-row.answer_count,row.pattern]};
+    function sortedResponseGroups(rows,sort){
+      const key=ROOT_PROGRESS_SORT_KEYS[sort]||ROOT_PROGRESS_SORT_KEYS.tree_nodes;
+      return rows.map(row=>[key(row),row]).sort((left,right)=>{
+        for(let index=0;index<left[0].length;index++){
+          if(left[0][index]<right[0][index])return -1;
+          if(left[0][index]>right[0][index])return 1;
+        }
+        return 0;
+      }).map(entry=>entry[1]);
+    }
+    const ROOT_PROGRESS_GROUP_STATES=["waiting","working","solved","inherited","trivial","loss"];
+    // `worked` is an affirmative answer -- this opener did the search -- and
+    // needs to read as one: a dash there is the same mark an unstarted group
+    // carries, which turns "I paid for this" and "nobody has paid for this
+    // yet" into the same cell.  The two that genuinely have no payer keep the
+    // dash, and the State column separates them.
+    const PROVENANCE_MARK={worked:"self",trivial:"\u2014",unattributed:"?",none:"\u2014"};
+    // A cost cell reads as measured, awaited, or absent — three states, and
+    // collapsing the middle one into a dash would report an unfetched rollup
+    // as "this cost nothing".
+    const costText=(row,render)=>row.shown_cost_known?render()
+      :(row.shown_cost_is_inherited?"\u2026":"\u2014");
+    // Who paid, drawn as a word the way every other word here is drawn.
+    //
+    // A payer that reached this branch in one guess is named by the pair --
+    // the finalize row was written at that node, so the branch is that
+    // opener's response group -- and the response colours the tiles.  A payer
+    // that needed more guesses is drawn as its opener alone, because no
+    // single guess of that opener isolates this answer set: QAJAQ reaches
+    // {sheet, skeet, sweet} only after two more, and its own first response
+    // holds nineteen hundred answers.  A marker carries the depth, since an
+    // opener on its own would otherwise read as having isolated the branch
+    // outright, and the whole spine is on the cell's tooltip.
+    //
+    // The cell is therefore never wider than two guesses, whatever depth the
+    // work happened at, and tapping opens the exact branch either way.
+    function paidByCell(row,state){
+      const cell=element("td","paid-by-"+row.provenance);
+      if(!row.paid_by){
+        cell.textContent=PROVENANCE_MARK[row.provenance]||"\u2014";
+        return cell;
+      }
+      const spine=row.paid_by_spine||[];
+      const target=spine.length?spineText(spine):row.paid_by.toUpperCase();
+      const button=element("button","tile-button");
+      button.title=target;
+      button.setAttribute("aria-label","Open the "+target+" branch report, which paid for this group");
+      button.append(wordTiles(row.paid_by,row.paid_by_pattern,row.paid_by_is_answer,"word-sm"));
+      if(row.paid_by_guess_depth>1)
+        button.append(element("span","payer-depth","\u00b7"+row.paid_by_guess_depth));
+      button.addEventListener("click",()=>setState({...state,kind:"auto",branch_target:target,tree:false,claims:false,answers:false,finalization_cursor:""}));
+      cell.append(button);
+      return cell;
+    }
     // Only groups still waiting hold work the estimate cannot see.  A group the
     // swarm never opened because it needed no search is not missing work.
     function excludedText(totals,estimate){
-      const waiting=(totals.state_counts||{}).waiting||0,parts=[];
+      const waiting=(totals.display_state_counts||totals.state_counts||{}).waiting||0,parts=[];
       if(waiting)parts.push(numText(waiting)+" waiting groups");
       if(estimate.stalled_branch_count)parts.push(numText(estimate.stalled_branch_count)+" stalled branches");
       return parts.length?"excludes "+parts.join(" and "):"";
@@ -1216,23 +1308,41 @@
     // reporting the remainder here leaves neither line restating the other.
     function renderRootProgressHeadline(data,solvedGroupCount){
       const totals=data.totals||{},estimate=data.estimate,parts=[];
-      const counts=totals.state_counts||{};
+      const counts=totals.display_state_counts||totals.state_counts||{};
       if(estimate)parts.push("~"+formatDuration(estimate.estimated_seconds)+" remaining"+(estimate.provisional?" (provisional)":""));
       if(counts.working)parts.push(numText(counts.working)+" groups working");
       if(counts.waiting)parts.push(numText(counts.waiting)+" waiting");
       parts.push("began "+absoluteTime(data.work_started_at));
       return statLine(parts);
     }
-    function renderRootProgressPanel(data,url,state){
+    function renderRootProgressPanel(data,url,state,headlineHost,host,solvedGroupCount){
       const fragment=document.createDocumentFragment(),totals=data.totals||{};
       const metrics=element("div","metrics");
       metrics.append(
-        ...ROOT_PROGRESS_GROUP_STATES.filter(state=>(totals.state_counts||{})[state])
-            .map(state=>metric(state,(totals.state_counts||{})[state])),
+        ...ROOT_PROGRESS_GROUP_STATES.filter(state=>(totals.display_state_counts||{})[state])
+            .map(state=>metric(state,(totals.display_state_counts||{})[state])),
         metric("branches evaluating",totals.open_branch_count),
         metric("nodes",formatNodeCount(totals.search_node_count)),
         metric("worker-time",formatDuration((totals.wall_millis||0)/1000)));
       fragment.append(metrics);
+      // A group solved by another opener first is finished without this one
+      // having done the work, so its cost is reported apart from the measured
+      // total rather than added into it.  Their sum is the tree's cost, which
+      // is a third quantity again.
+      const provenance=totals.provenance_counts||{},inheritedGroups=provenance.inherited||0;
+      if(inheritedGroups){
+        if(totals.inherited_cost_known){
+          const inheritedMetrics=element("div","metrics");
+          inheritedMetrics.append(
+            metric("inherited nodes",formatNodeCount(totals.inherited_search_node_count)),
+            metric("inherited worker-time",formatDuration((totals.inherited_wall_millis||0)/1000)),
+            metric("tree total nodes",formatNodeCount((totals.search_node_count||0)+(totals.inherited_search_node_count||0))),
+            metric("tree total worker-time",formatDuration(((totals.wall_millis||0)+(totals.inherited_wall_millis||0))/1000)));
+          fragment.append(inheritedMetrics);
+        }else{
+          fragment.append(element("p","dim","Measuring what other openers spent on the "+numText(inheritedGroups)+" inherited groups\u2026"));
+        }
+      }
       // A request time is only shown when the queue still holds a real one; a
       // stamp from a queue rebuild is dropped upstream rather than displayed
       // as though the work had started before it was asked for.
@@ -1258,13 +1368,27 @@
       }else{
         fragment.append(element("p","dim","No completion estimate: no candidates finished in the last "+formatDuration(totals.recent_window_seconds)+"."));
       }
+      const sortField=element("label","field root-progress-sort");
+      sortField.append(element("span","fieldlabel","Order by"));
+      const sortSelect=element("select","");
+      sortSelect.id="root-progress-sort";
+      sortSelect.replaceChildren(...ROOT_PROGRESS_SORT_OPTIONS.map(([value,text])=>{
+        const option=element("option","",text);option.value=value;return option;}));
+      sortSelect.value=rootProgressSort;
+      // Reordering rows already in hand, so no refetch: the second stage costs
+      // a scan of the finalize log and must not be paid again for a sort.
+      sortSelect.addEventListener("change",()=>{
+        rootProgressSort=sortSelect.value;
+        renderRootProgressInto(headlineHost,host,url,data,solvedGroupCount,state);});
+      sortField.append(sortSelect);
+      fragment.append(sortField);
       const table=element("table","root-progress"),head=element("thead",""),headRow=element("tr","");
-      for(const columnName of ["Response","State","Answers","Done","Evaluating","Nodes","Share","Elapsed","Worker-time"])headRow.append(element("th","",columnName));
+      for(const columnName of ["Response","State","Answers","Done","Evaluating","Nodes","Share","Elapsed","Worker-time","Paid by"])headRow.append(element("th","",columnName));
       head.append(headRow);
       table.append(head);
       const body=element("tbody","");
-      for(const row of data.response_groups||[]){
-        const line=element("tr",row.started?"":"dim");
+      for(const row of sortedResponseGroups(data.response_groups||[],rootProgressSort)){
+        const line=element("tr",row.started||row.provenance==="inherited"?"":"dim");
         const response=element("td","");
         const responseButton=element("button","tile-button");
         const branchSpine=(data.spine_prefix||String(data.word||"").toUpperCase())+" "+row.pattern;
@@ -1274,14 +1398,20 @@
         response.append(responseButton);
         line.append(
           response,
-          element("td","state-"+row.state.replace(/ /g,"-"),row.state),
+          element("td","state-"+row.display_state.replace(/ /g,"-"),row.display_state),
           element("td","",numText(row.answer_count)),
-          element("td","",row.started?numText(row.branch_count):"—"),
-          element("td","",row.started?numText(row.open_branch_count):"—"),
-          element("td","",row.started?formatNodeCount(row.search_node_count):"—"),
-          element("td","",row.started?(100*row.search_node_share).toFixed(1)+"%":"—"),
-          element("td","",row.elapsed_millis===null?"—":formatDuration(row.elapsed_millis/1000)),
-          element("td","",row.started&&row.branch_count?formatDuration(row.wall_millis/1000):"—"));
+          // An inherited group's cells hold the payer's figures — which is
+          // what Paid by on the same row says.  "…" is a rollup still in
+          // flight, and is not a measured zero.
+          element("td","",costText(row,()=>numText(row.shown_branch_count))),
+          // Open branches are this opener's own, so an inherited group has
+          // none to report rather than zero of them.
+          element("td","",row.shown_cost_is_inherited||!row.started?"—":numText(row.open_branch_count)),
+          element("td","",costText(row,()=>formatNodeCount(row.shown_search_node_count))),
+          element("td","",costText(row,()=>(100*row.search_node_share).toFixed(1)+"%")),
+          element("td","",costText(row,()=>row.shown_elapsed_millis===null?"—":formatDuration(row.shown_elapsed_millis/1000))),
+          element("td","",costText(row,()=>row.shown_branch_count?formatDuration(row.shown_wall_millis/1000):"—")),
+          paidByCell(row,state));
         body.append(line);
       }
       table.append(body);
@@ -1292,14 +1422,39 @@
       // top-left mid-read.
       scroller.addEventListener("scroll",()=>rootProgressScroll.set(url,{left:scroller.scrollLeft,top:scroller.scrollTop}));
       fragment.append(scroller);
-      fragment.append(element("p","dim","Share is the pattern's nodes as a fraction of this root's. Elapsed is wall-clock. Counts cover "+telemetryEpochText+"."));
+      // A legend rather than a sentence: the columns count four different
+      // things (branches, nodes, wall-clock, worker-time) and which one a
+      // column holds is not recoverable from its header.
+      const legend=element("dl","root-progress-legend");
+      for(const [term,definition] of [
+        ["State","Where the group stands. "+
+          "solved: this opener's own search finished it. "+
+          "inherited: another opener reached the same branch first and this one read the result — see Paid by. "+
+          "trivial: one answer left, never searched. "+
+          "working / waiting: in flight, or not yet opened. "+
+          "loss: proven unsolvable within the remaining budget."],
+        ["Answers","Answer words remaining in the group after this guess and response."],
+        ["Done","Branches finalized beneath the group, at any depth — not answers or candidates. A group carved into many sub-branches counts every one."],
+        ["Evaluating","Branches beneath the group open right now. Always blank on an inherited group: open branches are this opener's own, and it has none."],
+        ["Nodes","Search nodes spent on the group."],
+        ["Share","The group's nodes as a fraction of every row shown here."],
+        ["Elapsed","Wall-clock from first work to last, shared with whatever else the swarm was running."],
+        ["Worker-time","Summed worker time, so six workers for an hour counts as six hours."],
+        ["Paid by","The opener that first finalized this branch, and so paid for it. \u201cself\u201d when this opener did the work itself — and when it names another, every cost on that row is that opener's, not this one's. \u2026 means the rollup is still being fetched, which is not the same as nothing. A payer that reached the branch with its opening guess is drawn with that response; one that needed more carries ·2 or ·3 for how many guesses it took, with the full spine on the tooltip. Either way the cell opens the branch where the work was done."],
+      ]){
+        legend.append(element("dt","",term),element("dd","",definition));
+      }
+      const legendDetails=element("details","root-progress-legend-panel");
+      legendDetails.append(element("summary","clickable","What these columns mean"),legend);
+      fragment.append(legendDetails);
+      fragment.append(element("p","dim","Counts cover "+telemetryEpochText+"."));
       return fragment;
     }
     function renderRootProgressInto(headlineHost,host,url,data,solvedGroupCount,state){
       const refresh=element("button","refresh","Refresh");
-      refresh.addEventListener("click",()=>{rootProgressCache.delete(url);rootProgressFailure.delete(url);attachRootProgress(headlineHost,host,url,solvedGroupCount,state);});
+      refresh.addEventListener("click",()=>{invalidateRootProgress(url);attachRootProgress(headlineHost,host,url,solvedGroupCount,state);});
       headlineHost.replaceChildren(renderRootProgressHeadline(data,solvedGroupCount));
-      host.replaceChildren(renderRootProgressPanel(data,url,state),refresh);
+      host.replaceChildren(renderRootProgressPanel(data,url,state,headlineHost,host,solvedGroupCount),refresh);
       // The panel is built before the report is mounted, and scroll offsets do
       // not apply to a detached element.  A microtask runs after the mount and
       // before the paint, so the restored position is never seen scrolling.
@@ -1314,23 +1469,97 @@
     // the whole page below the panel would shift each time.  Refresh retries.
     function renderRootProgressFailure(headlineHost,host,url,message,solvedGroupCount,state){
       const refresh=element("button","refresh","Refresh");
-      refresh.addEventListener("click",()=>{rootProgressFailure.delete(url);attachRootProgress(headlineHost,host,url,solvedGroupCount,state);});
+      refresh.addEventListener("click",()=>{invalidateRootProgress(url);attachRootProgress(headlineHost,host,url,solvedGroupCount,state);});
       headlineHost.replaceChildren();
       host.replaceChildren(element("p","error",message),refresh);
+    }
+    // A report that costs too much to compute in one pass answers cheaply
+    // first and is filled in by a second request.  The enriched response
+    // replaces the cached one under the *first* stage's key, so a re-render --
+    // a poll, a scroll restore, a reopened panel -- keeps the filled-in
+    // figures instead of dropping back to the cheap shape.
+    //
+    // A failed enrichment leaves the rendered panel alone rather than
+    // replacing it with an error: the first stage is measured and correct on
+    // its own, and an error notice would claim more was lost than was.  It is
+    // recorded so the request is not reissued on every poll.
+    //
+    // `wanted` reads the rendered data and decides whether the second stage
+    // has anything to add, so a report with nothing to enrich never pays for
+    // the request.
+    // Refresh means "discard what is displayed and ask again", and a request
+    // already in flight predates that instruction.  Without a generation, the
+    // in-flight request keeps its place in rootProgressPending, so the fresh
+    // first stage finds the enrichment "already running" and starts none --
+    // and when the old one lands it writes its pre-refresh response under the
+    // shared cache key.  The panel then sits on stale data that an explicit
+    // Refresh was supposed to replace.
+    //
+    // Bumping the generation both frees the slot for a replacement request
+    // and marks every response issued before the refresh as superseded, so a
+    // late arrival is dropped rather than rendered.
+    function rootProgressGenerationOf(cacheKey){
+      return rootProgressGeneration.get(cacheKey)||0;
+    }
+    function invalidateRootProgress(cacheKey){
+      rootProgressGeneration.set(cacheKey,rootProgressGenerationOf(cacheKey)+1);
+      rootProgressCache.delete(cacheKey);
+      rootProgressFailure.delete(cacheKey);
+    }
+    function attachProgressiveStage({cacheKey,stageURL,host,data,wanted,render}){
+      if(!wanted(data))return;
+      const generation=rootProgressGenerationOf(cacheKey);
+      const stageKey=stageURL+"#"+generation;
+      if(rootProgressPending.has(stageKey)||rootProgressFailure.has(stageKey))return;
+      rootProgressPending.add(stageKey);
+      fetch(stageURL,{headers:{Accept:"application/json"}})
+        .then(response=>{if(!response.ok)throw new Error("Progressive stage request failed ("+response.status+")");return response.json();})
+        .then(enriched=>{
+          if(rootProgressGenerationOf(cacheKey)!==generation)return;
+          rootProgressCache.set(cacheKey,enriched.data);
+          if(host.isConnected)render(enriched.data);})
+        .catch(error=>{
+          if(rootProgressGenerationOf(cacheKey)===generation)
+            rootProgressFailure.set(stageKey,error.message);})
+        .finally(()=>rootProgressPending.delete(stageKey));
+    }
+    // Inherited cost is root progress's second stage: the first names which
+    // groups another opener paid for, this one measures what they cost.
+    const inheritedCostWanted=data=>
+      Boolean(((data.totals||{}).provenance_counts||{}).inherited)
+      &&!(data.totals||{}).inherited_cost_known;
+    function attachInheritedCost(headlineHost,host,url,state,solvedGroupCount,data){
+      attachProgressiveStage({
+        cacheKey:url,stageURL:rootProgressURL(state,true),host,data,
+        wanted:inheritedCostWanted,
+        render:enriched=>renderRootProgressInto(
+          headlineHost,host,url,enriched,solvedGroupCount,state)});
     }
     function attachRootProgress(headlineHost,host,url,solvedGroupCount,state){
       const failure=rootProgressFailure.get(url);
       if(failure!==undefined){renderRootProgressFailure(headlineHost,host,url,failure,solvedGroupCount,state);return;}
       const cached=rootProgressCache.get(url);
-      if(cached){renderRootProgressInto(headlineHost,host,url,cached,solvedGroupCount,state);return;}
+      if(cached){
+        renderRootProgressInto(headlineHost,host,url,cached,solvedGroupCount,state);
+        attachInheritedCost(headlineHost,host,url,state,solvedGroupCount,cached);
+        return;
+      }
       host.replaceChildren(element("p","dim","Computing root progress… (a full telemetry scan, usually a few seconds)"));
-      if(rootProgressPending.has(url))return;
-      rootProgressPending.add(url);
+      const generation=rootProgressGenerationOf(url),stageKey=url+"#"+generation;
+      if(rootProgressPending.has(stageKey))return;
+      rootProgressPending.add(stageKey);
       fetch(url,{headers:{Accept:"application/json"}})
         .then(response=>{if(!response.ok)throw new Error("Root progress request failed ("+response.status+")");return response.json();})
-        .then(progress=>{rootProgressCache.set(url,progress.data);if(host.isConnected)renderRootProgressInto(headlineHost,host,url,progress.data,solvedGroupCount,state);})
-        .catch(error=>{rootProgressFailure.set(url,error.message);if(host.isConnected)renderRootProgressFailure(headlineHost,host,url,error.message,solvedGroupCount,state);})
-        .finally(()=>rootProgressPending.delete(url));
+        .then(progress=>{
+          if(rootProgressGenerationOf(url)!==generation)return;
+          rootProgressCache.set(url,progress.data);
+          if(host.isConnected)renderRootProgressInto(headlineHost,host,url,progress.data,solvedGroupCount,state);
+          attachInheritedCost(headlineHost,host,url,state,solvedGroupCount,progress.data);})
+        .catch(error=>{
+          if(rootProgressGenerationOf(url)!==generation)return;
+          rootProgressFailure.set(url,error.message);
+          if(host.isConnected)renderRootProgressFailure(headlineHost,host,url,error.message,solvedGroupCount,state);})
+        .finally(()=>rootProgressPending.delete(stageKey));
     }
     function renderWord(report,previous,state){
       const fragment=document.createDocumentFragment(),data=report.data;const heading=element("h2","");heading.append(wordTiles(data.word,null,data.word_is_answer,"word-lg"));fragment.append(heading);
@@ -2300,7 +2529,7 @@
       addEventListener("resize",()=>{const root=byId("report");layoutSpines(root);layoutSweepMarkerDigits(root);for(const strip of root.querySelectorAll(".answer-strip"))measureAnswerStrip(strip);if(openGroupMenuNode)positionGroupMenu(openGroupMenuNode.node,openGroupMenuNode.opener);if(currentState?.kind==="leaderboard"&&lastReport&&root.clientWidth!==leaderboardReportWidth&&!reportHasFocusedControl()&&!reportHasActiveSelection())applyReport(lastReport,lastReport,currentState);});
       addEventListener("popstate",()=>{abortActiveRequest();currentState=parsePageState(location);syncControls();fetchReport();schedulePoll();});document.addEventListener("visibilitychange",()=>{if(!document.hidden){fetchReport();schedulePoll();}});fetchReport();schedulePoll();
     }
-    window.parsePageState=parsePageState;window.buildAPIURL=buildAPIURL;window.rootProgressURL=rootProgressURL;window.renderRootProgressHeadline=renderRootProgressHeadline;window.applyReport=applyReport;window.spineTextFromSelection=spineTextFromSelection;window.__reportClient={setState:state=>setState(state),getState:()=>({...currentState}),fetchReport};
+    window.parsePageState=parsePageState;window.buildAPIURL=buildAPIURL;window.rootProgressURL=rootProgressURL;window.attachProgressiveStage=attachProgressiveStage;window.renderRootProgressHeadline=renderRootProgressHeadline;window.applyReport=applyReport;window.spineTextFromSelection=spineTextFromSelection;window.__reportClient={setState:state=>setState(state),getState:()=>({...currentState}),fetchReport};
     document.addEventListener("DOMContentLoaded",initialize);
   })();
   </script>
