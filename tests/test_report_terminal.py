@@ -2292,6 +2292,12 @@ def root_progress_report(estimate=None, requested_at=1_798_000_000,
         row["paid_by"] = payer
         row["paid_by_is_answer"] = False
         row["paid_by_pattern"] = payer_pattern if payer else None
+        row["paid_by_spine"] = (
+            [{"word": payer.lower(), "pattern": payer_pattern,
+              "word_is_answer": False}] if payer and payer_pattern
+            else ([{"word": payer.lower(), "pattern": "-----",
+                    "word_is_answer": False}] * 3 if payer else []))
+        row["paid_by_guess_depth"] = len(row["paid_by_spine"])
         row["inherited_cost_known"] = bool(payer) and inherited_cost_known
         row["inherited_branch_count"] = 2 if row["inherited_cost_known"] else 0
         row["inherited_search_node_count"] = nodes if row["inherited_cost_known"] else 0
@@ -2815,6 +2821,8 @@ class TerminalUtilityTest(unittest.TestCase):
                                  "inherited_elapsed_millis": None,
                                  "paid_by_is_answer": False,
                                  "paid_by_pattern": None,
+                                 "paid_by_spine": [],
+                                 "paid_by_guess_depth": 0,
                                  "inherited_cost_known": False,
                                  "inherited_branch_count": 0,
                                  "inherited_search_node_count": 0,

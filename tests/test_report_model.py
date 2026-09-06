@@ -128,75 +128,6 @@ class ReportModelTest(unittest.TestCase):
             {"best_erd": None, "max_remaining_depth": None, "cache_state": "loss"}, 2), "loss")
         self.assertEqual(report_model.branch_status_and_worker_status(None, "finalized", 0), ("finalizing", "waiting"))
 
-    def test_payer_response_names_a_branch_only_when_it_is_the_whole_group(self):
-        """A shared response is not enough; the group must hold nothing else.
-
-        Every answer in a branch giving the payer the same response proves
-        only that the branch sits somewhere inside that response group.  A
-        payer that reached the branch several guesses deep still sends all of
-        them to one response, and naming that pair would point at a branch
-        many times the size of this one.
-        """
-        # Every SALET group over the shared four-word list holds one answer,
-        # and a one-answer group cannot tell the two failures apart.
-        wider = ANSWERS + ["humid", "vodou"]
-        response_cache = ResponseCache(wider, score_cache=None)
-        sizes = {}
-
-        def group_sizes_for(payer):
-            key = payer.lower()
-            if key not in sizes:
-                sizes[key] = response_cache.group_counts(key, wider)
-            return sizes[key]
-
-        def pattern_of(payer, words):
-            return report_model._payer_response_pattern(
-                response_cache, payer, words, group_sizes_for)
-
-        groups = response_cache.group_words("salet", list(wider))
-        whole = next(words for words in groups.values() if len(words) > 2)
-        # The branch is exactly this opener's response group, so the pair
-        # names it.
-        named = pattern_of("salet", whole)
-        self.assertIsNotNone(named)
-        self.assertEqual(set(response_cache.group_words("salet", list(whole))),
-                         {parse_pattern(named)})
-        # Drop one answer and the rest still share the response — the branch
-        # sits inside the group without being it, which is the shape a payer
-        # that arrived deeper leaves behind, and nothing names it.
-        self.assertIsNone(pattern_of("salet", whole[:-1]))
-        # A payer whose guess splits these answers reaches no single response.
-        splitting = next(word for word in wider
-                         if len(response_cache.group_counts(word, whole)) > 1)
-        self.assertIsNone(pattern_of(splitting, whole))
-        self.assertIsNone(pattern_of(None, whole))
-        self.assertIsNone(pattern_of("salet", []))
-
-        # The size check alone is not enough either.  Here ABACK splits the
-        # branch, and the response of its first answer happens to have a
-        # group of exactly the branch's size — so a size test that trusted an
-        # arbitrary one of several responses would name a branch these answers
-        # do not form.
-        coincident = ["aback", "abase", "abash", "abbey"]
-        coincident_cache = ResponseCache(coincident, score_cache=None)
-        coincident_sizes = {}
-
-        def coincident_group_sizes_for(payer):
-            key = payer.lower()
-            if key not in coincident_sizes:
-                coincident_sizes[key] = coincident_cache.group_counts(
-                    key, coincident)
-            return coincident_sizes[key]
-
-        split_branch = ["abase", "aback"]
-        responses = coincident_cache.group_counts("aback", split_branch)
-        self.assertEqual(len(responses), 2)
-        self.assertEqual(
-            coincident_group_sizes_for("aback")[next(iter(responses))],
-            len(split_branch))
-        self.assertIsNone(report_model._payer_response_pattern(
-            coincident_cache, "aback", split_branch,
-            coincident_group_sizes_for))
     def test_display_state_folds_provenance_into_one_word_without_losing_a_loss(self):
         display = report_model._root_progress_display_state
         # A group solved by this opener's own search is just solved; the two
@@ -3425,6 +3356,41 @@ class RootProgressReportTest(unittest.TestCase):
         self.assertFalse(row["inherited_cost_known"])
         self.assertEqual(row["inherited_search_node_count"], 0)
         self.assertFalse(data["totals"]["inherited_cost_known"])
+
+    def test_a_one_guess_payer_names_the_branch_and_a_deeper_one_does_not(self):
+        """The spine's length decides, because the row records where the work
+        happened.
+
+        A finalize row written at a one-guess node is itself the proof that
+        the branch is that opener's response group.  A deeper row is proof
+        that it is not: no single guess of that opener isolates the answer
+        set, so the opener carries only how many guesses it took.
+        """
+        pattern = self.INHERITED_PATTERN
+        self._inherit_group(pattern, payer_spine="TARSE -y-g-")
+        row = next(row for row in
+                   collect_report(self.sources, self._request())["data"]
+                   ["response_groups"] if row["pattern"] == pattern)
+        self.assertEqual(row["paid_by"], "TARSE")
+        self.assertEqual(row["paid_by_guess_depth"], 1)
+        self.assertEqual(row["paid_by_pattern"], "-y-g-")
+        self.assertEqual([step["word"] for step in row["paid_by_spine"]],
+                         ["tarse"])
+
+        self.tearDown()
+        self.setUp()
+        self._inherit_group(pattern, payer_spine="TARSE yg--- CLIPT -y--g")
+        row = next(row for row in
+                   collect_report(self.sources, self._request())["data"]
+                   ["response_groups"] if row["pattern"] == pattern)
+        self.assertEqual(row["paid_by"], "TARSE")
+        self.assertEqual(row["paid_by_guess_depth"], 2)
+        # Nothing colours the tiles, because no response of TARSE alone
+        # reaches this branch.
+        self.assertIsNone(row["paid_by_pattern"])
+        # The whole spine is still carried, for the tooltip and the link.
+        self.assertEqual([step["word"] for step in row["paid_by_spine"]],
+                         ["tarse", "clipt"])
 
     def test_inherited_cost_rolls_up_the_payer_whole_subtree(self):
         pattern = self.INHERITED_PATTERN

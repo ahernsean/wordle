@@ -962,7 +962,9 @@ class ReportClientBrowserTest(unittest.TestCase):
             with self.subTest(pattern=pattern):
                 self.assertEqual(cell[3], f"{row['inherited_branch_count']:,}")
                 self.assertNotIn(cell[5], ("—", "…", "0"))
-                self.assertEqual(cell[9], row["paid_by"])
+                # Names the payer; how it is drawn — the response, or the
+                # depth it took to get there — is pinned by the payer tests.
+                self.assertIn(row["paid_by"], cell[9])
                 # Open branches stay this opener's, so there are none here.
                 self.assertEqual(cell[4], "—")
         worked = next(p for p in patterns
@@ -982,60 +984,67 @@ class ReportClientBrowserTest(unittest.TestCase):
             "nodes => nodes.map(n => n.dataset.spine)")
         return rows, drawn
 
-    def test_a_payer_reached_in_one_guess_is_drawn_with_that_response(self):
-        """An opener partitions the answer set, so exactly one of its
-        responses yields this branch — the pair is determined by the payer and
-        the branch, not by which finalize row happened to be first, and is
-        worth drawing in full."""
+    def _payer_button(self, spine_text):
+        return self.page.locator(
+            f"table.root-progress td.paid-by-inherited"
+            f" .word[data-spine='{spine_text}']").first.locator(
+                "xpath=ancestor::button")
+
+    def test_a_payer_that_opened_onto_the_branch_is_drawn_with_its_response(self):
+        """A one-guess payer is named by the pair.
+
+        Its finalize row was written at that node, so the branch is that
+        opener's response group and the response colours the tiles.
+        """
         self.apply_branch_target("SALET")
         self.page.wait_for_selector("table.root-progress")
-        rows, drawn = self._paid_by_rows()
-        row = next(r for r in rows if r["paid_by_pattern"])
+        rows, _ = self._paid_by_rows()
+        row = next(r for r in rows if r["paid_by_guess_depth"] == 1)
         expected = f"{row['paid_by']} {row['paid_by_pattern']}"
-        self.assertIn(expected, drawn)
         coloured = self.page.eval_on_selector(
             f"table.root-progress td.paid-by-inherited"
             f" .word[data-spine='{expected}']",
             "node => node.querySelectorAll('.letter.g, .letter.y').length")
         self.assertGreater(coloured, 0)
-        button = self.page.locator(
-            f"table.root-progress td.paid-by-inherited"
-            f" .word[data-spine='{expected}']").first.locator(
-                "xpath=ancestor::button")
-        self.assertIn(expected, button.get_attribute("aria-label"))
-        # Tapping opens exactly what is drawn.
+        button = self._payer_button(expected)
+        # One guess, so no depth marker: the pair says everything.
+        self.assertEqual(button.locator(".payer-depth").count(), 0)
+        self.assertEqual(button.get_attribute("title"), expected)
         button.click()
         self.page.wait_for_function(
             "target => __reportClient.getState().branch_target === target",
             arg=expected)
 
-    def test_a_payer_that_arrived_deeper_is_drawn_as_its_opener_alone(self):
-        """A deeper payer took one route among many to the same answer set,
-        and which route was recorded is finalize order rather than a fact
-        about the branch — so only the opener survives, and an opener on its
-        own is a word rather than a guess, so nothing colours it."""
+    def test_a_deeper_payer_carries_its_depth_and_opens_the_exact_branch(self):
+        """A payer that needed more than one guess is drawn as its opener.
+
+        No single guess of that opener isolates this answer set, so nothing
+        colours the tiles — but the opener alone would read as though it had,
+        which is what the depth marker prevents.  The cell stays two guesses
+        wide whatever the depth, and the whole spine is on the tooltip and is
+        what the cell opens.
+        """
         self.apply_branch_target("SALET")
         self.page.wait_for_selector("table.root-progress")
-        rows, drawn = self._paid_by_rows()
-        row = next(r for r in rows if not r["paid_by_pattern"])
-        self.assertIn(row["paid_by"], drawn)
-        letters = self.page.eval_on_selector(
-            f"table.root-progress td.paid-by-inherited"
-            f" .word[data-spine='{row['paid_by']}']",
-            "node => [...node.querySelectorAll('.letter')]"
-            "          .map(n => [n.textContent, n.className])")
-        self.assertEqual([text for text, _ in letters], list(row["paid_by"]))
-        for _, classes in letters:
-            self.assertNotIn("g", classes.split())
-            self.assertNotIn("y", classes.split())
-        button = self.page.locator(
-            f"table.root-progress td.paid-by-inherited"
-            f" .word[data-spine='{row['paid_by']}']").first.locator(
-                "xpath=ancestor::button")
+        rows, _ = self._paid_by_rows()
+        row = next(r for r in rows if r["paid_by_guess_depth"] > 1)
+        opener = row["paid_by"]
+        spine = " ".join(f"{step['word'].upper()} {step['pattern']}"
+                         for step in row["paid_by_spine"])
+        button = self._payer_button(opener)
+        letters = button.locator(".word .letter")
+        self.assertEqual(letters.count(), 5)
+        self.assertEqual(
+            button.locator(".word .letter.g, .word .letter.y").count(), 0)
+        self.assertEqual(button.locator(".payer-depth").inner_text(),
+                         "\u00b7" + str(row["paid_by_guess_depth"]))
+        # The spine is not spent on column width, but it is not lost either.
+        self.assertEqual(button.get_attribute("title"), spine)
         button.click()
         self.page.wait_for_function(
-            "payer => __reportClient.getState().branch_target === payer",
-            arg=row["paid_by"])
+            "target => __reportClient.getState().branch_target === target",
+            arg=spine)
+
     def test_root_progress_names_who_paid_for_an_inherited_group(self):
         # A branch is its answer set, so the opener that reaches it first pays
         # and every later one reads the certificate.  Those groups are solved

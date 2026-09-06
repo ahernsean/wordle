@@ -68,6 +68,9 @@
     /* The payer is drawn as a word, so its cell is word-width like the
        response column rather than number-width like the measurements. */
     table.root-progress td.paid-by-inherited { text-align:left; }
+    /* How many guesses that opener needed to reach this branch.  Without it a
+       bare opener reads as having isolated the branch with its first guess. */
+    .payer-depth { margin-left:.25rem; color:var(--dim); font-size:.85em; }
     table.root-progress tr.dim td { color:var(--dim); }
     table.root-progress td.state-solved { color:var(--green); }
     table.root-progress td.state-loss { color:var(--red); }
@@ -1251,30 +1254,34 @@
     // as "this cost nothing".
     const costText=(row,render)=>row.shown_cost_known?render()
       :(row.shown_cost_is_inherited?"\u2026":"\u2014");
-    // Who paid, drawn as a word the way every other word here is drawn.  A
-    // payer that reached this branch in one guess is named by the pair: an
-    // opener partitions the answer set, so exactly one of its responses
-    // yields this branch and the response colours the tiles.  A payer that
-    // arrived deeper took one route among many to the same answer set, and
-    // which route was recorded is finalize order rather than a fact about the
-    // branch -- so only the opener is drawn, uncoloured, because an opener on
-    // its own is a word rather than a guess taken against an answer.
+    // Who paid, drawn as a word the way every other word here is drawn.
     //
-    // Tapping opens exactly what is drawn: the branch when a response names
-    // it, the opener's own report when it does not.
+    // A payer that reached this branch in one guess is named by the pair --
+    // the finalize row was written at that node, so the branch is that
+    // opener's response group -- and the response colours the tiles.  A payer
+    // that needed more guesses is drawn as its opener alone, because no
+    // single guess of that opener isolates this answer set: QAJAQ reaches
+    // {sheet, skeet, sweet} only after two more, and its own first response
+    // holds nineteen hundred answers.  A marker carries the depth, since an
+    // opener on its own would otherwise read as having isolated the branch
+    // outright, and the whole spine is on the cell's tooltip.
+    //
+    // The cell is therefore never wider than two guesses, whatever depth the
+    // work happened at, and tapping opens the exact branch either way.
     function paidByCell(row,state){
       const cell=element("td","paid-by-"+row.provenance);
       if(!row.paid_by){
         cell.textContent=PROVENANCE_MARK[row.provenance]||"\u2014";
         return cell;
       }
-      const opener=row.paid_by.toUpperCase();
-      const target=row.paid_by_pattern?opener+" "+row.paid_by_pattern:opener;
+      const spine=row.paid_by_spine||[];
+      const target=spine.length?spineText(spine):row.paid_by.toUpperCase();
       const button=element("button","tile-button");
-      button.setAttribute("aria-label",row.paid_by_pattern
-        ?"Open the "+target+" branch report, which paid for this group"
-        :"Open the "+opener+" word report, which paid for this group");
+      button.title=target;
+      button.setAttribute("aria-label","Open the "+target+" branch report, which paid for this group");
       button.append(wordTiles(row.paid_by,row.paid_by_pattern,row.paid_by_is_answer,"word-sm"));
+      if(row.paid_by_guess_depth>1)
+        button.append(element("span","payer-depth","\u00b7"+row.paid_by_guess_depth));
       button.addEventListener("click",()=>setState({...state,kind:"auto",branch_target:target,tree:false,claims:false,answers:false,finalization_cursor:""}));
       cell.append(button);
       return cell;
@@ -1429,7 +1436,7 @@
         ["Share","The group's nodes as a fraction of every row shown here."],
         ["Elapsed","Wall-clock from first work to last, shared with whatever else the swarm was running."],
         ["Worker-time","Summed worker time, so six workers for an hour counts as six hours."],
-        ["Paid by","The opener that first finalized this branch, and so paid for it. Blank when this opener did the work itself — and when it names another, every cost on that row is that opener's, not this one's. \u2026 means the rollup is still being fetched, which is not the same as nothing. A payer that reached the branch in one guess is drawn with that response; one that arrived deeper is drawn as the opener alone, because which of the many routes to the same answer set was recorded says nothing about the branch."],
+        ["Paid by","The opener that first finalized this branch, and so paid for it. Blank when this opener did the work itself — and when it names another, every cost on that row is that opener's, not this one's. \u2026 means the rollup is still being fetched, which is not the same as nothing. A payer that reached the branch with its opening guess is drawn with that response; one that needed more carries ·2 or ·3 for how many guesses it took, with the full spine on the tooltip. Either way the cell opens the branch where the work was done."],
       ]){
         legend.append(element("dt","",term),element("dd","",definition));
       }

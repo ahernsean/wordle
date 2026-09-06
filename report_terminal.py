@@ -1927,13 +1927,17 @@ def _render_root_progress_sections(report, width, display_order):
         # to report rather than zero of them.
         open_text = ("—" if row["shown_cost_is_inherited"] or not row["started"]
                      else f"{row['open_branch_count']:,}")
-        # A payer that reached this branch in one guess is named by the pair;
-        # a deeper one by its opener alone, since which route was recorded is
-        # finalize order rather than a fact about the branch.
-        payer_text = (
-            f"{row['paid_by']} {row['paid_by_pattern']}"
-            if row["paid_by"] and row["paid_by_pattern"]
-            else (row["paid_by"] or _PROVENANCE_MARK.get(row["provenance"], "—")))
+        # A payer that reached this branch with its opening guess is named by
+        # the pair.  One that needed more carries how many it took, rather
+        # than the whole spine: an opener alone would read as having isolated
+        # the branch outright, and a spine of three guesses is wider than the
+        # rest of the row.
+        if not row["paid_by"]:
+            payer_text = _PROVENANCE_MARK.get(row["provenance"], "—")
+        elif row["paid_by_pattern"]:
+            payer_text = f"{row['paid_by']} {row['paid_by_pattern']}"
+        else:
+            payer_text = f"{row['paid_by']} ·{row['paid_by_guess_depth']}"
         rows.append(_fit(
             f"{row['pattern']:<7} {row['display_state']:>9} {row['answer_count']:>7}"
             f" {branch_text:>8} {open_text:>10} {node_text:>9}"
