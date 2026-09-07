@@ -2190,5 +2190,61 @@ class TestPackerUsesCeilingBound(_TmpQueue):
         self.assertEqual(len(indices), 2)
 
 
+class TestSpineAttribution(_TmpQueue):
+    """Who first finalized a branch, and what their whole subtree cost."""
+
+    def _log(self, branch_key, spine, nodes, wall_millis, finalized_at):
+        self.q.add_branch_finalize_log(
+            branch_key, spine, 2, 4, 10, finalized_at, nodes, 1,
+            total_bundle_wall_millis=wall_millis)
+
+    def test_first_finalizing_spine_is_the_earliest_not_the_latest(self):
+        other = ScoreCache.encode_subset(WORDS[:1])
+        # The same branch reached from two openers.  Whoever finished first
+        # paid; a later finalization is a second opener reading the same
+        # answer set, so the earlier spine is the answer whatever order the
+        # rows were written in.
+        self._log(self.key, "TARSE -y-g-", 400, 4_000, finalized_at=500)
+        self._log(self.key, "SATER --y-y", 10, 100, finalized_at=900)
+        self._log(other, "CRANE -----", 7, 70, finalized_at=100)
+
+        spines = self.q.first_finalizing_spines([self.key, other])
+
+        self.assertEqual(spines[self.key], "TARSE -y-g-")
+        self.assertEqual(spines[other], "CRANE -----")
+        # A branch nobody finalized names no spine rather than a placeholder.
+        self.assertNotIn(ScoreCache.encode_subset(WORDS[1:2]), spines)
+
+    def test_subtree_rollup_counts_descendants_and_stops_at_the_boundary(self):
+        self._log(self.key, "TARSE -y-g-", 400, 4_000, finalized_at=500)
+        self._log(self.key, "TARSE -y-g- CRANE -----", 600, 6_000, finalized_at=600)
+        self._log(self.key, "TARSE -y-g- CRANE ----- NURDY -y---", 25, 250,
+                  finalized_at=700)
+        # Sibling response groups under the same opener sort either side of
+        # the range and must not be counted: one whose pattern sorts above the
+        # prefix and one below.  A rollup that keyed on the opener rather than
+        # the spine would take both.
+        self._log(self.key, "TARSE -y-gg", 999, 9_990, finalized_at=800)
+        self._log(self.key, "TARSE -----", 111, 1_110, finalized_at=810)
+
+        rollups = self.q.roll_up_spine_subtrees(["TARSE -y-g-"])
+
+        self.assertEqual(rollups["TARSE -y-g-"]["search_node_count"], 1_025)
+        self.assertEqual(rollups["TARSE -y-g-"]["wall_millis"], 10_250)
+        self.assertEqual(rollups["TARSE -y-g-"]["branch_count"], 3)
+
+    def test_subtree_rollup_reads_every_spine_from_one_scan(self):
+        for index, spine in enumerate(("AAAAA -----", "MMMMM -----", "ZZZZZ -----")):
+            self._log(self.key, spine, 10 * (index + 1), 100, finalized_at=index)
+            self._log(self.key, spine + " CRANE -----", 1, 10, finalized_at=index)
+        rollups = self.q.roll_up_spine_subtrees(
+            ["ZZZZZ -----", "AAAAA -----", "MMMMM -----", "AAAAA -----"])
+        self.assertEqual(rollups["AAAAA -----"]["search_node_count"], 11)
+        self.assertEqual(rollups["MMMMM -----"]["search_node_count"], 21)
+        self.assertEqual(rollups["ZZZZZ -----"]["search_node_count"], 31)
+        self.assertEqual(self.q.roll_up_spine_subtrees([]), {})
+        self.assertEqual(self.q.roll_up_spine_subtrees([""]), {})
+
+
 if __name__ == "__main__":
     unittest.main()

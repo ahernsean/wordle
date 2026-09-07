@@ -52,10 +52,11 @@ FIXTURE_FILENAMES = (
     "hotspots.json",
     "leaderboard.json",
     "root_progress.json",
+    "root_progress-inherited.json",
     "openers.json",
     "openers-word.json",
 )
-BOOLEAN_PARAMETERS = {"tree", "claims", "answers"}
+BOOLEAN_PARAMETERS = {"tree", "claims", "answers", "inherited_cost"}
 INTEGER_PARAMETERS = {
     "minimum_answer_count", "maximum_answer_count", "budget", "priority",
     "limit", "epoch", "since_seconds", "sample_size", "opener_offset",
@@ -158,6 +159,7 @@ def parse_report_request(path, query):
     tree = _boolean_value(parameters, "tree")
     include_claims = _boolean_value(parameters, "claims")
     include_answers = _boolean_value(parameters, "answers")
+    inherited_cost = _boolean_value(parameters, "inherited_cost")
     tree_parent = _single_value(parameters, "tree_parent", "")
     tree_cursor = _single_value(parameters, "tree_cursor")
     if (tree_parent or tree_cursor) and not tree:
@@ -308,12 +310,30 @@ def parse_report_request(path, query):
         tree_cursor=tree_cursor,
         since_seconds=since_seconds or 3600,
         sample_size=min(sample_size or 50_000, 1_000_000),
+        inherited_cost=inherited_cost,
     )
     try:
         validate_report_request(request)
     except ValueError as error:
         raise InvalidRequest(str(error)) from error
     return request
+
+
+# A report that fills itself in progressively answers one request cheaply and
+# a second one with the expensive part added.  Both shapes are real responses
+# the client renders, so each needs its own fixture, named by suffixing the
+# stage.  Add a report here when it grows a second stage; the client half is
+# `attachProgressiveStage`.
+PROGRESSIVE_STAGE_FLAGS = {"root_progress": (("inherited_cost", "inherited"),)}
+
+
+def progressive_stage_suffix(request):
+    """The fixture-name suffix naming the enrichments a request asked for."""
+    return "".join(
+        f"-{suffix}"
+        for attribute, suffix in PROGRESSIVE_STAGE_FLAGS.get(request.report_kind, ())
+        if getattr(request, attribute, False)
+    )
 
 
 def fixture_name_for_request(path, request):
@@ -333,7 +353,7 @@ def fixture_name_for_request(path, request):
     # named, so the two shapes need two fixtures.
     if kind == "openers" and request.branch_target.kind == "word":
         return "openers-word.json"
-    return f"{kind}.json"
+    return f"{kind}{progressive_stage_suffix(request)}.json"
 
 
 def load_fixtures(directory):

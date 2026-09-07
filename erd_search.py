@@ -102,6 +102,7 @@ from report_model import (
     applied_branch_filters,
     is_overview_request,
     OPENER_SORT_FIELDS,
+    ROOT_PROGRESS_SORT_FIELDS,
     OPENER_STATES,
     ReportFilters,
     ReportRequest,
@@ -1568,6 +1569,10 @@ def main():
         help='Show per-response-group work totals and a completion estimate '
              'for one opener')
     p_view.add_argument(
+        '--inherited-cost', dest='inherited_cost', action='store_true',
+        help='With --root-progress, roll up what other openers spent on the '
+             'response groups this one inherited')
+    p_view.add_argument(
         '--branch-status', type=_branch_status_filter, metavar='STATUSES',
         help='Comma-separated unqueued,queued,evaluating,finalizing,done, or '
              'all (unqueued selects only on a word report)')
@@ -1585,7 +1590,8 @@ def main():
     p_view.add_argument('--sort',
                         choices=tuple(sorted(
                             {'default', 'age', 'size', 'workers', 'priority',
-                             'nodes', 'slowest', *OPENER_SORT_FIELDS})))
+                             'nodes', 'slowest', *OPENER_SORT_FIELDS,
+                             *ROOT_PROGRESS_SORT_FIELDS})))
     p_view.add_argument('--limit', type=int, metavar='N')
     p_view.add_argument(
         '--by', choices=(
@@ -1867,6 +1873,7 @@ def main():
                 epoch=args.epoch,
                 since_seconds=args.since_seconds,
                 sample_size=args.sample_size,
+                inherited_cost=args.inherited_cost,
             ))
         except ValueError as error:
             parser.error(str(error))
