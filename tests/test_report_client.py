@@ -612,8 +612,8 @@ class ReportClientBrowserTest(unittest.TestCase):
         # already shows elsewhere: queued -> evaluating -> finalizing -> done.
         self.assertEqual(
             headers,
-            ["Response", "State", "Answers", "Done", "Evaluating", "Nodes",
-             "Share", "Elapsed", "Worker-time", "Paid by"])
+            ["Response", "State", "Answers", "Done", "Eval.", "Nodes",
+             "Share", "Elapsed", "Workers", "Paid by"])
 
     def test_root_progress_table_keeps_its_scroll_position_across_polls(self):
         # Every poll rebuilds the word report, so the scroller is a fresh
@@ -910,6 +910,27 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("inherited", metrics)
         self.assertNotIn("worked", metrics)
 
+    def test_payer_column_puts_both_of_its_forms_on_one_axis(self):
+        """The column answers "who", in tiles or as the word "self".
+
+        Everything else in the table is a measurement and right-aligns; this
+        column is not, and letting `self` inherit that alignment while the
+        tiles took their own left it with the two forms of one answer at
+        opposite edges of the cell.
+        """
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("table.root-progress")
+        alignments = self.page.eval_on_selector_all(
+            "table.root-progress tr > *:last-child",
+            "cells => [...new Set(cells.map(c => getComputedStyle(c).textAlign))]")
+        self.assertEqual(alignments, ["center"])
+        # The measurements beside it keep the numeric alignment.
+        self.assertEqual(
+            self.page.eval_on_selector(
+                "table.root-progress tbody tr td:nth-child(6)",
+                "cell => getComputedStyle(cell).textAlign"),
+            "right")
+
     def test_root_progress_legend_defines_the_columns_it_shows(self):
         # Four different units live in this table — branches, search nodes,
         # wall-clock and worker-time — and no header says which is which.
@@ -927,7 +948,12 @@ class ReportClientBrowserTest(unittest.TestCase):
         legend = self.page.locator("dl.root-progress-legend").inner_text()
         self.assertIn("Branches finalized beneath the group", legend)
         # An inherited row's costs are the payer's, which only Paid by says.
-        self.assertIn("every cost on that row is that opener's", legend)
+        self.assertIn("its costs fill the row", legend)
+        # Each definition says what the column is.  Saying what it is not
+        # doubled their length without telling a reader anything to act on.
+        for phrase in ("not a count", "not answers", "not the same as",
+                       "rather than a"):
+            self.assertNotIn(phrase, legend)
 
     def test_inherited_row_carries_the_payer_figures_in_its_own_cells(self):
         """A group is worked or inherited, never both.

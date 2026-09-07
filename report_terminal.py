@@ -1806,7 +1806,9 @@ def _render_root_progress_sections(report, width, display_order):
     telemetry_scope = (
         f"telemetry-epoch={selected_epoch}"
         if selected_epoch is not None
-        else ("telemetry-epochs=" + ",".join(str(epoch) for epoch in telemetry_epochs)
+        else (("telemetry-epochs=" if len(telemetry_epochs) > 1
+               else "telemetry-epoch=")
+              + ",".join(str(epoch) for epoch in telemetry_epochs)
               if telemetry_epochs else "telemetry-epochs=none")
     )
     header = _semantic_header(
@@ -1903,8 +1905,8 @@ def _render_root_progress_sections(report, width, display_order):
             summary.append(_fit("    excludes " + " and ".join(excluded),
                                 width))
     rows = [f"{'Pattern':<7} {'State':>9} {'Answers':>7} {'Done':>8}"
-            f" {'Evaluating':>10} {'Nodes':>9} {'Share':>5} {'Elapsed':>8}"
-            f" {'WorkerTime':>10} {'Paid by':>11}"]
+            f" {'Eval.':>6} {'Nodes':>9} {'Share':>5} {'Elapsed':>8}"
+            f" {'Workers':>8} {'Paid by':>11}"]
     for row in data["response_groups"]:
         # A group the swarm has not opened has no cost to report.  Printing
         # zeros would read as a measurement rather than an absence.  A group
@@ -1945,8 +1947,8 @@ def _render_root_progress_sections(report, width, display_order):
             payer_text = f"{row['paid_by']} ·{row['paid_by_guess_depth']}"
         rows.append(_fit(
             f"{row['pattern']:<7} {row['display_state']:>9} {row['answer_count']:>7}"
-            f" {branch_text:>8} {open_text:>10} {node_text:>9}"
-            f" {share_text:>5} {elapsed_text:>8} {worker_text:>10}"
+            f" {branch_text:>8} {open_text:>6} {node_text:>9}"
+            f" {share_text:>5} {elapsed_text:>8} {worker_text:>8}"
             f" {payer_text:>11}",
             width,
         ))

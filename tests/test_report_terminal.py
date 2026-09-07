@@ -2452,7 +2452,7 @@ class RootProgressRendererTest(unittest.TestCase):
         output = render_report(root_progress_report(), width=120)
         # Named for the lifecycle phase the branches are in, so the column
         # beside it can be named for the phase they reach.
-        self.assertIn("Evaluating", output.splitlines()[7])
+        self.assertIn("Eval.", output.splitlines()[7])
         self.assertIn("Done", output.splitlines()[7])
         hot = next(line for line in output.splitlines()
                    if line.startswith("-y---"))
