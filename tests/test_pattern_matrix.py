@@ -699,3 +699,105 @@ class TestAnswerListId(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestWidestSplitKernel(unittest.TestCase):
+    """The compiled floor scan and the NumPy expression are one value.
+
+    branch_cost_lower_bound feeds an admissible floor into the search's
+    pruning, so the two spellings disagreeing by one would prune a strategy
+    that is actually reachable.  These compare them directly rather than
+    through the floor, which divides the difference away below one ULP.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        rng = random.Random(11)
+        cls.guess_words = rng.sample(_ALL_GUESS_WORDS, 120)
+        cls.answer_words = rng.sample(_ALL_ANSWER_WORDS, 90)
+        cls.pm = PatternMatrix.build(cls.guess_words, cls.answer_words)
+        # A vocabulary that is its own answer list, so every guess row has a
+        # non-empty all-green group and the winning row is one that contains
+        # itself.  Disjoint fixtures put the all-green groups on rows that
+        # lose the maximum anyway, and a scan that ignores the term entirely
+        # still agrees with NumPy on them.
+        cls.self_words = rng.sample(_ALL_ANSWER_WORDS, 60)
+        cls.self_pm = PatternMatrix.build(cls.self_words, cls.self_words)
+
+    @staticmethod
+    def _numpy_widest_split(matrix_obj, branch_indices):
+        counts = matrix_obj.counts_for_all_candidates(branch_indices)
+        group_count = (counts > 0).sum(axis=1)
+        has_self = counts[:, 242] > 0
+        return int((group_count + has_self).max())
+
+    @staticmethod
+    def _numpy_widest_split_ignoring_self(matrix_obj, branch_indices):
+        counts = matrix_obj.counts_for_all_candidates(branch_indices)
+        return int((counts > 0).sum(axis=1).max())
+
+    def test_scan_matches_numpy_across_branch_sizes(self):
+        """The uncompiled scan is the algorithm; run it as plain Python."""
+        rng = random.Random(12)
+        for branch_size in (1, 2, 5, 17, 45, 90):
+            indices = np.array(
+                sorted(rng.sample(range(len(self.answer_words)), branch_size)),
+                dtype=np.int32)
+            self.assertEqual(
+                pattern_matrix._widest_split_scan(self.pm.matrix, indices),
+                self._numpy_widest_split(self.pm, indices),
+                f"scan disagrees with NumPy at branch_size={branch_size}")
+
+    def test_scan_matches_numpy_when_guesses_are_in_the_branch(self):
+        """The all-green term decides the maximum on a self-containing branch."""
+        indices = np.arange(len(self.self_words), dtype=np.int32)
+        expected = self._numpy_widest_split(self.self_pm, indices)
+        self.assertEqual(
+            self._numpy_widest_split_ignoring_self(self.self_pm, indices) + 1,
+            expected,
+            "fixture does not make the all-green term change the maximum")
+        self.assertEqual(
+            pattern_matrix._widest_split_scan(self.self_pm.matrix, indices),
+            expected)
+
+    def test_compiled_kernel_matches_numpy(self):
+        if pattern_matrix._widest_split_jit is None:
+            self.skipTest("numba not installed on this target")
+        rng = random.Random(13)
+        for branch_size in (2, 9, 33, 90):
+            indices = np.array(
+                sorted(rng.sample(range(len(self.answer_words)), branch_size)),
+                dtype=np.int32)
+            self.assertEqual(
+                int(pattern_matrix._widest_split_jit(self.pm.matrix, indices)),
+                self._numpy_widest_split(self.pm, indices))
+        self_indices = np.arange(len(self.self_words), dtype=np.int32)
+        self.assertEqual(
+            int(pattern_matrix._widest_split_jit(self.self_pm.matrix, self_indices)),
+            self._numpy_widest_split(self.self_pm, self_indices))
+
+    def test_floor_identical_with_and_without_numba(self):
+        """Absent numba, branch_cost_lower_bound returns the very same float.
+
+        Run on the self-containing branch so the all-green term is live: on a
+        branch where it never decides the maximum, a fallback that dropped it
+        would still match.
+        """
+        for matrix_obj, indices in (
+                (self.pm, np.array(sorted(random.Random(14).sample(
+                    range(len(self.answer_words)), 40)), dtype=np.int32)),
+                (self.self_pm, np.arange(len(self.self_words), dtype=np.int32))):
+            with_jit = matrix_obj.branch_cost_lower_bound(indices)
+            with mock.patch.object(pattern_matrix, "_widest_split_jit", None):
+                without_jit = matrix_obj.branch_cost_lower_bound(indices)
+            self.assertEqual(with_jit, without_jit)
+
+    def test_module_imports_without_numba(self):
+        """iOS has no numba; the import must not be what breaks there."""
+        import importlib
+        with mock.patch.dict("sys.modules", {"numba": None}):
+            reloaded = importlib.reload(pattern_matrix)
+            try:
+                self.assertIsNone(reloaded._widest_split_jit)
+            finally:
+                importlib.reload(pattern_matrix)
