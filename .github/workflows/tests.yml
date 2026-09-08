@@ -18,8 +18,14 @@ jobs:
         with:
           python-version: "3.13"
 
+      # Installed from requirements.txt rather than a hand-listed set, so a
+      # runtime dependency added there cannot silently go missing here.  numba
+      # matters specifically: without it pattern_matrix._widest_split_jit is
+      # None, the compiled branch-floor scan never runs, and the tests that
+      # compare it against the NumPy path would pass by comparing NumPy to
+      # itself.
       - name: Install dependencies
-        run: python -m pip install coverage numpy
+        run: python -m pip install coverage -r requirements.txt
 
       - name: Run unit suite with coverage
         run: |
@@ -115,6 +121,12 @@ jobs:
         with:
           python-version: "3.13"
 
+      # Deliberately not requirements.txt: numba is omitted here.  Every
+      # assertion in this job is a wall-clock ratio, and a first-call JIT
+      # compile lands inside the very measurement being taken.  The compiled
+      # kernel's correctness is covered by the unit job; this one measures
+      # coordination overhead, whose thresholds were calibrated on the NumPy
+      # path.
       - name: Install dependencies
         run: python -m pip install coverage numpy
 

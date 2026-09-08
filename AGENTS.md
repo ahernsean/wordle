@@ -65,6 +65,20 @@ best splitter**. On a branch whose all-green groups sit on rows that lose the
 maximum anyway, a scan that ignores the term entirely still agrees with NumPy,
 and every equality assertion passes against a broken kernel.
 
+**A missing numba fails the kernel tests; it does not skip them.** Same
+contract as the browser engines: without numba `_widest_split_jit` is `None`,
+every comparison against it comes out NumPy-versus-NumPy, and the suite goes
+green having never run the code every swarm worker executes.
+`SKIP_NUMBA_TESTS=1` is the deliberate opt-out for a target that genuinely
+cannot install it — reach for it to state that a run does not cover the
+compiled kernel, never to get a red suite green.
+
+For the same reason the `unit` CI job installs `-r requirements.txt` rather
+than a hand-listed set, so a runtime dependency cannot be added there and go
+missing in CI. The `scaling` job deliberately keeps its explicit
+`coverage numpy`: every assertion it makes is a wall-clock ratio, and a
+first-call JIT compile would land inside the measurement.
+
 ### Priority ladders, and the fan-out they prevent
 
 **Openers tied at one priority all become eligible at once, and the swarm

@@ -760,9 +760,26 @@ class TestWidestSplitKernel(unittest.TestCase):
             pattern_matrix._widest_split_scan(self.self_pm.matrix, indices),
             expected)
 
+    def _require_compiled_kernel(self):
+        """Missing numba fails this suite; it does not quietly skip it.
+
+        Same contract as the browser engines: an environment that cannot run
+        the thing under test says so deliberately, because a skip here is
+        indistinguishable from a pass and leaves the production path — the one
+        every swarm worker actually executes — unexercised.
+        """
+        if pattern_matrix._widest_split_jit is not None:
+            return
+        if os.environ.get("SKIP_NUMBA_TESTS") == "1":
+            self.skipTest("SKIP_NUMBA_TESTS=1: compiled kernel not covered")
+        self.fail(
+            "numba is missing, so the compiled branch-floor scan never ran and "
+            "the comparisons against it would pass by comparing NumPy to "
+            "itself. Install it (requirements.txt), or set SKIP_NUMBA_TESTS=1 "
+            "to state that this run deliberately does not cover it.")
+
     def test_compiled_kernel_matches_numpy(self):
-        if pattern_matrix._widest_split_jit is None:
-            self.skipTest("numba not installed on this target")
+        self._require_compiled_kernel()
         rng = random.Random(13)
         for branch_size in (2, 9, 33, 90):
             indices = np.array(
@@ -783,6 +800,7 @@ class TestWidestSplitKernel(unittest.TestCase):
         branch where it never decides the maximum, a fallback that dropped it
         would still match.
         """
+        self._require_compiled_kernel()
         for matrix_obj, indices in (
                 (self.pm, np.array(sorted(random.Random(14).sample(
                     range(len(self.answer_words)), 40)), dtype=np.int32)),
