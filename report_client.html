@@ -130,14 +130,11 @@
     main { width:min(1200px,100%); margin:auto; padding:.5rem clamp(.5rem,1.5vw,1rem) 2rem; }
     main:has(.grid.leaderboard) { width:min(1600px,100%); }
     .report-meta { display:flex; flex-wrap:wrap; gap:.2rem .6rem; align-items:baseline; margin:.2rem 0 .35rem; }
-    details.source-paths { display:inline-block; }
-    details.source-paths[open] { display:block; flex-basis:100%; }
-    details.source-paths > summary { cursor:pointer; font-size:1em; font-weight:normal; }
     h1,h2,h3 { margin:.4rem 0 .25rem; }
     h1 { font-size:1rem; display:inline; }
     h2 { font-size:.95rem; }
     h3 { font-size:.9rem; margin:0; }
-    .dim, .source, .empty { color:var(--dim); }
+    .dim, .empty { color:var(--dim); }
     .error { border-left:4px solid var(--red); padding:.4rem .6rem; background:var(--status-red-bg); }
     .metrics { margin:.3rem 0; gap:.15rem 1rem; }
     .metric { display:inline-flex; gap:.35rem; align-items:baseline; min-width:0; flex:0 1 auto; }
@@ -427,7 +424,7 @@
     const COMPLETED_BRANCH_HOLD_MILLIS=5000;
     const recentOverviewCompletionRows=new Map();
     let completionExpiryTimer=null;
-    let currentState, lastReport=null, lastContext=null, displayedState=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,shownBranchTarget=null,sourcePathsOpen=false,rootProgressOpen=true,rootProgressSort="tree_nodes",leaderboardReportWidth=null;
+    let currentState, lastReport=null, lastContext=null, displayedState=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,shownBranchTarget=null,rootProgressOpen=true,rootProgressSort="tree_nodes",leaderboardReportWidth=null;
     // The root-progress scan takes seconds, so a result is held per target and
     // reused across the poll cycle's re-renders; refreshing is explicit.
     const rootProgressCache=new Map(), rootProgressGeneration=new Map(), rootProgressPending=new Set(), rootProgressScroll=new Map(), rootProgressFailure=new Map();
@@ -978,7 +975,7 @@
       if(report.report_kind!=="branch"||report.tree)meta.append(branchTargetLabel(report,state));
       meta.append(element("span","dim","sorted by "+activeSortLabel(state)));
       if(report.tree){meta.append(element("span","dim","snapshot "+absoluteTime(report.generated_at)));const refreshButton=element("button","","Refresh tree");refreshButton.addEventListener("click",refreshTreeSnapshot);meta.append(refreshButton);}
-      if(!(report.tree&&report.report_kind==="queue")){const details=element("details","source-paths dim"),summary=element("summary","","Sources and filters");details.open=sourcePathsOpen;details.addEventListener("toggle",()=>{sourcePathsOpen=details.open;});details.append(summary);for(const [name,source] of Object.entries(report.sources||{})){const line=element("div","source",name+": "+valueOrDash(source.path));if(source.error)line.append(element("div","error",source.error));details.append(line);}if(report.sources?.queue?.epoch!==null)details.append(element("div","source","epoch "+report.sources.queue.epoch+" · "+valueOrDash(report.sources.queue.label)+" · "+valueOrDash(report.sources.queue.git_sha)));details.append(element("div","source","filters: "+JSON.stringify(report.filters||{})));meta.append(details);}return meta;
+      return meta;
     }
     function bestText(row,answerCount=row.answer_count){return bestGuessCell(row,answerCount,"best ");}
     function statusChips(row){
