@@ -3239,6 +3239,19 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.keyboard.press("Escape")
         self.assertEqual(self.page.locator(".conn-wrap.open").count(), 0)
 
+    def test_source_error_banner_shows_a_failed_source(self):
+        result = self.page.evaluate("""async () => {
+          const report=await (await fetch('/api/view')).json();
+          report.sources.queue.error='database is locked';
+          applyReport(report,null,__reportClient.getState());
+          return document.querySelector('.source-error-banner')?.textContent||null;
+        }""")
+        self.assertEqual(result, "queue unavailable: database is locked")
+
+    def test_source_error_banner_absent_on_a_healthy_report(self):
+        self.page.wait_for_selector(".report-meta")
+        self.assertEqual(self.page.locator(".source-error-banner").count(), 0)
+
     def test_unresolvable_reference_reports_error_not_a_fake_report(self):
         self.page.route(
             "**/api/view**",

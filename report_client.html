@@ -136,6 +136,7 @@
     h3 { font-size:.9rem; margin:0; }
     .dim, .empty { color:var(--dim); }
     .error { border-left:4px solid var(--red); padding:.4rem .6rem; background:var(--status-red-bg); }
+    .source-error-banner { margin-bottom:.35rem; }
     .metrics { margin:.3rem 0; gap:.15rem 1rem; }
     .metric { display:inline-flex; gap:.35rem; align-items:baseline; min-width:0; flex:0 1 auto; }
     .metric strong { overflow-wrap:anywhere; }
@@ -969,13 +970,24 @@
       const value=state.sort||options[0]?.[0]||"";
       return options.find(([optionValue])=>optionValue===value)?.[1]||value||"default";
     }
+    function sourceErrorBanner(report){
+      const failures=Object.entries(report.sources||{}).filter(([,source])=>source.error);
+      if(!failures.length)return null;
+      const banner=element("div","error source-error-banner");
+      for(const [name,source] of failures)banner.append(element("div","",name+" unavailable: "+source.error));
+      return banner;
+    }
     function reportHeader(report,state){
       const meta=element("section","report-meta");
       meta.append(element("h1","",report.report_kind+" report"));
       if(report.report_kind!=="branch"||report.tree)meta.append(branchTargetLabel(report,state));
       meta.append(element("span","dim","sorted by "+activeSortLabel(state)));
       if(report.tree){meta.append(element("span","dim","snapshot "+absoluteTime(report.generated_at)));const refreshButton=element("button","","Refresh tree");refreshButton.addEventListener("click",refreshTreeSnapshot);meta.append(refreshButton);}
-      return meta;
+      const banner=sourceErrorBanner(report);
+      if(!banner)return meta;
+      const fragment=document.createDocumentFragment();
+      fragment.append(banner,meta);
+      return fragment;
     }
     function bestText(row,answerCount=row.answer_count){return bestGuessCell(row,answerCount,"best ");}
     function statusChips(row){
