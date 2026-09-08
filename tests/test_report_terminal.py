@@ -1688,7 +1688,8 @@ class OpenersCommandEndToEndTest(unittest.TestCase):
         self.assertEqual(text.count("SLATE"), 1)
         self.assertEqual(len([
             line for line in text.splitlines()
-            if line.startswith("  ") and line.split()[0] in ("SLATE", "RAISE")
+            if line.startswith("  ")
+            and line.split()[0].rstrip("*") in ("SLATE", "RAISE")
         ]), 2)
         self.assertIn("Openers: 2", text)
         self.assertIn("requests: 2", text)
@@ -1739,9 +1740,11 @@ class OpenersCommandEndToEndTest(unittest.TestCase):
         # filtering the browser gets; grouping is browser-only.
         sorted_by_word = self._run("--sort", "word")
         rows = [line.split()[0] for line in sorted_by_word.splitlines()
-                if line.startswith("  ") and line.split()[0] in
+                if line.startswith("  ") and line.split()[0].rstrip("*") in
                 ("SLATE", "RAISE")]
-        self.assertEqual(rows, ["RAISE", "SLATE"])
+        # Both words are real answers, so the '*' marker rides along with
+        # the sort rather than only the CamelCase spelling.
+        self.assertEqual(rows, ["RAISE*", "SLATE*"])
         # Nothing is complete yet, so filtering to complete empties the table
         # and says so against the unfiltered total rather than reading as an
         # empty queue.
@@ -2685,6 +2688,18 @@ class TerminalUtilityTest(unittest.TestCase):
         self.assertIn("[context]", output)
         self.assertIn("unknown", output)
 
+    def test_opener_display_row_marks_answer_openers(self):
+        answer_row = report_terminal._opener_display_row({
+            "opener": "raise", "opener_is_answer": True, "state": "active",
+            "direct_branch_count": 1, "branch_count": 1,
+        }, generated_at=100)
+        self.assertEqual(answer_row["display_word"], "RAISE*")
+        non_answer_row = report_terminal._opener_display_row({
+            "opener": "salet", "opener_is_answer": False, "state": "active",
+            "direct_branch_count": 1, "branch_count": 1,
+        }, generated_at=100)
+        self.assertEqual(non_answer_row["display_word"], "SALET")
+
     def test_opener_erd_display_distinguishes_pending_and_infeasible(self):
         self.assertEqual(report_terminal._display_opener_erd(None), "—")
         self.assertEqual(report_terminal._display_opener_erd({
@@ -2768,7 +2783,7 @@ class TerminalUtilityTest(unittest.TestCase):
         report.update({"report_kind": "openers", "tree": False,
                        "branch_target": {"trailing_word": "raise"}})
         summary = {
-            "opener": "raise", "request_count": 2,
+            "opener": "raise", "opener_is_answer": True, "request_count": 2,
             "requested_priority": 7, "state": "active",
             "erd_summary": {"state": "pending", "resolved_group_count": 1,
                             "response_group_count": 2},
@@ -2781,7 +2796,8 @@ class TerminalUtilityTest(unittest.TestCase):
             "matched_rows": 1,
             "rows": [{
                 "branch_key_hex": "key", "opener_work_id": 4,
-                "opener": "raise", "branch_reference": "abcdefgh",
+                "opener": "raise", "opener_is_answer": True,
+                "branch_reference": "abcdefgh",
                 "branch_status": "evaluating", "branch_worker_status": "active",
                 "requested_priority": 7, "branch_effective_priority": 9,
                 "is_shared": True, "owner_count": 2, "root_pattern": "-----",
@@ -2792,6 +2808,9 @@ class TerminalUtilityTest(unittest.TestCase):
         self.assertIn("Openers: 1 of 2", output)
         self.assertIn("Ownership:", output)
         self.assertIn("shared, 2 owner(s)", output)
+        # RAISE is in the answer set here, so both the table row and the
+        # ownership row mark it -- the same fact the web client notches.
+        self.assertEqual(output.count("RAISE*"), 2)
 
     def test_root_progress_and_accuracy_renderers_show_estimates_and_raw_rows(self):
         report = overview_report()

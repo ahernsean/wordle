@@ -1889,7 +1889,7 @@
       const isFiltered=state.branch_target.toUpperCase()===word&&word!=="";
       if(isFiltered)card.classList.add("filtered");
       const title=element("div","card-title");
-      title.append(wordTiles(row.opener,null,false,"word-md"),element("span","chip",valueOrDash(row.state)));
+      title.append(wordTiles(row.opener,null,row.opener_is_answer,"word-md"),element("span","chip",valueOrDash(row.state)));
       // The branch list is the other thing this card leads to, so it gets its
       // own control rather than taking the card's own click.
       const branchesButton=element("button","",isFiltered?"Hide branches":"Branches");
@@ -1926,13 +1926,13 @@
       card.append(title);
       // The root (word, response) the membership descends from is a spine step,
       // so it is drawn as one rather than spelled out as a bare pattern.
-      if(row.root_pattern)card.append(renderSpine([{word:row.opener,pattern:row.root_pattern}],"word-sm"));
+      if(row.root_pattern)card.append(renderSpine([{word:row.opener,pattern:row.root_pattern,word_is_answer:row.opener_is_answer}],"word-sm"));
       // The opener is a work id and the word that was queued under it.  The id
       // is text because it is a number; the word is drawn, like the root step
       // above it.  The two sit in one inline run rather than a flex group, so
       // the tiles keep the baseline they were built to share with text.
       const openerFact=element("span","");
-      openerFact.append("#"+row.opener_work_id+" ",wordTiles(row.opener,null,false));
+      openerFact.append("#"+row.opener_work_id+" ",wordTiles(row.opener,null,row.opener_is_answer));
       card.append(labeledFacts([
         ["opener",openerFact],
         ["requested priority",row.requested_priority],

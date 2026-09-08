@@ -3447,7 +3447,7 @@ def collect_accuracy_report(sources: ReportOpeners, request: ReportRequest) -> d
     return report
 
 
-def _opener_summary_payload(row, rollup, timing, generated_at):
+def _opener_summary_payload(row, rollup, timing, generated_at, answer_set):
     """One opener, with its requests and branches rolled up.
 
     This is the report's unit: a word that spawned a thousand branches is one
@@ -3479,6 +3479,7 @@ def _opener_summary_payload(row, rollup, timing, generated_at):
             elapsed_millis = max(0, generated_at - started_at) * 1000
     return {
         "opener": opener.lower() if opener else None,
+        "opener_is_answer": _is_answer(opener, answer_set),
         "requested_priority": row["requested_priority"],
         "requested_at": _row_value(row, "requested_at"),
         "started_at": _row_value(row, "started_at"),
@@ -3749,7 +3750,7 @@ def _opener_rollups(membership_rows):
     return rollups
 
 
-def _opener_membership_payload(row, owner_count):
+def _opener_membership_payload(row, owner_count, answer_set):
     branch_key = bytes(row["branch_key"])
     parent_branch_key = _row_value(row, "parent_branch_key")
     opener = _row_value(row, "opener")
@@ -3765,6 +3766,7 @@ def _opener_membership_payload(row, owner_count):
     return {
         "opener_work_id": row["opener_work_id"],
         "opener": opener.lower() if opener else None,
+        "opener_is_answer": _is_answer(opener, answer_set),
         "requested_priority": row["requested_priority"],
         "opener_state": row["opener_state"],
         "branch_reference": branch_reference(branch_key),
@@ -3810,6 +3812,7 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
     report = _semantic_report(
         "openers", sources, request.branch_target, generated_at, data, request
     )
+    answer_set = _decorative_answer_set(sources)
     queue = None
     timing_cache = None
     try:
@@ -3869,7 +3872,7 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
                     {"completed_at": None, "elapsed_millis": None,
                      "worker_millis": None},
                 ),
-                generated_at,
+                generated_at, answer_set,
             )
             for row in summary_rows
         ]
@@ -3947,7 +3950,8 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
                 row["branch_id"] for row in all_membership_rows
             )
             payload_rows = [
-                _opener_membership_payload(row, owner_counts[row["branch_id"]])
+                _opener_membership_payload(
+                    row, owner_counts[row["branch_id"]], answer_set)
                 for row in all_membership_rows
                 if (row["opener"] or "").lower() == opener
             ]

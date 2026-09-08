@@ -1602,7 +1602,8 @@ def _opener_display_row(opener_row, generated_at):
     return {
         **opener_row,
         "display_requests": f"{opener_row.get('request_count', 1):,}",
-        "display_word": (opener_row["opener"] or "-").upper(),
+        "display_word": (opener_row["opener"] or "-").upper()
+        + ("*" if opener_row.get("opener_is_answer") else ""),
         "display_state": opener_row["state"],
         "display_erd": _display_opener_erd(opener_row.get("erd_summary")),
         "display_direct": f"{opener_row['direct_branch_count']:,}",
@@ -1708,7 +1709,8 @@ def _render_opener_sections(report, width, display_order):
                  if row.get("parent_branch_reference") else "")
         lines.append(_fit(
             f"    {hotkey_prefix}#{row['opener_work_id']} "
-            f"{(row['opener'] or '-').upper()} "
+            f"{(row['opener'] or '-').upper()}"
+            f"{'*' if row.get('opener_is_answer') else ''} "
             f"@{_display_reference(row['branch_reference'])} "
             f"{row['branch_status']}/{row['branch_worker_status'] or '-'} "
             f"requested={row['requested_priority']} "
