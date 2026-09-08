@@ -2000,6 +2000,15 @@ class ReportClientBrowserTest(unittest.TestCase):
     def test_changed_leaderboard_poll_keeps_the_reader_at_the_bottom(self):
         self.page.set_viewport_size({"width": 834, "height": 1112})
         distances = self.page.evaluate("""async () => {
+          // Each applyReport schedules its scroll restore in a frame of its
+          // own, so a measurement taken after a single frame can read a
+          // position the client is still adjusting.  Settling first measures
+          // where the reader was actually left.
+          const settle = async () => {
+            for (let frame = 0; frame < 3; frame++) {
+              await new Promise(requestAnimationFrame);
+            }
+          };
           const base = await (await fetch('/api/view/leaderboard')).json();
           const state = {...__reportClient.getState(), kind: 'leaderboard'};
           const leaderboard = count => {
@@ -2013,15 +2022,15 @@ class ReportClientBrowserTest(unittest.TestCase):
           };
           const before = leaderboard(12), after = leaderboard(15), later = leaderboard(18);
           applyReport(before, null, state);
-          await new Promise(requestAnimationFrame);
+          await settle();
           scrollTo(0, document.documentElement.scrollHeight);
           applyReport(after, before, state);
-          await new Promise(requestAnimationFrame);
+          await settle();
           const bottomDistance = document.documentElement.scrollHeight - (scrollY + innerHeight);
           scrollBy(0, -160);
           const nearBottomDistance = document.documentElement.scrollHeight - (scrollY + innerHeight);
           applyReport(later, after, state);
-          await new Promise(requestAnimationFrame);
+          await settle();
           return {bottomDistance, nearBottomDistance,
                   restoredNearBottomDistance: document.documentElement.scrollHeight - (scrollY + innerHeight)};
         }""")
