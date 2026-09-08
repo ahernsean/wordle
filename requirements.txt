@@ -2,3 +2,17 @@
 # NumPy is a hard requirement on every target: the kernel (pattern_matrix.py)
 # is the engine's sole NumPy import point and the vectorized paths assume it.
 numpy>=1.21
+
+# Numba compiles the branch-floor scan that dominates swarm CPU
+# (pattern_matrix._widest_split_scan).  Required here because every pip target
+# — Linux, CI, developer machines — should have it; the swarm runs about 4.5x
+# slower without it.
+#
+# It is nonetheless optional *in code*: iOS has no numba, and wordle.py imports
+# pattern_matrix there to play through cached results.  pattern_matrix guards
+# the import and falls back to the equivalent NumPy expression, so a target
+# that cannot install this line is slower and correct rather than broken.
+# That is why no environment marker appears here: the phone does not install
+# from this file at all, and a marker would only mis-describe which platforms
+# numba supports.  Do not import numba anywhere else.
+numba>=0.59

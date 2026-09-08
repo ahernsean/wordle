@@ -4,7 +4,7 @@
 
 A Wordle solver with six layers:
 - **Engine** (`wordle_engine.py`): core ERD search, scoring, response simulation
-- **Kernel** (`pattern_matrix.py`): NumPy response-pattern matrix and vectorized candidate statistics; the engine's sole NumPy import point. NumPy is a hard requirement on every target; the pure-Python engine paths remain permanently as the reference implementation (they never call NumPy), selected by passing `pattern_matrix=None`
+- **Kernel** (`pattern_matrix.py`): NumPy response-pattern matrix and vectorized candidate statistics; the engine's sole NumPy import point. NumPy is a hard requirement on every target; the pure-Python engine paths remain permanently as the reference implementation (they never call NumPy), selected by passing `pattern_matrix=None`. It is also the sole **numba** import point, and numba is **optional** — see below
 - **Cache** (`cache_sqlite.py`): SQLite-backed persistence of branch results and candidate scores
 - **Hints** (`hint_cache.py`): a second, read-only cache consulted for candidate order only
 - **Swarm** (`erd_swarm.py`, `erd_queue.py`, `erd_search.py`): parallel ERD precache workers
@@ -30,6 +30,54 @@ Queue mutations remain grouped under `erd_search.py queue`: `add`, `remove`,
 `clear`, `priority`, `opener-priority`, `reset-stale`, and
 `reconcile-orphaned-ownership`. The `queue` group has no read-only dashboard
 commands.
+
+### Numba is optional, and only one function uses it
+
+`branch_cost_lower_bound` is where the swarm's CPU goes: sampled across live
+workers it is 94% of run time on mid-size branches and 83% on the largest.
+`_widest_split_scan` is that computation written as explicit loops so numba can
+compile it, and `_widest_split_jit` is the compiled entry point — about 4.5x on
+the swarm end to end, measured against the telemetry's own time-by-branch-size
+distribution.
+
+**The loops are the point.** `@njit` on the array expression they replace buys
+essentially nothing (measured 0.97x–2.22x), because that expression is already
+NumPy and therefore already C. Numba compiles Python loops; it cannot improve a
+`bincount` call. Anyone "tidying" the scan back into array operations would
+silently return the module to the pre-numba speed.
+
+The win is memory traffic, not arithmetic: the array spelling materializes an
+`(n_guesses, 243)` count array to extract a single integer. For the same reason
+a cleverer scan is not automatically faster — a bitset-and-popcount version
+measured *slower* than this plain tally, because its inner branch defeats
+vectorization.
+
+**`_widest_split_jit` is `None` wherever numba is absent, and that is a
+supported configuration, not a degraded one.** iOS has no numba, and `wordle.py`
+imports this module there to play through cached results. `_widest_split` then
+evaluates the NumPy expression instead and returns the identical integer. Keep
+the import guarded, keep the fallback exact, and never call
+`_widest_split_scan` uncompiled in production — interpreted, it is one Python
+iteration per (guess word, branch word) pair.
+
+Tests must exercise the all-green term on a branch that **contains its own
+best splitter**. On a branch whose all-green groups sit on rows that lose the
+maximum anyway, a scan that ignores the term entirely still agrees with NumPy,
+and every equality assertion passes against a broken kernel.
+
+**A missing numba fails the kernel tests; it does not skip them.** Same
+contract as the browser engines: without numba `_widest_split_jit` is `None`,
+every comparison against it comes out NumPy-versus-NumPy, and the suite goes
+green having never run the code every swarm worker executes.
+`SKIP_NUMBA_TESTS=1` is the deliberate opt-out for a target that genuinely
+cannot install it — reach for it to state that a run does not cover the
+compiled kernel, never to get a red suite green.
+
+For the same reason the `unit` CI job installs `-r requirements.txt` rather
+than a hand-listed set, so a runtime dependency cannot be added there and go
+missing in CI. The `scaling` job deliberately keeps its explicit
+`coverage numpy`: every assertion it makes is a wall-clock ratio, and a
+first-call JIT compile would land inside the measurement.
 
 ### Priority ladders, and the fan-out they prevent
 

@@ -5,6 +5,13 @@ requirement on every deployment target (Pythonista bundles 1.22.3, the API
 floor). The engine's pure-Python implementations remain permanently — not as
 a runtime fallback but as the reference implementation the vectorized path is
 tested against; selecting them is a caller choice (pattern_matrix=None).
+
+Numba is the sole *optional* dependency, and only `branch_cost_lower_bound`
+consults it.  It is absent on iOS, where `wordle.py` imports this module to
+play through cached results, so its absence is an ordinary configuration and
+not an error: `_widest_split` falls back to the NumPy expression that path
+used before, computing the identical value more slowly.  Never make a numba
+import unconditional here, and never let one reach module scope.
 """
 import collections
 import hashlib
@@ -12,6 +19,11 @@ import logging
 import os
 
 import numpy as np
+
+try:
+    from numba import njit as _njit
+except ImportError:
+    _njit = None
 
 logger = logging.getLogger("wordle")
 
@@ -35,6 +47,53 @@ _COUNT_CHUNK_ROWS = 1024
 # float; 200k entries cost roughly 40 MB at the branch sizes the bound is worth
 # computing for, which is small next to the matrix itself.
 _BRANCH_FLOOR_CAPACITY = 200_000
+
+
+def _widest_split_scan(matrix, branch_indices):
+    """Largest (response-group count + all-green present) over every guess row.
+
+    Counts each row's branch patterns into a reused 243-entry tally and reduces
+    it in the same pass, so nothing proportional to n_guesses is allocated.
+    The vectorized spelling of the same quantity materializes an
+    (n_guesses, 243) count array to extract this one integer, and the memory
+    traffic — not the arithmetic — is what dominates it.
+
+    Written as explicit loops because that is what numba can compile; the
+    array expression it replaces is already C and gains nothing from a JIT.
+    Keep it loop-shaped even though it reads as un-Pythonic.
+
+    Pattern 242 is the all-green response, so a non-empty group there means
+    the guess word is itself in the branch.
+    """
+    n_guesses = matrix.shape[0]
+    branch_size = branch_indices.shape[0]
+    group_sizes = np.zeros(243, dtype=np.int32)
+    widest = 0
+    for row in range(n_guesses):
+        for pattern in range(243):
+            group_sizes[pattern] = 0
+        for position in range(branch_size):
+            group_sizes[matrix[row, branch_indices[position]]] += 1
+        group_count = 0
+        for pattern in range(243):
+            if group_sizes[pattern] > 0:
+                group_count += 1
+        if group_sizes[242] > 0:
+            group_count += 1
+        if group_count > widest:
+            widest = group_count
+    return widest
+
+
+# The compiled entry point, or None where numba is unavailable.  Callers must
+# treat None as "use the NumPy expression", never as a reason to run
+# _widest_split_scan interpreted: it is one Python-level iteration per
+# (guess word, branch word) pair, which is minutes where the array path is
+# milliseconds.
+_widest_split_jit = (
+    _njit(cache=True, nogil=True)(_widest_split_scan)
+    if _njit is not None else None
+)
 
 
 def _compute_answer_list_id(answer_words):
@@ -314,13 +373,26 @@ class PatternMatrix:
             # rather than reducing over an empty axis, which has no identity.
             widest_split = 0
         else:
-            counts = self.counts_for_all_candidates(branch_indices)
-            group_count = (counts > 0).sum(axis=1)
-            has_self = counts[:, 242] > 0
-            # Largest (group_count + has_self) gives the smallest per-candidate
-            # bound, so it is the branch-wide floor.
-            widest_split = int((group_count + has_self).max())
+            widest_split = self._widest_split(branch_indices)
         return max(all_singletons_floor, 3.0 - widest_split / branch_size)
+
+    def _widest_split(self, branch_indices):
+        """Largest (group_count + has_self) over the guess vocabulary.
+
+        Both spellings compute the same integer; only their cost differs, so
+        which one runs can never change a floor a search has already acted on.
+        The compiled scan needs a concrete int32 index array — `answer_indices`
+        already returns one, and `np.asarray` is a no-op on it.
+        """
+        if _widest_split_jit is not None:
+            return int(_widest_split_jit(
+                self.matrix, np.asarray(branch_indices, dtype=np.int32)))
+        counts = self.counts_for_all_candidates(branch_indices)
+        group_count = (counts > 0).sum(axis=1)
+        has_self = counts[:, 242] > 0
+        # Largest (group_count + has_self) gives the smallest per-candidate
+        # bound, so it is the branch-wide floor.
+        return int((group_count + has_self).max())
 
     def patterns_for_candidates(self, candidate_indices, branch_indices):
         """Raw (len(candidate_indices), n) uint8 slice of response pattern values."""
