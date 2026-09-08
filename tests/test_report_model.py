@@ -4237,9 +4237,50 @@ class WorkDistributionReportTest(unittest.TestCase):
             ({"branch_target": parse_report_branch_target("SALET")},
              "cannot take a branch target"),
             ({"filters": ReportFilters(branch_statuses=("queued",))},
-             "cannot use branch filters"),
+             "--branch-status"),
+            ({"filters": ReportFilters(branch_worker_statuses=("active",))},
+             "--branch-worker-status"),
+            ({"filters": ReportFilters(priority=5)}, "--priority"),
+            ({"filters": ReportFilters(sort="nodes")}, "--sort"),
+            ({"filters": ReportFilters(limit=10)}, "--limit"),
+            ({"filters": ReportFilters(budget=3)},
+             "budget is not recorded per claim"),
         ):
             with self.subTest(overrides=overrides):
                 with self.assertRaisesRegex(ValueError, message):
                     validate_report_request(ReportRequest(
                         report_kind="work_distribution", **overrides))
+
+    def test_the_report_accepts_the_answer_count_range_it_applies(self):
+        # Every filter the report honors must pass validation, or the refusal
+        # list has swept up one it can actually answer.
+        validate_report_request(ReportRequest(
+            report_kind="work_distribution",
+            filters=ReportFilters(minimum_answer_count=5,
+                                  maximum_answer_count=50)))
+
+    def test_an_answer_count_range_scopes_the_bands_and_is_reported(self):
+        small = ScoreCache.encode_subset(["salet", "crane"])
+        large = ScoreCache.encode_subset(["salet", "crane", "nurdy"])
+        self.queue.create_branch(small, 2, 2)
+        self.queue.create_branch(large, 3, 2)
+        for idx in range(6):
+            self.queue.add_claim_telemetry(
+                4, 10, 1, 2, branch_key=small, idx=idx,
+                candidate_evaluation_millis=50)
+        for idx in range(2):
+            self.queue.add_claim_telemetry(
+                80, 10, 500_000, 2, branch_key=large, idx=idx,
+                candidate_evaluation_millis=400_000)
+
+        data = self._report(
+            filters=ReportFilters(minimum_answer_count=50))["data"]
+
+        self.assertEqual(data["minimum_answer_count"], 50)
+        self.assertIsNone(data["maximum_answer_count"])
+        self.assertEqual(data["totals"]["branch_count"], 1)
+        self.assertEqual(data["totals"]["claim_count"], 2)
+        # Shares are of the narrowed population, so the surviving band holds
+        # all of it rather than the fraction it held of the whole sample.
+        self.assertEqual(data["bands"][3]["claim_share"], 1.0)
+        self.assertEqual(data["bands"][0]["claim_count"], 0)

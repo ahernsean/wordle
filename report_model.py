@@ -279,7 +279,8 @@ def validate_report_request(request: ReportRequest) -> None:
         raise ValueError("--claims requires a singular branch target")
     if request.include_answers and (
         request.tree
-        or report_kind in ("queue", "workers", "leaderboard", "openers")
+        or report_kind in ("queue", "workers", "leaderboard", "openers",
+                           "work_distribution")
         or (report_kind == "auto" and branch_target_kind == "root")
     ):
         raise ValueError(
@@ -372,13 +373,40 @@ def validate_report_request(request: ReportRequest) -> None:
     if report_kind == "work_distribution":
         if request.tree:
             raise ValueError("--tree cannot be used with --work-distribution")
-        # The bands describe the whole sampled claim population, and the shares
-        # are shares of it.  Narrowing that population to one branch would
-        # leave every percentage naming a total the report no longer shows.
+        # The bands describe a whole sampled population, and every share is a
+        # share of it.  An answer-count range narrows that population to a size
+        # region and is applied to the sample, so the shares stay shares of
+        # what the report shows.  A single branch is not a population: it would
+        # leave one band at 100% and every percentage naming a total the report
+        # no longer describes.
         if branch_target_kind != "root":
             raise ValueError("--work-distribution cannot take a branch target")
-        if request.filters.branch_statuses or request.filters.branch_worker_statuses:
-            raise ValueError("--work-distribution cannot use branch filters")
+        # Refused rather than ignored.  A filter the report accepts but never
+        # applies makes the printed population and shares contradict what was
+        # asked for, and does it silently.
+        unsupported = [
+            name for name, value in (
+                ("--branch-status", request.filters.branch_statuses),
+                ("--branch-worker-status", request.filters.branch_worker_statuses),
+                ("--priority", request.filters.priority),
+                ("--sort", request.filters.sort),
+                ("--limit", request.filters.limit),
+            ) if value
+        ]
+        if unsupported:
+            raise ValueError(
+                "--work-distribution cannot use "
+                + ", ".join(unsupported)
+                + ": it describes the whole sampled claim population"
+            )
+        # Budget is the one filter the claim rows cannot answer: they carry
+        # answer count but no budget, and joining one in from the live branch
+        # table would silently drop every branch that has already finished.
+        if request.filters.budget is not None:
+            raise ValueError(
+                "--work-distribution cannot use --budget: budget is not "
+                "recorded per claim"
+            )
     if report_kind == "root_progress":
         if request.tree:
             raise ValueError("--tree cannot be used with --root-progress")
@@ -3494,6 +3522,8 @@ def collect_work_distribution_report(
     data = {
         "population": None,
         "epoch": request.epoch,
+        "minimum_answer_count": request.filters.minimum_answer_count,
+        "maximum_answer_count": request.filters.maximum_answer_count,
         "since_seconds": since_seconds,
         "window_started_at": generated_at - since_seconds,
         "sample_size": sample_size,
@@ -3516,6 +3546,8 @@ def collect_work_distribution_report(
         result = queue.report_work_distribution(
             epoch, generated_at - since_seconds, sample_size,
             [seconds * 1000 for seconds in edge_seconds],
+            minimum_answer_count=request.filters.minimum_answer_count,
+            maximum_answer_count=request.filters.maximum_answer_count,
         )
         rows, totals = _work_distribution_band_rows(result["bands"], edge_seconds)
         data.update({

@@ -1593,7 +1593,15 @@ def _percent_text(share):
 def _render_work_distribution_sections(report, width):
     data = report["data"]
     totals = data["totals"]
-    header = _semantic_header(report, "Work distribution by worker time", width)
+    minimum_answer_count = data.get("minimum_answer_count")
+    maximum_answer_count = data.get("maximum_answer_count")
+    scope = ""
+    if minimum_answer_count is not None or maximum_answer_count is not None:
+        low = "1" if minimum_answer_count is None else f"{minimum_answer_count:,}"
+        high = "∞" if maximum_answer_count is None else f"{maximum_answer_count:,}"
+        scope = f"  answers {low}-{high}"
+    header = _semantic_header(
+        report, "Work distribution by worker time" + scope, width)
     unattributed = data["unattributed"]
     lines = [
         f"Population: {data['population']}",

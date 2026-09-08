@@ -5156,15 +5156,34 @@ class ERDQueue:
         """, (word.lower(),)).fetchall()
         return [dict(row) for row in rows]
 
+    @staticmethod
+    def _answer_count_condition(minimum_answer_count, maximum_answer_count):
+        """SQL and parameters narrowing a telemetry sample by answer count."""
+        condition = ""
+        parameters = []
+        if minimum_answer_count is not None:
+            condition += " AND n_words >= ?"
+            parameters.append(minimum_answer_count)
+        if maximum_answer_count is not None:
+            condition += " AND n_words <= ?"
+            parameters.append(maximum_answer_count)
+        return condition, parameters
+
     def _bounded_sample_metadata(self, table, epoch, since, sample_size,
-                                 spine_prefix=None, branch_key=None):
+                                 spine_prefix=None, branch_key=None,
+                                 minimum_answer_count=None,
+                                 maximum_answer_count=None):
         spine_condition = " AND (spine = ? OR spine LIKE ?)" if spine_prefix else ""
         branch_condition = " AND branch_key = ?" if branch_key is not None else ""
+        answer_count_condition, answer_count_parameters = (
+            self._answer_count_condition(
+                minimum_answer_count, maximum_answer_count))
         parameters = [epoch, since]
         if spine_prefix:
             parameters.extend((spine_prefix, spine_prefix + " %"))
         if branch_key is not None:
             parameters.append(branch_key)
+        parameters.extend(answer_count_parameters)
         parameters.append(sample_size + 1)
         row = self._conn.execute(
             f"""SELECT COUNT(*) AS sampled_row_count FROM (
@@ -5172,6 +5191,7 @@ class ERDQueue:
                     WHERE epoch = ? AND recorded_at >= ?
                     {spine_condition}
                     {branch_condition}
+                    {answer_count_condition}
                     ORDER BY recorded_at DESC, id DESC LIMIT ?
                 )""",
             parameters,
@@ -5330,7 +5350,9 @@ class ERDQueue:
         }
 
     def report_work_distribution(self, epoch, since, sample_size,
-                                 band_edge_millis) -> dict:
+                                 band_edge_millis,
+                                 minimum_answer_count=None,
+                                 maximum_answer_count=None) -> dict:
         """Aggregate claim telemetry into per-branch bands of worker time.
 
         The band key is the branch's own summed candidate_evaluation_millis,
@@ -5352,22 +5374,33 @@ class ERDQueue:
         Bands come from claims, not from finalizations, so a branch still being
         solved is present with the totals it has accumulated so far;
         unfinished_branch_count reports how many of a band's branches those are.
+
+        An answer-count range narrows the sample before it is banded, so the
+        totals and every share are of the branches in that size region.  The
+        range is applied to the claim rows rather than to the bands, which is
+        the same population the reported sample bound describes.
         """
         sampled_row_count, sample_truncated = self._bounded_sample_metadata(
-            "claim_telemetry", epoch, since, sample_size)
+            "claim_telemetry", epoch, since, sample_size,
+            minimum_answer_count=minimum_answer_count,
+            maximum_answer_count=maximum_answer_count)
         band_case = " ".join(
             f"WHEN worker_millis <= {int(edge)} THEN {index}"
             for index, edge in enumerate(band_edge_millis)
         )
-        sample_sql = """
+        answer_count_condition, answer_count_parameters = (
+            self._answer_count_condition(
+                minimum_answer_count, maximum_answer_count))
+        sample_sql = f"""
             SELECT branch_id, work_nodes, coordination_millis,
                    COALESCE(candidate_evaluation_millis, 0)
                        AS candidate_evaluation_millis
             FROM telemetry.claim_telemetry
             WHERE epoch = ? AND recorded_at >= ?
+            {answer_count_condition}
             ORDER BY recorded_at DESC, id DESC LIMIT ?
         """
-        parameters = (epoch, since, sample_size)
+        parameters = (epoch, since, *answer_count_parameters, sample_size)
         band_rows = self._conn.execute(f"""
             WITH sample AS ({sample_sql}),
             branch AS (

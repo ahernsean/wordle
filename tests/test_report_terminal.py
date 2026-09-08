@@ -2306,11 +2306,28 @@ class ViewParserTest(unittest.TestCase):
         self.assertEqual(request.report_kind, "work_distribution")
         self.assertEqual(request.since_seconds, 3600)
 
+    def test_work_distribution_accepts_an_answer_count_range(self):
+        with (
+            patch("sys.argv", [
+                "erd_search.py", "view", "--work-distribution",
+                "--minimum-answer-count", "5", "--maximum-answer-count", "50",
+            ]),
+            patch("report_terminal.run_view") as run_view,
+        ):
+            erd_search.main()
+        filters = run_view.call_args.args[0].filters
+        self.assertEqual(filters.minimum_answer_count, 5)
+        self.assertEqual(filters.maximum_answer_count, 50)
+
     def test_work_distribution_refuses_options_that_narrow_its_population(self):
         for options in (
             ["--work-distribution", "--tree"],
             ["--work-distribution", "RAISE"],
             ["--work-distribution", "--branch-status", "queued"],
+            ["--work-distribution", "--budget", "3"],
+            ["--work-distribution", "--priority", "5"],
+            ["--work-distribution", "--sort", "nodes"],
+            ["--work-distribution", "--limit", "10"],
         ):
             with self.subTest(options=options):
                 with (

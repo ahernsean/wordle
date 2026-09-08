@@ -384,7 +384,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.wait_for_selector("text=word report")
         self.apply_branch_target("CRANE .y..g")
         self.page.wait_for_selector("text=branch report")
-        self.assertEqual(self.page.locator("[data-kind]").count(), 7)
+        self.assertEqual(self.page.locator("[data-kind]").count(), 8)
         self.assertEqual(self.page.locator("text=Choose word or branch").count(), 0)
 
     def test_overview_nav_highlight_tracks_root_not_auto_kind(self):
@@ -4822,6 +4822,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         # reached phone widths overflowing because it was never measured here.
         for path in (
             "", "?kind=queue", "?kind=workers", "?kind=cache", "?kind=hotspots",
+            "?kind=work_distribution",
             "?kind=leaderboard", "?kind=openers", "?kind=queue&tree=1",
             "?branch_target=RAISE+.....",
             "?branch_target=RAISE+.....&tree=1",
@@ -5088,6 +5089,66 @@ class ReportClientBrowserTest(unittest.TestCase):
         cache_text = self.page.locator("#report").inner_text()
         self.assertNotIn("branch key hex", cache_text)
         self.assertNotIn("branch_key_hex", cache_text)
+
+    def open_work_distribution(self):
+        self.page.locator("[data-kind=work_distribution]").click()
+        self.page.wait_for_selector("table.work-distribution")
+
+    def test_work_distribution_renders_every_band_with_its_ratio(self):
+        self.open_work_distribution()
+        labels = self.page.locator(
+            "table.work-distribution tbody tr td:first-child"
+        ).all_inner_texts()
+        self.assertEqual(
+            labels, ["<=2s", "2-30s", "30-300s", "300-3600s", ">3600s"])
+        text = self.page.locator("#report").inner_text()
+        self.assertIn("recent claims by branch", text)
+        self.assertNotIn("recent_claims_by_branch", text)
+        # The cheap band coordinates far out of proportion to its work and the
+        # expensive band far under; both are called out rather than left in the
+        # column for the reader to find.
+        self.assertEqual(
+            self.page.locator(
+                "table.work-distribution tbody tr:first-child td.ratio-heavy"
+            ).count(), 1)
+        self.assertEqual(
+            self.page.locator(
+                "table.work-distribution tbody tr:last-child td.ratio-light"
+            ).count(), 1)
+
+    def test_work_distribution_counts_are_thousands_separated(self):
+        self.open_work_distribution()
+        row = self.page.locator(
+            "table.work-distribution tbody tr").last.inner_text()
+        self.assertIn("360,000,000", row)
+        self.assertNotIn("360000000", row)
+
+    def test_work_distribution_names_claims_outside_any_branch(self):
+        self.open_work_distribution()
+        text = self.page.locator("#report").inner_text()
+        self.assertIn("outside any branch", text)
+
+    def test_work_distribution_withdraws_filters_it_cannot_honor(self):
+        # A control the report ignores is worse than no control: it invites a
+        # filter whose absence from the result reads as "no such branches".
+        self.open_work_distribution()
+        self.page.locator("details.filters").evaluate("node => node.open = true")
+        self.assertTrue(self.page.locator("#branch-status-filters").is_hidden())
+        self.assertTrue(self.page.locator("#budget-field").is_hidden())
+        self.assertTrue(self.page.locator("#priority-field").is_hidden())
+        self.assertTrue(self.page.locator("#sort-field").is_hidden())
+        self.assertTrue(self.page.locator("#limit-field").is_hidden())
+        self.assertTrue(self.page.locator("#by-field").is_hidden())
+        # The answer-count range is applied, so it stays; the telemetry bounds
+        # are shared with hotspots and stay too.
+        self.assertTrue(self.page.locator("#minimum-answer-count").is_visible())
+        self.assertTrue(self.page.locator("#maximum-answer-count").is_visible())
+        self.assertTrue(self.page.locator("#epoch-field").is_visible())
+        self.assertTrue(self.page.locator("#since-seconds-field").is_visible())
+
+    def test_work_distribution_offers_no_tree_layout(self):
+        self.open_work_distribution()
+        self.assertTrue(self.page.locator("#layout-toggle").is_hidden())
 
     def open_sources(self):
         self.page.locator("[data-kind=openers]").click()

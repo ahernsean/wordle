@@ -1,0 +1,156 @@
+{
+  "branch_target": {
+    "branch_reference": null,
+    "input_text": "",
+    "kind": "root",
+    "steps": [],
+    "trailing_word": null
+  },
+  "data": {
+    "band_edge_seconds": [
+      2,
+      30,
+      300,
+      3600
+    ],
+    "bands": [
+      {
+        "band_index": 0,
+        "band_label": "<=2s",
+        "branch_count": 26,
+        "branch_share": 0.5777777777777777,
+        "claim_count": 364,
+        "claim_share": 0.3888888888888889,
+        "coordination_millis": 14924,
+        "coordination_share_per_work_share": 231869.61965811966,
+        "search_node_count": 728,
+        "search_node_share": 1.6771877638057388e-06,
+        "search_nodes_per_branch": 28.0,
+        "unfinished_branch_count": 0,
+        "worker_millis": 7644,
+        "worker_time_share": 0.0005290125016920925
+      },
+      {
+        "band_index": 1,
+        "band_label": "2-30s",
+        "branch_count": 9,
+        "branch_share": 0.2,
+        "claim_count": 288,
+        "claim_share": 0.3076923076923077,
+        "coordination_millis": 11808,
+        "coordination_share_per_work_share": 515.2658214624881,
+        "search_node_count": 259200,
+        "search_node_share": 0.0005971525664539114,
+        "search_nodes_per_branch": 28800.0,
+        "unfinished_branch_count": 0,
+        "worker_millis": 97920,
+        "worker_time_share": 0.006776675060922254
+      },
+      {
+        "band_index": 2,
+        "band_label": "30-300s",
+        "branch_count": 5,
+        "branch_share": 0.1111111111111111,
+        "claim_count": 200,
+        "claim_share": 0.21367521367521367,
+        "coordination_millis": 8200,
+        "coordination_share_per_work_share": 10.305316429249762,
+        "search_node_count": 9000000,
+        "search_node_share": 0.020734464112983034,
+        "search_nodes_per_branch": 1800000.0,
+        "unfinished_branch_count": 0,
+        "worker_millis": 520000,
+        "worker_time_share": 0.03598724501306752
+      },
+      {
+        "band_index": 3,
+        "band_label": "300-3600s",
+        "branch_count": 3,
+        "branch_share": 0.06666666666666667,
+        "claim_count": 72,
+        "claim_share": 0.07692307692307693,
+        "coordination_millis": 2952,
+        "coordination_share_per_work_share": 0.5152658214624881,
+        "search_node_count": 64800000,
+        "search_node_share": 0.14928814161347786,
+        "search_nodes_per_branch": 21600000.0,
+        "unfinished_branch_count": 3,
+        "worker_millis": 3024000,
+        "worker_time_share": 0.20927967099906958
+      },
+      {
+        "band_index": 4,
+        "band_label": ">3600s",
+        "branch_count": 2,
+        "branch_share": 0.044444444444444446,
+        "claim_count": 12,
+        "claim_share": 0.01282051282051282,
+        "coordination_millis": 492,
+        "coordination_share_per_work_share": 0.015457974643874644,
+        "search_node_count": 360000000,
+        "search_node_share": 0.8293785645193213,
+        "search_nodes_per_branch": 180000000.0,
+        "unfinished_branch_count": 2,
+        "worker_millis": 10800000,
+        "worker_time_share": 0.7474273964252486
+      }
+    ],
+    "epoch": 0,
+    "maximum_answer_count": null,
+    "minimum_answer_count": null,
+    "population": "recent_claims_by_branch",
+    "sample_size": 50000,
+    "sample_truncated": false,
+    "sampled_row_count": 973,
+    "since_seconds": 3600,
+    "totals": {
+      "branch_count": 45,
+      "claim_count": 936,
+      "coordination_millis": 38376,
+      "search_node_count": 434059928,
+      "unfinished_branch_count": 5,
+      "worker_millis": 14449564
+    },
+    "unattributed": {
+      "claim_count": 37,
+      "coordination_millis": 666,
+      "search_node_count": 0,
+      "worker_millis": 74
+    },
+    "window_started_at": 1770996400
+  },
+  "filters": {
+    "branch_statuses": [],
+    "branch_worker_statuses": [],
+    "budget": null,
+    "limit": null,
+    "maximum_answer_count": null,
+    "minimum_answer_count": null,
+    "priority": null,
+    "sort": null
+  },
+  "generated_at": 1771000000,
+  "report_kind": "work_distribution",
+  "schema_version": 3,
+  "sources": {
+    "cache": {
+      "error": null,
+      "ok": false,
+      "path": "runtime/wordle_cache.sqlite3"
+    },
+    "queue": {
+      "epoch": null,
+      "error": null,
+      "git_sha": null,
+      "label": null,
+      "ok": true,
+      "path": "runtime/erd_queue.sqlite3"
+    },
+    "telemetry": {
+      "error": null,
+      "ok": true,
+      "path": "runtime/erd_queue_telemetry.sqlite3"
+    }
+  },
+  "tree": false
+}

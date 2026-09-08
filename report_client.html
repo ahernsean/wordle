@@ -86,6 +86,17 @@
     dl.root-progress-legend dd { margin:0; color:var(--dim); }
     @media (max-width:560px) { dl.root-progress-legend { grid-template-columns:1fr; }
       dl.root-progress-legend dd { margin:0 0 .35rem; } }
+    .work-distribution-scroll { overflow-x:auto; margin-top:.4rem; }
+    table.work-distribution { border-collapse:collapse; white-space:nowrap; }
+    table.work-distribution th, table.work-distribution td { padding:.15rem .5rem; text-align:right; }
+    table.work-distribution td { border-bottom:1px solid var(--border); }
+    table.work-distribution thead th { background:var(--panel); box-shadow:inset 0 -1px 0 var(--border); }
+    table.work-distribution th:first-child, table.work-distribution td:first-child { text-align:left; }
+    /* The ratio is the column the report exists for, so an imbalanced band is
+       coloured rather than left for the reader to find among the numbers. */
+    table.work-distribution td.ratio-heavy { color:var(--red); }
+    table.work-distribution td.ratio-light { color:var(--dim); }
+    p.work-distribution-legend { margin:.4rem 0 0; color:var(--dim); font-size:.9em; }
     details.filters { margin-top:.35rem; color:var(--dim); }
     details.filters > summary { cursor:pointer; padding:.1rem 0; }
     .control-group { border:1px solid var(--border); border-radius:6px; background:var(--panel); padding:.4rem .5rem; margin-top:.4rem; }
@@ -343,7 +354,7 @@
 <body>
   <header>
     <div class="nav" id="report-nav">
-      <button data-kind="auto" data-overview="1">Overview</button><button data-kind="queue">Queue</button><button data-kind="workers">Workers</button><button data-kind="cache">Cache</button><button data-kind="hotspots">Hotspots</button><button data-kind="leaderboard">Leaderboard</button><button data-kind="openers">Openers</button><span class="layout-toggle" id="layout-toggle" role="group" aria-label="View layout"><span class="cap">View as</span><span class="seg"><button id="layout-flat" aria-pressed="true">Flat</button><button id="layout-tree" aria-pressed="false">Tree</button></span></span>
+      <button data-kind="auto" data-overview="1">Overview</button><button data-kind="queue">Queue</button><button data-kind="workers">Workers</button><button data-kind="cache">Cache</button><button data-kind="hotspots">Hotspots</button><button data-kind="work_distribution">Distribution</button><button data-kind="leaderboard">Leaderboard</button><button data-kind="openers">Openers</button><span class="layout-toggle" id="layout-toggle" role="group" aria-label="View layout"><span class="cap">View as</span><span class="seg"><button id="layout-flat" aria-pressed="true">Flat</button><button id="layout-tree" aria-pressed="false">Tree</button></span></span>
       <span class="conn-wrap">
         <span id="connection" aria-label="Poll status; opens refresh interval">●</span>
         <div class="refresh-pop">
@@ -362,14 +373,16 @@
         <div class="group-head"><span class="gname">Filters:</span><span class="ghint">narrow what's listed — applied as you change them</span></div>
         <div class="status-line" id="opener-state-filters"><span class="label">Opener state</span><span class="statuses" id="source-states"></span></div>
         <div id="branch-filters">
-          <div class="status-line"><span class="label">Branch status</span><span class="statuses" id="branch-statuses"></span></div>
-          <div class="status-line"><span class="label">Branch worker</span><span class="statuses" id="branch-worker-statuses"></span></div>
-          <div class="dim lifecycle-legend">Status: unqueued → queued → evaluating → finalizing → done. Worker: active or waiting (evaluating/finalizing only).</div>
+          <div id="branch-status-filters">
+            <div class="status-line"><span class="label">Branch status</span><span class="statuses" id="branch-statuses"></span></div>
+            <div class="status-line"><span class="label">Branch worker</span><span class="statuses" id="branch-worker-statuses"></span></div>
+            <div class="dim lifecycle-legend">Status: unqueued → queued → evaluating → finalizing → done. Worker: active or waiting (evaluating/finalizing only).</div>
+          </div>
           <div class="field-flow">
             <label class="field">Min answers<input id="minimum-answer-count" type="number"></label>
             <label class="field">Max answers<input id="maximum-answer-count" type="number"></label>
-            <label class="field">Budget<input id="budget" class="narrow" type="number"></label>
-            <label class="field">Priority<input id="priority" class="medium" type="number"></label>
+            <label class="field" id="budget-field">Budget<input id="budget" class="narrow" type="number"></label>
+            <label class="field" id="priority-field">Priority<input id="priority" class="medium" type="number"></label>
           </div>
         </div>
       </div>
@@ -418,9 +431,9 @@
     const OPENER_ONLY_SORT_VALUES=new Set(SORT_OPTIONS_OPENERS.map(([value])=>value).filter(value=>value&&!SORT_OPTIONS_DEFAULT.some(([defaultValue])=>defaultValue===value)));
     const GROUP_BY_OPTIONS_WORD=[["","none"],["status","status"],["answer_count","answer count"],["cache_state","cache state"],["worker_presence","worker"],["priority","priority"]];
     const GROUP_BY_OPTIONS_OPENERS=[["state","state (default)"],["completed","completion date"],["elapsed","elapsed time"],["worker_time","total worker time"],["requested","time since request"],["worker_presence","worker"],["priority","priority"],["none","none"]];
-    const explicitKinds=new Set(["queue","workers","cache","hotspots","leaderboard","openers"]);
-    const treelessKinds=new Set(["cache","hotspots","leaderboard","openers"]);
-    const populationNames={current_queue_branches:"current queue branches",recent_branch_finalizations:"recent branch finalizations",recent_cut_reuse_misses:"recent cut-reuse misses",recent_claim_coordination_buckets:"recent claim coordination buckets"};
+    const explicitKinds=new Set(["queue","workers","cache","hotspots","work_distribution","leaderboard","openers"]);
+    const treelessKinds=new Set(["cache","hotspots","work_distribution","leaderboard","openers"]);
+    const populationNames={current_queue_branches:"current queue branches",recent_branch_finalizations:"recent branch finalizations",recent_cut_reuse_misses:"recent cut-reuse misses",recent_claim_coordination_buckets:"recent claim coordination buckets",recent_claims_by_branch:"recent claims by branch"};
     const collapsedNodes=new Set(), initializedNodes=new Set(), collapsedWordGroups=new Set(), initializedWordGroups=new Set(), collapsedResponseGroups=new Set(), stickyOrders=new Map(), packedOrders=new Map(), gridColumnCounts=new Map(), treePageHistory=new Map(), treeGroupPages=new Map();
     const COMPLETED_BRANCH_HOLD_MILLIS=5000;
     const recentOverviewCompletionRows=new Map();
@@ -540,7 +553,13 @@
         // which is the first cut an operator makes by eye anyway.  "none" is
         // an explicit choice rather than the absence of one.
         if(!GROUP_BY_OPTIONS_OPENERS.some(([value])=>value===normalized.group_by))normalized.group_by="state";normalized.branch_target=isWordTarget(normalized.branch_target)?normalized.branch_target.split(/\s+/).filter(Boolean).pop():"";}
-      if(normalized.kind!=="hotspots"){normalized.by="";normalized.epoch=null;normalized.since_seconds=null;normalized.sample_size=null;}
+      if(normalized.kind!=="hotspots")normalized.by="";
+      if(normalized.kind!=="hotspots"&&normalized.kind!=="work_distribution"){normalized.epoch=null;normalized.since_seconds=null;normalized.sample_size=null;}
+      // The distribution describes a whole sampled population; a filter
+      // narrowing it to something else is cleared here rather than sent
+      // and refused.  The answer-count range survives because the report
+      // applies it, scoping the bands to one size region.
+      if(normalized.kind==="work_distribution"){normalized.branch_status=[];normalized.branch_worker_status=[];normalized.branch_target="";normalized.budget=null;normalized.priority=null;normalized.sort="";normalized.limit=null;normalized.answers=false;normalized.claims=false;}
       if(normalized.kind==="hotspots"&&["evaluated-candidates","bulk-completed-candidates","one-level-erd-prunes","two-level-erd-prunes","cut-reuse","coordination"].includes(normalized.by)){normalized.branch_status=[];normalized.branch_worker_status=[];}
       if(normalized.kind==="hotspots"&&normalized.by==="coordination")normalized.branch_target="";
       if(normalized.tree){normalized.claims=false;normalized.answers=false;}
@@ -581,7 +600,9 @@
       return query;
     }
     function buildAPIURL(state){
-      const endpoint=state.kind==="auto"?"/api/view":"/api/view/"+state.kind;
+      // Report kinds are snake_case; their routes are hyphenated, the same
+      // spelling root-progress already uses.
+      const endpoint=state.kind==="auto"?"/api/view":"/api/view/"+state.kind.replaceAll("_","-");
       const query=stateQuery(state,false); query.delete("kind");
       return endpoint+(query.size?"?"+query.toString():"");
     }
@@ -611,7 +632,7 @@
       byId("layout-flat").setAttribute("aria-pressed",currentState.tree?"false":"true");
       byId("layout-tree").setAttribute("aria-pressed",currentState.tree?"true":"false");
       for(const name of ["minimum-answer-count","maximum-answer-count","budget","priority","limit","epoch","since-seconds"]){const key=name.replaceAll("-","_");byId(name).value=currentState[key]??"";}
-      const kind=currentState.kind, isHotspots=kind==="hotspots", isSources=kind==="openers";
+      const kind=currentState.kind, isHotspots=kind==="hotspots", isDistribution=kind==="work_distribution", isSources=kind==="openers";
       const wordReport=isInferredWordState(kind,currentState.branch_target);
       const overviewReportState=isOverviewState(kind,currentState.branch_target,currentState.tree);
       const sortSelect=byId("sort"),sortMode=isSources?"openers":wordReport?"word":overviewReportState?"overview":"default";
@@ -638,15 +659,21 @@
       document.querySelectorAll("[data-source-state]").forEach(input=>input.checked=currentState.opener_state.includes(input.value));
       const historicalHotspot=isHotspots&&["evaluated-candidates","bulk-completed-candidates","one-level-erd-prunes","two-level-erd-prunes","cut-reuse","coordination"].includes(currentState.by);
       byId("filters-group").hidden=kind==="cache"||historicalHotspot;
+      byId("branch-filters").hidden=isSources;
+      // The distribution applies an answer-count range and nothing else here,
+      // so the filters it cannot honor are withdrawn rather than left to be
+      // set and silently refused.
+      byId("branch-status-filters").hidden=isDistribution;
+      byId("budget-field").hidden=byId("priority-field").hidden=isDistribution;
       // A source word is filtered by its own state, never by branch status,
       // worker status, answer count, budget or priority -- those describe one branch.
       byId("opener-state-filters").hidden=!isSources;
-      byId("branch-filters").hidden=isSources;
-      byId("sort-field").hidden=kind==="cache"||isHotspots;
+      byId("sort-field").hidden=kind==="cache"||isHotspots||isDistribution;
       byId("group-by-field").hidden=!wordReport&&!isSources;
-      byId("by-field").hidden=byId("epoch-field").hidden=byId("since-seconds-field").hidden=!isHotspots;
+      byId("by-field").hidden=!isHotspots;
+      byId("epoch-field").hidden=byId("since-seconds-field").hidden=!isHotspots&&!isDistribution;
       byId("limit-label").textContent=currentState.tree?"Items per page":isSources?"Words per page":kind==="auto"?"Branches shown":"Rows shown";
-      byId("limit-field").hidden=currentState.tree;
+      byId("limit-field").hidden=currentState.tree||isDistribution;
     }
     function readControls(){return {...currentState,branch_target:byId("branch-target-input").value,branch_status:[...document.querySelectorAll("[data-branch-status]:checked")].map(input=>input.value),branch_worker_status:[...document.querySelectorAll("[data-branch-worker-status]:checked")].map(input=>input.value),opener_state:[...document.querySelectorAll("[data-source-state]:checked")].map(input=>input.value),minimum_answer_count:byId("minimum-answer-count").value,maximum_answer_count:byId("maximum-answer-count").value,budget:byId("budget").value,priority:byId("priority").value,sort:byId("sort").value,group_by:byId("group-by").value,limit:currentState.tree?currentState.limit:byId("limit").value,opener_offset:null,branch_row_offset:null,by:byId("by").value,epoch:byId("epoch").value,since_seconds:byId("since-seconds").value,poll:byId("poll").value,finalization_cursor:"",tree_cursor:null};}
 
@@ -2266,6 +2293,55 @@
       fragment.append(grid);return fragment;
     }
     function renderCache(report,previous){const data=report.data,fragment=document.createDocumentFragment(),metrics=element("div","metrics");for(const [key,value] of Object.entries(data.summary||{}))metrics.append(metric(label(key),value));fragment.append(metrics);for(const [name,distribution] of Object.entries(data.distributions||{}))fragment.append(section(label(name),labeledFacts(Object.entries(distribution))));const rows=gridElement("cache"),previousRows=new Map(cacheRows((previous||{}).data||{}).map(row=>[String(row.branch_key_hex),row]));for(const row of cacheRows(data)){const card=section("@"+shortReference(valueOrDash(row.branch_reference)),labeledFacts(displayEntries(row,report.generated_at)),(row.cache_state||"")+" "+changeClass(row,previousRows.get(String(row.branch_key_hex))));card.dataset.identity=row.branch_key_hex;rows.append(card);}fragment.append(rows);return fragment;}
+    // Bands over the whole sampled claim population.  renderHotspots ranks the
+    // worst branches and shows the top of that ranking; this shows the shape of
+    // the population those branches sit in, which a top-N list cannot.
+    const percentText=share=>share===null||share===undefined?"—":(100*share).toFixed(1)+"%";
+    function renderWorkDistribution(report){
+      const data=report.data,fragment=document.createDocumentFragment(),meta=element("div","metrics");
+      const totals=data.totals||{},unattributed=data.unattributed||{};
+      for(const [labelText,value] of [
+        ["population",data.population?populationNames[data.population]||label(data.population):null],
+        ["epoch",data.epoch],["window seconds",data.since_seconds],
+        ["sample size",data.sample_size],["sampled",data.sampled_row_count],
+        ["branches",totals.branch_count],["still open",totals.unfinished_branch_count],
+        ["claims",totals.claim_count],["nodes",totals.search_node_count],
+      ])meta.append(metric(labelText,value));
+      if(data.sample_truncated)meta.append(element("span","badge","sample truncated"));
+      if(data.minimum_answer_count!==null&&data.minimum_answer_count!==undefined)meta.append(metric("min answers",data.minimum_answer_count));
+      if(data.maximum_answer_count!==null&&data.maximum_answer_count!==undefined)meta.append(metric("max answers",data.maximum_answer_count));
+      fragment.append(meta);
+      const scroll=element("div","work-distribution-scroll"),table=element("table","work-distribution");
+      const head=element("tr");
+      for(const heading of ["Band","Branches","Open","% branches","Worker time","% work","Nodes","% nodes","Claims","% claims","Coord/work"])head.append(element("th","",heading));
+      const thead=element("thead");thead.append(head);table.append(thead);
+      const body=element("tbody");
+      for(const band of data.bands||[]){
+        const row=element("tr");
+        row.dataset.band=band.band_label;
+        row.append(element("td","",band.band_label));
+        row.append(element("td","",formatInteger(band.branch_count)));
+        row.append(element("td","",formatInteger(band.unfinished_branch_count)));
+        row.append(element("td","",percentText(band.branch_share)));
+        row.append(element("td","",formatDuration((band.worker_millis||0)/1000)));
+        row.append(element("td","",percentText(band.worker_time_share)));
+        row.append(element("td","",formatInteger(band.search_node_count)));
+        row.append(element("td","",percentText(band.search_node_share)));
+        row.append(element("td","",formatInteger(band.claim_count)));
+        row.append(element("td","",percentText(band.claim_share)));
+        const ratio=band.coordination_share_per_work_share;
+        const ratioCell=element("td","",ratio===null||ratio===undefined?"—":ratio.toFixed(2));
+        if(ratio!==null&&ratio!==undefined){if(ratio>=2)ratioCell.classList.add("ratio-heavy");else if(ratio<=0.5)ratioCell.classList.add("ratio-light");}
+        row.append(ratioCell);
+        body.append(row);
+      }
+      table.append(body);scroll.append(table);
+      fragment.append(section("Work distribution by worker time",scroll));
+      const legend=element("p","work-distribution-legend","Coord/work is a band's share of coordination time over its share of search nodes; 1.00 is proportionate. Bands come from claims, so a branch still being solved is counted with what it has spent so far.");
+      fragment.append(legend);
+      if(unattributed.claim_count)fragment.append(element("p","work-distribution-legend",formatInteger(unattributed.claim_count)+" claim"+(unattributed.claim_count===1?"":"s")+" were taken outside any branch and belong to no band."));
+      return fragment;
+    }
     function renderHotspots(report,previous){const data=report.data,fragment=document.createDocumentFragment(),meta=element("div","metrics");for(const [labelText,value] of [["population",data.population?populationNames[data.population]||label(data.population):null],["epoch",data.epoch],["window seconds",data.since_seconds],["sample size",data.sample_size],["sampled",data.sampled_row_count]])meta.append(metric(labelText,value));if(data.sample_truncated)meta.append(element("span","badge","sample truncated"));fragment.append(meta);const rows=gridElement("hotspots"),previousRows=previousBy(previous,"rows","row_id");for(const row of data.rows||[]){const identity=String(row.row_id||row.branch_reference||"bucket"),title=row.branch_reference?"@"+shortReference(row.branch_reference):String(row.row_id||"bucket"),card=section(title,labeledFacts(displayEntries(row,report.generated_at)),changeClass(row,previousRows.get(identity)));card.dataset.identity=identity;rows.append(card);}fragment.append(rows);return fragment;}
     function captureGridCards(root){
       return new Map([...root.querySelectorAll(".grid[data-grid-key]")].map(grid=>[grid.dataset.gridKey,{
@@ -2428,7 +2504,7 @@
       // measured at rest rather than part-way through somebody else's animation.
       endGridTransitions();
       const root=byId("report"),beforeCards=captureGridCards(root),content=document.createDocumentFragment();comparisonAvailable=previousReport!==null;document.querySelector("details.filters").hidden=report.report_kind==="branch_reference_matches";if(report.report_kind!=="branch_reference_matches")content.append(reportHeader(report,state));
-      if(report.tree)content.append(renderTree(report,previousReport,state));else if(report.report_kind==="overview")content.append(renderOverview(report,previousReport,state));else if(report.report_kind==="word")content.append(renderWord(report,previousReport,state));else if(report.report_kind==="branch")content.append(renderBranch(report,previousReport,state));else if(report.report_kind==="branch_reference_matches")content.append(renderBranchReferenceMatches(report));else if(report.report_kind==="queue")content.append(renderQueue(report,previousReport,state));else if(report.report_kind==="workers")content.append(renderWorkers(report,previousReport,state));else if(report.report_kind==="cache")content.append(renderCache(report,previousReport));else if(report.report_kind==="hotspots")content.append(renderHotspots(report,previousReport,state));else if(report.report_kind==="leaderboard")content.append(renderLeaderboard(report,previousReport,state));else if(report.report_kind==="openers")content.append(renderSources(report,previousReport,state));else throw new Error("Unknown report kind");
+      if(report.tree)content.append(renderTree(report,previousReport,state));else if(report.report_kind==="overview")content.append(renderOverview(report,previousReport,state));else if(report.report_kind==="word")content.append(renderWord(report,previousReport,state));else if(report.report_kind==="branch")content.append(renderBranch(report,previousReport,state));else if(report.report_kind==="branch_reference_matches")content.append(renderBranchReferenceMatches(report));else if(report.report_kind==="queue")content.append(renderQueue(report,previousReport,state));else if(report.report_kind==="workers")content.append(renderWorkers(report,previousReport,state));else if(report.report_kind==="cache")content.append(renderCache(report,previousReport));else if(report.report_kind==="hotspots")content.append(renderHotspots(report,previousReport,state));else if(report.report_kind==="work_distribution")content.append(renderWorkDistribution(report));else if(report.report_kind==="leaderboard")content.append(renderLeaderboard(report,previousReport,state));else if(report.report_kind==="openers")content.append(renderSources(report,previousReport,state));else throw new Error("Unknown report kind");
       // Only glide cards on a refresh of the same view; switching report kinds
       // (or the first paint over a stale screen) snaps rather than stampedes.
       const sameView=!!previousReport&&previousReport.report_kind===report.report_kind&&!!previousReport.tree===!!report.tree,readingPosition=sameView?captureReadingPosition(root):null;

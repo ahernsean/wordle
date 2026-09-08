@@ -982,6 +982,49 @@ class WorkDistributionTests(unittest.TestCase):
         self.assertEqual(full["sampled_row_count"], 10)
         self.assertFalse(full["sample_truncated"])
 
+    def test_an_answer_count_range_narrows_the_banded_population(self):
+        small = self._branch("small", 4)
+        large = self._branch("large", 9)
+        self.q.create_branch(small, 4, 3)
+        self.q.create_branch(large, 9, 3)
+        for idx in range(3):
+            self.q.add_claim_telemetry(
+                4, 10, 5, 2, branch_key=small, idx=idx,
+                candidate_evaluation_millis=100)
+        for idx in range(2):
+            self.q.add_claim_telemetry(
+                9, 10, 900_000, 2, branch_key=large, idx=idx,
+                candidate_evaluation_millis=25_000)
+
+        only_large = self.q.report_work_distribution(
+            self.q.epoch, 0, 1000, BAND_EDGE_MILLIS, minimum_answer_count=5)
+        only_small = self.q.report_work_distribution(
+            self.q.epoch, 0, 1000, BAND_EDGE_MILLIS, maximum_answer_count=4)
+
+        self.assertEqual(self._band(only_large, 2)["branch_count"], 1)
+        self.assertIsNone(self._band(only_large, 0))
+        self.assertEqual(only_large["sampled_row_count"], 2)
+        self.assertEqual(self._band(only_small, 0)["branch_count"], 1)
+        self.assertIsNone(self._band(only_small, 2))
+        # The bound describes the narrowed population, not the whole table:
+        # a count taken before the filter would report five here.
+        self.assertEqual(only_small["sampled_row_count"], 3)
+
+    def test_an_answer_count_range_bounds_both_ends(self):
+        for size in (3, 7, 20):
+            branch_key = self._branch(f"b{size:03d}", 4)
+            self.q.create_branch(branch_key, 4, 3)
+            self.q.add_claim_telemetry(
+                size, 10, 5, 2, branch_key=branch_key, idx=0,
+                candidate_evaluation_millis=100)
+
+        banded = self.q.report_work_distribution(
+            self.q.epoch, 0, 1000, BAND_EDGE_MILLIS,
+            minimum_answer_count=5, maximum_answer_count=10)
+
+        self.assertEqual(banded["sampled_row_count"], 1)
+        self.assertEqual(self._band(banded, 0)["branch_count"], 1)
+
     def test_rows_outside_the_epoch_are_excluded(self):
         branch_key = self._branch("cheap", 4)
         self.q.create_branch(branch_key, 4, 3)

@@ -132,6 +132,7 @@ python3.13 erd_search.py view --hotspots --by nodes
 python3.13 erd_search.py view --hotspots --by coordination --since-seconds 900
 python3.13 erd_search.py view --work-distribution
 python3.13 erd_search.py view --work-distribution --since-seconds 86400 --sample-size 1000000
+python3.13 erd_search.py view --work-distribution --minimum-answer-count 200
 python3.13 erd_search.py view --openers
 python3.13 erd_search.py view --openers CRANE
 python3.13 erd_search.py view --root-progress CRANE
@@ -162,6 +163,14 @@ finalization: a parent that waits on promoted children accumulates wall time it
 did not work, and banding on that span would file it among the expensive
 branches for having done nothing. Claims taken outside any branch belong to no
 band and are counted separately.
+
+`--minimum-answer-count` and `--maximum-answer-count` scope the bands to one
+size region, narrowing the sample before it is banded so every share stays a
+share of what the report shows. Every other filter is refused rather than
+ignored: `--budget` because a claim row records answer count but no budget, and
+`--priority`, `--sort`, `--limit`, `--branch-status` and
+`--branch-worker-status` because they describe or order individual branches
+rather than the population.
 
 `--root-progress` reports one opener's work: every response group with the
 branches, search nodes, and node share spent under it, which groups have not
