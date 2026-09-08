@@ -187,6 +187,24 @@ _PUBLISH_EMA_TAU = 86400.0      # half-life (s) for the coordination/node-time E
 _PUBLISH_EMA_MIN_WEIGHT = 5     # decayed samples before the adaptive threshold goes live
 PUBLISH_THRESHOLD_BOOTSTRAP = 5000  # cold-start prior until the EMAs warm
 
+# node_time is the MARGINAL cost of a search node, so only a claim that actually
+# searched contributes a sample.  A claim completed in a handful of nodes spends
+# nearly its whole span on fixed per-candidate overhead — the cache lookup, the
+# bookkeeping, the complete_candidate write — and cand_elapsed / nodes_delta
+# reports that overhead as the price of a node.  Such claims are the
+# overwhelming majority of a warm swarm's traffic, so admitting them pulls the
+# estimator onto the overhead; the coordination term measures overhead too, and
+# a ratio of overhead to overhead is a constant near SAFETY_FACTOR on any
+# hardware, which is a threshold low enough to promote every sub-branch offered.
+NODE_TIME_MIN_SAMPLE_NODES = 100
+
+# Fixed break-even in node-equivalents, used in place of the measured one when
+# set.  Sweeping this against swarm throughput is how the break-even is
+# calibrated; unset, the live estimators decide.
+PUBLISH_THRESHOLD_OVERRIDE = (
+    float(os.environ['PUBLISH_THRESHOLD_OVERRIDE'])
+    if os.environ.get('PUBLISH_THRESHOLD_OVERRIDE') else None)
+
 # Budget at the root — before any guess is played.  A branch's remaining budget
 # is ROOT_BUDGET minus its guess_depth (the guesses already played to reach it),
 # so a queued position after the opener (guess_depth 1) is solved at ROOT_BUDGET
@@ -941,8 +959,11 @@ class _BranchWorker:
         """Adaptive 'worth-swarming' break-even in node-equivalents:
         SAFETY_FACTOR * coordination_time / node_time (both in seconds, so the
         unit cancels).  Falls back to PUBLISH_THRESHOLD_BOOTSTRAP until both live
-        estimators warm.
+        estimators warm, and reports PUBLISH_THRESHOLD_OVERRIDE whenever that is
+        set, which fixes the break-even for a calibration sweep.
         """
+        if PUBLISH_THRESHOLD_OVERRIDE is not None:
+            return PUBLISH_THRESHOLD_OVERRIDE
         coord = self._coord_ema.value()
         node_time = self._node_time_ema.value()
         if coord is None or node_time is None or node_time <= 0:
@@ -1326,7 +1347,6 @@ class _BranchWorker:
         shared_best = local_best
         last_refresh = time.time()
         claim_started = int(time.time())
-        t0 = time.time()
 
         def _bound_provider():
             # Refreshes shared_best from the queue at most every
@@ -1489,7 +1509,6 @@ class _BranchWorker:
         else:  # pragma: no cover
             self.n_useless += 1
 
-        elapsed = time.time() - t0
         self.queue.complete_candidate(branch_key, idx)
         # The outbound claim telemetry is required for branch ETA reporting,
         # regardless of whether this worker uses adaptive decomposition.
@@ -1498,9 +1517,12 @@ class _BranchWorker:
             0.0, (now_complete - self._last_claim_complete) - cand_elapsed)
         self._last_claim_complete = now_complete
         if self._adaptive:
-            coord_seconds = max(0.0, elapsed - cand_elapsed)
-            self._coord_ema.add(coord_seconds)
-            if nodes_delta > 0 and cand_elapsed > 0:
+            # The break-even is the cost of handing work to another worker, so
+            # the coordination term is the whole inter-claim span — the same
+            # quantity the telemetry records — not the residue inside one
+            # candidate's own call.
+            self._coord_ema.add(full_coord_seconds)
+            if nodes_delta >= NODE_TIME_MIN_SAMPLE_NODES and cand_elapsed > 0:
                 self._node_time_ema.add(cand_elapsed / nodes_delta)
             _record_candidate_accuracy()
         scheduling_millis = self._pending_scheduling_millis

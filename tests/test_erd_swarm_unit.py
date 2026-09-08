@@ -79,7 +79,9 @@ def _bare_worker():
     w._last_progress_log = 0.0
     w._last_util_log = 0.0
     w._eval_seconds = 0.0
-    w._last_claim_complete = 0.0
+    # A real worker opens its coordination window at startup; leaving this at 0
+    # would make the first claim's inter-claim span the whole Unix epoch.
+    w._last_claim_complete = time.time()
     w._last_checkpoint = 0.0
     w._last_wal_traffic = ({}, {})
     w._last_wal_traffic_log = 0.0
@@ -3250,6 +3252,104 @@ class TestPublishThresholdWarmPath(unittest.TestCase):
             w._node_time_ema.add(1e-6, now=0.0)  # 1 µs / node
         threshold = w._publish_threshold()
         self.assertGreater(threshold, erd_swarm.PUBLISH_THRESHOLD_BOOTSTRAP)
+
+
+class TestPublishThresholdEstimatorInputs(unittest.TestCase):
+    """What evaluate_claim feeds the two break-even estimators.
+
+    The threshold is coordination_time / node_time, so each term has to measure
+    a different thing: the cost of handing a claim to another worker, and the
+    marginal cost of one search node.  Feed both from per-candidate overhead and
+    the ratio collapses to a constant near SAFETY_FACTOR, which promotes every
+    sub-branch offered.
+    """
+
+    def _run_claim(self, w, nodes, gap_seconds=None):
+        """One evaluate_claim whose candidate advances the node counter by
+        `nodes`, optionally opening the coordination window `gap_seconds` ago."""
+        if gap_seconds is not None:
+            w._last_claim_complete = time.time() - gap_seconds
+
+        def fake_evaluate_candidate(*args, **kwargs):
+            w._nodes += nodes
+            return (SOLVED, 2.0, 2, False)
+
+        branch_key = ScoreCache.encode_subset(BRANCH)
+        with mock.patch('erd_swarm.evaluate_candidate',
+                        side_effect=fake_evaluate_candidate):
+            self.assertTrue(
+                w.evaluate_claim(branch_key, BRANCH, len(BRANCH), idx=0))
+
+    def test_claims_below_node_floor_leave_node_time_cold(self):
+        # A claim that searched almost nothing spends its span on fixed
+        # per-candidate overhead, so it says nothing about the price of a node.
+        w = _bare_worker()
+        for _ in range(erd_swarm._PUBLISH_EMA_MIN_WEIGHT * 2):
+            self._run_claim(w, nodes=erd_swarm.NODE_TIME_MIN_SAMPLE_NODES - 1)
+        self.assertIsNone(w._node_time_ema.value())
+        self.assertEqual(w._publish_threshold(),
+                         erd_swarm.PUBLISH_THRESHOLD_BOOTSTRAP)
+
+    def test_claims_at_node_floor_warm_node_time(self):
+        # One sample past min_weight: each add decays the running weight by a
+        # hair, so exactly min_weight adds land just under the threshold.
+        w = _bare_worker()
+        for _ in range(erd_swarm._PUBLISH_EMA_MIN_WEIGHT + 1):
+            self._run_claim(w, nodes=erd_swarm.NODE_TIME_MIN_SAMPLE_NODES)
+        self.assertIsNotNone(w._node_time_ema.value())
+
+    def test_coordination_term_is_the_inter_claim_span(self):
+        # Each claim opens its window 4s back, so the handoff cost is ~4s.  The
+        # residue inside one candidate's own call is microseconds, and reading
+        # that instead would put this estimate near zero.
+        w = _bare_worker()
+        for _ in range(erd_swarm._PUBLISH_EMA_MIN_WEIGHT + 1):
+            self._run_claim(w, nodes=1, gap_seconds=4.0)
+        self.assertAlmostEqual(w._coord_ema.value(), 4.0, delta=0.5)
+
+    def test_nonadaptive_worker_feeds_neither_estimator(self):
+        w = _bare_worker()
+        w._adaptive = False
+        for _ in range(erd_swarm._PUBLISH_EMA_MIN_WEIGHT + 1):
+            self._run_claim(w, nodes=erd_swarm.NODE_TIME_MIN_SAMPLE_NODES,
+                            gap_seconds=4.0)
+        self.assertIsNone(w._coord_ema.value())
+        self.assertIsNone(w._node_time_ema.value())
+
+
+class TestPublishThresholdOverride(unittest.TestCase):
+    """PUBLISH_THRESHOLD_OVERRIDE fixes the break-even for a calibration sweep."""
+
+    def test_unset_by_default(self):
+        self.assertIsNone(erd_swarm.PUBLISH_THRESHOLD_OVERRIDE)
+
+    def test_override_replaces_warm_measured_threshold(self):
+        w = _bare_worker()
+        for _ in range(erd_swarm._PUBLISH_EMA_MIN_WEIGHT):
+            w._coord_ema.add(0.01, now=0.0)
+            w._node_time_ema.add(1e-6, now=0.0)
+        measured = w._publish_threshold()
+        with mock.patch.object(erd_swarm, 'PUBLISH_THRESHOLD_OVERRIDE', 1234.0):
+            self.assertEqual(w._publish_threshold(), 1234.0)
+        self.assertNotEqual(measured, 1234.0)
+
+    def test_override_replaces_cold_bootstrap(self):
+        w = _bare_worker()
+        with mock.patch.object(erd_swarm, 'PUBLISH_THRESHOLD_OVERRIDE', 7.0):
+            self.assertEqual(w._publish_threshold(), 7.0)
+
+    def test_override_reaches_the_promotion_decision(self):
+        # A sub-branch the model prices at 500 nodes inlines under a 5,000-node
+        # break-even and promotes under a 100-node one.
+        w = _bare_worker()
+        w.queue.get_cost_typical.return_value = 500
+        expected = (SOLVED, 2.0, 3, False)
+        w.cooperative_solve = mock.MagicMock(return_value=expected)
+        words = ["crane"] * (PROMOTE_MIN_SIZE + 1)
+        with mock.patch.object(erd_swarm, 'PUBLISH_THRESHOLD_OVERRIDE', 5000.0):
+            self.assertIsNone(w._subbranch_solver(words, budget=5))
+        with mock.patch.object(erd_swarm, 'PUBLISH_THRESHOLD_OVERRIDE', 100.0):
+            self.assertEqual(w._subbranch_solver(words, budget=5), expected)
 
 
 class TestFlushCostModelBuffer(unittest.TestCase):
