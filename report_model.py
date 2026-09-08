@@ -369,6 +369,16 @@ def validate_report_request(request: ReportRequest) -> None:
         raise ValueError("coordination hotspots cannot use a branch target")
     if request.worker_id is not None and report_kind != "workers":
         raise ValueError("worker requires a workers report")
+    if report_kind == "work_distribution":
+        if request.tree:
+            raise ValueError("--tree cannot be used with --work-distribution")
+        # The bands describe the whole sampled claim population, and the shares
+        # are shares of it.  Narrowing that population to one branch would
+        # leave every percentage naming a total the report no longer shows.
+        if branch_target_kind != "root":
+            raise ValueError("--work-distribution cannot take a branch target")
+        if request.filters.branch_statuses or request.filters.branch_worker_statuses:
+            raise ValueError("--work-distribution cannot use branch filters")
     if report_kind == "root_progress":
         if request.tree:
             raise ValueError("--tree cannot be used with --root-progress")
@@ -3396,6 +3406,138 @@ def collect_hotspot_report(sources: ReportOpeners, request: ReportRequest) -> di
     return report
 
 
+# Upper bounds, in seconds of worker time, of every work-distribution band but
+# the last.  Fixed rather than configurable: the bands are the vocabulary the
+# over-promotion measurements are stated in, and a reader comparing two runs
+# needs the same edges under both.
+WORK_DISTRIBUTION_BAND_EDGE_SECONDS = (2, 30, 300, 3600)
+
+
+def work_distribution_band_labels(edge_seconds=WORK_DISTRIBUTION_BAND_EDGE_SECONDS):
+    labels = [f"<={edge_seconds[0]}s"]
+    labels.extend(
+        f"{low}-{high}s" for low, high in zip(edge_seconds, edge_seconds[1:])
+    )
+    labels.append(f">{edge_seconds[-1]}s")
+    return labels
+
+
+def _work_distribution_band_rows(bands, edge_seconds):
+    """Fill in every band and price each one against the sampled totals.
+
+    Bands the sample never populated are carried as zeros rather than dropped:
+    an absent band and an empty one are different findings, and a table that
+    silently omits one leaves the reader to work out which they are looking at.
+    """
+    labels = work_distribution_band_labels(edge_seconds)
+    by_index = {band["band_index"]: band for band in bands}
+    totals = {
+        key: sum(band[key] for band in bands)
+        for key in ("branch_count", "unfinished_branch_count", "claim_count",
+                    "search_node_count", "coordination_millis", "worker_millis")
+    }
+
+    def share(value, total):
+        return value / total if total else None
+
+    rows = []
+    for index, label in enumerate(labels):
+        band = by_index.get(index, {})
+        branch_count = band.get("branch_count", 0)
+        search_node_count = band.get("search_node_count", 0)
+        coordination_millis = band.get("coordination_millis", 0)
+        node_share = share(search_node_count, totals["search_node_count"])
+        coordination_share = share(
+            coordination_millis, totals["coordination_millis"])
+        rows.append({
+            "band_index": index,
+            "band_label": label,
+            "branch_count": branch_count,
+            "unfinished_branch_count": band.get("unfinished_branch_count", 0),
+            "claim_count": band.get("claim_count", 0),
+            "search_node_count": search_node_count,
+            "coordination_millis": coordination_millis,
+            "worker_millis": band.get("worker_millis", 0),
+            "branch_share": share(branch_count, totals["branch_count"]),
+            "claim_share": share(band.get("claim_count", 0),
+                                 totals["claim_count"]),
+            "search_node_share": node_share,
+            "worker_time_share": share(band.get("worker_millis", 0),
+                                       totals["worker_millis"]),
+            "search_nodes_per_branch": (
+                search_node_count / branch_count if branch_count else None),
+            # A band that did no search has no work for its coordination to be
+            # priced against, so the ratio is withheld rather than reported as
+            # an infinity that would sort above every real imbalance.
+            "coordination_share_per_work_share": (
+                coordination_share / node_share
+                if coordination_share is not None and node_share else None),
+        })
+    return rows, totals
+
+
+def collect_work_distribution_report(
+    sources: ReportOpeners, request: ReportRequest
+) -> dict:
+    """Band branches by worker time to show where work and coordination go.
+
+    The hotspot report ranks the worst individual branches and returns the top
+    of that ranking.  This one describes the whole sampled population, which is
+    the only way a table can show that most branches are trivial: the mass of
+    them is never in a top-N list.
+    """
+    generated_at = int(time.time())
+    since_seconds = request.since_seconds or 3600
+    sample_size = min(request.sample_size or 50_000, 1_000_000)
+    edge_seconds = WORK_DISTRIBUTION_BAND_EDGE_SECONDS
+    empty_rows, empty_totals = _work_distribution_band_rows([], edge_seconds)
+    data = {
+        "population": None,
+        "epoch": request.epoch,
+        "since_seconds": since_seconds,
+        "window_started_at": generated_at - since_seconds,
+        "sample_size": sample_size,
+        "sampled_row_count": 0,
+        "sample_truncated": False,
+        "band_edge_seconds": list(edge_seconds),
+        "bands": empty_rows,
+        "totals": empty_totals,
+        "unattributed": {"claim_count": 0, "search_node_count": 0,
+                         "coordination_millis": 0, "worker_millis": 0},
+    }
+    report = _semantic_report(
+        "work_distribution", sources, request.branch_target, generated_at,
+        data, request,
+    )
+    queue = None
+    try:
+        queue = _open_report_queue(sources)
+        epoch = queue.epoch if request.epoch is None else request.epoch
+        result = queue.report_work_distribution(
+            epoch, generated_at - since_seconds, sample_size,
+            [seconds * 1000 for seconds in edge_seconds],
+        )
+        rows, totals = _work_distribution_band_rows(result["bands"], edge_seconds)
+        data.update({
+            "population": result["population"],
+            "epoch": result["epoch"],
+            "window_started_at": result["since"],
+            "sample_size": result["sample_size"],
+            "sampled_row_count": result["sampled_row_count"],
+            "sample_truncated": result["sample_truncated"],
+            "bands": rows,
+            "totals": totals,
+            "unattributed": result["unattributed"],
+        })
+        _mark_queue_opener_ok(report)
+    except (sqlite3.Error, OSError) as error:
+        _mark_queue_opener_error(report, error)
+    finally:
+        if queue is not None:
+            queue.close()
+    return report
+
+
 def collect_accuracy_report(sources: ReportOpeners, request: ReportRequest) -> dict:
     """Collect the candidate-work calibration corpus without changing it."""
     generated_at = int(time.time())
@@ -4032,6 +4174,8 @@ def collect_report(sources: ReportOpeners, request: ReportRequest) -> dict:
         return collect_cache_report(sources, request)
     if report_kind == "hotspots":
         return collect_hotspot_report(sources, request)
+    if report_kind == "work_distribution":
+        return collect_work_distribution_report(sources, request)
     if report_kind == "accuracy":
         return collect_accuracy_report(sources, request)
     if report_kind == "leaderboard":

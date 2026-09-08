@@ -1586,6 +1586,73 @@ def _render_hotspot_sections(report, width, display_order):
     return [("header", header), ("hotspots", lines)]
 
 
+def _percent_text(share):
+    return "—" if share is None else f"{100.0 * share:.1f}%"
+
+
+def _render_work_distribution_sections(report, width):
+    data = report["data"]
+    totals = data["totals"]
+    header = _semantic_header(report, "Work distribution by worker time", width)
+    unattributed = data["unattributed"]
+    lines = [
+        f"Population: {data['population']}",
+        _fit(
+            f"  epoch={data['epoch']} since-seconds={data['since_seconds']:,} "
+            f"sample-size={data['sample_size']:,} "
+            f"sampled={data['sampled_row_count']:,} "
+            f"truncated={str(data['sample_truncated']).lower()}",
+            width,
+        ),
+        _fit(
+            f"  {totals['branch_count']:,} branches "
+            f"({totals['unfinished_branch_count']:,} still open), "
+            f"{totals['claim_count']:,} claims, "
+            f"{_format_node_count(totals['search_node_count'])} nodes",
+            width,
+        ),
+        _fit(
+            "  worker-time "
+            f"{_abbreviate_duration(totals['worker_millis'] / 1000)}, "
+            "coordination "
+            f"{_abbreviate_duration(totals['coordination_millis'] / 1000)}",
+            width,
+        ),
+    ]
+    unattributed_count = unattributed["claim_count"]
+    if unattributed_count:
+        lines.append(_fit(
+            f"  plus {unattributed_count:,} "
+            f"claim{'' if unattributed_count == 1 else 's'} taken outside any "
+            f"branch, belonging to no band",
+            width,
+        ))
+    rows = [f"{'Band':<9} {'Branches':>8} {'Open':>4} {'%Br':>6}"
+            f" {'Worker':>7} {'%Work':>6} {'Nodes':>7} {'%Nodes':>6}"
+            f" {'Claims':>9} {'%Claims':>7} {'Coord/work':>10}"]
+    for band in data["bands"]:
+        ratio = band["coordination_share_per_work_share"]
+        rows.append(_fit(
+            f"{band['band_label']:<9} {band['branch_count']:>8,}"
+            f" {band['unfinished_branch_count']:>4,}"
+            f" {_percent_text(band['branch_share']):>6}"
+            f" {_abbreviate_duration(band['worker_millis'] / 1000):>7}"
+            f" {_percent_text(band['worker_time_share']):>6}"
+            f" {_format_node_count(band['search_node_count']):>7}"
+            f" {_percent_text(band['search_node_share']):>6}"
+            f" {band['claim_count']:>9,}"
+            f" {_percent_text(band['claim_share']):>7}"
+            f" {('—' if ratio is None else f'{ratio:.2f}'):>10}",
+            width,
+        ))
+    rows.append(_fit(
+        "  Coord/work = coordination-time share ÷ search-node share; "
+        "1.00 is proportionate",
+        width,
+    ))
+    return [("header", header), ("summary", lines), ("bands", rows)]
+
+
 def _display_opener_erd(summary):
     """A word's own ERD, once every one of its response groups is solved."""
     if not summary:
@@ -1983,6 +2050,8 @@ def _report_sections(report, previous_report, color, width, display_order):
         return _render_cache_collection_sections(report, width, display_order)
     if report["report_kind"] == "hotspots":
         return _render_hotspot_sections(report, width, display_order)
+    if report["report_kind"] == "work_distribution":
+        return _render_work_distribution_sections(report, width)
     if report["report_kind"] == "accuracy":
         return _render_accuracy_sections(report, width)
     if report["report_kind"] == "leaderboard":

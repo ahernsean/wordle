@@ -130,6 +130,8 @@ python3.13 erd_search.py view --cache
 python3.13 erd_search.py view --cache CRANE
 python3.13 erd_search.py view --hotspots --by nodes
 python3.13 erd_search.py view --hotspots --by coordination --since-seconds 900
+python3.13 erd_search.py view --work-distribution
+python3.13 erd_search.py view --work-distribution --since-seconds 86400 --sample-size 1000000
 python3.13 erd_search.py view --openers
 python3.13 erd_search.py view --openers CRANE
 python3.13 erd_search.py view --root-progress CRANE
@@ -137,6 +139,29 @@ python3.13 erd_search.py view --root-progress CRANE --epoch 10
 python3.13 erd_search.py view --root-progress CRANE --inherited-cost
 python3.13 erd_search.py view --root-progress CRANE --inherited-cost --sort own_nodes
 ```
+
+`--work-distribution` answers a question about the population rather than about
+any one branch: is the swarm spending its coordination where its work is? It
+bands every branch in the sampled claim window by the worker time spent on it
+and prints, per band, how many branches it holds, how much search work they did,
+and how many claims that took. `--hotspots` ranks the worst individual branches
+and returns the top of that ranking, which cannot show the same thing: when most
+branches are trivial, the mass of them is never in a top-N list.
+
+The `Coord/work` column is a band's share of coordination time over its share of
+search nodes. A swarm coordinating in proportion to its work reads near 1.00 in
+every band; a spread of orders of magnitude between the cheapest and the most
+expensive band means coordination is being spent almost exactly where the work
+is not.
+
+Bands come from claims rather than from finalizations, so a branch still being
+solved is counted with the totals it has accumulated so far, and the `Open`
+column says how many of a band's branches those are. A branch is banded by its
+own summed worker time, never by the span between its creation and its
+finalization: a parent that waits on promoted children accumulates wall time it
+did not work, and banding on that span would file it among the expensive
+branches for having done nothing. Claims taken outside any branch belong to no
+band and are counted separately.
 
 `--root-progress` reports one opener's work: every response group with the
 branches, search nodes, and node share spent under it, which groups have not
@@ -299,8 +324,11 @@ matching nothing. Worker status narrows only the stages that carry one, so a
 status filter selecting neither evaluating nor finalizing drops it instead of
 matching nothing. The overview answers what the swarm is doing now and so
 defaults to `--branch-status evaluating,finalizing --branch-worker-status
-active`; every other report starts unfiltered. Historical hotspots
-are explicitly bounded by epoch, time window, and sample size. `--tree` uses
+active`; every other report starts unfiltered. Historical hotspots and the work
+distribution are explicitly bounded by epoch, time window, and sample size.
+`--work-distribution` describes that whole sampled population, so it takes no
+branch target and no branch filters: narrowing the population would leave every
+percentage naming a total the report no longer shows. `--tree` uses
 only extant queue topology; cache rows never reconstruct historical trees.
 
 ### Log files

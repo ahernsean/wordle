@@ -5328,6 +5328,100 @@ class ERDQueue:
             "sample_truncated": sample_truncated,
             "rows": normalized_rows,
         }
+
+    def report_work_distribution(self, epoch, since, sample_size,
+                                 band_edge_millis) -> dict:
+        """Aggregate claim telemetry into per-branch bands of worker time.
+
+        The band key is the branch's own summed candidate_evaluation_millis,
+        never the span between its creation and finalization: a parent that
+        waits on promoted children accumulates wall time it did not work, and
+        banding on that span would file it among the expensive branches for
+        having done nothing.
+
+        Every row of claim_telemetry is one candidate evaluation attributed to
+        one branch, so a promoted child's nodes land under the child's own
+        branch_id rather than the parent's.  Summing across bands therefore
+        counts each node once.
+
+        A claim taken outside any branch context stores branch_id NULL and is
+        no branch's work.  Those rows are totalled separately instead of
+        collapsing into a single synthetic branch that would dominate the
+        cheapest band.
+
+        Bands come from claims, not from finalizations, so a branch still being
+        solved is present with the totals it has accumulated so far;
+        unfinished_branch_count reports how many of a band's branches those are.
+        """
+        sampled_row_count, sample_truncated = self._bounded_sample_metadata(
+            "claim_telemetry", epoch, since, sample_size)
+        band_case = " ".join(
+            f"WHEN worker_millis <= {int(edge)} THEN {index}"
+            for index, edge in enumerate(band_edge_millis)
+        )
+        sample_sql = """
+            SELECT branch_id, work_nodes, coordination_millis,
+                   COALESCE(candidate_evaluation_millis, 0)
+                       AS candidate_evaluation_millis
+            FROM telemetry.claim_telemetry
+            WHERE epoch = ? AND recorded_at >= ?
+            ORDER BY recorded_at DESC, id DESC LIMIT ?
+        """
+        parameters = (epoch, since, sample_size)
+        band_rows = self._conn.execute(f"""
+            WITH sample AS ({sample_sql}),
+            branch AS (
+                SELECT branch_id,
+                       COUNT(*) AS claim_count,
+                       SUM(work_nodes) AS search_node_count,
+                       SUM(coordination_millis) AS coordination_millis,
+                       SUM(candidate_evaluation_millis) AS worker_millis
+                FROM sample WHERE branch_id IS NOT NULL GROUP BY branch_id
+            )
+            SELECT CASE {band_case} ELSE {len(band_edge_millis)} END AS band_index,
+                   COUNT(*) AS branch_count,
+                   SUM(branch.claim_count) AS claim_count,
+                   SUM(branch.search_node_count) AS search_node_count,
+                   SUM(branch.coordination_millis) AS coordination_millis,
+                   SUM(branch.worker_millis) AS worker_millis,
+                   SUM(CASE WHEN active_branches.branch_id IS NOT NULL
+                            THEN 1 ELSE 0 END) AS unfinished_branch_count
+            FROM branch
+            LEFT JOIN active_branches USING (branch_id)
+            GROUP BY band_index ORDER BY band_index
+        """, parameters).fetchall()
+        unattributed = self._conn.execute(f"""
+            WITH sample AS ({sample_sql})
+            SELECT COUNT(*) AS claim_count,
+                   COALESCE(SUM(work_nodes), 0) AS search_node_count,
+                   COALESCE(SUM(coordination_millis), 0) AS coordination_millis,
+                   COALESCE(SUM(candidate_evaluation_millis), 0) AS worker_millis
+            FROM sample WHERE branch_id IS NULL
+        """, parameters).fetchone()
+        return {
+            "population": "recent_claims_by_branch",
+            "epoch": epoch,
+            "since": since,
+            "sample_size": sample_size,
+            "sampled_row_count": sampled_row_count,
+            "sample_truncated": sample_truncated,
+            "bands": [{
+                "band_index": row["band_index"],
+                "branch_count": row["branch_count"],
+                "unfinished_branch_count": row["unfinished_branch_count"],
+                "claim_count": row["claim_count"],
+                "search_node_count": row["search_node_count"],
+                "coordination_millis": row["coordination_millis"],
+                "worker_millis": row["worker_millis"],
+            } for row in band_rows],
+            "unattributed": {
+                "claim_count": unattributed["claim_count"],
+                "search_node_count": unattributed["search_node_count"],
+                "coordination_millis": unattributed["coordination_millis"],
+                "worker_millis": unattributed["worker_millis"],
+            },
+        }
+
     # ------------------------------------------------------------------
     # run_meta key-value store
     # ------------------------------------------------------------------

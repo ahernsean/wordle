@@ -830,5 +830,170 @@ class QueueVisibilityTests(unittest.TestCase):
             "CRANE -----")
         self.assertEqual(self.q.row_spine_text({}), "")
 
+
+# Two seconds and thirty seconds of worker time, matching the first two
+# report_model band edges; the tests below build branches on either side.
+BAND_EDGE_MILLIS = [2_000, 30_000]
+
+
+class WorkDistributionTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.q = ERDQueue(os.path.join(self._tmp.name, "q.sqlite3"))
+        self.addCleanup(self.q.close)
+
+    def _branch(self, tag, size):
+        return ScoreCache.encode_subset(_words(tag, size))
+
+    def _claims(self, branch_key, count, nodes, evaluation_millis,
+                coordination_millis=10):
+        for idx in range(count):
+            self.q.add_claim_telemetry(
+                10, coordination_millis, nodes, 2, branch_key=branch_key,
+                idx=idx, candidate_evaluation_millis=evaluation_millis)
+
+    def _report(self, sample_size=1000):
+        return self.q.report_work_distribution(
+            self.q.epoch, 0, sample_size, BAND_EDGE_MILLIS)
+
+    def _band(self, report, band_index):
+        for band in report["bands"]:
+            if band["band_index"] == band_index:
+                return band
+        return None
+
+    def test_bands_come_from_summed_worker_time(self):
+        cheap = self._branch("cheap", 4)
+        costly = self._branch("costl", 6)
+        self.q.create_branch(cheap, 4, 3)
+        self.q.create_branch(costly, 6, 3)
+        # Ten claims of 100 ms each land the cheap branch at one second, under
+        # the two-second edge, even though it took more claims than the costly
+        # one; the band key is time, not claim count.
+        self._claims(cheap, 10, 5, 100)
+        self._claims(costly, 2, 900_000, 25_000)
+
+        report = self._report()
+
+        self.assertEqual(self._band(report, 0)["branch_count"], 1)
+        self.assertEqual(self._band(report, 0)["worker_millis"], 1_000)
+        self.assertEqual(self._band(report, 0)["claim_count"], 10)
+        self.assertEqual(self._band(report, 2)["branch_count"], 1)
+        self.assertEqual(self._band(report, 2)["worker_millis"], 50_000)
+        self.assertIsNone(self._band(report, 1))
+
+    def test_a_branch_that_waited_on_children_bands_by_its_own_work(self):
+        # The production shape of a promoting parent: it evaluates a handful of
+        # candidates itself, its children are solved by other workers, and its
+        # finalize row records the whole span including the wait.  Banding on
+        # that span would file the parent among the expensive branches.
+        parent = self._branch("paren", 8)
+        child = self._branch("child", 5)
+        self.q.create_branch(parent, 8, 3, spine="CRANE -----")
+        self.q.create_branch(child, 5, 3, spine="CRANE ----- LUBES -y---")
+        self._claims(parent, 3, 40, 200)
+        self._claims(child, 4, 500_000, 20_000)
+        finalized_at = int(time.time())
+        self.q.add_branch_finalize_log(
+            parent, "CRANE -----", 8, 3, finalized_at - 10_000, finalized_at,
+            120, 3)
+
+        report = self._report()
+
+        self.assertEqual(self._band(report, 0)["branch_count"], 1)
+        self.assertEqual(self._band(report, 0)["worker_millis"], 600)
+        self.assertEqual(self._band(report, 0)["search_node_count"], 120)
+        # The child's work is the child's, in its own band.
+        self.assertEqual(self._band(report, 2)["branch_count"], 1)
+        self.assertEqual(self._band(report, 2)["search_node_count"], 2_000_000)
+
+    def test_node_totals_across_bands_count_each_node_once(self):
+        parent = self._branch("paren", 8)
+        child = self._branch("child", 5)
+        self.q.create_branch(parent, 8, 3)
+        self.q.create_branch(child, 5, 3)
+        self._claims(parent, 3, 40, 200)
+        self._claims(child, 4, 500_000, 20_000)
+
+        report = self._report()
+
+        banded_nodes = sum(band["search_node_count"] for band in report["bands"])
+        recorded_nodes = self.q._conn.execute(
+            "SELECT SUM(work_nodes) AS nodes FROM telemetry.claim_telemetry"
+        ).fetchone()["nodes"]
+        self.assertEqual(banded_nodes, recorded_nodes)
+
+    def test_claims_outside_a_branch_are_totalled_separately(self):
+        branch_key = self._branch("cheap", 4)
+        self.q.create_branch(branch_key, 4, 3)
+        self._claims(branch_key, 2, 5, 100)
+        # A bulk lower-bound proof takes a claim with no branch context.
+        self.q.add_claim_telemetry(10, 7, 3, 2, candidate_evaluation_millis=50)
+        self.q.add_claim_telemetry(10, 7, 3, 2, candidate_evaluation_millis=50)
+
+        report = self._report()
+
+        self.assertEqual(sum(band["branch_count"] for band in report["bands"]), 1)
+        self.assertEqual(report["unattributed"]["claim_count"], 2)
+        self.assertEqual(report["unattributed"]["search_node_count"], 6)
+        self.assertEqual(report["unattributed"]["worker_millis"], 100)
+        self.assertEqual(report["unattributed"]["coordination_millis"], 14)
+        self.assertEqual(self._band(report, 0)["claim_count"], 2)
+
+    def test_unfinished_branch_count_counts_only_live_branches(self):
+        finished = self._branch("finis", 4)
+        running = self._branch("runni", 4)
+        self.q.create_branch(finished, 4, 3)
+        self.q.create_branch(running, 4, 3)
+        self._claims(finished, 2, 5, 100)
+        self._claims(running, 2, 5, 100)
+        self.q.delete_branch(finished)
+
+        report = self._report()
+
+        self.assertEqual(self._band(report, 0)["branch_count"], 2)
+        self.assertEqual(self._band(report, 0)["unfinished_branch_count"], 1)
+
+    def test_unfinished_branch_count_is_zero_with_nothing_running(self):
+        # The over-eager shape: a join that matched every branch would report
+        # the same count as branch_count here and pass the test above.
+        finished = self._branch("finis", 4)
+        self.q.create_branch(finished, 4, 3)
+        self._claims(finished, 2, 5, 100)
+        self.q.delete_branch(finished)
+
+        report = self._report()
+
+        self.assertEqual(self._band(report, 0)["branch_count"], 1)
+        self.assertEqual(self._band(report, 0)["unfinished_branch_count"], 0)
+
+    def test_sample_bound_is_reported_and_applied(self):
+        branch_key = self._branch("cheap", 4)
+        self.q.create_branch(branch_key, 4, 3)
+        self._claims(branch_key, 10, 5, 100)
+
+        bounded = self._report(sample_size=4)
+
+        self.assertEqual(bounded["sampled_row_count"], 4)
+        self.assertTrue(bounded["sample_truncated"])
+        self.assertEqual(self._band(bounded, 0)["claim_count"], 4)
+        full = self._report()
+        self.assertEqual(full["sampled_row_count"], 10)
+        self.assertFalse(full["sample_truncated"])
+
+    def test_rows_outside_the_epoch_are_excluded(self):
+        branch_key = self._branch("cheap", 4)
+        self.q.create_branch(branch_key, 4, 3)
+        self._claims(branch_key, 3, 5, 100)
+
+        other_epoch = self.q.report_work_distribution(
+            self.q.epoch + 1, 0, 1000, BAND_EDGE_MILLIS)
+
+        self.assertEqual(other_epoch["bands"], [])
+        self.assertEqual(other_epoch["unattributed"]["claim_count"], 0)
+        self.assertEqual(other_epoch["sampled_row_count"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
