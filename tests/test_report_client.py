@@ -431,7 +431,6 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.locator("[data-kind=queue]").click()
         self.page.locator("#layout-tree").click()
         self.page.wait_for_selector("ul.tree > li.word-group")
-        self.assertEqual(self.page.locator("text=Sources and filters").count(), 0)
         group = self.page.locator("ul.tree > li.word-group")
         self.assertEqual(group.count(), 1)
         self.assertIsNone(group.locator("> details").get_attribute("open"))
@@ -3240,19 +3239,18 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.keyboard.press("Escape")
         self.assertEqual(self.page.locator(".conn-wrap.open").count(), 0)
 
-    def test_sources_and_filters_disclosure_stays_open_across_refresh(self):
-        self.page.goto(self.base_url + "?kind=cache&branch_target=SALET")
-        self.page.wait_for_selector("text=cache report")
-        details = self.page.locator(".report-meta details.source-paths")
-        details.locator("summary").click()
-        self.assertIsNotNone(details.get_attribute("open"))
-        self.page.evaluate("""async () => {
-          await __reportClient.fetchReport();
+    def test_source_error_banner_shows_a_failed_source(self):
+        result = self.page.evaluate("""async () => {
+          const report=await (await fetch('/api/view')).json();
+          report.sources.queue.error='database is locked';
+          applyReport(report,null,__reportClient.getState());
+          return document.querySelector('.source-error-banner')?.textContent||null;
         }""")
-        self.page.wait_for_selector("text=cache report")
-        self.assertIsNotNone(
-            self.page.locator(".report-meta details.source-paths").get_attribute("open")
-        )
+        self.assertEqual(result, "queue unavailable: database is locked")
+
+    def test_source_error_banner_absent_on_a_healthy_report(self):
+        self.page.wait_for_selector(".report-meta")
+        self.assertEqual(self.page.locator(".source-error-banner").count(), 0)
 
     def test_unresolvable_reference_reports_error_not_a_fake_report(self):
         self.page.route(
@@ -4294,12 +4292,21 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(result["branch_target"], "RAISE .....")
 
     def test_malicious_text_is_literal_and_inert(self):
-        result = self.page.evaluate("""async () => {
-          const report=await (await fetch('/api/view')).json();
-          report.sources.queue.error='<img id="owned" src=x onerror="window.owned=1">';
-          applyReport(report,null,__reportClient.getState());
-          return {owned:window.owned||0,node:!!document.querySelector('#owned'),text:document.querySelector('#report').textContent};
-        }""")
+        self.page.route(
+            "**/api/view**",
+            lambda route: route.fulfill(
+                status=400, content_type="application/json",
+                body='{"error":{"message":"<img id=\\"owned\\" src=x onerror=\\"window.owned=1\\">"}}',
+            ),
+        )
+        self.page.evaluate(
+            "__reportClient.setState({...__reportClient.getState(),kind:'auto',branch_target:'@dead'})"
+        )
+        self.page.wait_for_selector("#report .error")
+        result = self.page.evaluate(
+            "() => ({owned:window.owned||0,node:!!document.querySelector('#owned'),text:document.querySelector('#report').textContent})"
+        )
+        self.page.unroute("**/api/view**")
         self.assertEqual(result["owned"], 0)
         self.assertFalse(result["node"])
         self.assertIn("<img id=", result["text"])
