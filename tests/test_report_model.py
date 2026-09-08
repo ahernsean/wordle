@@ -499,9 +499,18 @@ class ReportModelTest(unittest.TestCase):
                "started_at": 10}
         payload = report_model._opener_summary_payload(
             row, {"open_branch_count": 2, "worker_count": 1},
-            {"completed_at": None, "elapsed_millis": None, "worker_millis": None}, 20)
+            {"completed_at": None, "elapsed_millis": None, "worker_millis": None},
+            20, set(ANSWERS))
         self.assertEqual(payload["state"], "active")
         self.assertEqual(payload["elapsed_millis"], 10_000)
+        # "raise" is not in ANSWERS: a queued opener need not itself be a
+        # possible answer, and the payload must say so rather than guess.
+        self.assertFalse(payload["opener_is_answer"])
+        answer_payload = report_model._opener_summary_payload(
+            {**row, "opener": "salet"}, {"open_branch_count": 2, "worker_count": 1},
+            {"completed_at": None, "elapsed_millis": None, "worker_millis": None},
+            20, set(ANSWERS))
+        self.assertTrue(answer_payload["opener_is_answer"])
         self.assertEqual(report_model._opener_erd_sort_key({"opener": "raise"})[0], 3)
         self.assertEqual(report_model._duration_group_key(31 * 24 * 60 * 60 * 1000)[1], "[1 month, ∞)")
         self.assertEqual(report_model._opener_group_key(
@@ -522,9 +531,15 @@ class ReportModelTest(unittest.TestCase):
         }
         rollup = report_model._opener_rollups([row, row])["raise"]
         self.assertEqual(rollup["open_branch_count"], 1)
-        payload = report_model._opener_membership_payload(row, 2)
+        payload = report_model._opener_membership_payload(row, 2, set(ANSWERS))
         self.assertTrue(payload["is_shared"])
         self.assertEqual(payload["parent_branch_reference"], branch_reference(parent_key))
+        # "raise" is not in ANSWERS here, matching the summary payload's
+        # opener_is_answer contract above.
+        self.assertFalse(payload["opener_is_answer"])
+        answer_payload = report_model._opener_membership_payload(
+            {**row, "opener": "salet"}, 2, set(ANSWERS))
+        self.assertTrue(answer_payload["opener_is_answer"])
 
     def test_opener_erd_summary_reuses_the_current_cache_generation(self):
         branch_key = ScoreCache.encode_subset(["salet"])
@@ -2671,6 +2686,17 @@ class OpenerReportTest(unittest.TestCase):
         self.assertEqual(complete["total_opener_count"], 2)
         self.assertEqual(
             complete["matched_opener_count"], len(complete["summary"]))
+
+    def test_opener_report_marks_openers_that_are_themselves_answers(self):
+        # SALET is in ANSWERS; RAISE is only in the candidate list (set up in
+        # setUp), so the two words exercise both sides of opener_is_answer --
+        # the field the web notch and the terminal '*' both key off.
+        self._queue_words(("salet", 5, 1), ("raise", 5, 1))
+        rows = {row["opener"]: row for row in self._openers()["summary"]}
+        self.assertTrue(rows["salet"]["opener_is_answer"])
+        self.assertFalse(rows["raise"]["opener_is_answer"])
+        membership_rows = self._opener_rows_for("salet")
+        self.assertTrue(membership_rows["salet"]["opener_is_answer"])
 
     def test_opener_sorts_order_by_the_column_named(self):
         self._queue_words(("salet", 5, 3), ("crane", 9, 1), ("nurdy", 1, 7))

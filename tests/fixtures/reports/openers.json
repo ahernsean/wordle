@@ -35,9 +35,10 @@
     "summary": [
       {
         "opener": "salet",
+        "opener_is_answer": false,
         "requested_priority": 5,
-      "requested_at": 400,
-      "started_at": null,
+        "requested_at": 400,
+        "started_at": null,
         "completed_at": null,
         "request_count": 2,
         "state": "queued",
@@ -60,9 +61,10 @@
       },
       {
         "opener": "raise",
+        "opener_is_answer": true,
         "requested_priority": 3,
-      "requested_at": 200,
-      "started_at": null,
+        "requested_at": 200,
+        "started_at": null,
         "completed_at": null,
         "request_count": 1,
         "state": "queued",
@@ -85,9 +87,10 @@
       },
       {
         "opener": "crane",
+        "opener_is_answer": true,
         "requested_priority": 1,
-      "requested_at": 100,
-      "started_at": null,
+        "requested_at": 100,
+        "started_at": null,
         "request_count": 1,
         "state": "complete",
         "completed_at": 490,
@@ -115,6 +118,7 @@
         "rows": [
           {
             "opener": "salet",
+            "opener_is_answer": false,
             "requested_priority": 5,
             "requested_at": 400,
             "completed_at": null,
@@ -139,6 +143,7 @@
           },
           {
             "opener": "raise",
+            "opener_is_answer": true,
             "requested_priority": 3,
             "requested_at": 200,
             "completed_at": null,
@@ -175,6 +180,7 @@
         "rows": [
           {
             "opener": "crane",
+            "opener_is_answer": true,
             "requested_priority": 1,
             "requested_at": 100,
             "request_count": 1,

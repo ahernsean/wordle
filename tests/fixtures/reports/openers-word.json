@@ -35,9 +35,10 @@
     "summary": [
       {
         "opener": "salet",
+        "opener_is_answer": false,
         "requested_priority": 5,
-      "requested_at": 400,
-      "started_at": null,
+        "requested_at": 400,
+        "started_at": null,
         "completed_at": null,
         "request_count": 2,
         "state": "queued",
@@ -71,6 +72,7 @@
       {
         "opener_work_id": 1,
         "opener": "salet",
+        "opener_is_answer": false,
         "requested_priority": 5,
         "opener_state": "queued",
         "branch_reference": "222222222222",
@@ -88,6 +90,7 @@
       {
         "opener_work_id": 1,
         "opener": "salet",
+        "opener_is_answer": false,
         "requested_priority": 5,
         "opener_state": "queued",
         "branch_reference": "333333333333",
@@ -105,6 +108,7 @@
       {
         "opener_work_id": 2,
         "opener": "raise",
+        "opener_is_answer": true,
         "requested_priority": 3,
         "opener_state": "queued",
         "branch_reference": "222222222222",
@@ -122,6 +126,7 @@
       {
         "opener_work_id": 2,
         "opener": "raise",
+        "opener_is_answer": true,
         "requested_priority": 3,
         "opener_state": "queued",
         "branch_reference": "444444444444",

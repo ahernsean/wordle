@@ -1849,6 +1849,43 @@ class ReportClientBrowserTest(unittest.TestCase):
                                10 / 31, delta=0.02)
         self.assertIn("31", segments.nth(0).inner_text())
 
+    def test_opener_tab_notches_summary_and_ownership_cards(self):
+        # SALET is queued but is not itself a possible answer; RAISE and
+        # CRANE both are.  The Openers tab must notch each card by its own
+        # opener_is_answer, not uniformly.
+        self.page.locator("[data-kind=openers]").click()
+        self.page.wait_for_selector("text=openers report")
+        self.assertFalse(self.answer_notch(
+            self.page.locator(".card.source-word", has_text="SALET")
+                .first.locator(".word").first))
+        self.assertTrue(self.answer_notch(
+            self.page.locator(".card.source-word", has_text="RAISE")
+                .first.locator(".word").first))
+        self.assertTrue(self.answer_notch(
+            self.page.locator(".card.source-word", has_text="CRANE")
+                .first.locator(".word").first))
+        # Naming SALET opens its branch ownership; those cards draw the
+        # opener word twice (the root-step spine tile and the "opener" fact),
+        # and both must notch by the branch's own opener.
+        self.page.locator(".card.source-word", has_text="SALET").first.locator(
+            "button", has_text="Branches").click()
+        self.page.wait_for_selector("text=Branch ownership")
+        ownership_cards = self.page.locator(
+            '.grid[data-grid-key="source-memberships"] > .card')
+        self.assertEqual(ownership_cards.count(), 4)
+        salet_owned = ownership_cards.filter(has_text="SALET")
+        raise_owned = ownership_cards.filter(has_text="RAISE")
+        self.assertEqual(salet_owned.count(), 2)
+        self.assertEqual(raise_owned.count(), 2)
+        for index in range(salet_owned.count()):
+            words = salet_owned.nth(index).locator(".word")
+            for word_index in range(words.count()):
+                self.assertFalse(self.answer_notch(words.nth(word_index)))
+        for index in range(raise_owned.count()):
+            words = raise_owned.nth(index).locator(".word")
+            for word_index in range(words.count()):
+                self.assertTrue(self.answer_notch(words.nth(word_index)))
+
     def test_leaderboard_poll_renders_changed_data(self):
         self.page.locator("[data-kind=leaderboard]").click()
         self.page.wait_for_selector("text=Opener leaderboard")
