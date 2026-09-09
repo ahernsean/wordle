@@ -4252,6 +4252,10 @@ class WorkDistributionReportTest(unittest.TestCase):
             ({"filters": ReportFilters(priority=0)}, "--priority"),
             ({"filters": ReportFilters(limit=0)}, "--limit"),
             ({"sample_size": 1000}, "--sample-size"),
+            ({"filters": ReportFilters(
+                finalization_cursor_direction="after",
+                finalization_cursor_recorded_at=1,
+                finalization_cursor_id=1)}, "finalization_cursor"),
             ({"filters": ReportFilters(sort="nodes")}, "--sort"),
             ({"filters": ReportFilters(limit=10)}, "--limit"),
             ({"filters": ReportFilters(budget=3)},

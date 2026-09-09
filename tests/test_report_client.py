@@ -5245,6 +5245,12 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertTrue(self.page.locator("#maximum-answer-count").is_visible())
         self.assertTrue(self.page.locator("#epoch-field").is_visible())
         self.assertTrue(self.page.locator("#since-seconds-field").is_visible())
+        # A page cursor the API refuses must never leave the client, or the
+        # view breaks on a parameter the reader cannot see or clear.
+        self.assertEqual(
+            self.page.evaluate(
+                "() => __reportClient.getState().finalization_cursor"),
+            "")
 
     def test_work_distribution_offers_no_tree_layout(self):
         self.open_work_distribution()

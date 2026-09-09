@@ -396,6 +396,10 @@ def validate_report_request(request: ReportRequest) -> None:
                 ("--sort", bool(request.filters.sort)),
                 ("--limit", request.filters.limit is not None),
                 ("--sample-size", request.sample_size is not None),
+                # A page of a listing, asked of a report that returns one row
+                # per band and never paginates.
+                ("finalization_cursor",
+                 request.filters.finalization_cursor_direction is not None),
             ) if present
         ]
         if unsupported:

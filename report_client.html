@@ -560,7 +560,7 @@
       // narrowing it to something else is cleared here rather than sent
       // and refused.  The answer-count range survives because the report
       // applies it, scoping the bands to one size region.
-      if(normalized.kind==="work_distribution"){normalized.branch_status=[];normalized.branch_worker_status=[];normalized.branch_target="";normalized.budget=null;normalized.priority=null;normalized.sort="";normalized.limit=null;normalized.answers=false;normalized.claims=false;normalized.sample_size=null;}
+      if(normalized.kind==="work_distribution"){normalized.branch_status=[];normalized.branch_worker_status=[];normalized.branch_target="";normalized.budget=null;normalized.priority=null;normalized.sort="";normalized.limit=null;normalized.answers=false;normalized.claims=false;normalized.sample_size=null;normalized.finalization_cursor="";}
       if(normalized.kind==="hotspots"&&["evaluated-candidates","bulk-completed-candidates","one-level-erd-prunes","two-level-erd-prunes","cut-reuse","coordination"].includes(normalized.by)){normalized.branch_status=[];normalized.branch_worker_status=[];}
       if(normalized.kind==="hotspots"&&normalized.by==="coordination")normalized.branch_target="";
       if(normalized.tree){normalized.claims=false;normalized.answers=false;}

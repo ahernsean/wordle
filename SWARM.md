@@ -356,11 +356,13 @@ matching nothing. Worker status narrows only the stages that carry one, so a
 status filter selecting neither evaluating nor finalizing drops it instead of
 matching nothing. The overview answers what the swarm is doing now and so
 defaults to `--branch-status evaluating,finalizing --branch-worker-status
-active`; every other report starts unfiltered. Historical hotspots and the work
-distribution are explicitly bounded by epoch, time window, and sample size.
-`--work-distribution` describes that whole sampled population, so it takes no
-branch target and no branch filters: narrowing the population would leave every
-percentage naming a total the report no longer shows. `--tree` uses
+active`; every other report starts unfiltered. Historical hotspots are
+explicitly bounded by epoch, time window, and sample size. The work
+distribution is bounded by epoch and, optionally, a time window: it aggregates
+rather than samples, so it takes no sample size at all. It describes that whole
+population, so it also takes no branch target, no branch filters and no page
+cursor: narrowing the population would leave every percentage naming a total
+the report no longer shows. `--tree` uses
 only extant queue topology; cache rows never reconstruct historical trees.
 
 ### Log files
