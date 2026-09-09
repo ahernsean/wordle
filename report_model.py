@@ -384,20 +384,26 @@ def validate_report_request(request: ReportRequest) -> None:
         # Refused rather than ignored.  A filter the report accepts but never
         # applies makes the printed population and shares contradict what was
         # asked for, and does it silently.
+        # Presence, not truthiness: 0 is a real requested priority and would
+        # otherwise be accepted and then ignored.  The status tuples and the
+        # sort string are genuinely absent when empty.
         unsupported = [
-            name for name, value in (
-                ("--branch-status", request.filters.branch_statuses),
-                ("--branch-worker-status", request.filters.branch_worker_statuses),
-                ("--priority", request.filters.priority),
-                ("--sort", request.filters.sort),
-                ("--limit", request.filters.limit),
-            ) if value
+            name for name, present in (
+                ("--branch-status", bool(request.filters.branch_statuses)),
+                ("--branch-worker-status",
+                 bool(request.filters.branch_worker_statuses)),
+                ("--priority", request.filters.priority is not None),
+                ("--sort", bool(request.filters.sort)),
+                ("--limit", request.filters.limit is not None),
+                ("--sample-size", request.sample_size is not None),
+            ) if present
         ]
         if unsupported:
             raise ValueError(
                 "--work-distribution cannot use "
                 + ", ".join(unsupported)
-                + ": it describes the whole sampled claim population"
+                + ": it aggregates the whole epoch rather than ranking or "
+                  "sampling branches"
             )
         # Budget is the one filter the claim rows cannot answer: they carry
         # answer count but no budget, and joining one in from the live branch
@@ -3510,30 +3516,35 @@ def collect_work_distribution_report(
     """Band branches by worker time to show where work and coordination go.
 
     The hotspot report ranks the worst individual branches and returns the top
-    of that ranking.  This one describes the whole sampled population, which is
-    the only way a table can show that most branches are trivial: the mass of
-    them is never in a top-N list.
+    of that ranking.  This one describes the whole population, which is the only
+    way a table can show that most branches are trivial: the mass of them is
+    never in a top-N list.
+
+    The epoch is aggregated whole unless --since-seconds narrows it, because a
+    branch is banded by its lifetime worker time and a recent-rows sample clips
+    the long-lived branches hardest -- seating exactly the tarpits this report
+    exists to surface in the cheapest bands.
     """
     generated_at = int(time.time())
-    since_seconds = request.since_seconds or 3600
-    sample_size = min(request.sample_size or 50_000, 1_000_000)
+    since_seconds = request.since_seconds
     edge_seconds = WORK_DISTRIBUTION_BAND_EDGE_SECONDS
     empty_rows, empty_totals = _work_distribution_band_rows([], edge_seconds)
+    empty_population = {"claim_count": 0, "search_node_count": 0,
+                        "coordination_millis": 0, "worker_millis": 0}
     data = {
         "population": None,
         "epoch": request.epoch,
         "minimum_answer_count": request.filters.minimum_answer_count,
         "maximum_answer_count": request.filters.maximum_answer_count,
         "since_seconds": since_seconds,
-        "window_started_at": generated_at - since_seconds,
-        "sample_size": sample_size,
-        "sampled_row_count": 0,
-        "sample_truncated": False,
+        "window_started_at": (
+            None if since_seconds is None else generated_at - since_seconds),
         "band_edge_seconds": list(edge_seconds),
         "bands": empty_rows,
         "totals": empty_totals,
-        "unattributed": {"claim_count": 0, "search_node_count": 0,
-                         "coordination_millis": 0, "worker_millis": 0},
+        "unattributed": dict(empty_population),
+        "unmeasured": dict(empty_population, branch_count=0),
+        "scan_seconds": None,
     }
     report = _semantic_report(
         "work_distribution", sources, request.branch_target, generated_at,
@@ -3543,23 +3554,27 @@ def collect_work_distribution_report(
     try:
         queue = _open_report_queue(sources)
         epoch = queue.epoch if request.epoch is None else request.epoch
+        started = time.monotonic()
         result = queue.report_work_distribution(
-            epoch, generated_at - since_seconds, sample_size,
+            epoch,
+            None if since_seconds is None else generated_at - since_seconds,
             [seconds * 1000 for seconds in edge_seconds],
             minimum_answer_count=request.filters.minimum_answer_count,
             maximum_answer_count=request.filters.maximum_answer_count,
         )
+        scan_seconds = time.monotonic() - started
         rows, totals = _work_distribution_band_rows(result["bands"], edge_seconds)
         data.update({
             "population": result["population"],
             "epoch": result["epoch"],
             "window_started_at": result["since"],
-            "sample_size": result["sample_size"],
-            "sampled_row_count": result["sampled_row_count"],
-            "sample_truncated": result["sample_truncated"],
             "bands": rows,
             "totals": totals,
             "unattributed": result["unattributed"],
+            "unmeasured": result["unmeasured"],
+            # The scan is linear in the epoch's claim rows, so its cost is a
+            # fact about the report worth showing rather than hiding.
+            "scan_seconds": round(scan_seconds, 3),
         })
         _mark_queue_opener_ok(report)
     except (sqlite3.Error, OSError) as error:

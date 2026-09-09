@@ -5349,11 +5349,23 @@ class ERDQueue:
             "rows": normalized_rows,
         }
 
-    def report_work_distribution(self, epoch, since, sample_size,
-                                 band_edge_millis,
+    # Group keys the band CASE cannot produce, so one pass over the claim rows
+    # yields the bands and the two populations that are not bands.
+    UNATTRIBUTED_BAND_INDEX = -1
+    UNMEASURED_BAND_INDEX = -2
+
+    def report_work_distribution(self, epoch, since, band_edge_millis,
                                  minimum_answer_count=None,
                                  maximum_answer_count=None) -> dict:
         """Aggregate claim telemetry into per-branch bands of worker time.
+
+        The whole epoch is aggregated, not a bounded sample of its most recent
+        rows.  A branch is banded by its lifetime worker time, so a sample that
+        keeps only recent claims clips the long-lived branches hardest and bands
+        them far below where they belong -- on epoch 17 the six branches holding
+        57.8% of all node work contributed no claims at all to the last hour.
+        This is a GROUP BY returning a handful of rows rather than a row
+        listing, so the cost is one linear pass and there is no output to bound.
 
         The band key is the branch's own summed candidate_evaluation_millis,
         never the span between its creation and finalization: a parent that
@@ -5366,24 +5378,21 @@ class ERDQueue:
         branch_id rather than the parent's.  Summing across bands therefore
         counts each node once.
 
-        A claim taken outside any branch context stores branch_id NULL and is
-        no branch's work.  Those rows are totalled separately instead of
-        collapsing into a single synthetic branch that would dominate the
-        cheapest band.
+        Two populations are counted apart from the bands rather than folded
+        into them.  A claim taken outside any branch context stores branch_id
+        NULL and is no branch's work.  A branch holding any claim whose
+        candidate_evaluation_millis is NULL has no measurable worker time at
+        all: treating that as zero would seat a branch of unknown -- possibly
+        very large -- cost in the cheapest band while still counting its nodes,
+        which is a confidently wrong distribution rather than an admitted gap.
 
         Bands come from claims, not from finalizations, so a branch still being
         solved is present with the totals it has accumulated so far;
         unfinished_branch_count reports how many of a band's branches those are.
 
-        An answer-count range narrows the sample before it is banded, so the
-        totals and every share are of the branches in that size region.  The
-        range is applied to the claim rows rather than to the bands, which is
-        the same population the reported sample bound describes.
+        An answer-count range narrows the claim rows before they are banded, so
+        the totals and every share are of the branches in that size region.
         """
-        sampled_row_count, sample_truncated = self._bounded_sample_metadata(
-            "claim_telemetry", epoch, since, sample_size,
-            minimum_answer_count=minimum_answer_count,
-            maximum_answer_count=maximum_answer_count)
         band_case = " ".join(
             f"WHEN worker_millis <= {int(edge)} THEN {index}"
             for index, edge in enumerate(band_edge_millis)
@@ -5391,27 +5400,37 @@ class ERDQueue:
         answer_count_condition, answer_count_parameters = (
             self._answer_count_condition(
                 minimum_answer_count, maximum_answer_count))
-        sample_sql = f"""
-            SELECT branch_id, work_nodes, coordination_millis,
-                   COALESCE(candidate_evaluation_millis, 0)
-                       AS candidate_evaluation_millis
-            FROM telemetry.claim_telemetry
-            WHERE epoch = ? AND recorded_at >= ?
-            {answer_count_condition}
-            ORDER BY recorded_at DESC, id DESC LIMIT ?
-        """
-        parameters = (epoch, since, *answer_count_parameters, sample_size)
-        band_rows = self._conn.execute(f"""
-            WITH sample AS ({sample_sql}),
-            branch AS (
+        since_condition = " AND recorded_at >= ?" if since is not None else ""
+        parameters = [epoch]
+        if since is not None:
+            parameters.append(since)
+        parameters.extend(answer_count_parameters)
+        # SQLite groups NULL branch_id together, so the claims belonging to no
+        # branch arrive as one group and are recognised by their key rather than
+        # by a second pass over the same rows.
+        rows = self._conn.execute(f"""
+            WITH branch AS (
                 SELECT branch_id,
                        COUNT(*) AS claim_count,
                        SUM(work_nodes) AS search_node_count,
                        SUM(coordination_millis) AS coordination_millis,
-                       SUM(candidate_evaluation_millis) AS worker_millis
-                FROM sample WHERE branch_id IS NOT NULL GROUP BY branch_id
+                       SUM(COALESCE(candidate_evaluation_millis, 0))
+                           AS worker_millis,
+                       SUM(CASE WHEN candidate_evaluation_millis IS NULL
+                                THEN 1 ELSE 0 END) AS unmeasured_claim_count
+                FROM telemetry.claim_telemetry
+                WHERE epoch = ? {since_condition}
+                {answer_count_condition}
+                GROUP BY branch_id
             )
-            SELECT CASE {band_case} ELSE {len(band_edge_millis)} END AS band_index,
+            SELECT CASE
+                       WHEN branch.branch_id IS NULL
+                           THEN {self.UNATTRIBUTED_BAND_INDEX}
+                       WHEN branch.unmeasured_claim_count > 0
+                           THEN {self.UNMEASURED_BAND_INDEX}
+                       {band_case}
+                       ELSE {len(band_edge_millis)}
+                   END AS band_index,
                    COUNT(*) AS branch_count,
                    SUM(branch.claim_count) AS claim_count,
                    SUM(branch.search_node_count) AS search_node_count,
@@ -5423,36 +5442,38 @@ class ERDQueue:
             LEFT JOIN active_branches USING (branch_id)
             GROUP BY band_index ORDER BY band_index
         """, parameters).fetchall()
-        unattributed = self._conn.execute(f"""
-            WITH sample AS ({sample_sql})
-            SELECT COUNT(*) AS claim_count,
-                   COALESCE(SUM(work_nodes), 0) AS search_node_count,
-                   COALESCE(SUM(coordination_millis), 0) AS coordination_millis,
-                   COALESCE(SUM(candidate_evaluation_millis), 0) AS worker_millis
-            FROM sample WHERE branch_id IS NULL
-        """, parameters).fetchone()
-        return {
-            "population": "recent_claims_by_branch",
-            "epoch": epoch,
-            "since": since,
-            "sample_size": sample_size,
-            "sampled_row_count": sampled_row_count,
-            "sample_truncated": sample_truncated,
-            "bands": [{
-                "band_index": row["band_index"],
-                "branch_count": row["branch_count"],
-                "unfinished_branch_count": row["unfinished_branch_count"],
+
+        def totals(row):
+            return {
                 "claim_count": row["claim_count"],
                 "search_node_count": row["search_node_count"],
                 "coordination_millis": row["coordination_millis"],
                 "worker_millis": row["worker_millis"],
-            } for row in band_rows],
-            "unattributed": {
-                "claim_count": unattributed["claim_count"],
-                "search_node_count": unattributed["search_node_count"],
-                "coordination_millis": unattributed["coordination_millis"],
-                "worker_millis": unattributed["worker_millis"],
-            },
+            }
+
+        empty = {"claim_count": 0, "search_node_count": 0,
+                 "coordination_millis": 0, "worker_millis": 0}
+        unattributed, unmeasured = dict(empty), dict(empty, branch_count=0)
+        bands = []
+        for row in rows:
+            if row["band_index"] == self.UNATTRIBUTED_BAND_INDEX:
+                unattributed = totals(row)
+            elif row["band_index"] == self.UNMEASURED_BAND_INDEX:
+                unmeasured = dict(totals(row), branch_count=row["branch_count"])
+            else:
+                bands.append({
+                    "band_index": row["band_index"],
+                    "branch_count": row["branch_count"],
+                    "unfinished_branch_count": row["unfinished_branch_count"],
+                    **totals(row),
+                })
+        return {
+            "population": "epoch_claims_by_branch",
+            "epoch": epoch,
+            "since": since,
+            "bands": bands,
+            "unattributed": unattributed,
+            "unmeasured": unmeasured,
         }
 
     # ------------------------------------------------------------------

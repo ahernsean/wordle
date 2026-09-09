@@ -5111,8 +5111,9 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(
             labels, ["<=2s", "2-30s", "30-300s", "300-3600s", ">3600s"])
         text = self.page.locator("#report").inner_text()
-        self.assertIn("recent claims by branch", text)
-        self.assertNotIn("recent_claims_by_branch", text)
+        self.assertIn("epoch claims by branch", text)
+        self.assertNotIn("epoch_claims_by_branch", text)
+        self.assertIn("whole epoch", text)
         # The cheap band coordinates far out of proportion to its work and the
         # expensive band far under; both are called out rather than left in the
         # column for the reader to find.
@@ -5136,6 +5137,28 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.open_work_distribution()
         text = self.page.locator("#report").inner_text()
         self.assertIn("outside any branch", text)
+
+    def test_work_distribution_names_branches_it_could_not_band(self):
+        # A branch with no recorded worker time is excluded rather than seated
+        # in the cheapest band, and the reader is told it exists.
+        self.open_work_distribution()
+        text = self.page.locator("#report").inner_text()
+        self.assertIn("unrecorded worker time", text)
+
+    def test_work_distribution_does_not_refetch_on_the_poll_timer(self):
+        # The scan outlasts the poll interval, so a timer-driven refetch would
+        # pile scans on top of each other.
+        self.open_work_distribution()
+        requests = []
+        self.page.on("request", lambda request: (
+            requests.append(request.url)
+            if "/api/view/work-distribution" in request.url else None))
+        self.page.wait_for_timeout(2500)
+        self.assertEqual(requests, [])
+        # Explicit refresh still works: the view is off the clock, not frozen.
+        self.page.locator("#work-distribution-refresh").click()
+        self.page.wait_for_timeout(500)
+        self.assertEqual(len(requests), 1)
 
     def test_work_distribution_withdraws_filters_it_cannot_honor(self):
         # A control the report ignores is worse than no control: it invites a

@@ -4096,8 +4096,7 @@ class WorkDistributionReportTest(unittest.TestCase):
                 idx=idx, candidate_evaluation_millis=evaluation_millis)
 
     def _report(self, **overrides):
-        request = ReportRequest(report_kind="work_distribution",
-                                since_seconds=3600, **overrides)
+        request = ReportRequest(report_kind="work_distribution", **overrides)
         return collect_work_distribution_report(self.sources, request)
 
     def test_band_labels_name_every_edge_and_the_open_top_band(self):
@@ -4207,17 +4206,19 @@ class WorkDistributionReportTest(unittest.TestCase):
         self.assertIsNone(bands[0]["search_node_share"])
         self.assertIsNone(bands[0]["coordination_share_per_work_share"])
 
-    def test_the_report_names_its_population_and_sample_bound(self):
+    def test_the_report_names_its_population_and_scan_cost(self):
         branch_key = ScoreCache.encode_subset(["salet", "crane"])
         self.queue.create_branch(branch_key, 2, 2)
         self._claims(branch_key, 6, 1, 10)
 
-        data = self._report(sample_size=3)["data"]
+        data = self._report()["data"]
 
-        self.assertEqual(data["population"], "recent_claims_by_branch")
-        self.assertEqual(data["sample_size"], 3)
-        self.assertEqual(data["sampled_row_count"], 3)
-        self.assertTrue(data["sample_truncated"])
+        self.assertEqual(data["population"], "epoch_claims_by_branch")
+        # No window given means the whole epoch, which is what makes a branch's
+        # lifetime worker time the band key rather than a recent slice of it.
+        self.assertIsNone(data["since_seconds"])
+        self.assertIsNone(data["window_started_at"])
+        self.assertIsNotNone(data["scan_seconds"])
         self.assertEqual(data["band_edge_seconds"],
                          list(WORK_DISTRIBUTION_BAND_EDGE_SECONDS))
 
@@ -4241,6 +4242,10 @@ class WorkDistributionReportTest(unittest.TestCase):
             ({"filters": ReportFilters(branch_worker_statuses=("active",))},
              "--branch-worker-status"),
             ({"filters": ReportFilters(priority=5)}, "--priority"),
+            # Zero is a real requested priority, so presence is what matters.
+            ({"filters": ReportFilters(priority=0)}, "--priority"),
+            ({"filters": ReportFilters(limit=0)}, "--limit"),
+            ({"sample_size": 1000}, "--sample-size"),
             ({"filters": ReportFilters(sort="nodes")}, "--sort"),
             ({"filters": ReportFilters(limit=10)}, "--limit"),
             ({"filters": ReportFilters(budget=3)},

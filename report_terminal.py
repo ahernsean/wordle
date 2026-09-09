@@ -1603,13 +1603,16 @@ def _render_work_distribution_sections(report, width):
     header = _semantic_header(
         report, "Work distribution by worker time" + scope, width)
     unattributed = data["unattributed"]
+    unmeasured = data.get("unmeasured") or {}
+    since_seconds = data.get("since_seconds")
+    window_text = ("whole epoch" if since_seconds is None
+                   else f"last {_abbreviate_duration(since_seconds)}")
+    scan_seconds = data.get("scan_seconds")
     lines = [
         f"Population: {data['population']}",
         _fit(
-            f"  epoch={data['epoch']} since-seconds={data['since_seconds']:,} "
-            f"sample-size={data['sample_size']:,} "
-            f"sampled={data['sampled_row_count']:,} "
-            f"truncated={str(data['sample_truncated']).lower()}",
+            f"  epoch={data['epoch']} window={window_text}"
+            + ("" if scan_seconds is None else f" scanned in {scan_seconds:.1f}s"),
             width,
         ),
         _fit(
@@ -1635,22 +1638,35 @@ def _render_work_distribution_sections(report, width):
             f"branch, belonging to no band",
             width,
         ))
-    rows = [f"{'Band':<9} {'Branches':>8} {'Open':>4} {'%Br':>6}"
-            f" {'Worker':>7} {'%Work':>6} {'Nodes':>7} {'%Nodes':>6}"
-            f" {'Claims':>9} {'%Claims':>7} {'Coord/work':>10}"]
+    # A branch whose worker time was never recorded cannot be banded at all.
+    # Naming it keeps the bands a statement about measured branches rather than
+    # a distribution with unknown cost quietly seated in its cheapest row.
+    unmeasured_branches = unmeasured.get("branch_count", 0)
+    if unmeasured_branches:
+        lines.append(_fit(
+            f"  plus {unmeasured_branches:,} "
+            f"branch{'' if unmeasured_branches == 1 else 'es'} with unrecorded "
+            f"worker time, excluded from every band "
+            f"({_format_node_count(unmeasured.get('search_node_count', 0))} nodes)",
+            width,
+        ))
+    # Coord/work is the column the report exists for, so it sits immediately
+    # after the band and cannot be the first thing an 80-column terminal drops.
+    rows = [f"{'Band':<9} {'Coord/work':>10} {'Branches':>9} {'Open':>5}"
+            f" {'Worker':>7} {'%Work':>6} {'Nodes':>7} {'%Nodes':>7}"
+            f" {'Claims':>9} {'%Claims':>8}"]
     for band in data["bands"]:
         ratio = band["coordination_share_per_work_share"]
         rows.append(_fit(
-            f"{band['band_label']:<9} {band['branch_count']:>8,}"
-            f" {band['unfinished_branch_count']:>4,}"
-            f" {_percent_text(band['branch_share']):>6}"
+            f"{band['band_label']:<9}"
+            f" {('—' if ratio is None else f'{ratio:.2f}'):>10}"
+            f" {band['branch_count']:>9,} {band['unfinished_branch_count']:>5,}"
             f" {_abbreviate_duration(band['worker_millis'] / 1000):>7}"
             f" {_percent_text(band['worker_time_share']):>6}"
             f" {_format_node_count(band['search_node_count']):>7}"
-            f" {_percent_text(band['search_node_share']):>6}"
+            f" {_percent_text(band['search_node_share']):>7}"
             f" {band['claim_count']:>9,}"
-            f" {_percent_text(band['claim_share']):>7}"
-            f" {('—' if ratio is None else f'{ratio:.2f}'):>10}",
+            f" {_percent_text(band['claim_share']):>8}",
             width,
         ))
     rows.append(_fit(

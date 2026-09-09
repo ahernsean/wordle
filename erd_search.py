@@ -1816,11 +1816,12 @@ def main():
         )
         if args.by is not None and not args.hotspots:
             parser.error('--by requires --hotspots')
-        if not (args.hotspots or args.accuracy or args.work_distribution) and any(
-                value is not None
-                for value in (args.since_seconds, args.sample_size)):
-            parser.error('--since-seconds and --sample-size require --hotspots, '
-                         '--accuracy, or --work-distribution')
+        if args.sample_size is not None and not (args.hotspots or args.accuracy):
+            parser.error('--sample-size requires --hotspots or --accuracy')
+        if args.since_seconds is not None and not (
+                args.hotspots or args.accuracy or args.work_distribution):
+            parser.error('--since-seconds requires --hotspots, --accuracy, or '
+                         '--work-distribution')
         if args.epoch is not None and not (args.hotspots or args.root_progress
                                            or args.accuracy
                                            or args.work_distribution):
@@ -1864,8 +1865,12 @@ def main():
             limit=args.limit,
         ))
         args.hotspot_field = hotspot_field if args.hotspots else None
-        args.sample_size = min(args.sample_size or 50_000, 1_000_000)
-        if args.hotspots or args.work_distribution:
+        # The work distribution aggregates rather than samples, so it carries
+        # no sample bound at all and defaults to the whole epoch.
+        args.sample_size = (
+            None if args.work_distribution
+            else min(args.sample_size or 50_000, 1_000_000))
+        if args.hotspots:
             args.since_seconds = args.since_seconds or 3600
         try:
             validate_report_request(ReportRequest(

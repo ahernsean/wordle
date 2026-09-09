@@ -131,7 +131,7 @@ python3.13 erd_search.py view --cache CRANE
 python3.13 erd_search.py view --hotspots --by nodes
 python3.13 erd_search.py view --hotspots --by coordination --since-seconds 900
 python3.13 erd_search.py view --work-distribution
-python3.13 erd_search.py view --work-distribution --since-seconds 86400 --sample-size 1000000
+python3.13 erd_search.py view --work-distribution --epoch 17
 python3.13 erd_search.py view --work-distribution --minimum-answer-count 200
 python3.13 erd_search.py view --openers
 python3.13 erd_search.py view --openers CRANE
@@ -161,16 +161,32 @@ column says how many of a band's branches those are. A branch is banded by its
 own summed worker time, never by the span between its creation and its
 finalization: a parent that waits on promoted children accumulates wall time it
 did not work, and banding on that span would file it among the expensive
-branches for having done nothing. Claims taken outside any branch belong to no
-band and are counted separately.
+branches for having done nothing.
+
+**It aggregates the whole epoch, and that is not an option to trade away for
+speed.** A branch is banded by its lifetime worker time, so keeping only recent
+claims clips the long-lived branches hardest and bands them far below where
+they belong. On epoch 17 the six branches holding 57.8% of all node work
+contributed no claims at all to the last hour, so every windowed view showed a
+nearly balanced swarm while the truth was a `Coord/work` spread of 18.53 down
+to 0.00. The scan is one linear pass returning a handful of rows — about ten
+seconds over 8.4 million claims — and the report prints how long it took.
+`--since-seconds` narrows it deliberately and is worth reaching for only when
+the question really is about a window.
+
+Two populations are counted apart from the bands. Claims taken outside any
+branch belong to no branch's work. A branch holding any claim whose worker time
+was never recorded has no measurable cost at all: banding it as zero would seat
+a branch of unknown cost in the cheapest row while still counting its nodes, so
+it is excluded and named instead.
 
 `--minimum-answer-count` and `--maximum-answer-count` scope the bands to one
-size region, narrowing the sample before it is banded so every share stays a
-share of what the report shows. Every other filter is refused rather than
-ignored: `--budget` because a claim row records answer count but no budget, and
-`--priority`, `--sort`, `--limit`, `--branch-status` and
-`--branch-worker-status` because they describe or order individual branches
-rather than the population.
+size region, narrowing the claim rows before they are banded so every share
+stays a share of what the report shows. Every other filter is refused rather
+than ignored: `--budget` because a claim row records answer count but no
+budget; `--sample-size` because nothing here samples; and `--priority`,
+`--sort`, `--limit`, `--branch-status` and `--branch-worker-status` because
+they describe or order individual branches rather than the population.
 
 `--root-progress` reports one opener's work: every response group with the
 branches, search nodes, and node share spent under it, which groups have not

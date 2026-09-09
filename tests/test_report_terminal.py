@@ -846,7 +846,7 @@ class OverviewRendererTest(unittest.TestCase):
         self.assertIn("truncated=true", output)
 
     @staticmethod
-    def _work_distribution_report(bands, unattributed=None):
+    def _work_distribution_report(bands, unattributed=None, unmeasured=None):
         # The band rows are shaped by report_model's own pricing so the render
         # is exercised against the structure it is actually handed.
         rows, totals = _work_distribution_band_rows(
@@ -854,15 +854,17 @@ class OverviewRendererTest(unittest.TestCase):
         report = overview_report()
         report.update({"report_kind": "work_distribution", "tree": False})
         report["data"] = {
-            "population": "recent_claims_by_branch",
-            "epoch": 17, "since_seconds": 3600, "window_started_at": 100,
-            "sample_size": 50_000, "sampled_row_count": 50_000,
-            "sample_truncated": True,
+            "population": "epoch_claims_by_branch",
+            "epoch": 17, "since_seconds": None, "window_started_at": None,
+            "scan_seconds": 10.4,
             "band_edge_seconds": list(WORK_DISTRIBUTION_BAND_EDGE_SECONDS),
             "bands": rows,
             "totals": totals,
             "unattributed": unattributed or {
                 "claim_count": 0, "search_node_count": 0,
+                "coordination_millis": 0, "worker_millis": 0},
+            "unmeasured": unmeasured or {
+                "branch_count": 0, "claim_count": 0, "search_node_count": 0,
                 "coordination_millis": 0, "worker_millis": 0},
         }
         return report
@@ -888,9 +890,10 @@ class OverviewRendererTest(unittest.TestCase):
 
         output = render_report(report, width=140)
 
-        self.assertIn("Population: recent_claims_by_branch", output)
+        self.assertIn("Population: epoch_claims_by_branch", output)
         self.assertIn("epoch=17", output)
-        self.assertIn("truncated=true", output)
+        self.assertIn("window=whole epoch", output)
+        self.assertIn("scanned in 10.4s", output)
         for label in ("<=2s", "2-30s", "30-300s", "300-3600s", ">3600s"):
             with self.subTest(label=label):
                 self.assertIn(label, output)
@@ -2277,11 +2280,10 @@ class ViewParserTest(unittest.TestCase):
         self.assertEqual(args.sample_size, 1_000_000)
         self.assertEqual(args.limit, 10)
 
-    def test_work_distribution_defaults_and_sample_cap_are_normalized(self):
+    def test_work_distribution_defaults_to_the_whole_epoch(self):
         with (
             patch("sys.argv", [
-                "erd_search.py", "view", "--work-distribution",
-                "--epoch", "17", "--sample-size", "2000000",
+                "erd_search.py", "view", "--work-distribution", "--epoch", "17",
             ]),
             patch("report_terminal.run_view") as run_view,
         ):
@@ -2289,8 +2291,10 @@ class ViewParserTest(unittest.TestCase):
         args = run_view.call_args.args[0]
         self.assertEqual(args.report_kind, "work_distribution")
         self.assertEqual(args.epoch, 17)
-        self.assertEqual(args.since_seconds, 3600)
-        self.assertEqual(args.sample_size, 1_000_000)
+        # No window and no sample bound: a recent slice would band the
+        # long-lived branches far below their lifetime cost.
+        self.assertIsNone(args.since_seconds)
+        self.assertIsNone(args.sample_size)
         self.assertIsNone(args.hotspot_field)
 
     def test_work_distribution_reaches_the_collected_request(self):
@@ -2304,7 +2308,7 @@ class ViewParserTest(unittest.TestCase):
             session._collect()
         request = collect_report.call_args.args[1]
         self.assertEqual(request.report_kind, "work_distribution")
-        self.assertEqual(request.since_seconds, 3600)
+        self.assertIsNone(request.since_seconds)
 
     def test_work_distribution_accepts_an_answer_count_range(self):
         with (
@@ -2328,6 +2332,8 @@ class ViewParserTest(unittest.TestCase):
             ["--work-distribution", "--priority", "5"],
             ["--work-distribution", "--sort", "nodes"],
             ["--work-distribution", "--limit", "10"],
+            ["--work-distribution", "--priority", "0"],
+            ["--work-distribution", "--sample-size", "1000"],
         ):
             with self.subTest(options=options):
                 with (
@@ -3284,23 +3290,26 @@ class WorkDistributionCommandEndToEndTest(unittest.TestCase):
     def test_text_output_bands_the_two_branches_apart(self):
         text = self._run()
         self.assertIn("Work distribution by worker time", text)
-        self.assertIn("Population: recent_claims_by_branch", text)
+        self.assertIn("Population: epoch_claims_by_branch", text)
         band_rows = {
             line.split()[0]: line.split()
             for line in text.splitlines() if line.startswith(("<=", "2-", "30-",
                                                               "300-", ">3"))
         }
         # 20 claims of 20 ms is 400 ms of worker time; 2 claims of 350 s is
-        # 700 s.  Claim count and band are independent.
-        self.assertEqual(band_rows["<=2s"][1], "1")
-        self.assertEqual(band_rows["300-3600s"][1], "1")
-        self.assertEqual(band_rows["2-30s"][1], "0")
+        # 700 s.  Claim count and band are independent.  Coord/work sits in the
+        # second column so an 80-column terminal cannot drop it, and the branch
+        # count follows it.
+        self.assertEqual(band_rows["<=2s"][2], "1")
+        self.assertEqual(band_rows["300-3600s"][2], "1")
+        self.assertEqual(band_rows["2-30s"][2], "0")
 
     def test_json_output_round_trips_the_bands_and_their_shares(self):
         report = json.loads(self._run("--format", "json"))
         self.assertEqual(report["report_kind"], "work_distribution")
         self.assertTrue(report["sources"]["queue"]["ok"])
         data = report["data"]
+        self.assertEqual(data["population"], "epoch_claims_by_branch")
         self.assertEqual(data["totals"]["claim_count"], 22)
         self.assertEqual(data["totals"]["branch_count"], 2)
         self.assertAlmostEqual(

@@ -266,6 +266,10 @@ def parse_report_request(path, query):
             "epoch, since_seconds, and sample_size require the hotspots or "
             "work-distribution endpoint"
         )
+    # The work distribution aggregates the whole epoch rather than sampling it,
+    # so a sample bound here would be accepted and then never applied.
+    if sample_size is not None and explicit_kind == "work_distribution":
+        raise InvalidRequest("sample_size requires the hotspots endpoint")
     if hotspot_field is not None and hotspot_field not in HOTSPOT_FIELDS:
         raise InvalidRequest(f"invalid hotspot field {hotspot_field!r}")
     hotspot_field = hotspot_field or ("nodes" if explicit_kind == "hotspots" else None)
@@ -318,8 +322,10 @@ def parse_report_request(path, query):
         epoch=integer_values["epoch"],
         tree_parent=tree_parent,
         tree_cursor=tree_cursor,
-        since_seconds=since_seconds or 3600,
-        sample_size=min(sample_size or 50_000, 1_000_000),
+        since_seconds=(since_seconds if explicit_kind == "work_distribution"
+                       else (since_seconds or 3600)),
+        sample_size=(None if explicit_kind == "work_distribution"
+                     else min(sample_size or 50_000, 1_000_000)),
         inherited_cost=inherited_cost,
     )
     try:

@@ -98,11 +98,9 @@
     "epoch": 0,
     "maximum_answer_count": null,
     "minimum_answer_count": null,
-    "population": "recent_claims_by_branch",
-    "sample_size": 50000,
-    "sample_truncated": false,
-    "sampled_row_count": 973,
-    "since_seconds": 3600,
+    "population": "epoch_claims_by_branch",
+    "scan_seconds": 0.184,
+    "since_seconds": null,
     "totals": {
       "branch_count": 45,
       "claim_count": 936,
@@ -117,7 +115,14 @@
       "search_node_count": 0,
       "worker_millis": 74
     },
-    "window_started_at": 1770996400
+    "unmeasured": {
+      "branch_count": 1,
+      "claim_count": 5,
+      "coordination_millis": 150,
+      "search_node_count": 60000,
+      "worker_millis": 0
+    },
+    "window_started_at": null
   },
   "filters": {
     "branch_statuses": [],

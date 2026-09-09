@@ -853,9 +853,9 @@ class WorkDistributionTests(unittest.TestCase):
                 10, coordination_millis, nodes, 2, branch_key=branch_key,
                 idx=idx, candidate_evaluation_millis=evaluation_millis)
 
-    def _report(self, sample_size=1000):
+    def _report(self, since=None):
         return self.q.report_work_distribution(
-            self.q.epoch, 0, sample_size, BAND_EDGE_MILLIS)
+            self.q.epoch, since, BAND_EDGE_MILLIS)
 
     def _band(self, report, band_index):
         for band in report["bands"]:
@@ -968,19 +968,60 @@ class WorkDistributionTests(unittest.TestCase):
         self.assertEqual(self._band(report, 0)["branch_count"], 1)
         self.assertEqual(self._band(report, 0)["unfinished_branch_count"], 0)
 
-    def test_sample_bound_is_reported_and_applied(self):
+    def test_a_window_narrows_the_population_and_the_whole_epoch_is_default(self):
         branch_key = self._branch("cheap", 4)
         self.q.create_branch(branch_key, 4, 3)
         self._claims(branch_key, 10, 5, 100)
+        self.q._conn.execute(
+            "UPDATE telemetry.claim_telemetry SET recorded_at = 100 "
+            "WHERE idx < 4")
 
-        bounded = self._report(sample_size=4)
+        whole = self._report()
+        windowed = self._report(since=101)
 
-        self.assertEqual(bounded["sampled_row_count"], 4)
-        self.assertTrue(bounded["sample_truncated"])
-        self.assertEqual(self._band(bounded, 0)["claim_count"], 4)
-        full = self._report()
-        self.assertEqual(full["sampled_row_count"], 10)
-        self.assertFalse(full["sample_truncated"])
+        self.assertEqual(self._band(whole, 0)["claim_count"], 10)
+        self.assertEqual(self._band(windowed, 0)["claim_count"], 6)
+        # A branch banded by its lifetime worker time bands lower inside a
+        # window: the window is a deliberate narrowing, not the default.
+        self.assertEqual(self._band(whole, 0)["worker_millis"], 1_000)
+        self.assertEqual(self._band(windowed, 0)["worker_millis"], 600)
+
+    def test_a_branch_with_unrecorded_worker_time_is_never_banded(self):
+        # add_claim_telemetry leaves candidate_evaluation_millis NULL when the
+        # caller does not supply it.  Coalescing that to zero would seat a
+        # branch of unknown cost in the cheapest band while still counting its
+        # nodes -- a confidently wrong distribution rather than an admitted gap.
+        measured = self._branch("measu", 4)
+        unmeasured = self._branch("unmea", 6)
+        self.q.create_branch(measured, 4, 3)
+        self.q.create_branch(unmeasured, 6, 3)
+        self._claims(measured, 2, 5, 100)
+        for idx in range(3):
+            self.q.add_claim_telemetry(
+                6, 10, 900_000, 2, branch_key=unmeasured, idx=idx)
+
+        report = self._report()
+
+        self.assertEqual(sum(b["branch_count"] for b in report["bands"]), 1)
+        self.assertEqual(self._band(report, 0)["branch_count"], 1)
+        self.assertEqual(self._band(report, 0)["search_node_count"], 10)
+        self.assertEqual(report["unmeasured"]["branch_count"], 1)
+        self.assertEqual(report["unmeasured"]["claim_count"], 3)
+        self.assertEqual(report["unmeasured"]["search_node_count"], 2_700_000)
+
+    def test_one_unrecorded_claim_taints_its_whole_branch(self):
+        # Partial measurement is still unmeasurable: summing the known part
+        # would under-report the branch and band it too low.
+        branch_key = self._branch("mixed", 4)
+        self.q.create_branch(branch_key, 4, 3)
+        self._claims(branch_key, 4, 5, 100_000)
+        self.q.add_claim_telemetry(4, 10, 5, 2, branch_key=branch_key, idx=9)
+
+        report = self._report()
+
+        self.assertEqual(report["bands"], [])
+        self.assertEqual(report["unmeasured"]["branch_count"], 1)
+        self.assertEqual(report["unmeasured"]["claim_count"], 5)
 
     def test_an_answer_count_range_narrows_the_banded_population(self):
         small = self._branch("small", 4)
@@ -997,18 +1038,16 @@ class WorkDistributionTests(unittest.TestCase):
                 candidate_evaluation_millis=25_000)
 
         only_large = self.q.report_work_distribution(
-            self.q.epoch, 0, 1000, BAND_EDGE_MILLIS, minimum_answer_count=5)
+            self.q.epoch, None, BAND_EDGE_MILLIS, minimum_answer_count=5)
         only_small = self.q.report_work_distribution(
-            self.q.epoch, 0, 1000, BAND_EDGE_MILLIS, maximum_answer_count=4)
+            self.q.epoch, None, BAND_EDGE_MILLIS, maximum_answer_count=4)
 
         self.assertEqual(self._band(only_large, 2)["branch_count"], 1)
         self.assertIsNone(self._band(only_large, 0))
-        self.assertEqual(only_large["sampled_row_count"], 2)
+        self.assertEqual(self._band(only_large, 2)["claim_count"], 2)
         self.assertEqual(self._band(only_small, 0)["branch_count"], 1)
         self.assertIsNone(self._band(only_small, 2))
-        # The bound describes the narrowed population, not the whole table:
-        # a count taken before the filter would report five here.
-        self.assertEqual(only_small["sampled_row_count"], 3)
+        self.assertEqual(self._band(only_small, 0)["claim_count"], 3)
 
     def test_an_answer_count_range_bounds_both_ends(self):
         for size in (3, 7, 20):
@@ -1019,11 +1058,11 @@ class WorkDistributionTests(unittest.TestCase):
                 candidate_evaluation_millis=100)
 
         banded = self.q.report_work_distribution(
-            self.q.epoch, 0, 1000, BAND_EDGE_MILLIS,
+            self.q.epoch, None, BAND_EDGE_MILLIS,
             minimum_answer_count=5, maximum_answer_count=10)
 
-        self.assertEqual(banded["sampled_row_count"], 1)
         self.assertEqual(self._band(banded, 0)["branch_count"], 1)
+        self.assertEqual(self._band(banded, 0)["claim_count"], 1)
 
     def test_rows_outside_the_epoch_are_excluded(self):
         branch_key = self._branch("cheap", 4)
@@ -1031,11 +1070,10 @@ class WorkDistributionTests(unittest.TestCase):
         self._claims(branch_key, 3, 5, 100)
 
         other_epoch = self.q.report_work_distribution(
-            self.q.epoch + 1, 0, 1000, BAND_EDGE_MILLIS)
+            self.q.epoch + 1, None, BAND_EDGE_MILLIS)
 
         self.assertEqual(other_epoch["bands"], [])
         self.assertEqual(other_epoch["unattributed"]["claim_count"], 0)
-        self.assertEqual(other_epoch["sampled_row_count"], 0)
 
 
 if __name__ == "__main__":

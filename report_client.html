@@ -97,6 +97,7 @@
     table.work-distribution td.ratio-heavy { color:var(--red); }
     table.work-distribution td.ratio-light { color:var(--dim); }
     p.work-distribution-legend { margin:.4rem 0 0; color:var(--dim); font-size:.9em; }
+    .work-distribution-refresh { display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; margin:.4rem 0; font-size:.9em; }
     details.filters { margin-top:.35rem; color:var(--dim); }
     details.filters > summary { cursor:pointer; padding:.1rem 0; }
     .control-group { border:1px solid var(--border); border-radius:6px; background:var(--panel); padding:.4rem .5rem; margin-top:.4rem; }
@@ -559,7 +560,7 @@
       // narrowing it to something else is cleared here rather than sent
       // and refused.  The answer-count range survives because the report
       // applies it, scoping the bands to one size region.
-      if(normalized.kind==="work_distribution"){normalized.branch_status=[];normalized.branch_worker_status=[];normalized.branch_target="";normalized.budget=null;normalized.priority=null;normalized.sort="";normalized.limit=null;normalized.answers=false;normalized.claims=false;}
+      if(normalized.kind==="work_distribution"){normalized.branch_status=[];normalized.branch_worker_status=[];normalized.branch_target="";normalized.budget=null;normalized.priority=null;normalized.sort="";normalized.limit=null;normalized.answers=false;normalized.claims=false;normalized.sample_size=null;}
       if(normalized.kind==="hotspots"&&["evaluated-candidates","bulk-completed-candidates","one-level-erd-prunes","two-level-erd-prunes","cut-reuse","coordination"].includes(normalized.by)){normalized.branch_status=[];normalized.branch_worker_status=[];}
       if(normalized.kind==="hotspots"&&normalized.by==="coordination")normalized.branch_target="";
       if(normalized.tree){normalized.claims=false;normalized.answers=false;}
@@ -2302,15 +2303,24 @@
       const totals=data.totals||{},unattributed=data.unattributed||{};
       for(const [labelText,value] of [
         ["population",data.population?populationNames[data.population]||label(data.population):null],
-        ["epoch",data.epoch],["window seconds",data.since_seconds],
-        ["sample size",data.sample_size],["sampled",data.sampled_row_count],
+        ["epoch",data.epoch],
+        ["window",data.since_seconds===null||data.since_seconds===undefined?"whole epoch":formatDuration(data.since_seconds)],
+        ["scanned in",data.scan_seconds===null||data.scan_seconds===undefined?null:data.scan_seconds.toFixed(1)+"s"],
         ["branches",totals.branch_count],["still open",totals.unfinished_branch_count],
         ["claims",totals.claim_count],["nodes",totals.search_node_count],
       ])meta.append(metric(labelText,value));
-      if(data.sample_truncated)meta.append(element("span","badge","sample truncated"));
       if(data.minimum_answer_count!==null&&data.minimum_answer_count!==undefined)meta.append(metric("min answers",data.minimum_answer_count));
       if(data.maximum_answer_count!==null&&data.maximum_answer_count!==undefined)meta.append(metric("max answers",data.maximum_answer_count));
       fragment.append(meta);
+      // A full-epoch scan outlasts the poll interval, so this view is not on
+      // the timer and says so rather than showing a figure the reader assumes
+      // is live.
+      const refreshRow=element("div","work-distribution-refresh");
+      const refreshButton=element("button","","Refresh");
+      refreshButton.id="work-distribution-refresh";
+      refreshButton.addEventListener("click",()=>{fetchReport();});
+      refreshRow.append(refreshButton,element("span","dim","This view does not auto-refresh: the scan takes longer than the poll interval."));
+      fragment.append(refreshRow);
       const scroll=element("div","work-distribution-scroll"),table=element("table","work-distribution");
       const head=element("tr");
       for(const heading of ["Band","Branches","Open","% branches","Worker time","% work","Nodes","% nodes","Claims","% claims","Coord/work"])head.append(element("th","",heading));
@@ -2340,6 +2350,8 @@
       const legend=element("p","work-distribution-legend","Coord/work is a band's share of coordination time over its share of search nodes; 1.00 is proportionate. Bands come from claims, so a branch still being solved is counted with what it has spent so far.");
       fragment.append(legend);
       if(unattributed.claim_count)fragment.append(element("p","work-distribution-legend",formatInteger(unattributed.claim_count)+" claim"+(unattributed.claim_count===1?"":"s")+" were taken outside any branch and belong to no band."));
+      const unmeasured=data.unmeasured||{};
+      if(unmeasured.branch_count)fragment.append(element("p","work-distribution-legend",formatInteger(unmeasured.branch_count)+" branch"+(unmeasured.branch_count===1?"":"es")+" have unrecorded worker time and are excluded from every band."));
       return fragment;
     }
     function renderHotspots(report,previous){const data=report.data,fragment=document.createDocumentFragment(),meta=element("div","metrics");for(const [labelText,value] of [["population",data.population?populationNames[data.population]||label(data.population):null],["epoch",data.epoch],["window seconds",data.since_seconds],["sample size",data.sample_size],["sampled",data.sampled_row_count]])meta.append(metric(labelText,value));if(data.sample_truncated)meta.append(element("span","badge","sample truncated"));fragment.append(meta);const rows=gridElement("hotspots"),previousRows=previousBy(previous,"rows","row_id");for(const row of data.rows||[]){const identity=String(row.row_id||row.branch_reference||"bucket"),title=row.branch_reference?"@"+shortReference(row.branch_reference):String(row.row_id||"bucket"),card=section(title,labeledFacts(displayEntries(row,report.generated_at)),changeClass(row,previousRows.get(identity)));card.dataset.identity=identity;rows.append(card);}fragment.append(rows);return fragment;}
@@ -2589,7 +2601,12 @@
       lastContext=contextKey(currentState);
       byId("branch-target-input").value=currentState.branch_target;shownBranchTarget=currentState.branch_target;
     }
-    function schedulePoll(){clearTimeout(pollTimer);pollTimer=setTimeout(async()=>{await fetchReport();schedulePoll();},currentState.poll);}
+    // A view whose report costs a full-epoch scan cannot ride the poll timer:
+    // the scan outlasts the interval, so every tick would pile another one on.
+    // It is fetched when entered and when the reader asks, never on a clock.
+    const pollExemptKinds=new Set(["work_distribution"]);
+    const pollExempt=()=>pollExemptKinds.has(currentState.kind)&&lastReport&&lastReport.report_kind===currentState.kind;
+    function schedulePoll(){clearTimeout(pollTimer);pollTimer=setTimeout(async()=>{if(!pollExempt())await fetchReport();schedulePoll();},currentState.poll);}
     function initialize(){
       const addFilterControls=(containerId,names,dataName)=>{const container=byId(containerId);for(const name of names){const filterLabel=element("label"),input=element("input");input.type="checkbox";input.value=name;input.dataset[dataName]="1";filterLabel.append(input," "+name);container.append(filterLabel);}};
       addFilterControls("branch-statuses",branchStatusNames,"branchStatus");addFilterControls("branch-worker-statuses",branchWorkerStatusNames,"branchWorkerStatus");addFilterControls("source-states",sourceStateNames,"sourceState");
