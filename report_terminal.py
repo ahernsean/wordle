@@ -1634,8 +1634,8 @@ def _render_work_distribution_sections(report, width):
     if unattributed_count:
         lines.append(_fit(
             f"  plus {unattributed_count:,} "
-            f"claim{'' if unattributed_count == 1 else 's'} taken outside any "
-            f"branch, belonging to no band",
+            f"claim{'' if unattributed_count == 1 else 's'} with no recorded "
+            f"branch attribution, belonging to no band",
             width,
         ))
     # A branch whose worker time was never recorded cannot be banded at all.

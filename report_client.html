@@ -2349,7 +2349,7 @@
       fragment.append(section("Work distribution by worker time",scroll));
       const legend=element("p","work-distribution-legend","Coord/work is a band's share of coordination time over its share of search nodes; 1.00 is proportionate. Bands come from claims, so a branch still being solved is counted with what it has spent so far.");
       fragment.append(legend);
-      if(unattributed.claim_count)fragment.append(element("p","work-distribution-legend",formatInteger(unattributed.claim_count)+" claim"+(unattributed.claim_count===1?"":"s")+" were taken outside any branch and belong to no band."));
+      if(unattributed.claim_count)fragment.append(element("p","work-distribution-legend",formatInteger(unattributed.claim_count)+" claim"+(unattributed.claim_count===1?"":"s")+" have no recorded branch attribution and belong to no band."));
       const unmeasured=data.unmeasured||{};
       if(unmeasured.branch_count)fragment.append(element("p","work-distribution-legend",formatInteger(unmeasured.branch_count)+" branch"+(unmeasured.branch_count===1?"":"es")+" have unrecorded worker time and are excluded from every band."));
       return fragment;

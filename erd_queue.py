@@ -5379,8 +5379,12 @@ class ERDQueue:
         counts each node once.
 
         Two populations are counted apart from the bands rather than folded
-        into them.  A claim taken outside any branch context stores branch_id
-        NULL and is no branch's work.  A branch holding any claim whose
+        into them.  A claim with branch_id NULL has no recorded branch
+        attribution: most such rows were taken outside any branch context, but
+        the migration that added branch_id also leaves it NULL on every claim
+        recorded before per-branch attribution existed, and the two cases are
+        indistinguishable here -- so this population is named by what is
+        missing, not by an assumed cause.  A branch holding any claim whose
         candidate_evaluation_millis is NULL has no measurable worker time at
         all: treating that as zero would seat a branch of unknown -- possibly
         very large -- cost in the cheapest band while still counting its nodes,

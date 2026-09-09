@@ -5133,10 +5133,10 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("360,000,000", row)
         self.assertNotIn("360000000", row)
 
-    def test_work_distribution_names_claims_outside_any_branch(self):
+    def test_work_distribution_names_claims_with_no_branch_attribution(self):
         self.open_work_distribution()
         text = self.page.locator("#report").inner_text()
-        self.assertIn("outside any branch", text)
+        self.assertIn("no recorded branch attribution", text)
 
     def test_work_distribution_names_branches_it_could_not_band(self):
         # A branch with no recorded worker time is excluded rather than seated

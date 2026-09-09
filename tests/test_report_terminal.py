@@ -900,7 +900,7 @@ class OverviewRendererTest(unittest.TestCase):
         self.assertIn("39,332", output)
         self.assertIn("coordination-time share ÷ search-node share", output)
 
-    def test_work_distribution_render_names_claims_outside_any_branch(self):
+    def test_work_distribution_render_names_claims_with_no_branch_attribution(self):
         report = self._work_distribution_report(
             [self._band(0, branch_count=1, claim_count=2, search_node_count=4,
                         coordination_millis=10, worker_millis=20)],
@@ -910,8 +910,8 @@ class OverviewRendererTest(unittest.TestCase):
 
         output = render_report(report, width=120)
 
-        self.assertIn("1 claim taken outside any branch", output)
-        self.assertNotIn("1 claims taken", output)
+        self.assertIn("1 claim with no recorded branch attribution", output)
+        self.assertNotIn("1 claims with no recorded", output)
 
     def test_work_distribution_render_omits_the_unattributed_line_at_zero(self):
         output = render_report(
@@ -920,7 +920,7 @@ class OverviewRendererTest(unittest.TestCase):
                             search_node_count=4, worker_millis=20)]),
             width=120,
         )
-        self.assertNotIn("outside any branch", output)
+        self.assertNotIn("no recorded branch attribution", output)
 
     def test_work_distribution_render_dashes_a_band_with_no_search(self):
         output = render_report(

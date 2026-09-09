@@ -174,11 +174,14 @@ seconds over 8.4 million claims — and the report prints how long it took.
 `--since-seconds` narrows it deliberately and is worth reaching for only when
 the question really is about a window.
 
-Two populations are counted apart from the bands. Claims taken outside any
-branch belong to no branch's work. A branch holding any claim whose worker time
-was never recorded has no measurable cost at all: banding it as zero would seat
-a branch of unknown cost in the cheapest row while still counting its nodes, so
-it is excluded and named instead.
+Two populations are counted apart from the bands. Claims with no recorded
+branch attribution belong to no branch's work — most were taken outside any
+branch, but a claim recorded before per-branch attribution existed also reads
+this way and cannot be told apart from one, so the population is named by what
+is missing rather than by an assumed cause. A branch holding any claim whose
+worker time was never recorded has no measurable cost at all: banding it as
+zero would seat a branch of unknown cost in the cheapest row while still
+counting its nodes, so it is excluded and named instead.
 
 In the web client this view is off the refresh cycle entirely: a scan that
 outlasts the poll interval cannot be retried on a clock or on a tab switch,
