@@ -716,22 +716,22 @@ or a clear, which keep the same container.
 
 ## Before committing and pushing
 
-Before committing and pushing a code change, run the targeted tests that cover
-the changed behavior and its related paths. Use `python3.13`; for example:
+Write tests for every new or changed executable path.  Before committing and
+pushing a code change, run the specific tests that cover the changed behavior
+and its related paths. Use `python3.13`; for example:
 
 ```
 python3.13 -m unittest tests.test_report_model tests.test_report_terminal
 ```
 
-Write tests for every new or changed executable path.
-
-**Targeted means targeted, and then push.** A local full-suite pass costs about
-twenty minutes and spends nearly all of it re-running tests the change cannot
-reach. That latency is not free: it delays the push, and the push is what lets
-CI run the whole suite in parallel *and* lets a reviewing agent start reading
-the code. Holding a change that its own focused tests and failure-proof have
+**Your tests should be specific, and then push.** A local full-suite pass can
+cost about twenty minutes and could spend nearly all of it running tests your
+change doesn't reach. That latency is not free: it delays the push, and the
+push is what lets CI run the whole suite in parallel and lets a reviewing agent
+start reading the code. Holding back a change that its own focused tests have
 already cleared, so that unrelated tests can be re-run locally first, is
-strictly worse than pushing it. Read CI's result rather than pre-empting it.
+strictly worse than pushing it. Let CI do its job; read CI's result rather than
+pre-empting it.
 
 **The one trap of narrow scope is user-facing strings.**
 `tests/test_erd_search_lifecycle.py` pins `erd_search.py`'s `parser.error`
