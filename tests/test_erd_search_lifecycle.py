@@ -452,7 +452,10 @@ class QueueOperatorCommandTest(unittest.TestCase):
              "pattern can only be used with --word"),
             (["view", "NOTAWORD"], "five-letter word"),
             (["view", "--since-seconds", "30"],
-             "require --hotspots or --accuracy"),
+             "--since-seconds requires --hotspots, --accuracy, or "
+             "--work-distribution"),
+            (["view", "--sample-size", "30"],
+             "--sample-size requires --hotspots or --accuracy"),
             (["view", "--opener", "raise"], "requires --accuracy"),
             (["view", "--accuracy", "--accuracy-offset", "-1"],
              "cannot be negative"),

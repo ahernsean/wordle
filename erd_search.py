@@ -1560,6 +1560,10 @@ def main():
     view_kind.add_argument('--hotspots', action='store_true')
     view_kind.add_argument('--accuracy', action='store_true',
                            help='Show predicted-versus-actual candidate work')
+    view_kind.add_argument(
+        '--work-distribution', dest='work_distribution', action='store_true',
+        help='Band branches by worker time to show where search work and '
+             'coordination actually go')
     view_kind.add_argument('--leaderboard', action='store_true')
     view_kind.add_argument(
         '--openers', action='store_true',
@@ -1804,6 +1808,7 @@ def main():
             'workers' if args.workers or args.worker is not None else
             'cache' if args.view_cache else
             'hotspots' if args.hotspots else
+            'work_distribution' if args.work_distribution else
             'accuracy' if args.accuracy else
             'leaderboard' if args.leaderboard else
             'openers' if args.openers else
@@ -1811,13 +1816,17 @@ def main():
         )
         if args.by is not None and not args.hotspots:
             parser.error('--by requires --hotspots')
-        if not (args.hotspots or args.accuracy) and any(
-                value is not None
-                for value in (args.since_seconds, args.sample_size)):
-            parser.error('--since-seconds and --sample-size require --hotspots or --accuracy')
+        if args.sample_size is not None and not (args.hotspots or args.accuracy):
+            parser.error('--sample-size requires --hotspots or --accuracy')
+        if args.since_seconds is not None and not (
+                args.hotspots or args.accuracy or args.work_distribution):
+            parser.error('--since-seconds requires --hotspots, --accuracy, or '
+                         '--work-distribution')
         if args.epoch is not None and not (args.hotspots or args.root_progress
-                                           or args.accuracy):
-            parser.error('--epoch requires --hotspots, --accuracy, or --root-progress')
+                                           or args.accuracy
+                                           or args.work_distribution):
+            parser.error('--epoch requires --hotspots, --accuracy, '
+                         '--root-progress, or --work-distribution')
         if args.opener is not None and not args.accuracy:
             parser.error('--opener requires --accuracy')
         if args.accuracy_offset and not args.accuracy:
@@ -1856,7 +1865,11 @@ def main():
             limit=args.limit,
         ))
         args.hotspot_field = hotspot_field if args.hotspots else None
-        args.sample_size = min(args.sample_size or 50_000, 1_000_000)
+        # The work distribution aggregates rather than samples, so it carries
+        # no sample bound at all and defaults to the whole epoch.
+        args.sample_size = (
+            None if args.work_distribution
+            else min(args.sample_size or 50_000, 1_000_000))
         if args.hotspots:
             args.since_seconds = args.since_seconds or 3600
         try:

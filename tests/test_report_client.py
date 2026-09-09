@@ -384,7 +384,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.wait_for_selector("text=word report")
         self.apply_branch_target("CRANE .y..g")
         self.page.wait_for_selector("text=branch report")
-        self.assertEqual(self.page.locator("[data-kind]").count(), 7)
+        self.assertEqual(self.page.locator("[data-kind]").count(), 8)
         self.assertEqual(self.page.locator("text=Choose word or branch").count(), 0)
 
     def test_overview_nav_highlight_tracks_root_not_auto_kind(self):
@@ -2000,6 +2000,15 @@ class ReportClientBrowserTest(unittest.TestCase):
     def test_changed_leaderboard_poll_keeps_the_reader_at_the_bottom(self):
         self.page.set_viewport_size({"width": 834, "height": 1112})
         distances = self.page.evaluate("""async () => {
+          // Each applyReport schedules its scroll restore in a frame of its
+          // own, so a measurement taken after a single frame can read a
+          // position the client is still adjusting.  Settling first measures
+          // where the reader was actually left.
+          const settle = async () => {
+            for (let frame = 0; frame < 3; frame++) {
+              await new Promise(requestAnimationFrame);
+            }
+          };
           const base = await (await fetch('/api/view/leaderboard')).json();
           const state = {...__reportClient.getState(), kind: 'leaderboard'};
           const leaderboard = count => {
@@ -2013,15 +2022,15 @@ class ReportClientBrowserTest(unittest.TestCase):
           };
           const before = leaderboard(12), after = leaderboard(15), later = leaderboard(18);
           applyReport(before, null, state);
-          await new Promise(requestAnimationFrame);
+          await settle();
           scrollTo(0, document.documentElement.scrollHeight);
           applyReport(after, before, state);
-          await new Promise(requestAnimationFrame);
+          await settle();
           const bottomDistance = document.documentElement.scrollHeight - (scrollY + innerHeight);
           scrollBy(0, -160);
           const nearBottomDistance = document.documentElement.scrollHeight - (scrollY + innerHeight);
           applyReport(later, after, state);
-          await new Promise(requestAnimationFrame);
+          await settle();
           return {bottomDistance, nearBottomDistance,
                   restoredNearBottomDistance: document.documentElement.scrollHeight - (scrollY + innerHeight)};
         }""")
@@ -4822,6 +4831,7 @@ class ReportClientBrowserTest(unittest.TestCase):
         # reached phone widths overflowing because it was never measured here.
         for path in (
             "", "?kind=queue", "?kind=workers", "?kind=cache", "?kind=hotspots",
+            "?kind=work_distribution",
             "?kind=leaderboard", "?kind=openers", "?kind=queue&tree=1",
             "?branch_target=RAISE+.....",
             "?branch_target=RAISE+.....&tree=1",
@@ -5088,6 +5098,182 @@ class ReportClientBrowserTest(unittest.TestCase):
         cache_text = self.page.locator("#report").inner_text()
         self.assertNotIn("branch key hex", cache_text)
         self.assertNotIn("branch_key_hex", cache_text)
+
+    def open_work_distribution(self):
+        self.page.locator("[data-kind=work_distribution]").click()
+        self.page.wait_for_selector("table.work-distribution")
+
+    def test_work_distribution_renders_every_band_with_its_ratio(self):
+        self.open_work_distribution()
+        labels = self.page.locator(
+            "table.work-distribution tbody tr td:first-child"
+        ).all_inner_texts()
+        self.assertEqual(
+            labels, ["<=2s", "2-30s", "30-300s", "300-3,600s", ">3,600s"])
+        text = self.page.locator("#report").inner_text()
+        self.assertIn("epoch claims by branch", text)
+        self.assertNotIn("epoch_claims_by_branch", text)
+        self.assertIn("whole epoch", text)
+        # The cheap band coordinates far out of proportion to its work and the
+        # expensive band far under; both are called out rather than left in the
+        # column for the reader to find.
+        self.assertEqual(
+            self.page.locator(
+                "table.work-distribution tbody tr:first-child td.ratio-heavy"
+            ).count(), 1)
+        self.assertEqual(
+            self.page.locator(
+                "table.work-distribution tbody tr:last-child td.ratio-light"
+            ).count(), 1)
+
+    def test_work_distribution_counts_are_thousands_separated(self):
+        self.open_work_distribution()
+        row = self.page.locator(
+            "table.work-distribution tbody tr").last.inner_text()
+        self.assertIn("360,000,000", row)
+        self.assertNotIn("360000000", row)
+
+    def test_work_distribution_names_claims_with_no_branch_attribution(self):
+        self.open_work_distribution()
+        text = self.page.locator("#report").inner_text()
+        self.assertIn("no recorded branch attribution", text)
+
+    def test_work_distribution_names_branches_it_could_not_band(self):
+        # A branch with no recorded worker time is excluded rather than seated
+        # in the cheapest band, and the reader is told it exists.
+        self.open_work_distribution()
+        text = self.page.locator("#report").inner_text()
+        self.assertIn("unrecorded worker time", text)
+
+    def _distribution_requests(self):
+        """Record every distribution scan the page starts from now on."""
+        requests = []
+        self.page.on("request", lambda request: (
+            requests.append(request.url)
+            if "/api/view/work-distribution" in request.url else None))
+        return requests
+
+    def test_work_distribution_is_exempt_while_its_first_scan_is_in_flight(self):
+        # A scan slower than STUCK_REQUEST_MILLIS would otherwise be aborted and
+        # restarted while lastReport still held the previous view, and an
+        # aborted fetch does not stop the query already running on the server.
+        # The exemption must hold from the moment the scan starts, not from the
+        # moment its report lands.
+        self.page.goto(self.base_url)
+        self.page.wait_for_selector("#report h1:text-is('overview report')")
+        in_flight = self.page.evaluate("""async () => {
+          let release;
+          const held = new Promise(resolve => { release = resolve; });
+          const realFetch = window.fetch;
+          window.fetch = (...args) => String(args[0]).includes('work-distribution')
+            ? held.then(() => realFetch(...args)) : realFetch(...args);
+          const before = __reportClient.getState();
+          __reportClient.setState({...before, kind: 'work_distribution'});
+          await new Promise(resolve => setTimeout(resolve, 50));
+          const skipped = window.__skipAutomaticScanProbe();
+          release();
+          window.fetch = realFetch;
+          return skipped;
+        }""")
+        self.assertTrue(in_flight)
+
+    def test_work_distribution_retries_a_failed_change_of_context(self):
+        # A cached report is an exemption only for the request that produced it.
+        # Changing epoch, window or answer count and having that scan fail
+        # leaves the previous distribution payload in lastReport; matching on
+        # kind alone would suppress every retry, and the failed navigation has
+        # already replaced the report with an error that takes the Refresh
+        # button with it, so nothing could restart the view.
+        self.open_work_distribution()
+        self.page.route("**/api/view/work-distribution**",
+                        lambda route: route.abort())
+        stranded = self.page.evaluate("""async () => {
+          __reportClient.setState({...__reportClient.getState(), epoch: 11});
+          await new Promise(resolve => setTimeout(resolve, 400));
+          return window.__skipAutomaticScanProbe();
+        }""")
+        self.assertFalse(stranded)
+        self.page.unroute("**/api/view/work-distribution**")
+        self.page.wait_for_selector("table.work-distribution")
+
+    def test_work_distribution_does_not_rescan_when_the_tab_is_reentered(self):
+        # visibilitychange refreshes every other view on return.  Here it would
+        # break the UI's own promise that the view does not auto-refresh, and
+        # while a slow scan is in flight it would abort the browser request and
+        # start a second full scan the server runs alongside the first.
+        self.open_work_distribution()
+        requests = self._distribution_requests()
+        self.page.evaluate(
+            "() => document.dispatchEvent(new Event('visibilitychange'))")
+        self.page.wait_for_timeout(500)
+        self.assertEqual(requests, [])
+
+    def test_work_distribution_recovers_when_its_first_scan_never_lands(self):
+        # A page opened in a background tab early-returns from fetchReport while
+        # hidden, and a first scan can simply fail; either way the view reaches
+        # a state with no report of its kind and nothing in flight.  Exempting
+        # on the selected kind alone would stand it up empty with no path that
+        # ever starts a scan, so the exemption must lift here.
+        self.page.goto(self.base_url)
+        self.page.wait_for_selector("#report h1:text-is('overview report')")
+        self.page.route("**/api/view/work-distribution**",
+                        lambda route: route.abort())
+        stranded = self.page.evaluate("""async () => {
+          __reportClient.setState({...__reportClient.getState(),
+                                   kind: 'work_distribution'});
+          await new Promise(resolve => setTimeout(resolve, 400));
+          return {kind: __reportClient.getState().kind,
+                  skipped: window.__skipAutomaticScanProbe()};
+        }""")
+        # The kind is selected and the exemption is lifted, which is what lets
+        # the poll or a return to the tab try again.
+        self.assertEqual(stranded["kind"], "work_distribution")
+        self.assertFalse(stranded["skipped"])
+        self.page.unroute("**/api/view/work-distribution**")
+        self.page.wait_for_selector("table.work-distribution")
+
+    def test_work_distribution_does_not_refetch_on_the_poll_timer(self):
+        # The scan outlasts the poll interval, so a timer-driven refetch would
+        # pile scans on top of each other.
+        self.open_work_distribution()
+        requests = []
+        self.page.on("request", lambda request: (
+            requests.append(request.url)
+            if "/api/view/work-distribution" in request.url else None))
+        self.page.wait_for_timeout(2500)
+        self.assertEqual(requests, [])
+        # Explicit refresh still works: the view is off the clock, not frozen.
+        self.page.locator("#work-distribution-refresh").click()
+        self.page.wait_for_timeout(500)
+        self.assertEqual(len(requests), 1)
+
+    def test_work_distribution_withdraws_filters_it_cannot_honor(self):
+        # A control the report ignores is worse than no control: it invites a
+        # filter whose absence from the result reads as "no such branches".
+        self.open_work_distribution()
+        self.page.locator("details.filters").evaluate("node => node.open = true")
+        self.assertTrue(self.page.locator("#branch-status-filters").is_hidden())
+        self.assertTrue(self.page.locator("#budget-field").is_hidden())
+        self.assertTrue(self.page.locator("#priority-field").is_hidden())
+        self.assertTrue(self.page.locator("#sort-field").is_hidden())
+        self.assertTrue(self.page.locator("#limit-field").is_hidden())
+        self.assertTrue(self.page.locator("#by-field").is_hidden())
+        # The answer-count range is applied, so it stays; the telemetry bounds
+        # are shared with hotspots and stay too.
+        self.assertTrue(self.page.locator("#minimum-answer-count").is_visible())
+        self.assertTrue(self.page.locator("#maximum-answer-count").is_visible())
+        self.assertTrue(self.page.locator("#epoch-field").is_visible())
+        self.assertTrue(self.page.locator("#since-seconds-field").is_visible())
+        # A page cursor the API refuses must never leave the client, or the
+        # view breaks on a parameter the reader cannot see or clear.
+        self.assertEqual(
+            self.page.evaluate(
+                "() => __reportClient.getState().finalization_cursor"),
+            "")
+
+    def test_work_distribution_offers_no_tree_layout(self):
+        self.open_work_distribution()
+        self.assertTrue(self.page.locator("#layout-toggle").is_hidden())
 
     def open_sources(self):
         self.page.locator("[data-kind=openers]").click()

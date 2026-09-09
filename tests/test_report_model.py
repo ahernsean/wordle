@@ -19,6 +19,9 @@ from report_model import (
     ReportRequest,
     ReportOpeners,
     WORKER_LIVENESS_SECONDS,
+    WORK_DISTRIBUTION_BAND_EDGE_SECONDS,
+    collect_work_distribution_report,
+    work_distribution_band_labels,
     _candidate_erd_summary,
     _candidate_eta,
     _opener_group_key,
@@ -640,6 +643,7 @@ class ReportModelTest(unittest.TestCase):
         for kind, function_name in (
             ("workers", "collect_workers_report"), ("cache", "collect_cache_report"),
             ("hotspots", "collect_hotspot_report"), ("accuracy", "collect_accuracy_report"),
+            ("work_distribution", "collect_work_distribution_report"),
             ("leaderboard", "collect_leaderboard_report"), ("openers", "collect_opener_report"),
             ("root_progress", "collect_root_progress_report"),
         ):
@@ -4060,3 +4064,238 @@ class WorkerWorkPositionTest(unittest.TestCase):
                 position = workers[0]["work_position"]
                 if position["state"] == "working":
                     self.assertNotIn(position["candidate_index"], done)
+
+
+class WorkDistributionReportTest(unittest.TestCase):
+    """Bands over the sampled claim population, and the shares priced on them."""
+
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        directory = self.temporary_directory.name
+        self.queue_path = os.path.join(directory, "queue.sqlite3")
+        self.telemetry_path = os.path.join(directory, "telemetry.sqlite3")
+        self.answer_list_path = os.path.join(directory, "answers.txt")
+        with open(self.answer_list_path, "w") as answer_file:
+            answer_file.write("\n".join(ANSWERS) + "\n")
+        self.sources = ReportOpeners(
+            queue_path=self.queue_path,
+            cache_path=os.path.join(directory, "cache.sqlite3"),
+            answer_list_path=self.answer_list_path,
+            candidate_list_path=self.answer_list_path,
+            telemetry_path=self.telemetry_path,
+        )
+        self.queue = ERDQueue(self.queue_path, telemetry_path=self.telemetry_path)
+        self.addCleanup(self.queue.close)
+
+    def _claims(self, branch_key, count, nodes, evaluation_millis,
+                coordination_millis=10):
+        for idx in range(count):
+            self.queue.add_claim_telemetry(
+                10, coordination_millis, nodes, 2, branch_key=branch_key,
+                idx=idx, candidate_evaluation_millis=evaluation_millis)
+
+    def _report(self, **overrides):
+        request = ReportRequest(report_kind="work_distribution", **overrides)
+        return collect_work_distribution_report(self.sources, request)
+
+    def test_band_labels_name_every_edge_and_the_open_top_band(self):
+        self.assertEqual(
+            work_distribution_band_labels((2, 30)),
+            ["<=2s", "2-30s", ">30s"],
+        )
+        # Bounds are quantities, so they carry separators like every other
+        # number shown to a reader.
+        self.assertEqual(
+            work_distribution_band_labels((300, 3600, 86400)),
+            ["<=300s", "300-3,600s", "3,600-86,400s", ">86,400s"],
+        )
+        self.assertEqual(
+            len(work_distribution_band_labels()),
+            len(WORK_DISTRIBUTION_BAND_EDGE_SECONDS) + 1,
+        )
+
+    def test_every_band_is_present_even_when_the_sample_populates_none(self):
+        report = self._report()
+        data = report["data"]
+        self.assertEqual(
+            [band["band_label"] for band in data["bands"]],
+            work_distribution_band_labels(),
+        )
+        self.assertTrue(all(band["branch_count"] == 0 for band in data["bands"]))
+        self.assertEqual(data["totals"]["claim_count"], 0)
+        # No population, so no share can be computed; a zero here would read as
+        # a measured zero share rather than as an absent denominator.
+        self.assertTrue(all(band["branch_share"] is None for band in data["bands"]))
+
+    def test_shares_are_priced_against_the_sampled_totals(self):
+        cheap = ScoreCache.encode_subset(["salet", "crane"])
+        costly = ScoreCache.encode_subset(["salet", "crane", "nurdy"])
+        self.queue.create_branch(cheap, 2, 2)
+        self.queue.create_branch(costly, 3, 2)
+        self._claims(cheap, 30, 1, 10, coordination_millis=30)
+        self._claims(costly, 2, 500_000, 400_000, coordination_millis=30)
+
+        bands = self._report()["data"]["bands"]
+        cheap_band, costly_band = bands[0], bands[3]
+
+        self.assertAlmostEqual(cheap_band["branch_share"], 0.5)
+        self.assertAlmostEqual(cheap_band["claim_share"], 30 / 32)
+        self.assertAlmostEqual(cheap_band["search_node_share"], 30 / 1_000_030)
+        self.assertAlmostEqual(cheap_band["search_nodes_per_branch"], 30.0)
+        self.assertAlmostEqual(costly_band["claim_share"], 2 / 32)
+        for key in ("branch_share", "claim_share", "search_node_share",
+                    "worker_time_share"):
+            with self.subTest(key=key):
+                self.assertAlmostEqual(
+                    sum(band[key] for band in bands), 1.0)
+
+    def test_coordination_per_unit_work_prices_coordination_against_nodes(self):
+        # Per-claim coordination differs between the two branches, so a ratio
+        # built from claim share instead of coordination-time share comes out
+        # to a different number here.  Uniform coordination would make the two
+        # definitions numerically identical and the assertion blind.
+        cheap = ScoreCache.encode_subset(["salet", "crane"])
+        costly = ScoreCache.encode_subset(["salet", "crane", "nurdy"])
+        self.queue.create_branch(cheap, 2, 2)
+        self.queue.create_branch(costly, 3, 2)
+        self._claims(cheap, 30, 1, 10, coordination_millis=30)
+        self._claims(costly, 2, 500_000, 400_000, coordination_millis=500)
+
+        bands = self._report()["data"]["bands"]
+
+        coordination_total = 30 * 30 + 2 * 500
+        self.assertAlmostEqual(
+            bands[0]["coordination_share_per_work_share"],
+            (900 / coordination_total) / (30 / 1_000_030),
+            places=3,
+        )
+        self.assertAlmostEqual(
+            bands[3]["coordination_share_per_work_share"],
+            (1_000 / coordination_total) / (1_000_000 / 1_000_030),
+            places=6,
+        )
+        # The claim-share reading of the same band is a different number, so
+        # this assertion fails against a ratio built from claim counts.
+        self.assertNotAlmostEqual(
+            bands[0]["coordination_share_per_work_share"],
+            (30 / 32) / (30 / 1_000_030),
+            places=3,
+        )
+
+    def test_a_band_that_searched_nothing_withholds_the_ratio(self):
+        # An infinite ratio would sort above every real imbalance and read as
+        # the worst band in the table, which is the opposite of the truth: a
+        # band with no search has nothing to say about coordination balance.
+        # The sample as a whole did search, so this band's node share is a
+        # measured zero rather than an absent denominator -- the production
+        # shape of an empty band, and the one a None-guard alone misses.
+        searching = ScoreCache.encode_subset(["salet", "crane", "nurdy"])
+        self.queue.create_branch(searching, 3, 2)
+        self._claims(searching, 2, 500_000, 400_000)
+
+        bands = self._report()["data"]["bands"]
+
+        self.assertEqual(bands[0]["search_node_count"], 0)
+        self.assertEqual(bands[0]["search_node_share"], 0.0)
+        self.assertIsNone(bands[0]["coordination_share_per_work_share"])
+        self.assertEqual(bands[3]["search_node_share"], 1.0)
+
+    def test_a_sample_with_no_search_at_all_withholds_every_share(self):
+        branch_key = ScoreCache.encode_subset(["salet", "crane"])
+        self.queue.create_branch(branch_key, 2, 2)
+        self._claims(branch_key, 4, 0, 10)
+
+        bands = self._report()["data"]["bands"]
+
+        self.assertEqual(bands[0]["claim_count"], 4)
+        self.assertIsNone(bands[0]["search_node_share"])
+        self.assertIsNone(bands[0]["coordination_share_per_work_share"])
+
+    def test_the_report_names_its_population_and_scan_cost(self):
+        branch_key = ScoreCache.encode_subset(["salet", "crane"])
+        self.queue.create_branch(branch_key, 2, 2)
+        self._claims(branch_key, 6, 1, 10)
+
+        data = self._report()["data"]
+
+        self.assertEqual(data["population"], "epoch_claims_by_branch")
+        # No window given means the whole epoch, which is what makes a branch's
+        # lifetime worker time the band key rather than a recent slice of it.
+        self.assertIsNone(data["since_seconds"])
+        self.assertIsNone(data["window_started_at"])
+        self.assertIsNotNone(data["scan_seconds"])
+        self.assertEqual(data["band_edge_seconds"],
+                         list(WORK_DISTRIBUTION_BAND_EDGE_SECONDS))
+
+    def test_an_unreadable_queue_marks_the_source_rather_than_raising(self):
+        sources = replace(self.sources, queue_path=os.path.join(
+            self.temporary_directory.name, "missing", "queue.sqlite3"))
+        request = ReportRequest(report_kind="work_distribution")
+
+        report = collect_work_distribution_report(sources, request)
+
+        self.assertFalse(report["sources"]["queue"]["ok"])
+        self.assertEqual(report["data"]["population"], None)
+
+    def test_the_report_refuses_options_that_would_narrow_its_population(self):
+        for overrides, message in (
+            ({"tree": True}, "--tree cannot be used"),
+            ({"branch_target": parse_report_branch_target("SALET")},
+             "cannot take a branch target"),
+            ({"filters": ReportFilters(branch_statuses=("queued",))},
+             "--branch-status"),
+            ({"filters": ReportFilters(branch_worker_statuses=("active",))},
+             "--branch-worker-status"),
+            ({"filters": ReportFilters(priority=5)}, "--priority"),
+            # Zero is a real requested priority, so presence is what matters.
+            ({"filters": ReportFilters(priority=0)}, "--priority"),
+            ({"filters": ReportFilters(limit=0)}, "--limit"),
+            ({"sample_size": 1000}, "--sample-size"),
+            ({"filters": ReportFilters(
+                finalization_cursor_direction="after",
+                finalization_cursor_recorded_at=1,
+                finalization_cursor_id=1)}, "finalization_cursor"),
+            ({"filters": ReportFilters(sort="nodes")}, "--sort"),
+            ({"filters": ReportFilters(limit=10)}, "--limit"),
+            ({"filters": ReportFilters(budget=3)},
+             "budget is not recorded per claim"),
+        ):
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_report_request(ReportRequest(
+                        report_kind="work_distribution", **overrides))
+
+    def test_the_report_accepts_the_answer_count_range_it_applies(self):
+        # Every filter the report honors must pass validation, or the refusal
+        # list has swept up one it can actually answer.
+        validate_report_request(ReportRequest(
+            report_kind="work_distribution",
+            filters=ReportFilters(minimum_answer_count=5,
+                                  maximum_answer_count=50)))
+
+    def test_an_answer_count_range_scopes_the_bands_and_is_reported(self):
+        small = ScoreCache.encode_subset(["salet", "crane"])
+        large = ScoreCache.encode_subset(["salet", "crane", "nurdy"])
+        self.queue.create_branch(small, 2, 2)
+        self.queue.create_branch(large, 3, 2)
+        for idx in range(6):
+            self.queue.add_claim_telemetry(
+                4, 10, 1, 2, branch_key=small, idx=idx,
+                candidate_evaluation_millis=50)
+        for idx in range(2):
+            self.queue.add_claim_telemetry(
+                80, 10, 500_000, 2, branch_key=large, idx=idx,
+                candidate_evaluation_millis=400_000)
+
+        data = self._report(
+            filters=ReportFilters(minimum_answer_count=50))["data"]
+
+        self.assertEqual(data["minimum_answer_count"], 50)
+        self.assertIsNone(data["maximum_answer_count"])
+        self.assertEqual(data["totals"]["branch_count"], 1)
+        self.assertEqual(data["totals"]["claim_count"], 2)
+        # Shares are of the narrowed population, so the surviving band holds
+        # all of it rather than the fraction it held of the whole sample.
+        self.assertEqual(data["bands"][3]["claim_share"], 1.0)
+        self.assertEqual(data["bands"][0]["claim_count"], 0)

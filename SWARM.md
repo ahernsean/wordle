@@ -130,6 +130,9 @@ python3.13 erd_search.py view --cache
 python3.13 erd_search.py view --cache CRANE
 python3.13 erd_search.py view --hotspots --by nodes
 python3.13 erd_search.py view --hotspots --by coordination --since-seconds 900
+python3.13 erd_search.py view --work-distribution
+python3.13 erd_search.py view --work-distribution --epoch 17
+python3.13 erd_search.py view --work-distribution --minimum-answer-count 200
 python3.13 erd_search.py view --openers
 python3.13 erd_search.py view --openers CRANE
 python3.13 erd_search.py view --root-progress CRANE
@@ -137,6 +140,63 @@ python3.13 erd_search.py view --root-progress CRANE --epoch 10
 python3.13 erd_search.py view --root-progress CRANE --inherited-cost
 python3.13 erd_search.py view --root-progress CRANE --inherited-cost --sort own_nodes
 ```
+
+`--work-distribution` answers a question about the population rather than about
+any one branch: is the swarm spending its coordination where its work is? It
+bands every branch in the sampled claim window by the worker time spent on it
+and prints, per band, how many branches it holds, how much search work they did,
+and how many claims that took. `--hotspots` ranks the worst individual branches
+and returns the top of that ranking, which cannot show the same thing: when most
+branches are trivial, the mass of them is never in a top-N list.
+
+The `Coord/work` column is a band's share of coordination time over its share of
+search nodes. A swarm coordinating in proportion to its work reads near 1.00 in
+every band; a spread of orders of magnitude between the cheapest and the most
+expensive band means coordination is being spent almost exactly where the work
+is not.
+
+Bands come from claims rather than from finalizations, so a branch still being
+solved is counted with the totals it has accumulated so far, and the `Open`
+column says how many of a band's branches those are. A branch is banded by its
+own summed worker time, never by the span between its creation and its
+finalization: a parent that waits on promoted children accumulates wall time it
+did not work, and banding on that span would file it among the expensive
+branches for having done nothing.
+
+**It aggregates the whole epoch, and that is not an option to trade away for
+speed.** A branch is banded by its lifetime worker time, so keeping only recent
+claims clips the long-lived branches hardest and bands them far below where
+they belong. On epoch 17 the six branches holding 57.8% of all node work
+contributed no claims at all to the last hour, so every windowed view showed a
+nearly balanced swarm while the truth was a `Coord/work` spread of 18.53 down
+to 0.00. The scan is one linear pass returning a handful of rows — about ten
+seconds over 8.4 million claims — and the report prints how long it took.
+`--since-seconds` narrows it deliberately and is worth reaching for only when
+the question really is about a window.
+
+Two populations are counted apart from the bands. Claims with no recorded
+branch attribution belong to no branch's work — most were taken outside any
+branch, but a claim recorded before per-branch attribution existed also reads
+this way and cannot be told apart from one, so the population is named by what
+is missing rather than by an assumed cause. A branch holding any claim whose
+worker time was never recorded has no measurable cost at all: banding it as
+zero would seat a branch of unknown cost in the cheapest row while still
+counting its nodes, so it is excluded and named instead.
+
+In the web client this view is off the refresh cycle entirely: a scan that
+outlasts the poll interval cannot be retried on a clock or on a tab switch,
+because an aborted request does not stop the query already running on the
+server. It is fetched when entered and when the `Refresh` button is pressed.
+The exemption lifts when there is neither a scan running nor a report on
+screen, so a view whose first scan failed can still recover.
+
+`--minimum-answer-count` and `--maximum-answer-count` scope the bands to one
+size region, narrowing the claim rows before they are banded so every share
+stays a share of what the report shows. Every other filter is refused rather
+than ignored: `--budget` because a claim row records answer count but no
+budget; `--sample-size` because nothing here samples; and `--priority`,
+`--sort`, `--limit`, `--branch-status` and `--branch-worker-status` because
+they describe or order individual branches rather than the population.
 
 `--root-progress` reports one opener's work: every response group with the
 branches, search nodes, and node share spent under it, which groups have not
@@ -299,8 +359,13 @@ matching nothing. Worker status narrows only the stages that carry one, so a
 status filter selecting neither evaluating nor finalizing drops it instead of
 matching nothing. The overview answers what the swarm is doing now and so
 defaults to `--branch-status evaluating,finalizing --branch-worker-status
-active`; every other report starts unfiltered. Historical hotspots
-are explicitly bounded by epoch, time window, and sample size. `--tree` uses
+active`; every other report starts unfiltered. Historical hotspots are
+explicitly bounded by epoch, time window, and sample size. The work
+distribution is bounded by epoch and, optionally, a time window: it aggregates
+rather than samples, so it takes no sample size at all. It describes that whole
+population, so it also takes no branch target, no branch filters and no page
+cursor: narrowing the population would leave every percentage naming a total
+the report no longer shows. `--tree` uses
 only extant queue topology; cache rows never reconstruct historical trees.
 
 ### Log files

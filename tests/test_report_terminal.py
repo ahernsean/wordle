@@ -18,7 +18,12 @@ import erd_search
 from erd_queue import ERDQueue, encode_subset
 import report_model
 import report_terminal
-from report_model import ReportFilters, parse_report_branch_target
+from report_model import (
+    WORK_DISTRIBUTION_BAND_EDGE_SECONDS,
+    ReportFilters,
+    parse_report_branch_target,
+    _work_distribution_band_rows,
+)
 from report_terminal import DisplayOrder, WatchSession, render_overview, render_report
 from wordle_engine import ERD_ALL
 
@@ -839,6 +844,93 @@ class OverviewRendererTest(unittest.TestCase):
         self.assertIn("since-seconds=3600", output)
         self.assertIn("sample-size=50000", output)
         self.assertIn("truncated=true", output)
+
+    @staticmethod
+    def _work_distribution_report(bands, unattributed=None, unmeasured=None):
+        # The band rows are shaped by report_model's own pricing so the render
+        # is exercised against the structure it is actually handed.
+        rows, totals = _work_distribution_band_rows(
+            bands, WORK_DISTRIBUTION_BAND_EDGE_SECONDS)
+        report = overview_report()
+        report.update({"report_kind": "work_distribution", "tree": False})
+        report["data"] = {
+            "population": "epoch_claims_by_branch",
+            "epoch": 17, "since_seconds": None, "window_started_at": None,
+            "scan_seconds": 10.4,
+            "band_edge_seconds": list(WORK_DISTRIBUTION_BAND_EDGE_SECONDS),
+            "bands": rows,
+            "totals": totals,
+            "unattributed": unattributed or {
+                "claim_count": 0, "search_node_count": 0,
+                "coordination_millis": 0, "worker_millis": 0},
+            "unmeasured": unmeasured or {
+                "branch_count": 0, "claim_count": 0, "search_node_count": 0,
+                "coordination_millis": 0, "worker_millis": 0},
+        }
+        return report
+
+    @staticmethod
+    def _band(band_index, **overrides):
+        band = {"band_index": band_index, "branch_count": 0,
+                "unfinished_branch_count": 0, "claim_count": 0,
+                "search_node_count": 0, "coordination_millis": 0,
+                "worker_millis": 0}
+        band.update(overrides)
+        return band
+
+    def test_work_distribution_render_shows_every_band_and_the_ratio_legend(self):
+        report = self._work_distribution_report([
+            self._band(0, branch_count=39_332, unfinished_branch_count=4,
+                       claim_count=499_756, search_node_count=7_643_478,
+                       coordination_millis=20_600_000, worker_millis=39_000_000),
+            self._band(4, branch_count=9, unfinished_branch_count=9,
+                       claim_count=14_681, search_node_count=417_486_717,
+                       coordination_millis=600_000, worker_millis=90_000_000),
+        ])
+
+        output = render_report(report, width=140)
+
+        self.assertIn("Population: epoch_claims_by_branch", output)
+        self.assertIn("epoch=17", output)
+        self.assertIn("window=whole epoch", output)
+        self.assertIn("scanned in 10.4s", output)
+        for label in ("<=2s", "2-30s", "30-300s", "300-3,600s", ">3,600s"):
+            with self.subTest(label=label):
+                self.assertIn(label, output)
+        self.assertIn("39,332", output)
+        self.assertIn("coordination-time share ÷ search-node share", output)
+
+    def test_work_distribution_render_names_claims_with_no_branch_attribution(self):
+        report = self._work_distribution_report(
+            [self._band(0, branch_count=1, claim_count=2, search_node_count=4,
+                        coordination_millis=10, worker_millis=20)],
+            unattributed={"claim_count": 1, "search_node_count": 3,
+                          "coordination_millis": 7, "worker_millis": 5},
+        )
+
+        output = render_report(report, width=120)
+
+        self.assertIn("1 claim with no recorded branch attribution", output)
+        self.assertNotIn("1 claims with no recorded", output)
+
+    def test_work_distribution_render_omits_the_unattributed_line_at_zero(self):
+        output = render_report(
+            self._work_distribution_report(
+                [self._band(0, branch_count=1, claim_count=2,
+                            search_node_count=4, worker_millis=20)]),
+            width=120,
+        )
+        self.assertNotIn("no recorded branch attribution", output)
+
+    def test_work_distribution_render_dashes_a_band_with_no_search(self):
+        output = render_report(
+            self._work_distribution_report(
+                [self._band(0, branch_count=1, claim_count=2,
+                            coordination_millis=9, worker_millis=20)]),
+            width=120,
+        )
+        # Every band did zero search, so no share and no ratio exists to print.
+        self.assertIn("—", output)
 
     def test_accuracy_render_distinguishes_requested_and_achieved_samples(self):
         report = overview_report()
@@ -2188,6 +2280,70 @@ class ViewParserTest(unittest.TestCase):
         self.assertEqual(args.sample_size, 1_000_000)
         self.assertEqual(args.limit, 10)
 
+    def test_work_distribution_defaults_to_the_whole_epoch(self):
+        with (
+            patch("sys.argv", [
+                "erd_search.py", "view", "--work-distribution", "--epoch", "17",
+            ]),
+            patch("report_terminal.run_view") as run_view,
+        ):
+            erd_search.main()
+        args = run_view.call_args.args[0]
+        self.assertEqual(args.report_kind, "work_distribution")
+        self.assertEqual(args.epoch, 17)
+        # No window and no sample bound: a recent slice would band the
+        # long-lived branches far below their lifetime cost.
+        self.assertIsNone(args.since_seconds)
+        self.assertIsNone(args.sample_size)
+        self.assertIsNone(args.hotspot_field)
+
+    def test_work_distribution_reaches_the_collected_request(self):
+        with (
+            patch("sys.argv", ["erd_search.py", "view", "--work-distribution"]),
+            patch("report_terminal.run_view") as run_view,
+        ):
+            erd_search.main()
+        session = WatchSession(run_view.call_args.args[0])
+        with patch("report_terminal.collect_report") as collect_report:
+            session._collect()
+        request = collect_report.call_args.args[1]
+        self.assertEqual(request.report_kind, "work_distribution")
+        self.assertIsNone(request.since_seconds)
+
+    def test_work_distribution_accepts_an_answer_count_range(self):
+        with (
+            patch("sys.argv", [
+                "erd_search.py", "view", "--work-distribution",
+                "--minimum-answer-count", "5", "--maximum-answer-count", "50",
+            ]),
+            patch("report_terminal.run_view") as run_view,
+        ):
+            erd_search.main()
+        filters = run_view.call_args.args[0].filters
+        self.assertEqual(filters.minimum_answer_count, 5)
+        self.assertEqual(filters.maximum_answer_count, 50)
+
+    def test_work_distribution_refuses_options_that_narrow_its_population(self):
+        for options in (
+            ["--work-distribution", "--tree"],
+            ["--work-distribution", "RAISE"],
+            ["--work-distribution", "--branch-status", "queued"],
+            ["--work-distribution", "--budget", "3"],
+            ["--work-distribution", "--priority", "5"],
+            ["--work-distribution", "--sort", "nodes"],
+            ["--work-distribution", "--limit", "10"],
+            ["--work-distribution", "--priority", "0"],
+            ["--work-distribution", "--sample-size", "1000"],
+        ):
+            with self.subTest(options=options):
+                with (
+                    patch("sys.argv", ["erd_search.py", "view", *options]),
+                    patch("sys.stderr", io.StringIO()),
+                    self.assertRaises(SystemExit) as raised,
+                ):
+                    erd_search.main()
+                self.assertEqual(raised.exception.code, 2)
+
     def test_claims_and_answers_reach_watch_session_request(self):
         with (
             patch("sys.argv", [
@@ -3092,3 +3248,81 @@ class WordReportRenderingTest(unittest.TestCase):
         )
         self.assertIn(report_terminal.RED, output)
         self.assertIn("salet crane", output)
+
+
+class WorkDistributionCommandEndToEndTest(unittest.TestCase):
+    """`view --work-distribution` end to end against a real temp queue."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.queue_path = os.path.join(self._tmp.name, "queue.sqlite3")
+        self.cache_path = os.path.join(self._tmp.name, "cache.sqlite3")
+        queue = ERDQueue(self.queue_path)
+        cheap = encode_subset(["crane", "slate"])
+        costly = encode_subset(["crane", "slate", "fresh"])
+        queue.create_branch(cheap, 2, 2)
+        queue.create_branch(costly, 3, 2)
+        for index in range(20):
+            queue.add_claim_telemetry(
+                2, 25, 1, 2, branch_key=cheap, idx=index,
+                candidate_evaluation_millis=20)
+        for index in range(2):
+            queue.add_claim_telemetry(
+                3, 25, 400_000, 2, branch_key=costly, idx=index,
+                candidate_evaluation_millis=350_000)
+        queue.close()
+
+    def _run(self, *args):
+        output = io.StringIO()
+        with (
+            patch("sys.argv", [
+                "erd_search.py", "view", "--work-distribution",
+                "--queue-path", self.queue_path,
+                "--cache-path", self.cache_path,
+                *args,
+            ]),
+            redirect_stdout(output),
+        ):
+            erd_search.main()
+        return output.getvalue()
+
+    def test_text_output_bands_the_two_branches_apart(self):
+        text = self._run()
+        self.assertIn("Work distribution by worker time", text)
+        self.assertIn("Population: epoch_claims_by_branch", text)
+        band_rows = {
+            line.split()[0]: line.split()
+            for line in text.splitlines() if line.startswith(("<=", "2-", "30-",
+                                                              "300-", ">3"))
+        }
+        # 20 claims of 20 ms is 400 ms of worker time; 2 claims of 350 s is
+        # 700 s.  Claim count and band are independent.  Coord/work sits in the
+        # second column so an 80-column terminal cannot drop it, and the branch
+        # count follows it.
+        self.assertEqual(band_rows["<=2s"][2], "1")
+        self.assertEqual(band_rows["300-3,600s"][2], "1")
+        self.assertEqual(band_rows["2-30s"][2], "0")
+
+    def test_json_output_round_trips_the_bands_and_their_shares(self):
+        report = json.loads(self._run("--format", "json"))
+        self.assertEqual(report["report_kind"], "work_distribution")
+        self.assertTrue(report["sources"]["queue"]["ok"])
+        data = report["data"]
+        self.assertEqual(data["population"], "epoch_claims_by_branch")
+        self.assertEqual(data["totals"]["claim_count"], 22)
+        self.assertEqual(data["totals"]["branch_count"], 2)
+        self.assertAlmostEqual(
+            sum(band["claim_share"] for band in data["bands"]), 1.0)
+        self.assertAlmostEqual(
+            sum(band["search_node_share"] for band in data["bands"]), 1.0)
+        cheap = data["bands"][0]
+        self.assertEqual(cheap["claim_count"], 20)
+        self.assertEqual(cheap["worker_millis"], 400)
+        self.assertGreater(cheap["coordination_share_per_work_share"], 100)
+
+    def test_jsonl_output_is_one_line(self):
+        lines = self._run("--format", "jsonl").splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(
+            json.loads(lines[0])["report_kind"], "work_distribution")

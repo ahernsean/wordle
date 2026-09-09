@@ -50,6 +50,7 @@ FIXTURE_FILENAMES = (
     "workers-tree.json",
     "cache.json",
     "hotspots.json",
+    "work_distribution.json",
     "leaderboard.json",
     "root_progress.json",
     "root_progress-inherited.json",
@@ -139,6 +140,7 @@ def parse_report_request(path, query):
         "/api/view/workers": "workers",
         "/api/view/cache": "cache",
         "/api/view/hotspots": "hotspots",
+        "/api/view/work-distribution": "work_distribution",
         "/api/view/leaderboard": "leaderboard",
         "/api/view/openers": "openers",
         "/api/view/root-progress": "root_progress",
@@ -253,14 +255,26 @@ def parse_report_request(path, query):
         integer_values[name] is not None
         for name in ("epoch", "since_seconds", "sample_size")
     )
-    if explicit_kind != "hotspots" and (hotspot_field or historical_options_present):
+    if hotspot_field and explicit_kind != "hotspots":
+        raise InvalidRequest("by requires the hotspots endpoint")
+    # Both telemetry-backed reports are bounded by epoch, window, and sample
+    # size; only hotspots chooses a ranking field.
+    if historical_options_present and explicit_kind not in (
+        "hotspots", "work_distribution"
+    ):
         raise InvalidRequest(
-            "by, epoch, since_seconds, and sample_size require the hotspots endpoint"
+            "epoch, since_seconds, and sample_size require the hotspots or "
+            "work-distribution endpoint"
         )
+    # The work distribution aggregates the whole epoch rather than sampling it,
+    # so a sample bound here would be accepted and then never applied.
+    if sample_size is not None and explicit_kind == "work_distribution":
+        raise InvalidRequest("sample_size requires the hotspots endpoint")
     if hotspot_field is not None and hotspot_field not in HOTSPOT_FIELDS:
         raise InvalidRequest(f"invalid hotspot field {hotspot_field!r}")
     hotspot_field = hotspot_field or ("nodes" if explicit_kind == "hotspots" else None)
-    if tree and explicit_kind in ("cache", "hotspots", "leaderboard", "openers"):
+    if tree and explicit_kind in ("cache", "hotspots", "leaderboard", "openers",
+                                 "work_distribution"):
         raise InvalidRequest(f"tree cannot be used with {explicit_kind}")
     worker_id = _single_value(parameters, "worker")
     if worker_id is not None and explicit_kind != "workers":
@@ -272,7 +286,7 @@ def parse_report_request(path, query):
         raise InvalidRequest("claims requires a singular branch target")
     if include_answers and (
         tree
-        or explicit_kind in ("queue", "workers")
+        or explicit_kind in ("queue", "workers", "work_distribution")
         or (explicit_kind == "auto" and branch_target.kind == "root")
     ):
         raise InvalidRequest("answers requires a word or branch report without tree")
@@ -308,8 +322,10 @@ def parse_report_request(path, query):
         epoch=integer_values["epoch"],
         tree_parent=tree_parent,
         tree_cursor=tree_cursor,
-        since_seconds=since_seconds or 3600,
-        sample_size=min(sample_size or 50_000, 1_000_000),
+        since_seconds=(since_seconds if explicit_kind == "work_distribution"
+                       else (since_seconds or 3600)),
+        sample_size=(None if explicit_kind == "work_distribution"
+                     else min(sample_size or 50_000, 1_000_000)),
         inherited_cost=inherited_cost,
     )
     try:
