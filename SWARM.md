@@ -180,6 +180,13 @@ was never recorded has no measurable cost at all: banding it as zero would seat
 a branch of unknown cost in the cheapest row while still counting its nodes, so
 it is excluded and named instead.
 
+In the web client this view is off the refresh cycle entirely: a scan that
+outlasts the poll interval cannot be retried on a clock or on a tab switch,
+because an aborted request does not stop the query already running on the
+server. It is fetched when entered and when the `Refresh` button is pressed.
+The exemption lifts when there is neither a scan running nor a report on
+screen, so a view whose first scan failed can still recover.
+
 `--minimum-answer-count` and `--maximum-answer-count` scope the bands to one
 size region, narrowing the claim rows before they are banded so every share
 stays a share of what the report shows. Every other filter is refused rather

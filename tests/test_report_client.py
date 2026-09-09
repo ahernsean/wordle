@@ -5145,20 +5145,73 @@ class ReportClientBrowserTest(unittest.TestCase):
         text = self.page.locator("#report").inner_text()
         self.assertIn("unrecorded worker time", text)
 
-    def test_work_distribution_is_exempt_before_its_first_report_arrives(self):
+    def _distribution_requests(self):
+        """Record every distribution scan the page starts from now on."""
+        requests = []
+        self.page.on("request", lambda request: (
+            requests.append(request.url)
+            if "/api/view/work-distribution" in request.url else None))
+        return requests
+
+    def test_work_distribution_is_exempt_while_its_first_scan_is_in_flight(self):
         # A scan slower than STUCK_REQUEST_MILLIS would otherwise be aborted and
-        # restarted every minute while lastReport still held the previous view,
-        # and an aborted fetch does not stop the query already running on the
-        # server.  The exemption must therefore hold from the moment the kind is
-        # selected, not from the moment a report of that kind lands.
+        # restarted while lastReport still held the previous view, and an
+        # aborted fetch does not stop the query already running on the server.
+        # The exemption must hold from the moment the scan starts, not from the
+        # moment its report lands.
         self.page.goto(self.base_url)
         self.page.wait_for_selector("#report h1:text-is('overview report')")
-        exempt = self.page.evaluate("""() => {
+        in_flight = self.page.evaluate("""async () => {
+          let release;
+          const held = new Promise(resolve => { release = resolve; });
+          const realFetch = window.fetch;
+          window.fetch = (...args) => String(args[0]).includes('work-distribution')
+            ? held.then(() => realFetch(...args)) : realFetch(...args);
           const before = __reportClient.getState();
           __reportClient.setState({...before, kind: 'work_distribution'});
-          return window.__pollExemptProbe();
+          await new Promise(resolve => setTimeout(resolve, 50));
+          const skipped = window.__skipAutomaticScanProbe();
+          release();
+          window.fetch = realFetch;
+          return skipped;
         }""")
-        self.assertTrue(exempt)
+        self.assertTrue(in_flight)
+
+    def test_work_distribution_does_not_rescan_when_the_tab_is_reentered(self):
+        # visibilitychange refreshes every other view on return.  Here it would
+        # break the UI's own promise that the view does not auto-refresh, and
+        # while a slow scan is in flight it would abort the browser request and
+        # start a second full scan the server runs alongside the first.
+        self.open_work_distribution()
+        requests = self._distribution_requests()
+        self.page.evaluate(
+            "() => document.dispatchEvent(new Event('visibilitychange'))")
+        self.page.wait_for_timeout(500)
+        self.assertEqual(requests, [])
+
+    def test_work_distribution_recovers_when_its_first_scan_never_lands(self):
+        # A page opened in a background tab early-returns from fetchReport while
+        # hidden, and a first scan can simply fail; either way the view reaches
+        # a state with no report of its kind and nothing in flight.  Exempting
+        # on the selected kind alone would stand it up empty with no path that
+        # ever starts a scan, so the exemption must lift here.
+        self.page.goto(self.base_url)
+        self.page.wait_for_selector("#report h1:text-is('overview report')")
+        self.page.route("**/api/view/work-distribution**",
+                        lambda route: route.abort())
+        stranded = self.page.evaluate("""async () => {
+          __reportClient.setState({...__reportClient.getState(),
+                                   kind: 'work_distribution'});
+          await new Promise(resolve => setTimeout(resolve, 400));
+          return {kind: __reportClient.getState().kind,
+                  skipped: window.__skipAutomaticScanProbe()};
+        }""")
+        # The kind is selected and the exemption is lifted, which is what lets
+        # the poll or a return to the tab try again.
+        self.assertEqual(stranded["kind"], "work_distribution")
+        self.assertFalse(stranded["skipped"])
+        self.page.unroute("**/api/view/work-distribution**")
+        self.page.wait_for_selector("table.work-distribution")
 
     def test_work_distribution_does_not_refetch_on_the_poll_timer(self):
         # The scan outlasts the poll interval, so a timer-driven refetch would
