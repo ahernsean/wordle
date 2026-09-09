@@ -5177,6 +5177,25 @@ class ReportClientBrowserTest(unittest.TestCase):
         }""")
         self.assertTrue(in_flight)
 
+    def test_work_distribution_retries_a_failed_change_of_context(self):
+        # A cached report is an exemption only for the request that produced it.
+        # Changing epoch, window or answer count and having that scan fail
+        # leaves the previous distribution payload in lastReport; matching on
+        # kind alone would suppress every retry, and the failed navigation has
+        # already replaced the report with an error that takes the Refresh
+        # button with it, so nothing could restart the view.
+        self.open_work_distribution()
+        self.page.route("**/api/view/work-distribution**",
+                        lambda route: route.abort())
+        stranded = self.page.evaluate("""async () => {
+          __reportClient.setState({...__reportClient.getState(), epoch: 11});
+          await new Promise(resolve => setTimeout(resolve, 400));
+          return window.__skipAutomaticScanProbe();
+        }""")
+        self.assertFalse(stranded)
+        self.page.unroute("**/api/view/work-distribution**")
+        self.page.wait_for_selector("table.work-distribution")
+
     def test_work_distribution_does_not_rescan_when_the_tab_is_reentered(self):
         # visibilitychange refreshes every other view on return.  Here it would
         # break the UI's own promise that the view does not auto-refresh, and

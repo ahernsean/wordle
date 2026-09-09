@@ -2607,15 +2607,19 @@
     // each automatic retry adds another full scan the reader never sees.  Such
     // a view is fetched when entered and when the reader asks.
     //
-    // The test is whether a scan is already running or its result is already on
-    // screen, not the selected kind alone.  A page opened in a background tab
-    // early-returns from fetchReport while hidden, so a kind-only exemption
-    // would leave it with no report, nothing in flight, and no path that ever
-    // starts one.
+    // The test is whether a scan is already running or the result for this
+    // exact request is already on screen, not the selected kind alone.  A page
+    // opened in a background tab early-returns from fetchReport while hidden,
+    // so a kind-only exemption would leave it with no report, nothing in
+    // flight, and no path that ever starts one; and a scan that fails after the
+    // reader changes epoch, window or answer count leaves the previous
+    // distribution payload in lastReport, so matching on kind would suppress
+    // every retry of a request that never succeeded.  The context key is the
+    // request itself, so it answers both.
     const scanExemptKinds=new Set(["work_distribution"]);
     const skipAutomaticScan=()=>scanExemptKinds.has(currentState.kind)
       &&(activeRequestController!==null
-         ||(lastReport&&lastReport.report_kind===currentState.kind));
+         ||(lastReport&&lastContext===contextKey(currentState)));
     function schedulePoll(){clearTimeout(pollTimer);pollTimer=setTimeout(async()=>{if(!skipAutomaticScan())await fetchReport();schedulePoll();},currentState.poll);}
     function initialize(){
       const addFilterControls=(containerId,names,dataName)=>{const container=byId(containerId);for(const name of names){const filterLabel=element("label"),input=element("input");input.type="checkbox";input.value=name;input.dataset[dataName]="1";filterLabel.append(input," "+name);container.append(filterLabel);}};
