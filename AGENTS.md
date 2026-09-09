@@ -725,6 +725,21 @@ python3.13 -m unittest tests.test_report_model tests.test_report_terminal
 
 Write tests for every new or changed executable path.
 
+**Targeted means targeted, and then push.** A local full-suite pass costs about
+twenty minutes and spends nearly all of it re-running tests the change cannot
+reach. That latency is not free: it delays the push, and the push is what lets
+CI run the whole suite in parallel *and* lets a reviewing agent start reading
+the code. Holding a change that its own focused tests and failure-proof have
+already cleared, so that unrelated tests can be re-run locally first, is
+strictly worse than pushing it. Read CI's result rather than pre-empting it.
+
+**The one trap of narrow scope is user-facing strings.**
+`tests/test_erd_search_lifecycle.py` pins `erd_search.py`'s `parser.error`
+messages by substring, so widening one report's option set fails a test in a
+module the diff never touches. When a change alters an error message, grep
+`tests/` for a distinctive fragment of the old wording — that is cheaper and
+more certain than running everything.
+
 **Prove a new test can fail.** Disable the fix — stub the function to a no-op,
 or patch the constant back — and confirm the tests that are supposed to catch
 the bug do. A test that passes both ways proves nothing, and the failure mode
@@ -739,8 +754,10 @@ never reaches, and every assertion built on it is then testing fiction. Follow
 the real call sequence when constructing "already finished" or "already
 failed" states.
 
-Run the full suite when the change has broad cross-layer risk, when targeted
-tests do not provide enough confidence, or when the user asks for it:
+Run the full suite when the change carries genuine cross-layer risk — a schema
+migration, or a shared helper that many modules import — or when the user asks
+for it. Being unsure which tests are related is not cross-layer risk; find the
+related tests instead.
 
 ```
 python3.13 -m unittest discover -s tests -t . -p 'test_*.py'
