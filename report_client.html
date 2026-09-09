@@ -2604,8 +2604,14 @@
     // A view whose report costs a full-epoch scan cannot ride the poll timer:
     // the scan outlasts the interval, so every tick would pile another one on.
     // It is fetched when entered and when the reader asks, never on a clock.
+    // The test is the selected kind alone, never whether a report has arrived
+    // yet: a scan that outlasts STUCK_REQUEST_MILLIS would otherwise be aborted
+    // and restarted every minute while still holding the previous view's
+    // report, and an aborted fetch does not stop the query already running on
+    // the server.  Every navigation path fetches for itself, so nothing here
+    // depends on the timer for a first result.
     const pollExemptKinds=new Set(["work_distribution"]);
-    const pollExempt=()=>pollExemptKinds.has(currentState.kind)&&lastReport&&lastReport.report_kind===currentState.kind;
+    const pollExempt=()=>pollExemptKinds.has(currentState.kind);
     function schedulePoll(){clearTimeout(pollTimer);pollTimer=setTimeout(async()=>{if(!pollExempt())await fetchReport();schedulePoll();},currentState.poll);}
     function initialize(){
       const addFilterControls=(containerId,names,dataName)=>{const container=byId(containerId);for(const name of names){const filterLabel=element("label"),input=element("input");input.type="checkbox";input.value=name;input.dataset[dataName]="1";filterLabel.append(input," "+name);container.append(filterLabel);}};
@@ -2633,7 +2639,7 @@
       addEventListener("resize",()=>{const root=byId("report");layoutSpines(root);layoutSweepMarkerDigits(root);for(const strip of root.querySelectorAll(".answer-strip"))measureAnswerStrip(strip);if(openGroupMenuNode)positionGroupMenu(openGroupMenuNode.node,openGroupMenuNode.opener);if(currentState?.kind==="leaderboard"&&lastReport&&root.clientWidth!==leaderboardReportWidth&&!reportHasFocusedControl()&&!reportHasActiveSelection())applyReport(lastReport,lastReport,currentState);});
       addEventListener("popstate",()=>{abortActiveRequest();currentState=parsePageState(location);syncControls();fetchReport();schedulePoll();});document.addEventListener("visibilitychange",()=>{if(!document.hidden){fetchReport();schedulePoll();}});fetchReport();schedulePoll();
     }
-    window.parsePageState=parsePageState;window.buildAPIURL=buildAPIURL;window.rootProgressURL=rootProgressURL;window.attachProgressiveStage=attachProgressiveStage;window.renderRootProgressHeadline=renderRootProgressHeadline;window.applyReport=applyReport;window.spineTextFromSelection=spineTextFromSelection;window.__reportClient={setState:state=>setState(state),getState:()=>({...currentState}),fetchReport};
+    window.parsePageState=parsePageState;window.buildAPIURL=buildAPIURL;window.rootProgressURL=rootProgressURL;window.attachProgressiveStage=attachProgressiveStage;window.renderRootProgressHeadline=renderRootProgressHeadline;window.applyReport=applyReport;window.spineTextFromSelection=spineTextFromSelection;window.__pollExemptProbe=()=>pollExempt();window.__reportClient={setState:state=>setState(state),getState:()=>({...currentState}),fetchReport};
     document.addEventListener("DOMContentLoaded",initialize);
   })();
   </script>

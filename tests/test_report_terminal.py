@@ -894,7 +894,7 @@ class OverviewRendererTest(unittest.TestCase):
         self.assertIn("epoch=17", output)
         self.assertIn("window=whole epoch", output)
         self.assertIn("scanned in 10.4s", output)
-        for label in ("<=2s", "2-30s", "30-300s", "300-3600s", ">3600s"):
+        for label in ("<=2s", "2-30s", "30-300s", "300-3,600s", ">3,600s"):
             with self.subTest(label=label):
                 self.assertIn(label, output)
         self.assertIn("39,332", output)
@@ -3301,7 +3301,7 @@ class WorkDistributionCommandEndToEndTest(unittest.TestCase):
         # second column so an 80-column terminal cannot drop it, and the branch
         # count follows it.
         self.assertEqual(band_rows["<=2s"][2], "1")
-        self.assertEqual(band_rows["300-3600s"][2], "1")
+        self.assertEqual(band_rows["300-3,600s"][2], "1")
         self.assertEqual(band_rows["2-30s"][2], "0")
 
     def test_json_output_round_trips_the_bands_and_their_shares(self):

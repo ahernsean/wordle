@@ -5109,7 +5109,7 @@ class ReportClientBrowserTest(unittest.TestCase):
             "table.work-distribution tbody tr td:first-child"
         ).all_inner_texts()
         self.assertEqual(
-            labels, ["<=2s", "2-30s", "30-300s", "300-3600s", ">3600s"])
+            labels, ["<=2s", "2-30s", "30-300s", "300-3,600s", ">3,600s"])
         text = self.page.locator("#report").inner_text()
         self.assertIn("epoch claims by branch", text)
         self.assertNotIn("epoch_claims_by_branch", text)
@@ -5144,6 +5144,21 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.open_work_distribution()
         text = self.page.locator("#report").inner_text()
         self.assertIn("unrecorded worker time", text)
+
+    def test_work_distribution_is_exempt_before_its_first_report_arrives(self):
+        # A scan slower than STUCK_REQUEST_MILLIS would otherwise be aborted and
+        # restarted every minute while lastReport still held the previous view,
+        # and an aborted fetch does not stop the query already running on the
+        # server.  The exemption must therefore hold from the moment the kind is
+        # selected, not from the moment a report of that kind lands.
+        self.page.goto(self.base_url)
+        self.page.wait_for_selector("#report h1:text-is('overview report')")
+        exempt = self.page.evaluate("""() => {
+          const before = __reportClient.getState();
+          __reportClient.setState({...before, kind: 'work_distribution'});
+          return window.__pollExemptProbe();
+        }""")
+        self.assertTrue(exempt)
 
     def test_work_distribution_does_not_refetch_on_the_poll_timer(self):
         # The scan outlasts the poll interval, so a timer-driven refetch would

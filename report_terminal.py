@@ -1652,13 +1652,13 @@ def _render_work_distribution_sections(report, width):
         ))
     # Coord/work is the column the report exists for, so it sits immediately
     # after the band and cannot be the first thing an 80-column terminal drops.
-    rows = [f"{'Band':<9} {'Coord/work':>10} {'Branches':>9} {'Open':>5}"
+    rows = [f"{'Band':<10} {'Coord/work':>10} {'Branches':>9} {'Open':>5}"
             f" {'Worker':>7} {'%Work':>6} {'Nodes':>7} {'%Nodes':>7}"
             f" {'Claims':>9} {'%Claims':>8}"]
     for band in data["bands"]:
         ratio = band["coordination_share_per_work_share"]
         rows.append(_fit(
-            f"{band['band_label']:<9}"
+            f"{band['band_label']:<10}"
             f" {('—' if ratio is None else f'{ratio:.2f}'):>10}"
             f" {band['branch_count']:>9,} {band['unfinished_branch_count']:>5,}"
             f" {_abbreviate_duration(band['worker_millis'] / 1000):>7}"

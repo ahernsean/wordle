@@ -4104,6 +4104,12 @@ class WorkDistributionReportTest(unittest.TestCase):
             work_distribution_band_labels((2, 30)),
             ["<=2s", "2-30s", ">30s"],
         )
+        # Bounds are quantities, so they carry separators like every other
+        # number shown to a reader.
+        self.assertEqual(
+            work_distribution_band_labels((300, 3600, 86400)),
+            ["<=300s", "300-3,600s", "3,600-86,400s", ">86,400s"],
+        )
         self.assertEqual(
             len(work_distribution_band_labels()),
             len(WORK_DISTRIBUTION_BAND_EDGE_SECONDS) + 1,

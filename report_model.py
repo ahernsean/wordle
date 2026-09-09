@@ -3448,11 +3448,12 @@ WORK_DISTRIBUTION_BAND_EDGE_SECONDS = (2, 30, 300, 3600)
 
 
 def work_distribution_band_labels(edge_seconds=WORK_DISTRIBUTION_BAND_EDGE_SECONDS):
-    labels = [f"<={edge_seconds[0]}s"]
+    """Band bounds as the display conventions render every other quantity."""
+    labels = [f"<={edge_seconds[0]:,}s"]
     labels.extend(
-        f"{low}-{high}s" for low, high in zip(edge_seconds, edge_seconds[1:])
+        f"{low:,}-{high:,}s" for low, high in zip(edge_seconds, edge_seconds[1:])
     )
-    labels.append(f">{edge_seconds[-1]}s")
+    labels.append(f">{edge_seconds[-1]:,}s")
     return labels
 
 

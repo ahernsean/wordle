@@ -64,7 +64,7 @@
       },
       {
         "band_index": 3,
-        "band_label": "300-3600s",
+        "band_label": "300-3,600s",
         "branch_count": 3,
         "branch_share": 0.06666666666666667,
         "claim_count": 72,
@@ -80,7 +80,7 @@
       },
       {
         "band_index": 4,
-        "band_label": ">3600s",
+        "band_label": ">3,600s",
         "branch_count": 2,
         "branch_share": 0.044444444444444446,
         "claim_count": 12,
