@@ -6,6 +6,20 @@ on:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  # One in-flight run per pull request: pushing again supersedes the run the
+  # previous push started rather than racing it, which otherwise leaves two
+  # full matrices competing for runners and reports the loser's result second.
+  #
+  # Everything else gets a group of its own, keyed on the run id.  A shared
+  # group holds at most one running and one pending run, and queuing a third
+  # cancels the pending one -- `cancel-in-progress: false` protects only the
+  # run already going.  So grouping main pushes together would drop the middle
+  # commit of any three that overlap, and a commit landing on main gets a
+  # recorded result rather than a preview for a later commit to supersede.
+  group: tests-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   unit:
     runs-on: ubuntu-latest
