@@ -10,9 +10,14 @@ concurrency:
   # One in-flight run per pull request: pushing again supersedes the run the
   # previous push started rather than racing it, which otherwise leaves two
   # full matrices competing for runners and reports the loser's result second.
-  # Pushes to main are grouped by ref but never cancelled -- each commit landing
-  # on main gets its own recorded result, which is not a preview to supersede.
-  group: tests-${{ github.event.pull_request.number || github.ref }}
+  #
+  # Everything else gets a group of its own, keyed on the run id.  A shared
+  # group holds at most one running and one pending run, and queuing a third
+  # cancels the pending one -- `cancel-in-progress: false` protects only the
+  # run already going.  So grouping main pushes together would drop the middle
+  # commit of any three that overlap, and a commit landing on main gets a
+  # recorded result rather than a preview for a later commit to supersede.
+  group: tests-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
