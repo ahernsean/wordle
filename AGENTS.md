@@ -724,14 +724,18 @@ and its related paths. Use `python3.13`; for example:
 python3.13 -m unittest tests.test_report_model tests.test_report_terminal
 ```
 
-**Your tests should be specific, and then push.** A local full-suite pass can
-cost about twenty minutes and could spend nearly all of it running tests your
-change doesn't reach. That latency is not free: it delays the push, and the
-push is what lets CI run the whole suite in parallel and lets a reviewing agent
-start reading the code. Holding back a change that its own focused tests have
-already cleared, so that unrelated tests can be re-run locally first, is
-strictly worse than pushing it. Let CI do its job; read CI's result rather than
-pre-empting it.
+**Your tests should be specific, then push and open the pull request.** A local
+full-suite pass can cost about twenty minutes and could spend nearly all of it
+running tests your change doesn't reach. That latency is not free: it delays
+the point at which CI can run the whole suite in parallel. Holding back a
+change that its own focused tests have already cleared, so that unrelated tests
+can be re-run locally first, is strictly worse than getting it there.
+
+The push by itself starts nothing. `tests.yml` runs on pushes to `main` and on
+pull-request events, so a feature branch pushed with no pull request open runs
+no CI at all; opening the pull request is what starts it, and pushing again to
+an open one restarts it. Open the pull request as soon as the change is worth
+CI's time. Let CI do its job; read its result rather than pre-empting it.
 
 **The one trap of narrow scope is user-facing strings.**
 `tests/test_erd_search_lifecycle.py` pins `erd_search.py`'s `parser.error`
