@@ -14,9 +14,11 @@ they miss:
 - cooperative_solve(): the cached-result fast path (result already in cache →
   returns immediately without evaluating any candidates).
 """
+import ast
 import math
 import multiprocessing
 import os
+import pathlib
 import sqlite3
 import tempfile
 import time
@@ -3346,6 +3348,46 @@ class TestCoordinationWindowExcludesNonHandoffTime(unittest.TestCase):
         self.assertGreater(
             worker._last_claim_complete, opened_at + 500.0,
             "idle span left open; it would be charged to the next claim")
+
+    def test_every_worker_wait_restarts_the_coordination_window(self):
+        """No bare time.sleep on the worker: every wait goes through _idle_wait.
+
+        This defect was reported three times against three different sleep
+        sites, so the guard is structural rather than one test per site.  A new
+        wait added with a bare sleep silently reopens it, and no behavioural
+        test covers a site nobody thought to write one for.
+        """
+        source = pathlib.Path(erd_swarm.__file__).read_text()
+        offenders = []
+        for class_node in [n for n in ast.parse(source).body
+                           if isinstance(n, ast.ClassDef)]:
+            for function in [n for n in class_node.body
+                             if isinstance(n, ast.FunctionDef)]:
+                if function.name == "_idle_wait":
+                    continue        # the one place the real sleep belongs
+                for node in ast.walk(function):
+                    if (isinstance(node, ast.Call)
+                            and isinstance(node.func, ast.Attribute)
+                            and node.func.attr == "sleep"
+                            and isinstance(node.func.value, ast.Name)
+                            and node.func.value.id == "time"):
+                        offenders.append(
+                            f"{class_node.name}.{function.name} line {node.lineno}")
+        self.assertEqual(
+            offenders, [],
+            "bare time.sleep leaves the handoff window open across the wait; "
+            "use self._idle_wait")
+
+    def test_a_cooperative_wait_restarts_the_window(self):
+        # cooperative_solve waits in its recursion-cap and failed-pairing
+        # paths.  The window it opened on entry must not stay open across
+        # those, or the wait is charged to whatever claim lands next.
+        worker = _bare_worker()
+        opened_at = time.time() - 400.0
+        worker._last_claim_complete = opened_at
+        with mock.patch('erd_swarm.time.sleep'):
+            worker._idle_wait(0.05)
+        self.assertGreater(worker._last_claim_complete, opened_at + 300.0)
 
     def test_a_promoted_solve_gives_its_claims_their_own_window(self):
         # cooperative_solve runs while the enclosing candidate is still being

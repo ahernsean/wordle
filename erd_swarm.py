@@ -740,6 +740,24 @@ class _BranchWorker:
         # see MAX_HELP_RECURSION_DEPTH.
         self._help_recursion_depth = 0
 
+    def _idle_wait(self, seconds):
+        """Sleep while this worker has no claimable work, then reopen the
+        handoff window.
+
+        Every wait in this class is starvation rather than coordination: a
+        checkpoint pause, a rival's finalize, a full recursion stack, a scan
+        that found nothing free.  full_coord_seconds telescopes from the
+        previous claim completion, so a wait left inside that window is charged
+        to the next completed claim as handoff cost -- and in the log domain a
+        single multi-minute sample dominates the five that warm the estimator.
+
+        Every sleep on this class goes through here; a bare time.sleep would
+        reopen the defect silently, so test_every_worker_wait_restarts_the_
+        coordination_window refuses one.
+        """
+        time.sleep(seconds)
+        self._last_claim_complete = time.time()
+
     # -- lifecycle ----------------------------------------------------------
 
     def close(self):
@@ -1043,7 +1061,7 @@ class _BranchWorker:
         if not self._checkpoint_pause_active():
             return
         while not self.cancel() and self.queue.checkpoint_paused():
-            time.sleep(PAUSE_POLL_SECONDS)
+            self._idle_wait(PAUSE_POLL_SECONDS)
         self._pause_active = False
 
     def _check_disk(self):
@@ -2005,7 +2023,7 @@ class _BranchWorker:
                            'mid-finalize', self.name, n_words)
             self.maybe_finalize(branch_key, words, n_candidates)
             return
-        time.sleep(0.05)
+        self._idle_wait(0.05)
 
     # -- recursive cooperative solving --------------------------------------
 
@@ -2402,7 +2420,7 @@ class _BranchWorker:
                     # _help_other_branch's capped-depth contract already
                     # promises its callers.
                     self._cur_candidate = None
-                    time.sleep(0.05)
+                    self._idle_wait(0.05)
                 else:
                     # No bundle: every candidate is claimed, or another worker
                     # holds the branch.  Try free or promotable work first —
@@ -2442,7 +2460,7 @@ class _BranchWorker:
                             self._evaluate_dependency_bundle(
                                 branch_key, words, n_words, paired, budget)
                         else:
-                            time.sleep(0.05)    # let claims land
+                            self._idle_wait(0.05)   # let claims land
 
             if self.cancel():  # pragma: no cover
                 return CANCEL_RECVD
@@ -2744,13 +2762,7 @@ class _BranchWorker:
                 self._cur_candidate = None      # idle, no candidate in flight
                 self._heartbeat(None, None, None, None,
                                 None, None, force=True)
-                time.sleep(0.5)
-                # Waiting for the queue to hold claimable work is starvation,
-                # not the cost of a handoff.  Without this the whole idle span
-                # lands on the next completed claim as coordination, and a
-                # log-domain estimator warming on five samples cannot dilute
-                # one of those.
-                self._last_claim_complete = time.time()
+                self._idle_wait(0.5)
                 continue
             idle_since = None
             context, branch, bundle_id, indices, forced = work
@@ -2824,7 +2836,7 @@ class _BranchWorker:
                 self._heartbeat(branch_key, branch['n_words'], None, None,
                                 None, None, force=True)
                 self.queue.reclaim_stale_claims(HB_TIMEOUT_SECONDS)
-                time.sleep(0.1)
+                self._idle_wait(0.1)
                 continue
             bundle_id, indices, forced = claim
             if self.evaluate_bundle(branch_key, words, branch['n_words'], bundle_id,
