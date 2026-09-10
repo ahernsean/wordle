@@ -716,14 +716,33 @@ or a clear, which keep the same container.
 
 ## Before committing and pushing
 
-Before committing and pushing a code change, run the targeted tests that cover
-the changed behavior and its related paths. Use `python3.13`; for example:
+Write tests for every new or changed executable path.  Before committing and
+pushing a code change, run the specific tests that cover the changed behavior
+and its related paths. Use `python3.13`; for example:
 
 ```
 python3.13 -m unittest tests.test_report_model tests.test_report_terminal
 ```
 
-Write tests for every new or changed executable path.
+**Your tests should be specific, then push and open the pull request.** A local
+full-suite pass can cost about twenty minutes and could spend nearly all of it
+running tests your change doesn't reach. That latency is not free: it delays
+the point at which CI can run the whole suite in parallel. Holding back a
+change that its own focused tests have already cleared, so that unrelated tests
+can be re-run locally first, is strictly worse than getting it there.
+
+The push by itself starts nothing. `tests.yml` runs on pushes to `main` and on
+pull-request events, so a feature branch pushed with no pull request open runs
+no CI at all; opening the pull request is what starts it, and pushing again to
+an open one restarts it. Open the pull request as soon as the change is worth
+CI's time. Let CI do its job; read its result rather than pre-empting it.
+
+**The one trap of narrow scope is user-facing strings.**
+`tests/test_erd_search_lifecycle.py` pins `erd_search.py`'s `parser.error`
+messages by substring, so widening one report's option set fails a test in a
+module the diff never touches. When a change alters an error message, grep
+`tests/` for a distinctive fragment of the old wording — that is cheaper and
+more certain than running everything.
 
 **Prove a new test can fail.** Disable the fix — stub the function to a no-op,
 or patch the constant back — and confirm the tests that are supposed to catch
@@ -739,8 +758,10 @@ never reaches, and every assertion built on it is then testing fiction. Follow
 the real call sequence when constructing "already finished" or "already
 failed" states.
 
-Run the full suite when the change has broad cross-layer risk, when targeted
-tests do not provide enough confidence, or when the user asks for it:
+Run the full suite when the change carries genuine cross-layer risk — a schema
+migration, or a shared helper that many modules import — or when the user asks
+for it. Being unsure which tests are related is not cross-layer risk; find the
+related tests instead.
 
 ```
 python3.13 -m unittest discover -s tests -t . -p 'test_*.py'
