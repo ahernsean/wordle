@@ -2252,6 +2252,19 @@ class _BranchWorker:
         child_spine = self._promoted_spine(self.root_budget - budget)
         parent_context = self._work_context
         with ExitStack() as context_stack:
+            # Claims taken while helping a promoted sub-branch belong to their
+            # own coordination window.  The enclosing candidate's evaluation is
+            # still running, so telescoping from its last completion would
+            # charge that search time to the child as handoff cost, and the
+            # child's completion would then leave the enclosing claim
+            # reporting a span its child had already consumed.  Restoring on
+            # the way out keeps the enclosing claim measured from its own
+            # previous completion, which its candidate_evaluation_millis --
+            # covering the nested work -- cancels correctly.
+            enclosing_claim_window = self._last_claim_complete
+            self._last_claim_complete = time.time()
+            context_stack.callback(
+                setattr, self, '_last_claim_complete', enclosing_claim_window)
             branch_key = encode_subset(words)
             n_words = len(words)
             # Already solved by someone? reuse without re-promoting.
@@ -2732,6 +2745,12 @@ class _BranchWorker:
                 self._heartbeat(None, None, None, None,
                                 None, None, force=True)
                 time.sleep(0.5)
+                # Waiting for the queue to hold claimable work is starvation,
+                # not the cost of a handoff.  Without this the whole idle span
+                # lands on the next completed claim as coordination, and a
+                # log-domain estimator warming on five samples cannot dilute
+                # one of those.
+                self._last_claim_complete = time.time()
                 continue
             idle_since = None
             context, branch, bundle_id, indices, forced = work

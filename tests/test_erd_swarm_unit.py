@@ -3317,6 +3317,73 @@ class TestPublishThresholdEstimatorInputs(unittest.TestCase):
         self.assertIsNone(w._node_time_ema.value())
 
 
+class TestCoordinationWindowExcludesNonHandoffTime(unittest.TestCase):
+    """What the coordination window must not contain.
+
+    full_coord_seconds telescopes from the worker's previous claim completion,
+    so any span between completions that is not the cost of getting the next
+    claim reaches the estimator as handoff cost.  Two such spans exist: the
+    enclosing candidate's own evaluation while a promoted sub-branch is being
+    helped, and time spent idle because the queue held nothing claimable.
+    """
+
+    def test_idle_waiting_restarts_the_window_before_the_next_claim(self):
+        # Drives run()'s idle branch: nothing claimable, so it sleeps and
+        # loops.  The window must not still be open on the far side, or the
+        # whole starved span lands on the next completed claim.
+        worker = _bare_worker()
+        worker.queue = mock.Mock()
+        worker._heartbeat = mock.Mock()
+        worker.claim_one = mock.Mock(return_value=None)
+        worker._log = mock.Mock()
+        opened_at = time.time() - 600.0        # ten minutes with no work
+        worker._last_claim_complete = opened_at
+        # One idle pass, then stop.
+        worker.cancel = mock.Mock(side_effect=[False, True])
+        with mock.patch('erd_swarm.time.sleep'):
+            worker.run()
+
+        self.assertGreater(
+            worker._last_claim_complete, opened_at + 500.0,
+            "idle span left open; it would be charged to the next claim")
+
+    def test_a_promoted_solve_gives_its_claims_their_own_window(self):
+        # cooperative_solve runs while the enclosing candidate is still being
+        # evaluated.  Claims taken inside it must measure from the promotion,
+        # not from the enclosing claim's last completion.
+        worker = _bare_worker()
+        worker.queue = mock.Mock()
+        worker.score_cache = mock.Mock()
+        enclosing_window = time.time() - 300.0   # enclosing candidate searching
+        worker._last_claim_complete = enclosing_window
+        seen = []
+
+        def capture(*args, **kwargs):
+            # Called inside cooperative_solve's ExitStack, so it observes the
+            # window a nested claim would telescope from.
+            seen.append(worker._last_claim_complete)
+            return None
+
+        worker.score_cache.read_for_budget = mock.Mock(side_effect=capture)
+        worker.score_cache.read_loss = mock.Mock(return_value=None)
+        worker.score_cache.read_cut_result = mock.Mock(return_value=None)
+        worker._promoted_spine = mock.Mock(return_value="CRANE -----")
+        with mock.patch.object(_BranchWorker, 'cooperative_solve',
+                               _BranchWorker.cooperative_solve):
+            try:
+                worker.cooperative_solve(list(BRANCH), 3)
+            except Exception:
+                pass   # the solve cannot complete on a skeleton worker
+
+        self.assertTrue(seen, "cooperative_solve never opened its window")
+        self.assertGreater(
+            seen[0], enclosing_window + 200.0,
+            "nested claims would telescope from the enclosing candidate")
+        self.assertEqual(
+            worker._last_claim_complete, enclosing_window,
+            "the enclosing claim's own window was not restored")
+
+
 class TestPublishThresholdOverride(unittest.TestCase):
     """PUBLISH_THRESHOLD_OVERRIDE fixes the break-even for a calibration sweep."""
 
