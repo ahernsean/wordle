@@ -6,6 +6,15 @@ on:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  # One in-flight run per pull request: pushing again supersedes the run the
+  # previous push started rather than racing it, which otherwise leaves two
+  # full matrices competing for runners and reports the loser's result second.
+  # Pushes to main are grouped by ref but never cancelled -- each commit landing
+  # on main gets its own recorded result, which is not a preview to supersede.
+  group: tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   unit:
     runs-on: ubuntu-latest
