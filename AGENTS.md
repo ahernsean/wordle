@@ -627,6 +627,15 @@ If you notice only after editing the shared checkout, no harm done: save the
 diff to the scratchpad (`git diff <paths> > …patch`), restore their tree with
 `git checkout -- <paths>`, then apply the patch inside the worktree.
 
+**Remove your worktree when the pull request is open** — `git worktree remove
+<path>` — and put it under the session scratchpad so an abandoned session takes
+the directory with it. A session that ends first leaves one behind; that is the
+accepted cost of not tripping over each other, and it is small (a worktree of
+this repository is under 10 MB). `git worktree list` shows every one, and
+`git worktree prune` clears registry entries whose directory is already gone.
+The branch a worktree created outlives it either way, which is what you want
+while a pull request points at it.
+
 A clean tree on `main` means you are alone and can work in place — but confirm
 it, do not assume it.
 
