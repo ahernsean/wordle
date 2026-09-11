@@ -119,11 +119,21 @@ list at step 5 occupies 75,000 values. Priorities at or above
 `LEGACY_PROMOTED_PRIORITY_MIN` (1,000,000) are the legacy promoted band and
 never preempt requested work.
 
-**The scan cost is linear in queued openers.** Both work-selection paths walk
-every unfinished request on each claim, and `_help_other_branch` additionally
-issues one query per request. Measured on rocky: 0.6 ms per claim at 64
-openers, 157 ms at 15,000. Invisible at today's batch sizes and fatal at the
-scale of a full sweep — see the open issue before queueing thousands.
+**Work selection costs the same at 64 queued openers as at 15,000.**
+`_BranchWorker._opener_work_candidates` is a generator over
+`ERDQueue.opener_work_candidates(limit=1, after=...)`: the common claim takes
+the highest-priority opener in one bounded query, and a blocked opener advances
+the cursor only when the current one yields no bundle. Nothing on the claim
+path materializes the whole unfinished list, which is what makes a full-sweep
+queue of every candidate viable.
+
+The shape to avoid is a scan that returns *all* unfinished openers and then
+loops over them — that spelling measured 0.6 ms per claim at 64 openers and
+157 ms at 15,000, linear in the queue, and reintroducing it would be invisible
+at batch sizes of a few dozen and fatal at sweep scale. `opener_work_candidates`
+accepts `limit=None` for exactly one reason: operator commands want every
+matching request and are not on the claim path. Do not call it that way from a
+worker.
 
 ### One worker per branch
 
