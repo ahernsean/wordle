@@ -119,21 +119,33 @@ list at step 5 occupies 75,000 values. Priorities at or above
 `LEGACY_PROMOTED_PRIORITY_MIN` (1,000,000) are the legacy promoted band and
 never preempt requested work.
 
-**Work selection costs the same at 64 queued openers as at 15,000.**
-`_BranchWorker._opener_work_candidates` is a generator over
-`ERDQueue.opener_work_candidates(limit=1, after=...)`: the common claim takes
-the highest-priority opener in one bounded query, and a blocked opener advances
-the cursor only when the current one yields no bundle. Nothing on the claim
-path materializes the whole unfinished list, which is what makes a full-sweep
-queue of every candidate viable.
+**A claim that finds work is flat in queued openers. A claim that finds none
+is linear in them.** `_BranchWorker._opener_work_candidates` is a generator
+over `ERDQueue.opener_work_candidates(limit=1, after=...)`, so a claim served
+by the highest-priority opener issues one bounded query and returns. That is
+the steady-state case, and it is what makes a queue of every candidate viable.
 
-The shape to avoid is a scan that returns *all* unfinished openers and then
-loops over them — that spelling measured 0.6 ms per claim at 64 openers and
-157 ms at 15,000, linear in the queue, and reintroducing it would be invisible
-at batch sizes of a few dozen and fatal at sweep scale. `opener_work_candidates`
-accepts `limit=None` for exactly one reason: operator commands want every
-matching request and are not on the claim path. Do not call it that way from a
-worker.
+`_claim_one_uninstrumented` appends every row it visits to `opener_work_rows`.
+When no opener offers an unoccupied branch or a promotable pending one, the
+loop runs to exhaustion and that list ends up holding every unfinished
+request — one cursor query, one `branches_in_progress`, and a
+`_promote_opener_work` attempt per opener, after which `_claim_paired_branch`
+walks the same list and issues `branches_in_progress` for each one again. The
+cursor does not bound this path; it is linear in queue size and costs several
+queries per opener.
+
+Exhaustion means nothing anywhere is claimable, which is the drained or
+fully-occupied condition rather than the common one. Do not read the flat
+common case as a guarantee for the whole scheduler: at sweep scale the pairing
+fallback is the path to measure.
+
+The shape to avoid elsewhere is a scan that returns *all* unfinished openers
+and loops over them on every claim — that spelling measured 0.6 ms per claim
+at 64 openers and 157 ms at 15,000, and reintroducing it on the served path
+would be invisible at batch sizes of a few dozen and fatal at sweep scale.
+`opener_work_candidates` accepts `limit=None` for exactly one reason: operator
+commands want every matching request and are not on the claim path. Do not
+call it that way from a worker.
 
 ### One worker per branch
 
