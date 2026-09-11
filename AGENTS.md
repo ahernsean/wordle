@@ -584,6 +584,42 @@ Prefer designs where the common case cannot raise.
 
 ---
 
+## Look at the repository before you start
+
+**Run `git status` and `git branch --show-current` before making any change.**
+The checkout is shared and another agent is frequently mid-task in it. Read
+that state first: it is evidence about who else is working, and it costs
+nothing to check before you have edits of your own tangled up in it.
+
+Treat any of these as another agent at work:
+
+- The current branch is not `main`.
+- `git log origin/main..HEAD` lists commits, pushed or not.
+- The working tree is dirty with changes you did not make.
+- Recent commits carry a `Co-Authored-By` that is not yours.
+
+**When any of them holds, work in a `git worktree` instead of the shared
+checkout:**
+
+```
+git worktree add -b <your-branch> <scratchpad-path> origin/main
+```
+
+Committing onto their branch folds your change into their pull request, and
+switching branches under them rewrites files their next command expects to
+find. Neither failure is visible to you — only to them, and only after it has
+happened. A worktree gives you a clean tree at `origin/main` and leaves theirs
+untouched. Remove it once the pull request is open.
+
+If you notice only after editing the shared checkout, no harm done: save the
+diff to the scratchpad (`git diff <paths> > …patch`), restore their tree with
+`git checkout -- <paths>`, then apply the patch inside the worktree.
+
+A clean tree on `main` means you are alone and can work in place — but confirm
+it, do not assume it.
+
+---
+
 ## Dangerous operations — always ask first
 
 Never perform any of the following without explicit instruction from the user:
