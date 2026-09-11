@@ -119,11 +119,33 @@ list at step 5 occupies 75,000 values. Priorities at or above
 `LEGACY_PROMOTED_PRIORITY_MIN` (1,000,000) are the legacy promoted band and
 never preempt requested work.
 
-**The scan cost is linear in queued openers.** Both work-selection paths walk
-every unfinished request on each claim, and `_help_other_branch` additionally
-issues one query per request. Measured on rocky: 0.6 ms per claim at 64
-openers, 157 ms at 15,000. Invisible at today's batch sizes and fatal at the
-scale of a full sweep — see the open issue before queueing thousands.
+**A claim that finds work is flat in queued openers. A claim that finds none
+is linear in them.** `_BranchWorker._opener_work_candidates` is a generator
+over `ERDQueue.opener_work_candidates(limit=1, after=...)`, so a claim served
+by the highest-priority opener issues one bounded query and returns. That is
+the steady-state case, and it is what makes a queue of every candidate viable.
+
+`_claim_one_uninstrumented` appends every row it visits to `opener_work_rows`.
+When no opener offers an unoccupied branch or a promotable pending one, the
+loop runs to exhaustion and that list ends up holding every unfinished
+request — one cursor query, one `branches_in_progress`, and a
+`_promote_opener_work` attempt per opener, after which `_claim_paired_branch`
+walks the same list and issues `branches_in_progress` for each one again. The
+cursor does not bound this path; it is linear in queue size and costs several
+queries per opener.
+
+Exhaustion means nothing anywhere is claimable, which is the drained or
+fully-occupied condition rather than the common one. Do not read the flat
+common case as a guarantee for the whole scheduler: at sweep scale the pairing
+fallback is the path to measure.
+
+The shape to avoid elsewhere is a scan that returns *all* unfinished openers
+and loops over them on every claim — that spelling measured 0.6 ms per claim
+at 64 openers and 157 ms at 15,000, and reintroducing it on the served path
+would be invisible at batch sizes of a few dozen and fatal at sweep scale.
+`opener_work_candidates` accepts `limit=None` for exactly one reason: operator
+commands want every matching request and are not on the claim path. Do not
+call it that way from a worker.
 
 ### One worker per branch
 
@@ -571,6 +593,51 @@ the answer list with no queue dependency, so finalization returns an ordinary
 resolved.
 
 Prefer designs where the common case cannot raise.
+
+---
+
+## Look at the repository before you start
+
+**Run `git status` and `git branch --show-current` before making any change.**
+The checkout is shared and another agent is frequently mid-task in it. Read
+that state first: it is evidence about who else is working, and it costs
+nothing to check before you have edits of your own tangled up in it.
+
+Treat any of these as another agent at work:
+
+- The current branch is not `main`.
+- `git log origin/main..HEAD` lists commits, pushed or not.
+- The working tree is dirty with changes you did not make.
+- Recent commits carry a `Co-Authored-By` that is not yours.
+
+**When any of them holds, work in a `git worktree` instead of the shared
+checkout:**
+
+```
+git worktree add -b <your-branch> <scratchpad-path> origin/main
+```
+
+Committing onto their branch folds your change into their pull request, and
+switching branches under them rewrites files their next command expects to
+find. Neither failure is visible to you — only to them, and only after it has
+happened. A worktree gives you a clean tree at `origin/main` and leaves theirs
+untouched. Remove it once the pull request is open.
+
+If you notice only after editing the shared checkout, no harm done: save the
+diff to the scratchpad (`git diff <paths> > …patch`), restore their tree with
+`git checkout -- <paths>`, then apply the patch inside the worktree.
+
+**Remove your worktree when the pull request is open** — `git worktree remove
+<path>` — and put it under the session scratchpad so an abandoned session takes
+the directory with it. A session that ends first leaves one behind; that is the
+accepted cost of not tripping over each other, and it is small (a worktree of
+this repository is under 10 MB). `git worktree list` shows every one, and
+`git worktree prune` clears registry entries whose directory is already gone.
+The branch a worktree created outlives it either way, which is what you want
+while a pull request points at it.
+
+A clean tree on `main` means you are alone and can work in place — but confirm
+it, do not assume it.
 
 ---
 
