@@ -643,7 +643,19 @@ CREATE TABLE IF NOT EXISTS telemetry.cost_samples (
 -- idle_millis means genuinely unaccounted wait -- scheduling work is called
 -- out separately so a large idle_millis cannot be misread as starved workers
 -- when it is really scan cost.  All five span time BETWEEN candidate
--- evaluations.  candidate_evaluation_millis is the elapsed solver work for this
+-- evaluations.
+--
+-- fruitless_scan_millis is NOT one of those five and must not be added to
+-- them.  It measures the scans since the previous row that selected no branch
+-- at all, and those lie OUTSIDE every coordination window: each is followed by
+-- an idle wait, which restarts the window, so their cost was never inside any
+-- row's coordination_millis and subtracting it would drive idle_millis to its
+-- clamp.  It is separate worker time, reported here because it belongs to no
+-- claim and would otherwise be recorded nowhere.  fruitless_scans counts them,
+-- making the fraction of scans that select nothing measurable from this table.
+-- scan_openers_walked and fruitless_scan_openers_walked are the opener-work
+-- requests each kind of scan examined: an exhausted scan's cost is linear in
+-- them, so the millis are uninterpretable without them.  candidate_evaluation_millis is the elapsed solver work for this
 -- candidate.  Queue work done
 -- during a candidate's own evaluation (sub-branch promotion taking the write
 -- lock) sits inside the evaluation span that coordination_millis excludes and
@@ -673,6 +685,10 @@ CREATE TABLE IF NOT EXISTS telemetry.claim_telemetry (
     claim_transaction_millis  INTEGER,
     claim_commit_millis       INTEGER,
     scheduling_millis         INTEGER,
+    scan_openers_walked       INTEGER,
+    fruitless_scan_millis     INTEGER,
+    fruitless_scans           INTEGER,
+    fruitless_scan_openers_walked INTEGER,
     idle_millis               INTEGER,
     epoch                     INTEGER NOT NULL DEFAULT 0,
     recorded_at               INTEGER NOT NULL
@@ -1310,6 +1326,17 @@ class ERDQueue:
             "idle_millis": "INTEGER",
             "branch_worker_count": "INTEGER",
             "evaluation_bound_erd": "REAL",
+        }, schema="telemetry")
+
+        # Fruitless-scan attribution.  A row predating these columns holds
+        # NULL rather than 0: its fruitless-scan cost was folded into
+        # idle_millis and cannot be recovered, so NULL states that the split
+        # is unknown for that row while 0 would assert there was none.
+        self._add_columns("claim_telemetry", {
+            "scan_openers_walked": "INTEGER",
+            "fruitless_scan_millis": "INTEGER",
+            "fruitless_scans": "INTEGER",
+            "fruitless_scan_openers_walked": "INTEGER",
         }, schema="telemetry")
 
         # Candidate-accuracy identity and lifecycle fields (issue #223).
@@ -6455,6 +6482,26 @@ class ERDQueue:
         """, (policy, n_words, nodes, wall_millis, budget, censored, source,
               self.epoch, now))
 
+    def discard_claim_attribution(self):
+        """Drop the claim attribution accumulated since the last telemetry row.
+
+        These counters are consumed by add_claim_telemetry and are otherwise
+        never cleared, so they outlive any window a caller restarts.  A caller
+        that moves its coordination window forward past the work they describe
+        must call this: left in place they are reported inside a window that no
+        longer contains them, and the phases then exceed coordination_millis
+        and pin idle_millis to its clamp.
+
+        Discarding is the correct outcome rather than a loss.  The restarted
+        window has already excluded the span these measure, so reporting them
+        as zero is what keeps the row self-consistent; a caller that wants to
+        keep the figure must read it before restarting the window.
+        """
+        self._last_claim_busy_millis = 0
+        self._last_claim_retries = 0
+        self._last_claim_transaction_millis = 0
+        self._last_claim_commit_millis = 0
+
     def add_claim_telemetry(self, n_words: int, coordination_millis: int,
                             work_nodes: int, worker_count: int,
                             branch_key: bytes = None, spine: str = None,
@@ -6462,6 +6509,10 @@ class ERDQueue:
                             idx: int = None, bundle_start_idx: int = None,
                             bundle_end_idx: int = None,
                             scheduling_millis: int = 0,
+                            scan_openers_walked: int = 0,
+                            fruitless_scan_millis: int = 0,
+                            fruitless_scans: int = 0,
+                            fruitless_scan_openers_walked: int = 0,
                             candidate_evaluation_millis: int = None,
                             evaluation_bound_erd: float = None):
         """Append a claim coordination record to claim_telemetry for offline analysis.
@@ -6492,10 +6543,22 @@ class ERDQueue:
         scheduling_millis is the caller's work-selection scan for this claim
         (opener-work ordering, pending promotion, joining an in-progress
         branch), already net of any lock wait and claim transaction it
-        contained so the phases stay disjoint.  idle_millis is
-        coordination_millis minus every other timed phase, so those five
-        partition it exactly and idle_millis means genuinely unaccounted
-        wait rather than unattributed scan work.
+        contained so the phases stay disjoint.
+
+        idle_millis is coordination_millis minus every other timed phase, so
+        those five partition it exactly and idle_millis means genuinely
+        unaccounted wait rather than unattributed scan work.
+
+        fruitless_scan_millis is deliberately NOT part of that partition.  It
+        measures the scans since the previous row that selected nothing, which
+        the caller carries forward because they belong to no claim -- and each
+        of them is followed by an idle wait that restarts the coordination
+        window, so their cost lies outside every window rather than inside
+        this row's.  Subtracting it would make the parts exceed the whole and
+        pin idle_millis to its clamp.  fruitless_scans counts those scans, and
+        scan_openers_walked / fruitless_scan_openers_walked report the
+        opener-work requests each kind of scan examined -- the quantity an
+        exhausted scan's cost is linear in.
 
         Every row is one candidate evaluation, so COUNT(*) over the table is a
         claim count.  Branch finalize cost is deliberately not recorded here —
@@ -6531,15 +6594,22 @@ class ERDQueue:
                  branch_worker_count, evaluation_bound_erd, bundle_id, idx, bundle_start_idx,
                  bundle_end_idx,
                  claim_transaction_millis, claim_commit_millis,
-                 scheduling_millis, idle_millis, epoch, recorded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 scheduling_millis, scan_openers_walked,
+                 fruitless_scan_millis, fruitless_scans,
+                 fruitless_scan_openers_walked,
+                 idle_millis, epoch, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?)
         """, (n_words, coordination_millis, candidate_evaluation_millis, work_nodes,
               self._last_claim_retries,
               self._last_claim_busy_millis, worker_count, branch_id, spine,
               worker_id, branch_worker_count, evaluation_bound_erd, bundle_id, idx, bundle_start_idx,
               bundle_end_idx,
               self._last_claim_transaction_millis, self._last_claim_commit_millis,
-              scheduling_millis, idle_millis, self.epoch, now))
+              scheduling_millis, scan_openers_walked,
+              fruitless_scan_millis, fruitless_scans,
+              fruitless_scan_openers_walked,
+              idle_millis, self.epoch, now))
         self._last_claim_retries = 0
         self._last_claim_busy_millis = 0
         self._last_claim_transaction_millis = 0

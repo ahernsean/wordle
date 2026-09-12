@@ -148,6 +148,62 @@ Exhaustion means nothing anywhere is claimable, which is the drained or
 fully-occupied condition rather than the common one. Do not read the flat
 common case as a guarantee for the whole scheduler.
 
+**A scan that selects nothing lands in `fruitless_scan_millis`, and that
+column is not a phase of `coordination_millis`.** `scheduling_millis` is the
+scan that chose the branch its row belongs to. An exhausted scan chose nothing,
+so no claim can carry it — and `run()` follows every such scan with an idle
+wait, which restarts the coordination window, so its cost is outside every
+window rather than inside the next row's. Before these columns it was recorded
+nowhere at all: the one scheduling path whose cost grows with queue size was
+the only one with no measurement. Do not add it to the five phases; the parts
+would exceed the whole and `idle_millis` would sit at its `max(0, …)` clamp.
+
+`fruitless_scans` counts those scans, so the fallback rate is measured here
+rather than inferred, and `scan_openers_walked`/`fruitless_scan_openers_walked`
+carry the queue depth each scan walked — the quantity the `6N + 4` cost is
+linear in, without which neither millis column can be read. A row predating the
+columns holds NULL, not 0, because its split is unrecoverable.
+
+**Returning None is not the same as selecting nothing.** A scan that promotes a
+branch and loses its bundle to a racing worker returns None from the short
+served path, never having walked to exhaustion; `_scan_selected_work` marks it
+so it stays out of both the count and the timing population.
+
+### Two clocks, one restart
+
+Claim timing runs on two counters with **different reset points**, and three
+separate defects have come from moving one without the other.
+
+- The **coordination window** — `_BranchWorker._last_claim_complete`.
+  `coordination_millis` telescopes from it. It restarts at every wait, after
+  every finalize, and around a helped sub-branch.
+- The **queue's claim attribution** — `_last_claim_busy_millis`,
+  `_last_claim_retries`, `_last_claim_transaction_millis`,
+  `_last_claim_commit_millis` on the `ERDQueue` connection. The first two
+  accumulate with `+=`. Nothing clears any of them except
+  `add_claim_telemetry`, when a row consumes them.
+
+So a restart that moves the window forward leaves attribution describing work
+that happened *before* the new origin, and the next row reports it as a phase
+of a window that excludes it. The parts then exceed the whole and
+`idle_millis` sits on its `max(0, …)` clamp — visible only under contention,
+which is why unit tests miss it.
+
+**Every window restart goes through `_restart_coordination_window`**, which
+moves the origin and calls `queue.discard_claim_attribution()` together.
+`test_every_window_restart_drops_the_queue_attribution_with_it` is an AST guard
+that refuses a bare `_last_claim_complete` assignment, because the defect keeps
+arriving at sites nobody wrote a behavioural test for. Two sites assign
+directly and are exempt with stated reasons: `__init__` starts both clocks at
+zero, and `evaluate_claim` advances the window immediately before the
+`add_claim_telemetry` that clears the attribution itself.
+
+Discarding is the right outcome, not a loss: the restarted window already
+excludes the span those counters measure, so reporting zero is what keeps a row
+self-consistent. A caller that wants to keep the figure must read it *before*
+restarting — which is exactly what `claim_one` does to make
+`fruitless_scan_millis` gross.
+
 Three costs on that path are already removed and must not come back.
 `_claim_paired_branch` rewalks the branches the main loop recorded instead of
 re-reading them. It passes `sweep_finalize=False`, because the main walk already

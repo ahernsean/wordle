@@ -103,6 +103,12 @@ def _bare_worker():
     w._work_context = WorkContext.empty()
     w._help_recursion_depth = 0
     w._pending_scheduling_millis = 0
+    w._pending_scan_openers_walked = 0
+    w._pending_fruitless_scan_millis = 0
+    w._pending_fruitless_scans = 0
+    w._pending_fruitless_scan_openers_walked = 0
+    w._scan_openers_walked = 0
+    w._scan_selected_work = False
     w._adaptive = True
     w._erd_lower_bound_pruned_accuracy_n = 0
     w._typical_cache = {}
@@ -1287,6 +1293,232 @@ class TestSolveBranchFocusedClaimTelemetryAttribution(unittest.TestCase):
         self.assertGreaterEqual(row["scheduling_millis"], 40)
         # The scan is the bulk of the window, so idle must not have absorbed it.
         self.assertLess(row["idle_millis"], row["scheduling_millis"])
+
+    def _seed_claim_attribution(self, queue, busy=7, retries=3):
+        """Leave the queue holding attribution from a contended claim.
+
+        These accumulators ARE the production artifact: a claim that waited on
+        the write lock adds to them, and nothing clears them until a telemetry
+        row is written.  Setting them directly reproduces that state without
+        needing real contention, which a unit test cannot schedule.
+        """
+        queue._last_claim_busy_millis = busy
+        queue._last_claim_retries = retries
+
+    def test_a_fruitless_scans_lock_wait_stays_off_the_next_claims_row(self):
+        # run()'s real sequence: a scan that finds nothing, an idle wait that
+        # restarts the coordination window, then a claim.  The scan's lock wait
+        # lies before the new window origin, so reporting it as this row's
+        # busy_wait_millis puts the phases outside the window they partition --
+        # under contention the five then exceed coordination_millis and
+        # idle_millis pins to its clamp.
+        ScoreCache(self.cache_path, BRANCH).close()
+        branch_key = ScoreCache.encode_subset(BRANCH)
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        try:
+            self.assertIsNone(w.claim_one())        # nothing queued yet
+            self._seed_claim_attribution(w.queue)
+            w._idle_wait(0.01)                      # what run() does next
+            w.queue.create_branch(branch_key, len(BRANCH), len(CANDIDATES),
+                                  budget=ROOT_BUDGET, spine="CRANE -----")
+            work = w.claim_one()
+            self.assertIsNotNone(work)
+            context, branch, _bundle_id, indices, _forced = work
+            with w._entered(context):
+                w.evaluate_claim(branch_key, decode_subset(branch_key),
+                                 branch['n_words'], indices[0],
+                                 budget=ROOT_BUDGET)
+        finally:
+            w.close()
+
+        q = ERDQueue(self.queue_path)
+        row = q._conn.execute(
+            "SELECT coordination_millis, busy_wait_millis, claim_retries, "
+            "claim_transaction_millis, claim_commit_millis, "
+            "scheduling_millis, idle_millis FROM claim_telemetry "
+            "ORDER BY id LIMIT 1").fetchone()
+        q.close()
+        self.assertEqual(row["busy_wait_millis"], 0)
+        self.assertEqual(row["claim_retries"], 0)
+        self.assertLessEqual(
+            row["claim_transaction_millis"] + row["claim_commit_millis"]
+            + row["busy_wait_millis"] + row["scheduling_millis"]
+            + row["idle_millis"],
+            row["coordination_millis"])
+
+    def test_a_fruitless_scans_own_lock_wait_is_inside_its_reported_cost(self):
+        # fruitless_scan_millis is gross where scheduling_millis is net.  A
+        # successful claim reports its lock wait in busy_wait_millis, so its
+        # scan figure excludes it to keep the phases disjoint; a scan that
+        # produced no row has no such sibling, and the window restart that
+        # follows discards the accumulator, so time left out here is lost.
+        #
+        # A unit test cannot schedule real lock contention and sub-millisecond
+        # waits round to zero, so the scan is stood in for by one that leaves
+        # the same accumulator behind -- which is all a contended scan does.
+        ScoreCache(self.cache_path, BRANCH).close()
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+
+        def scan_that_waited_on_the_lock():
+            w.queue._last_claim_busy_millis += 7
+            return None
+        try:
+            w._claim_one_uninstrumented = scan_that_waited_on_the_lock
+            self.assertIsNone(w.claim_one())
+        finally:
+            w.close()
+
+        self.assertEqual(w._pending_fruitless_scans, 1)
+        self.assertGreaterEqual(w._pending_fruitless_scan_millis, 7)
+
+    def test_restarting_the_window_drops_the_attribution_that_predates_it(self):
+        # The contract the structural guard relies on.  Every window restart --
+        # the idle wait, the post-finalize restart, the helped sub-branch's own
+        # window and the enclosing one it restores -- routes through this, so
+        # covering it here covers each site without four fixtures that each
+        # have to reach a different corner of the worker's lifecycle.
+        ScoreCache(self.cache_path, BRANCH).close()
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        try:
+            self._seed_claim_attribution(w.queue)
+            w.queue._last_claim_transaction_millis = 5
+            w.queue._last_claim_commit_millis = 2
+            before = w._last_claim_complete
+
+            w._restart_coordination_window()
+
+            self.assertGreaterEqual(w._last_claim_complete, before)
+            self.assertEqual(w.queue._last_claim_busy_millis, 0)
+            self.assertEqual(w.queue._last_claim_retries, 0)
+            self.assertEqual(w.queue._last_claim_transaction_millis, 0)
+            self.assertEqual(w.queue._last_claim_commit_millis, 0)
+        finally:
+            w.close()
+
+    def test_restoring_an_enclosing_window_drops_attribution_too(self):
+        # _help_other_branch restores the enclosing claim's window on the way
+        # out.  The helped branch's own queue writes happened inside the
+        # enclosing candidate's evaluation, which coordination_millis
+        # subtracts, so carrying them back out would report a phase the
+        # restored window does not contain.
+        ScoreCache(self.cache_path, BRANCH).close()
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        try:
+            enclosing = w._last_claim_complete
+            w._restart_coordination_window()
+            self._seed_claim_attribution(w.queue)
+
+            w._restart_coordination_window(enclosing)
+
+            self.assertEqual(w._last_claim_complete, enclosing)
+            self.assertEqual(w.queue._last_claim_busy_millis, 0)
+            self.assertEqual(w.queue._last_claim_retries, 0)
+        finally:
+            w.close()
+
+    def test_a_scan_that_selects_nothing_is_recorded_outside_the_window(self):
+        # A scan that selects no branch is followed by an idle wait, and an
+        # idle wait restarts the coordination window -- so its cost is not in
+        # the next row's coordination_millis, nor in any other row's.  Untimed
+        # it is recorded nowhere at all, which left the exhausted scan, the one
+        # path whose cost grows with queue size, the only one invisible.
+        #
+        # Follows run()'s real sequence (fruitless claim, idle wait, claim),
+        # because it is the idle wait that puts the scan outside the window:
+        # without it the scan stays inside and the test cannot see the case it
+        # exists for.
+        ScoreCache(self.cache_path, BRANCH).close()
+        branch_key = ScoreCache.encode_subset(BRANCH)
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        real_scan = w.queue.direct_branches_in_progress
+
+        def slow_scan(*args, **kwargs):
+            time.sleep(0.05)          # inside claim_one's scan, no lock held
+            return real_scan(*args, **kwargs)
+        try:
+            w.queue.direct_branches_in_progress = slow_scan
+            self.assertIsNone(w.claim_one())        # nothing queued yet
+            w.queue.direct_branches_in_progress = real_scan
+            w._idle_wait(0.01)                      # what run() does next
+            w.queue.create_branch(branch_key, len(BRANCH), len(CANDIDATES),
+                                  budget=ROOT_BUDGET, spine="CRANE -----")
+            work = w.claim_one()
+            self.assertIsNotNone(work)
+            context, branch, _bundle_id, indices, _forced = work
+            with w._entered(context):
+                w.evaluate_claim(branch_key, decode_subset(branch_key),
+                                 branch['n_words'], indices[0],
+                                 budget=ROOT_BUDGET)
+        finally:
+            w.close()
+
+        q = ERDQueue(self.queue_path)
+        row = q._conn.execute(
+            "SELECT scheduling_millis, fruitless_scan_millis, "
+            "fruitless_scans, idle_millis, coordination_millis, "
+            "claim_transaction_millis, claim_commit_millis, busy_wait_millis "
+            "FROM claim_telemetry ORDER BY id LIMIT 1").fetchone()
+        q.close()
+        self.assertEqual(row["fruitless_scans"], 1)
+        self.assertGreaterEqual(row["fruitless_scan_millis"], 40)
+        # The scan that chose this branch is not the expensive one.
+        self.assertLess(row["scheduling_millis"],
+                        row["fruitless_scan_millis"])
+        # It is outside the window, not merely unattributed within it: the
+        # window is shorter than the scan it followed.  Treating it as a sixth
+        # phase would make the parts exceed the whole and pin idle to its
+        # clamp, so the five phases must still partition coordination exactly.
+        self.assertLess(row["coordination_millis"],
+                        row["fruitless_scan_millis"])
+        self.assertEqual(
+            row["claim_transaction_millis"] + row["claim_commit_millis"]
+            + row["busy_wait_millis"] + row["scheduling_millis"]
+            + row["idle_millis"],
+            row["coordination_millis"])
+
+    def test_fruitless_scan_cost_is_charged_to_one_row_only(self):
+        # The counters accumulate across scans and are consumed by the next
+        # claim that succeeds, so they must be cleared by the row that reports
+        # them.  Left uncleared they would repeat on every later candidate of
+        # the same worker, turning one wasted scan into an unbounded one.
+        ScoreCache(self.cache_path, BRANCH).close()
+        branch_key = ScoreCache.encode_subset(BRANCH)
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        try:
+            self.assertIsNone(w.claim_one())        # nothing queued yet
+            w.queue.create_branch(branch_key, len(BRANCH), len(CANDIDATES),
+                                  budget=ROOT_BUDGET, spine="CRANE -----")
+            evaluated = 0
+            while evaluated < 2:
+                work = w.claim_one()
+                self.assertIsNotNone(work)
+                context, branch, _bundle_id, indices, _forced = work
+                with w._entered(context):
+                    for idx in indices:
+                        w.evaluate_claim(branch_key, decode_subset(branch_key),
+                                         branch['n_words'], idx,
+                                         budget=ROOT_BUDGET)
+                        evaluated += 1
+                        if evaluated >= 2:
+                            break
+        finally:
+            w.close()
+
+        q = ERDQueue(self.queue_path)
+        rows = q._conn.execute(
+            "SELECT fruitless_scans, fruitless_scan_millis, "
+            "fruitless_scan_openers_walked FROM claim_telemetry "
+            "ORDER BY id").fetchall()
+        q.close()
+        self.assertGreaterEqual(len(rows), 2)
+        self.assertEqual(rows[0]["fruitless_scans"], 1)
+        for row in rows[1:]:
+            self.assertEqual(row["fruitless_scans"], 0)
+            self.assertEqual(row["fruitless_scan_millis"], 0)
+            self.assertEqual(row["fruitless_scan_openers_walked"], 0)
 
     def test_finalize_cost_lands_on_its_own_branch_and_not_the_next_one(self):
         # A worker that finalizes branch1 then moves on to branch2 must record
@@ -3378,6 +3610,49 @@ class TestCoordinationWindowExcludesNonHandoffTime(unittest.TestCase):
             "bare time.sleep leaves the handoff window open across the wait; "
             "use self._idle_wait")
 
+    def test_every_window_restart_drops_the_queue_attribution_with_it(self):
+        """No bare assignment to _last_claim_complete: every restart goes
+        through _restart_coordination_window.
+
+        The coordination window and the queue's claim attribution are two
+        clocks with different reset points -- the window restarts at every
+        wait and every finalize, the attribution only when a telemetry row
+        consumes it.  Three separate defects have come from moving one and not
+        the other, each reported against a different site, so the guard is
+        structural rather than one test per site: a new restart written as a
+        bare assignment reopens it silently, and the phases then exceed
+        coordination_millis only under contention, where no unit test looks.
+
+        Two sites assign directly and are exempt for stated reasons.
+        __init__ starts both clocks at zero together.  evaluate_claim advances
+        the window immediately before add_claim_telemetry, which consumes and
+        clears the attribution itself -- the one place the two are already
+        paired, and where discarding first would zero the row's own phases.
+        """
+        exempt = {"__init__", "_restart_coordination_window", "evaluate_claim"}
+        source = pathlib.Path(erd_swarm.__file__).read_text()
+        offenders = []
+        for class_node in [n for n in ast.parse(source).body
+                           if isinstance(n, ast.ClassDef)]:
+            for function in [n for n in class_node.body
+                             if isinstance(n, ast.FunctionDef)]:
+                if function.name in exempt:
+                    continue
+                for node in ast.walk(function):
+                    if not isinstance(node, ast.Assign):
+                        continue
+                    for target in node.targets:
+                        if (isinstance(target, ast.Attribute)
+                                and target.attr == "_last_claim_complete"):
+                            offenders.append(
+                                f"{class_node.name}.{function.name} "
+                                f"line {node.lineno}")
+        self.assertEqual(
+            offenders, [],
+            "a bare _last_claim_complete assignment leaves the queue's claim "
+            "attribution behind the new window origin; use "
+            "self._restart_coordination_window")
+
     def test_a_cooperative_wait_restarts_the_window(self):
         # cooperative_solve waits in its recursion-cap and failed-pairing
         # paths.  The window it opened on entry must not stay open across
@@ -5031,6 +5306,58 @@ if __name__ == "__main__":
                          "branch was free")
 
 
+class TestPromotedWithoutBundleIsNotAFruitlessScan(BranchOccupancyFixture,
+                                                   unittest.TestCase):
+    """A scan that promotes a branch and loses its bundle returns None like an
+    exhausted scan and is nothing like one: it selected work, on the short
+    served path, rather than walking every opener to exhaustion.
+
+    Counting it would inflate the fallback rate -- the figure these columns
+    exist to measure -- and mix cheap served-path scans into the timing
+    population that is supposed to describe the walk.
+    """
+
+    def _opener_whose_promotion_finds_its_branch_taken(self):
+        """Queue one opener with two branches and leave both open and held at
+        the cap, with the second branch's pending row still unclaimed.
+
+        The main walk then rejects both on occupancy and falls through to
+        promotion, which claims that pending row, finds the branch it names
+        already created and full, and returns the sentinel.
+        """
+        keys = self._queue_opener([BRANCH, BRANCH[:4]], opener=CANDIDATES[0])
+        promoted_key, opener_work_id = self._promote(CANDIDATES[0])
+        for holder in range(MAX_WORKERS_PER_BRANCH):
+            self._occupy(promoted_key, 10 + holder)
+
+        pending_key = next(key for key in keys if key != promoted_key)
+        owner = self.queue.owner_row_for_branch(promoted_key)
+        # Created without consuming its pending row: a branch reached by
+        # another spine is open while the queue still owes this request.
+        self.queue.create_branch(
+            pending_key, len(decode_subset(pending_key)), len(CANDIDATES),
+            budget=ROOT_BUDGET, priority=owner["owner_priority"],
+            opener=CANDIDATES[0], opener_pattern=owner["opener_pattern"],
+            opener_work_id=opener_work_id)
+        for holder in range(MAX_WORKERS_PER_BRANCH):
+            self._occupy(pending_key, 20 + holder)
+        return pending_key
+
+    def test_a_promoted_branch_with_no_bundle_is_not_counted_or_timed(self):
+        self._opener_whose_promotion_finds_its_branch_taken()
+        worker = self._worker(90)
+
+        self.assertIsNone(worker.claim_one())
+
+        # It selected work, so it is neither a fruitless scan nor billable to
+        # the scheduling phase of a claim that never happened.
+        self.assertTrue(worker._scan_selected_work)
+        self.assertEqual(worker._pending_fruitless_scans, 0)
+        self.assertEqual(worker._pending_fruitless_scan_millis, 0)
+        self.assertEqual(worker._pending_fruitless_scan_openers_walked, 0)
+        self.assertEqual(worker._pending_scheduling_millis, 0)
+
+
 class TestExhaustedScanReadsEachOpenerOnce(BranchOccupancyFixture,
                                            unittest.TestCase):
     """Work selection walks every opener twice when nothing is claimable: once
@@ -5098,6 +5425,40 @@ class TestExhaustedScanReadsEachOpenerOnce(BranchOccupancyFixture,
                  if opener_work_id is not None]
         self.assertEqual(len(named), len(keys))
         self.assertEqual(len(named), len(set(named)))
+
+    def test_a_scan_that_selects_nothing_records_the_openers_it_walked(self):
+        # The exhausted scan's cost is linear in the openers it walks, so its
+        # millis say nothing on their own: the same figure is a healthy queue
+        # at three openers and a scheduler that does nothing else at fourteen
+        # thousand.  claim_one banks the count with the time, for the next
+        # claim that succeeds to report.
+        keys = self._stuck_openers(3)
+        worker = self._worker(90)
+
+        self.assertIsNone(worker.claim_one())
+
+        self.assertEqual(worker._pending_fruitless_scans, 1)
+        self.assertEqual(worker._pending_fruitless_scan_openers_walked,
+                         len(keys))
+        # Nothing was selected, so the scheduling phase claims neither the
+        # time nor the walk.
+        self.assertEqual(worker._pending_scheduling_millis, 0)
+        self.assertEqual(worker._pending_scan_openers_walked, 0)
+
+    def test_successive_scans_that_select_nothing_accumulate(self):
+        # A worker with nothing to claim scans repeatedly before any claim
+        # succeeds, so the counters must sum across those scans rather than
+        # report only the last one -- the total is what the eventual row owes
+        # to scanning.
+        keys = self._stuck_openers(3)
+        worker = self._worker(90)
+
+        for _ in range(2):
+            self.assertIsNone(worker.claim_one())
+
+        self.assertEqual(worker._pending_fruitless_scans, 2)
+        self.assertEqual(worker._pending_fruitless_scan_openers_walked,
+                         2 * len(keys))
 
     def test_pairing_walk_does_not_repeat_the_finalize_sweep(self):
         keys = self._stuck_openers(3)

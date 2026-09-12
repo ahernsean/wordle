@@ -700,8 +700,23 @@ class _BranchWorker:
         self._work_context = WorkContext.empty()
         # Work-selection scan time for the claim currently in hand, set by
         # claim_one and consumed by the first candidate's telemetry row (the
-        # scan is paid once per claim, like the claim transaction itself).
+        # scan is paid once per claim, like the claim transaction itself),
+        # alongside the number of opener-work requests that scan examined.
         self._pending_scheduling_millis = 0
+        self._pending_scan_openers_walked = 0
+        # The scans since that telemetry row that found nothing.  A scan that
+        # claims nothing has no claim to be billed to, so these accumulate
+        # until a claim succeeds and are consumed by its row: they are the
+        # exhausted-scan cost, which would otherwise be indistinguishable from
+        # waiting inside idle_millis.
+        self._pending_fruitless_scan_millis = 0
+        self._pending_fruitless_scans = 0
+        self._pending_fruitless_scan_openers_walked = 0
+        # Openers examined by the scan in flight, counted by
+        # _claim_one_uninstrumented and banked by claim_one, and whether that
+        # scan selected a branch despite returning no bundle.
+        self._scan_openers_walked = 0
+        self._scan_selected_work = False
         # Direct cooperative callers can create active branches without a
         # opener-work request.  Keep their tight claim loop free of the
         # opener-admission query used by queued opener work.
@@ -740,6 +755,22 @@ class _BranchWorker:
         # see MAX_HELP_RECURSION_DEPTH.
         self._help_recursion_depth = 0
 
+    def _restart_coordination_window(self, origin=None):
+        """Move the coordination window to `origin` (now by default) and drop
+        the queue attribution that predates it.
+
+        The window and the queue's attribution counters are two clocks with
+        different reset points: the window restarts here, at every wait and at
+        every finalize, while _last_claim_busy_millis and its siblings are
+        cleared only when a telemetry row consumes them.  Moving one without
+        the other leaves lock waits and claim transactions from before the new
+        origin to be reported inside a window that excludes them, which makes
+        the phases exceed coordination_millis.  Every restart goes through
+        here so the two cannot drift apart.
+        """
+        self._last_claim_complete = time.time() if origin is None else origin
+        self.queue.discard_claim_attribution()
+
     def _idle_wait(self, seconds):
         """Sleep while this worker has no claimable work, then reopen the
         handoff window.
@@ -756,7 +787,7 @@ class _BranchWorker:
         coordination_window refuses one.
         """
         time.sleep(seconds)
-        self._last_claim_complete = time.time()
+        self._restart_coordination_window()
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -1548,7 +1579,16 @@ class _BranchWorker:
                 self._node_time_ema.add(cand_elapsed / nodes_delta)
             _record_candidate_accuracy()
         scheduling_millis = self._pending_scheduling_millis
+        scan_openers_walked = self._pending_scan_openers_walked
+        fruitless_scan_millis = self._pending_fruitless_scan_millis
+        fruitless_scans = self._pending_fruitless_scans
+        fruitless_scan_openers_walked = (
+            self._pending_fruitless_scan_openers_walked)
         self._pending_scheduling_millis = 0
+        self._pending_scan_openers_walked = 0
+        self._pending_fruitless_scan_millis = 0
+        self._pending_fruitless_scans = 0
+        self._pending_fruitless_scan_openers_walked = 0
         self.queue.add_claim_telemetry(
             n_words, int(full_coord_seconds * 1e3), nodes_delta,
             self.n_workers, branch_key=branch_key,
@@ -1556,6 +1596,10 @@ class _BranchWorker:
             bundle_id=bundle_id, idx=idx,
             bundle_start_idx=bundle_start_idx, bundle_end_idx=bundle_end_idx,
             scheduling_millis=scheduling_millis,
+            scan_openers_walked=scan_openers_walked,
+            fruitless_scan_millis=fruitless_scan_millis,
+            fruitless_scans=fruitless_scans,
+            fruitless_scan_openers_walked=fruitless_scan_openers_walked,
             candidate_evaluation_millis=round(cand_elapsed * 1e3),
             evaluation_bound_erd=evaluation_bound_erd)
         self.claims_done += 1
@@ -1973,8 +2017,10 @@ class _BranchWorker:
         # telescopes coordination_millis from the previous claim's completion,
         # so without this the finalize span would reappear as idle time on the
         # first claim of whatever branch this worker picks up next — a
-        # different, unrelated branch.
-        self._last_claim_complete = time.time()
+        # different, unrelated branch.  The finalize's own write transactions
+        # go with it: claim_telemetry does not carry finalize cost at all, and
+        # branch_finalize_log.cache_write_millis is where it belongs.
+        self._restart_coordination_window()
         return True
 
     def _hint_outcome(self, branch_key, best_guess, budget):
@@ -2284,9 +2330,9 @@ class _BranchWorker:
             # previous completion, which its candidate_evaluation_millis --
             # covering the nested work -- cancels correctly.
             enclosing_claim_window = self._last_claim_complete
-            self._last_claim_complete = time.time()
+            self._restart_coordination_window()
             context_stack.callback(
-                setattr, self, '_last_claim_complete', enclosing_claim_window)
+                self._restart_coordination_window, enclosing_claim_window)
             branch_key = encode_subset(words)
             n_words = len(words)
             # Already solved by someone? reuse without re-promoting.
@@ -2554,25 +2600,55 @@ class _BranchWorker:
         Times the work-selection scan into _pending_scheduling_millis for the
         resulting claim's telemetry row, net of the lock wait and claim
         transaction the queue already accounts for separately, so the phases
-        stay disjoint.  A call that finds nothing clears the figure rather
-        than carrying it forward: that scan chose no branch, so billing it to
-        whichever branch is claimed later would misattribute it (it stays in
-        that row's idle_millis, which is what a fruitless scan is).
+        stay disjoint, and banks the number of opener-work requests the scan
+        examined so that time has a denominator.
+
+        A call that selects nothing has no branch to bill, so its cost goes to
+        _pending_fruitless_scan_millis and waits for the next claim that does
+        succeed.  Charging it to scheduling_millis would attribute a scan to a
+        branch it did not choose, and it cannot go to that row's idle_millis
+        either: run() follows every such call with an idle wait, which
+        restarts the coordination window, so the scan lies outside every
+        window and no phase of any row contains it.  Untimed here it is
+        recorded nowhere at all, which is what left the exhausted scan — the
+        one path whose cost grows with queue size — the only one invisible.
+
+        Selecting nothing is not the same as returning nothing.  A scan that
+        promotes a branch and loses its bundle to a racing worker also returns
+        None, having done the short work of the served path rather than the
+        walk to exhaustion; _scan_selected_work marks it so it is excluded
+        from both the count and the timing population.
         """
         scan_t0 = time.perf_counter()
         attributed_before = self._queue_attributed_millis()
+        self._scan_openers_walked = 0
+        self._scan_selected_work = False
         work = None
         try:
             work = self._claim_one_uninstrumented()
             return work
         finally:
+            attributed = max(
+                0, self._queue_attributed_millis() - attributed_before)
+            elapsed = max(
+                0, int((time.perf_counter() - scan_t0) * 1000) - attributed)
             if work is None:
                 self._pending_scheduling_millis = 0
+                self._pending_scan_openers_walked = 0
+                if not self._scan_selected_work:
+                    # Gross, where scheduling_millis is net: a scan that
+                    # produced no row has no sibling columns to carry the lock
+                    # wait and claim transactions it took, so they belong in
+                    # this figure or nowhere.  Read here and discarded by the
+                    # window restart the caller is about to perform, which is
+                    # the single owner of that clearing.
+                    self._pending_fruitless_scan_millis += elapsed + attributed
+                    self._pending_fruitless_scans += 1
+                    self._pending_fruitless_scan_openers_walked += (
+                        self._scan_openers_walked)
             else:
-                elapsed = int((time.perf_counter() - scan_t0) * 1000)
-                self._pending_scheduling_millis = max(
-                    0, elapsed - (self._queue_attributed_millis()
-                                  - attributed_before))
+                self._pending_scheduling_millis = elapsed
+                self._pending_scan_openers_walked = self._scan_openers_walked
 
     def _queue_attributed_millis(self):
         """Coordination time the queue has already attributed to a named phase
@@ -2696,6 +2772,7 @@ class _BranchWorker:
         candidate_rows = (self._opener_work_candidates()
                           if self._opener_work_enabled else ())
         for opener_work in candidate_rows:
+            self._scan_openers_walked += 1
             if top_priority is None:
                 top_priority = opener_work['requested_priority']
             opener_work_id = opener_work['opener_work_id']
@@ -2723,7 +2800,13 @@ class _BranchWorker:
 
             promoted = self._promote_opener_work(opener_work_id, role)
             if promoted is not None:
-                return None if promoted is _PROMOTED_NO_BUNDLE else promoted
+                if promoted is not _PROMOTED_NO_BUNDLE:
+                    return promoted
+                # The scan selected an opener and promoted its branch; only
+                # the bundle went elsewhere.  It returns None like an
+                # exhausted scan and is nothing like one, so say which it was.
+                self._scan_selected_work = True
+                return None
         # A queue upgraded while active work is present can carry branches
         # from before opener lineage was recorded.  They remain claimable
         # until finalization; new work always follows opener-first order.
