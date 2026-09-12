@@ -171,6 +171,18 @@ nothing. A branch another worker *opened* mid-scan is not in the recording at
 all; it keeps its place in the queue and is taken at the next claim boundary,
 where selection runs from a fresh read.
 
+**The budget a caller intends to evaluate at is a precondition of the claim
+transaction**, checked against `active_branches.budget` in the same read that
+already checks status, so the guard costs no query. A finalized branch can be
+re-created at another budget under the same opener work — the same answer set
+reached by a second spine of a different length — so any caller holding an
+`active_branches` row read earlier may be describing a branch that no longer
+exists. Ownership and priority both survive that re-creation and so catch
+nothing; without this check the claim succeeds and the candidates are evaluated
+at the old budget while being folded into the new branch. A row whose stored
+budget is NULL predates the column and is admitted, matching how callers derive
+a budget from the spine for those.
+
 The shape to avoid elsewhere is a scan that returns *all* unfinished openers
 and loops over them on every claim — that spelling measured 0.6 ms per claim
 at 64 openers and 157 ms at 15,000, and reintroducing it on the served path
