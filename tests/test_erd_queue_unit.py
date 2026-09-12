@@ -732,6 +732,25 @@ class TestCandidateClaiming(_TmpQueue):
         super().setUp()
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES)
 
+    def test_claim_refuses_a_budget_the_branch_was_not_created_at(self):
+        """A finalized branch can be re-created at another budget, so a caller
+        holding an older active_branches row can be describing a branch that no
+        longer exists.  Ownership and priority both survive that re-creation,
+        so the budget the caller intends to evaluate at is what separates them.
+        A row predating the column admits any budget."""
+        budgeted_key = ScoreCache.encode_subset(WORDS[:3])
+        self.q.create_branch(budgeted_key, 3, N_CANDIDATES, budget=4)
+
+        self.assertIsNone(self.q.claim_next_bundle(
+            budgeted_key, "worker-0", N_CANDIDATES, _IDENTITY_ORDER,
+            _ZERO_LOWER_BOUND, small_count=1, count_cap=1, expected_budget=5))
+        self.assertIsNotNone(self.q.claim_next_bundle(
+            budgeted_key, "worker-0", N_CANDIDATES, _IDENTITY_ORDER,
+            _ZERO_LOWER_BOUND, small_count=1, count_cap=1, expected_budget=4))
+        self.assertIsNotNone(self.q.claim_next_bundle(
+            self.key, "worker-0", N_CANDIDATES, _IDENTITY_ORDER,
+            _ZERO_LOWER_BOUND, small_count=1, count_cap=1, expected_budget=5))
+
     def test_claim_returns_none_for_finalized_branch(self):
         self.q.try_finalize_branch(self.key)  # transitions status to 'finalized'
         idx = self._claim_one_idx(self.key, "worker-0")

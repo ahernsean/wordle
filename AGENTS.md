@@ -123,21 +123,65 @@ never preempt requested work.
 is linear in them.** `_BranchWorker._opener_work_candidates` is a generator
 over `ERDQueue.opener_work_candidates(limit=1, after=...)`, so a claim served
 by the highest-priority opener issues one bounded query and returns. That is
-the steady-state case, and it is what makes a queue of every candidate viable.
+the steady-state case.
 
-`_claim_one_uninstrumented` appends every row it visits to `opener_work_rows`.
-When no opener offers an unoccupied branch or a promotable pending one, the
-loop runs to exhaustion and that list ends up holding every unfinished
-request — one cursor query, one `branches_in_progress`, and a
-`_promote_opener_work` attempt per opener, after which `_claim_paired_branch`
-walks the same list and issues `branches_in_progress` for each one again. The
-cursor does not bound this path; it is linear in queue size and costs several
-queries per opener.
+It is not enough to make a queue of every candidate viable, because roughly one
+claim in six finds nothing. `_claim_one_uninstrumented` records every opener it
+visits in `opener_work_rows`, together with that opener's open branches. When no
+opener offers an unoccupied branch or a promotable pending one, the loop runs to
+exhaustion and that list ends up holding every unfinished request — one cursor
+query, one `branches_in_progress` and a `_promote_opener_work` attempt per
+opener. The cursor does not bound this path; it is linear in queue size.
+
+**Measured on a synthetic queue of stuck openers: 74 ms for one scan at 506
+openers, 12.3 s at 14,000.** Statements are exactly `6N + 4`, and wall time is
+super-linear (~N^1.29) because the queue file outgrows cache. Folded into the
+observed 16.7% fallback rate, the 506-opener point reproduces epoch 17's
+measured coordination share to within a percentage point without being fitted
+to it; 14,000 predicts 98%, which is a swarm that does nothing but scan.
+
+**So the sweep must be queued a few hundred openers at a time. Nothing in the
+code enforces that, and exceeding it degrades throughput smoothly rather than
+failing.**
 
 Exhaustion means nothing anywhere is claimable, which is the drained or
 fully-occupied condition rather than the common one. Do not read the flat
-common case as a guarantee for the whole scheduler: at sweep scale the pairing
-fallback is the path to measure.
+common case as a guarantee for the whole scheduler.
+
+Three costs on that path are already removed and must not come back.
+`_claim_paired_branch` rewalks the branches the main loop recorded instead of
+re-reading them. It passes `sweep_finalize=False`, because the main walk already
+swept those same branches for finalization and a repeat sweep costs a done-count
+query per branch to find what the first already found. And
+`_claim_active_branch` defers `decode_subset` and `WorkContext.from_branch_row`
+until a branch is actually claimed or finalized, because at sweep scale most
+rows it walks are rejected on occupancy and a rejected row needs neither.
+Together these take statements per opener from 8 to 6 and the 506-opener scan
+from ~104 ms to ~70 ms.
+
+**Reusing the recording is not the same as assuming nothing changed.** Other
+workers run while the scan does, and an exhausted scan is the long one, so the
+branches it walked first were judged against the oldest information it holds.
+`_claim_paired_branch` therefore re-reads *occupancy* — one query — and when the
+refreshed map differs from the one the scan opened with, it walks the recording
+for a branch nobody holds before it walks it for one to join. A branch another
+worker finished is free work, and free work outranks every pairing. The gate
+matters: without it that extra walk runs on every exhausted scan to find
+nothing. A branch another worker *opened* mid-scan is not in the recording at
+all; it keeps its place in the queue and is taken at the next claim boundary,
+where selection runs from a fresh read.
+
+**The budget a caller intends to evaluate at is a precondition of the claim
+transaction**, checked against `active_branches.budget` in the same read that
+already checks status, so the guard costs no query. A finalized branch can be
+re-created at another budget under the same opener work — the same answer set
+reached by a second spine of a different length — so any caller holding an
+`active_branches` row read earlier may be describing a branch that no longer
+exists. Ownership and priority both survive that re-creation and so catch
+nothing; without this check the claim succeeds and the candidates are evaluated
+at the old budget while being folded into the new branch. A row whose stored
+budget is NULL predates the column and is admitted, matching how callers derive
+a budget from the spine for those.
 
 The shape to avoid elsewhere is a scan that returns *all* unfinished openers
 and loops over them on every claim — that spelling measured 0.6 ms per claim

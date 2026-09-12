@@ -4319,13 +4319,13 @@ class TestCeilingFinalizeIntegration(unittest.TestCase):
         sc.close()
 
 
-class TestOneWorkerPerBranch(unittest.TestCase):
-    """Work selection takes one worker to a branch: an unoccupied branch is
-    always preferred, a branch with one worker is joined only as a last
-    resort, and a branch nobody holds a claim on is claimable again.
+class BranchOccupancyFixture:
+    """Queue, cache and worker helpers for openers whose branches are
+    open and occupied.
 
-    Occupancy throughout is unfinished candidate claims, which is what the
-    scheduler reads.  Heartbeats are reporting state and decide nothing here.
+    Every step follows the production call sequence — add_pending_many,
+    claim_next, create_branch, _claim_bundle — so the rows are the ones a
+    running swarm leaves behind rather than an approximation of them.
     """
 
     def setUp(self):
@@ -4414,6 +4414,17 @@ class TestOneWorkerPerBranch(unittest.TestCase):
     def _claimed_key(self, work):
         self.assertIsNotNone(work)
         return bytes(work[1]["branch_key"])
+
+
+class TestOneWorkerPerBranch(BranchOccupancyFixture, unittest.TestCase):
+
+    """Work selection takes one worker to a branch: an unoccupied branch is
+    always preferred, a branch with one worker is joined only as a last
+    resort, and a branch nobody holds a claim on is claimable again.
+
+    Occupancy throughout is unfinished candidate claims, which is what the
+    scheduler reads.  Heartbeats are reporting state and decide nothing here.
+    """
 
     # -- occupancy -------------------------------------------------------
 
@@ -5018,3 +5029,216 @@ if __name__ == "__main__":
         self.assertEqual(self.queue.claim_holders_by_branch().get(taken[0]), 1,
                          "paired onto a recursion-capped dependency while a "
                          "branch was free")
+
+
+class TestExhaustedScanReadsEachOpenerOnce(BranchOccupancyFixture,
+                                           unittest.TestCase):
+    """Work selection walks every opener twice when nothing is claimable: once
+    looking for an unoccupied branch, and again in _claim_paired_branch looking
+    for one to join.  The second walk reuses the first walk's reads.
+
+    That reuse is sound because the scan reaches the second walk only when no
+    claim succeeded, so no branch it would re-read can have changed in between.
+    The cost it removes is linear in queued openers, which is what makes the
+    scan the dominant term in coordination at sweep scale.
+    """
+
+    BRANCH_WORD_SETS = [BRANCH, BRANCH[:4], BRANCH[:3], BRANCH[:2]]
+
+    def _stuck_openers(self, count):
+        """Queue `count` openers, each owning one open branch that is already
+        held by the maximum number of workers, and return their branch keys in
+        descending priority order.
+
+        Every branch is therefore passed over by the main walk (occupied) and
+        refused by the pairing walk (at the cap), which is the only state that
+        drives the scan to exhaustion.
+        """
+        keys = []
+        for index in range(count):
+            words = self.BRANCH_WORD_SETS[index]
+            self._queue_opener([words], opener=CANDIDATES[index],
+                               priority=100 - index)
+            branch_key, _ = self._promote(CANDIDATES[index])
+            for holder in range(MAX_WORKERS_PER_BRANCH):
+                self._occupy(branch_key, 10 * (index + 1) + holder)
+            keys.append(branch_key)
+        return keys
+
+    def _exhausted_scan(self, worker):
+        """Run one scan that must reach exhaustion, failing loudly if it does
+        not — a fixture that still offers claimable work never reaches the code
+        these tests are about, and would pass them vacuously."""
+        work = worker._claim_one_uninstrumented()
+        self.assertIsNone(
+            work, "fixture is not stuck: the scan found claimable work, so it "
+                  "never reached _claim_paired_branch")
+
+    def _record_calls(self, owner, name):
+        """Record every call to owner.name, returning the list of first
+        arguments."""
+        calls = []
+        real = getattr(owner, name)
+
+        def recording(*args, **kwargs):
+            calls.append(args[0] if args else None)
+            return real(*args, **kwargs)
+
+        setattr(owner, name, recording)
+        return calls
+
+    def test_exhausted_scan_reads_each_openers_branches_once(self):
+        keys = self._stuck_openers(3)
+        worker = self._worker(90)
+        reads = self._record_calls(worker.queue, "branches_in_progress")
+
+        self._exhausted_scan(worker)
+
+        named = [opener_work_id for opener_work_id in reads
+                 if opener_work_id is not None]
+        self.assertEqual(len(named), len(keys))
+        self.assertEqual(len(named), len(set(named)))
+
+    def test_pairing_walk_does_not_repeat_the_finalize_sweep(self):
+        keys = self._stuck_openers(3)
+        worker = self._worker(90)
+        swept = self._record_calls(worker.queue, "branch_done_candidates")
+
+        self._exhausted_scan(worker)
+
+        self.assertEqual([bytes(branch_key) for branch_key in swept], keys)
+
+    def test_branch_passed_over_for_occupancy_is_never_decoded(self):
+        self._stuck_openers(3)
+        worker = self._worker(90)
+
+        with mock.patch.object(erd_swarm, "decode_subset",
+                               wraps=decode_subset) as decoded:
+            self._exhausted_scan(worker)
+
+        self.assertEqual(decoded.call_args_list, [])
+
+    def test_occupied_branch_is_still_finalized_once_with_its_words(self):
+        """Deferring the decode must not cost the finalize sweep its words, and
+        suppressing the pairing walk's sweep must not cost the first walk its
+        own."""
+        keys = self._stuck_openers(1)
+        worker = self._worker(90)
+
+        with mock.patch.object(worker.queue, "branch_done_candidates",
+                               return_value=10 ** 6), \
+             mock.patch.object(worker, "maybe_finalize") as finalize:
+            self._exhausted_scan(worker)
+
+        self.assertEqual([bytes(call.args[0])
+                          for call in finalize.call_args_list], keys)
+        self.assertEqual(finalize.call_args.args[1], decode_subset(keys[0]))
+
+    def _recreate_at_budget(self, branch_key, opener_work_id, budget):
+        """Finalize a branch and re-create it under the same opener work at
+        another budget, the way a second spine of a different length reaching
+        the same answer set does."""
+        self.queue.requeue_pending(branch_key)
+        self.queue.delete_branch(branch_key)
+        claimed = self.queue.claim_next("promoter", opener_work_id)
+        self.queue.create_branch(
+            claimed["branch_key"], claimed["n_words"], len(CANDIDATES),
+            budget=budget, priority=claimed["priority"],
+            opener=claimed["opener"],
+            opener_pattern=claimed["opener_pattern"],
+            opener_work_id=claimed["opener_work_id"])
+
+    def test_recording_cannot_claim_a_branch_recreated_at_another_budget(self):
+        """Ownership and priority both survive a re-creation, so neither
+        catches this: the recorded row describes a branch that no longer
+        exists, and claiming through it would evaluate candidates at the old
+        budget and fold them into the new branch."""
+        self._queue_opener([BRANCH], opener="crane", priority=100)
+        branch_key, opener_work_id = self._promote("crane")
+        recorded = self.queue.branches_in_progress(opener_work_id)
+        self.assertEqual([bytes(row["branch_key"]) for row in recorded],
+                         [branch_key])
+        self._recreate_at_budget(branch_key, opener_work_id, ROOT_BUDGET - 1)
+
+        claim = self._worker(90)._claim_active_branch(
+            recorded, opener_work_id, SCHEDULING_ROLE_PREFERRED, occupancy={})
+
+        self.assertIsNone(claim)
+
+    def test_recording_still_claims_a_branch_recreated_at_its_own_budget(self):
+        """The control for the refusal above: re-creation is not itself
+        disqualifying, so a branch back at the recorded budget is claimable
+        through the recording."""
+        self._queue_opener([BRANCH], opener="crane", priority=100)
+        branch_key, opener_work_id = self._promote("crane")
+        recorded = self.queue.branches_in_progress(opener_work_id)
+        self._recreate_at_budget(branch_key, opener_work_id, ROOT_BUDGET)
+
+        claim = self._worker(90)._claim_active_branch(
+            recorded, opener_work_id, SCHEDULING_ROLE_PREFERRED, occupancy={})
+
+        self.assertEqual(self._claimed_key(claim), branch_key)
+
+    def test_pairing_walk_makes_one_pass_when_no_branch_was_released(self):
+        """The free-first pass is gated on occupancy having changed.  With every
+        branch still held by the same workers it can find nothing, and running
+        it anyway would walk every recorded branch a second time."""
+        self._stuck_openers(3)
+        worker = self._worker(90)
+        caps = []
+        claim_active_branch = worker._claim_active_branch
+
+        def record_cap(*args, **kwargs):
+            caps.append(kwargs.get("max_other_workers", 0))
+            return claim_active_branch(*args, **kwargs)
+
+        worker._claim_active_branch = record_cap
+
+        self._exhausted_scan(worker)
+
+        # Three openers and the direct-branch check, walked once for free work
+        # and once for a branch to join.
+        self.assertEqual(caps, [0] * 4 + [MAX_WORKERS_PER_BRANCH - 1] * 4)
+
+    def test_branch_freed_during_the_scan_is_claimed_rather_than_paired(self):
+        """Occupancy is re-read before pairing, so a branch another worker
+        finished while the scan ran is taken outright rather than remembered as
+        occupied and passed over in favour of a pairing."""
+        self._queue_opener([BRANCH], opener="crane", priority=100)
+        busy_key, _ = self._promote("crane")
+        for holder in range(MAX_WORKERS_PER_BRANCH):
+            self._occupy(busy_key, 10 + holder)
+        self._queue_opener([BRANCH[:3]], opener="slate", priority=99)
+        freed_key, _ = self._promote("slate")
+        holders = [self._occupy(freed_key, 20 + holder)[0]
+                   for holder in range(MAX_WORKERS_PER_BRANCH)]
+
+        worker = self._worker(90)
+        promote_opener_work = worker._promote_opener_work
+
+        def finish_the_other_workers(*args, **kwargs):
+            """Stand in for workers completing their bundles mid-scan."""
+            for holder in holders:
+                worker.queue.reclaim_claims_of_worker(holder.name)
+            return promote_opener_work(*args, **kwargs)
+
+        worker._promote_opener_work = finish_the_other_workers
+
+        work = worker._claim_one_uninstrumented()
+
+        self.assertEqual(self._claimed_key(work), freed_key)
+
+    def test_pairing_still_joins_a_branch_from_the_reused_list(self):
+        """The reused list is the one the pairing walk judges, so a branch the
+        main walk passed over for occupancy is still joinable through it."""
+        self._queue_opener([BRANCH], opener="crane", priority=100)
+        full_key, _ = self._promote("crane")
+        for holder in range(MAX_WORKERS_PER_BRANCH):
+            self._occupy(full_key, 10 + holder)
+        self._queue_opener([BRANCH[:3]], opener="slate", priority=99)
+        joinable_key, _ = self._promote("slate")
+        self._occupy(joinable_key, 20)
+
+        work = self._worker(90)._claim_one_uninstrumented()
+
+        self.assertEqual(self._claimed_key(work), joinable_key)

@@ -1301,7 +1301,10 @@ class _BranchWorker:
         budget is the branch's own solve budget, and is required rather than
         defaulted because it selects the packing order's hint scope: a default
         would let a call site quietly fall back to the unrestricted one and
-        pass over every branch the artifact covers only at a budget.
+        pass over every branch the artifact covers only at a budget.  It is
+        also the claim transaction's precondition on the branch: a caller whose
+        active_branches row has since been replaced by one at another budget is
+        refused rather than evaluating at the budget it read.
 
         max_other_workers caps concurrent occupancy of the branch, checked
         inside the claim transaction.  Selection filters on occupancy first,
@@ -1331,7 +1334,8 @@ class _BranchWorker:
                 republish_limit=self.republish_limit,
                 expected_opener_work_id=expected_opener_work_id,
                 expected_opener_priority=expected_opener_priority,
-                max_other_workers=max_other_workers)
+                max_other_workers=max_other_workers,
+                expected_budget=budget)
             if result is not CLAIM_RETRY:
                 return result
         return None
@@ -2471,7 +2475,8 @@ class _BranchWorker:
 
     def _claim_active_branch(self, branches, opener_work_id=None,
                              scheduling_role=SCHEDULING_ROLE_DIRECT,
-                             occupancy=None, max_other_workers=0):
+                             occupancy=None, max_other_workers=0,
+                             sweep_finalize=True):
         """Claim a candidate bundle from an open branch, if one is available.
 
         occupancy maps branch_key to the count of workers other than this one
@@ -2496,17 +2501,27 @@ class _BranchWorker:
 
         The finalize sweep runs for every branch regardless of occupancy, so
         passing a branch over for claiming never leaves it unfinalized.
+
+        Decoding the branch key and building its work context are deferred
+        until a branch is actually claimed or finalized.  At sweep scale most
+        rows this walks are passed over, and a rejected row needs neither.
+
+        sweep_finalize=False suppresses the finalize sweep for a caller
+        rewalking branches an earlier walk in the same scan already swept.
+        Nothing between the two walks can have completed a candidate — the
+        scan reaches the second only because no claim succeeded — so the
+        repeat sweep costs a done-count query per branch and can find nothing
+        the first did not.
         """
         for active_branch in branches:
-            branch = dict(active_branch)
-            context = WorkContext.from_branch_row(branch, scheduling_role)
             branch_key = bytes(active_branch['branch_key'])
-            words = decode_subset(branch_key)
+            words = None
             if (occupancy is None
                     or occupancy.get(branch_key, 0) <= max_other_workers):
+                words = decode_subset(branch_key)
                 claim = self._claim_bundle(
                     branch_key, active_branch['n_candidates'], words,
-                    self._branch_budget(branch),
+                    self._branch_budget(active_branch),
                     expected_opener_work_id=opener_work_id,
                     expected_opener_priority=(
                         active_branch['owner_priority']
@@ -2514,9 +2529,16 @@ class _BranchWorker:
                     max_other_workers=max_other_workers)
                 if claim is not None:
                     bundle_id, indices, forced = claim
-                    return context, branch, bundle_id, indices, forced
-            if self.queue.branch_done_candidates(branch_key) >= active_branch['n_candidates']:
-                with self._entered(context):
+                    branch = dict(active_branch)
+                    return (WorkContext.from_branch_row(branch, scheduling_role),
+                            branch, bundle_id, indices, forced)
+            if (sweep_finalize
+                    and self.queue.branch_done_candidates(branch_key)
+                        >= active_branch['n_candidates']):
+                if words is None:
+                    words = decode_subset(branch_key)
+                with self._entered(WorkContext.from_branch_row(
+                        dict(active_branch), scheduling_role)):
                     self.maybe_finalize(
                         branch_key, words, active_branch['n_candidates'])
         return None
@@ -2674,7 +2696,6 @@ class _BranchWorker:
         candidate_rows = (self._opener_work_candidates()
                           if self._opener_work_enabled else ())
         for opener_work in candidate_rows:
-            opener_work_rows.append(opener_work)
             if top_priority is None:
                 top_priority = opener_work['requested_priority']
             opener_work_id = opener_work['opener_work_id']
@@ -2687,9 +2708,16 @@ class _BranchWorker:
             role = (SCHEDULING_ROLE_PREFERRED
                    if opener_work['requested_priority'] == top_priority
                    else SCHEDULING_ROLE_FALLBACK)
+            open_branches = self.queue.branches_in_progress(opener_work_id)
+            # _claim_paired_branch rewalks this same list rather than
+            # re-reading it, so an exhausted scan costs one
+            # branches_in_progress per opener instead of two, and both walks
+            # judge the same branches.  Nothing promotes while the loop runs —
+            # a successful promotion returns immediately — so the list a
+            # pairing sees is the one this iteration read.
+            opener_work_rows.append((opener_work, open_branches))
             active_work = self._claim_active_branch(
-                self.queue.branches_in_progress(opener_work_id), opener_work_id,
-                role, occupancy=occupancy)
+                open_branches, opener_work_id, role, occupancy=occupancy)
             if active_work is not None:
                 return active_work
 
@@ -2722,8 +2750,10 @@ class _BranchWorker:
             yield opener_work
             after = opener_work
 
-    def _claim_paired_branch(self, opener_work_rows, top_priority, occupancy):
-        """Join a branch already held by exactly one other worker, or None.
+    def _claim_paired_branch(self, opener_work_rows, top_priority,
+                             scan_start_occupancy):
+        """Claim a branch freed while the scan ran, or join one held by
+        exactly one other worker, or None.
 
         The last resort of work selection, reached only when no opener offers
         an unoccupied branch or a promotable pending one.  Six workers with
@@ -2734,20 +2764,47 @@ class _BranchWorker:
 
         The cap of one other worker is what keeps this safe: the second worker
         on a branch is the only one whose marginal contribution is positive.
+
+        opener_work_rows pairs each opener the scan visited with the open
+        branches it read for that opener, so this walk reuses those reads.
+        Occupancy is read again, because the scan that reaches here is the long
+        one and the branches it walked first were judged against the oldest
+        information it holds.  A branch another worker finished in the meantime
+        is free work and outranks every pairing, so when the refreshed
+        map differs from the one the scan opened with, the recorded branches
+        are walked once for a branch nobody holds before they are walked for
+        one to join.
+
+        Both walks read from the recording, so a branch another worker OPENED
+        during the scan is not among them.  That branch keeps its place in the
+        queue and is taken at the next claim boundary, where selection runs
+        again from a fresh read.
         """
-        for opener_work in opener_work_rows:
-            role = (SCHEDULING_ROLE_PREFERRED
-                   if opener_work['requested_priority'] == top_priority
-                   else SCHEDULING_ROLE_FALLBACK)
-            paired = self._claim_active_branch(
-                self.queue.branches_in_progress(opener_work['opener_work_id']),
-                opener_work['opener_work_id'], role, occupancy=occupancy,
-                max_other_workers=MAX_WORKERS_PER_BRANCH - 1)
-            if paired is not None:
-                return paired
-        return self._claim_active_branch(
-            self.queue.direct_branches_in_progress(), occupancy=occupancy,
-            max_other_workers=MAX_WORKERS_PER_BRANCH - 1)
+        occupancy = self._branch_occupancy()
+        direct_branches = self.queue.direct_branches_in_progress()
+        # The free-first pass exists for branches released while the scan ran.
+        # Equal occupancy maps mean no branch changed hands, so that pass has
+        # nothing to find and the walk stays at one pass over the recording.
+        caps = ((0, MAX_WORKERS_PER_BRANCH - 1)
+                if occupancy != scan_start_occupancy
+                else (MAX_WORKERS_PER_BRANCH - 1,))
+        for max_other_workers in caps:
+            for opener_work, open_branches in opener_work_rows:
+                role = (SCHEDULING_ROLE_PREFERRED
+                       if opener_work['requested_priority'] == top_priority
+                       else SCHEDULING_ROLE_FALLBACK)
+                work = self._claim_active_branch(
+                    open_branches, opener_work['opener_work_id'], role,
+                    occupancy=occupancy, max_other_workers=max_other_workers,
+                    sweep_finalize=False)
+                if work is not None:
+                    return work
+            work = self._claim_active_branch(
+                direct_branches, occupancy=occupancy,
+                max_other_workers=max_other_workers, sweep_finalize=False)
+            if work is not None:
+                return work
+        return None
 
     # -- main loop ----------------------------------------------------------
 
