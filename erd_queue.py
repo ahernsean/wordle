@@ -6482,6 +6482,26 @@ class ERDQueue:
         """, (policy, n_words, nodes, wall_millis, budget, censored, source,
               self.epoch, now))
 
+    def discard_claim_attribution(self):
+        """Drop the claim attribution accumulated since the last telemetry row.
+
+        These counters are consumed by add_claim_telemetry and are otherwise
+        never cleared, so they outlive any window a caller restarts.  A caller
+        that moves its coordination window forward past the work they describe
+        must call this: left in place they are reported inside a window that no
+        longer contains them, and the phases then exceed coordination_millis
+        and pin idle_millis to its clamp.
+
+        Discarding is the correct outcome rather than a loss.  The restarted
+        window has already excluded the span these measure, so reporting them
+        as zero is what keeps the row self-consistent; a caller that wants to
+        keep the figure must read it before restarting the window.
+        """
+        self._last_claim_busy_millis = 0
+        self._last_claim_retries = 0
+        self._last_claim_transaction_millis = 0
+        self._last_claim_commit_millis = 0
+
     def add_claim_telemetry(self, n_words: int, coordination_millis: int,
                             work_nodes: int, worker_count: int,
                             branch_key: bytes = None, spine: str = None,

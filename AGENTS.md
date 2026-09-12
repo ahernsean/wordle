@@ -169,6 +169,41 @@ branch and loses its bundle to a racing worker returns None from the short
 served path, never having walked to exhaustion; `_scan_selected_work` marks it
 so it stays out of both the count and the timing population.
 
+### Two clocks, one restart
+
+Claim timing runs on two counters with **different reset points**, and three
+separate defects have come from moving one without the other.
+
+- The **coordination window** — `_BranchWorker._last_claim_complete`.
+  `coordination_millis` telescopes from it. It restarts at every wait, after
+  every finalize, and around a helped sub-branch.
+- The **queue's claim attribution** — `_last_claim_busy_millis`,
+  `_last_claim_retries`, `_last_claim_transaction_millis`,
+  `_last_claim_commit_millis` on the `ERDQueue` connection. The first two
+  accumulate with `+=`. Nothing clears any of them except
+  `add_claim_telemetry`, when a row consumes them.
+
+So a restart that moves the window forward leaves attribution describing work
+that happened *before* the new origin, and the next row reports it as a phase
+of a window that excludes it. The parts then exceed the whole and
+`idle_millis` sits on its `max(0, …)` clamp — visible only under contention,
+which is why unit tests miss it.
+
+**Every window restart goes through `_restart_coordination_window`**, which
+moves the origin and calls `queue.discard_claim_attribution()` together.
+`test_every_window_restart_drops_the_queue_attribution_with_it` is an AST guard
+that refuses a bare `_last_claim_complete` assignment, because the defect keeps
+arriving at sites nobody wrote a behavioural test for. Two sites assign
+directly and are exempt with stated reasons: `__init__` starts both clocks at
+zero, and `evaluate_claim` advances the window immediately before the
+`add_claim_telemetry` that clears the attribution itself.
+
+Discarding is the right outcome, not a loss: the restarted window already
+excludes the span those counters measure, so reporting zero is what keeps a row
+self-consistent. A caller that wants to keep the figure must read it *before*
+restarting — which is exactly what `claim_one` does to make
+`fruitless_scan_millis` gross.
+
 Three costs on that path are already removed and must not come back.
 `_claim_paired_branch` rewalks the branches the main loop recorded instead of
 re-reading them. It passes `sweep_finalize=False`, because the main walk already

@@ -1294,6 +1294,129 @@ class TestSolveBranchFocusedClaimTelemetryAttribution(unittest.TestCase):
         # The scan is the bulk of the window, so idle must not have absorbed it.
         self.assertLess(row["idle_millis"], row["scheduling_millis"])
 
+    def _seed_claim_attribution(self, queue, busy=7, retries=3):
+        """Leave the queue holding attribution from a contended claim.
+
+        These accumulators ARE the production artifact: a claim that waited on
+        the write lock adds to them, and nothing clears them until a telemetry
+        row is written.  Setting them directly reproduces that state without
+        needing real contention, which a unit test cannot schedule.
+        """
+        queue._last_claim_busy_millis = busy
+        queue._last_claim_retries = retries
+
+    def test_a_fruitless_scans_lock_wait_stays_off_the_next_claims_row(self):
+        # run()'s real sequence: a scan that finds nothing, an idle wait that
+        # restarts the coordination window, then a claim.  The scan's lock wait
+        # lies before the new window origin, so reporting it as this row's
+        # busy_wait_millis puts the phases outside the window they partition --
+        # under contention the five then exceed coordination_millis and
+        # idle_millis pins to its clamp.
+        ScoreCache(self.cache_path, BRANCH).close()
+        branch_key = ScoreCache.encode_subset(BRANCH)
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        try:
+            self.assertIsNone(w.claim_one())        # nothing queued yet
+            self._seed_claim_attribution(w.queue)
+            w._idle_wait(0.01)                      # what run() does next
+            w.queue.create_branch(branch_key, len(BRANCH), len(CANDIDATES),
+                                  budget=ROOT_BUDGET, spine="CRANE -----")
+            work = w.claim_one()
+            self.assertIsNotNone(work)
+            context, branch, _bundle_id, indices, _forced = work
+            with w._entered(context):
+                w.evaluate_claim(branch_key, decode_subset(branch_key),
+                                 branch['n_words'], indices[0],
+                                 budget=ROOT_BUDGET)
+        finally:
+            w.close()
+
+        q = ERDQueue(self.queue_path)
+        row = q._conn.execute(
+            "SELECT coordination_millis, busy_wait_millis, claim_retries, "
+            "claim_transaction_millis, claim_commit_millis, "
+            "scheduling_millis, idle_millis FROM claim_telemetry "
+            "ORDER BY id LIMIT 1").fetchone()
+        q.close()
+        self.assertEqual(row["busy_wait_millis"], 0)
+        self.assertEqual(row["claim_retries"], 0)
+        self.assertLessEqual(
+            row["claim_transaction_millis"] + row["claim_commit_millis"]
+            + row["busy_wait_millis"] + row["scheduling_millis"]
+            + row["idle_millis"],
+            row["coordination_millis"])
+
+    def test_a_fruitless_scans_own_lock_wait_is_inside_its_reported_cost(self):
+        # fruitless_scan_millis is gross where scheduling_millis is net.  A
+        # successful claim reports its lock wait in busy_wait_millis, so its
+        # scan figure excludes it to keep the phases disjoint; a scan that
+        # produced no row has no such sibling, and the window restart that
+        # follows discards the accumulator, so time left out here is lost.
+        #
+        # A unit test cannot schedule real lock contention and sub-millisecond
+        # waits round to zero, so the scan is stood in for by one that leaves
+        # the same accumulator behind -- which is all a contended scan does.
+        ScoreCache(self.cache_path, BRANCH).close()
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+
+        def scan_that_waited_on_the_lock():
+            w.queue._last_claim_busy_millis += 7
+            return None
+        try:
+            w._claim_one_uninstrumented = scan_that_waited_on_the_lock
+            self.assertIsNone(w.claim_one())
+        finally:
+            w.close()
+
+        self.assertEqual(w._pending_fruitless_scans, 1)
+        self.assertGreaterEqual(w._pending_fruitless_scan_millis, 7)
+
+    def test_restarting_the_window_drops_the_attribution_that_predates_it(self):
+        # The contract the structural guard relies on.  Every window restart --
+        # the idle wait, the post-finalize restart, the helped sub-branch's own
+        # window and the enclosing one it restores -- routes through this, so
+        # covering it here covers each site without four fixtures that each
+        # have to reach a different corner of the worker's lifecycle.
+        ScoreCache(self.cache_path, BRANCH).close()
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        try:
+            self._seed_claim_attribution(w.queue)
+            w.queue._last_claim_transaction_millis = 5
+            w.queue._last_claim_commit_millis = 2
+            before = w._last_claim_complete
+
+            w._restart_coordination_window()
+
+            self.assertGreaterEqual(w._last_claim_complete, before)
+            self.assertEqual(w.queue._last_claim_busy_millis, 0)
+            self.assertEqual(w.queue._last_claim_retries, 0)
+            self.assertEqual(w.queue._last_claim_transaction_millis, 0)
+            self.assertEqual(w.queue._last_claim_commit_millis, 0)
+        finally:
+            w.close()
+
+    def test_restoring_an_enclosing_window_drops_attribution_too(self):
+        # _help_other_branch restores the enclosing claim's window on the way
+        # out.  The helped branch's own queue writes happened inside the
+        # enclosing candidate's evaluation, which coordination_millis
+        # subtracts, so carrying them back out would report a phase the
+        # restored window does not contain.
+        ScoreCache(self.cache_path, BRANCH).close()
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        try:
+            enclosing = w._last_claim_complete
+            w._restart_coordination_window()
+            self._seed_claim_attribution(w.queue)
+
+            w._restart_coordination_window(enclosing)
+
+            self.assertEqual(w._last_claim_complete, enclosing)
+            self.assertEqual(w.queue._last_claim_busy_millis, 0)
+            self.assertEqual(w.queue._last_claim_retries, 0)
+        finally:
+            w.close()
+
     def test_a_scan_that_selects_nothing_is_recorded_outside_the_window(self):
         # A scan that selects no branch is followed by an idle wait, and an
         # idle wait restarts the coordination window -- so its cost is not in
@@ -3486,6 +3609,49 @@ class TestCoordinationWindowExcludesNonHandoffTime(unittest.TestCase):
             offenders, [],
             "bare time.sleep leaves the handoff window open across the wait; "
             "use self._idle_wait")
+
+    def test_every_window_restart_drops_the_queue_attribution_with_it(self):
+        """No bare assignment to _last_claim_complete: every restart goes
+        through _restart_coordination_window.
+
+        The coordination window and the queue's claim attribution are two
+        clocks with different reset points -- the window restarts at every
+        wait and every finalize, the attribution only when a telemetry row
+        consumes it.  Three separate defects have come from moving one and not
+        the other, each reported against a different site, so the guard is
+        structural rather than one test per site: a new restart written as a
+        bare assignment reopens it silently, and the phases then exceed
+        coordination_millis only under contention, where no unit test looks.
+
+        Two sites assign directly and are exempt for stated reasons.
+        __init__ starts both clocks at zero together.  evaluate_claim advances
+        the window immediately before add_claim_telemetry, which consumes and
+        clears the attribution itself -- the one place the two are already
+        paired, and where discarding first would zero the row's own phases.
+        """
+        exempt = {"__init__", "_restart_coordination_window", "evaluate_claim"}
+        source = pathlib.Path(erd_swarm.__file__).read_text()
+        offenders = []
+        for class_node in [n for n in ast.parse(source).body
+                           if isinstance(n, ast.ClassDef)]:
+            for function in [n for n in class_node.body
+                             if isinstance(n, ast.FunctionDef)]:
+                if function.name in exempt:
+                    continue
+                for node in ast.walk(function):
+                    if not isinstance(node, ast.Assign):
+                        continue
+                    for target in node.targets:
+                        if (isinstance(target, ast.Attribute)
+                                and target.attr == "_last_claim_complete"):
+                            offenders.append(
+                                f"{class_node.name}.{function.name} "
+                                f"line {node.lineno}")
+        self.assertEqual(
+            offenders, [],
+            "a bare _last_claim_complete assignment leaves the queue's claim "
+            "attribution behind the new window origin; use "
+            "self._restart_coordination_window")
 
     def test_a_cooperative_wait_restarts_the_window(self):
         # cooperative_solve waits in its recursion-cap and failed-pairing

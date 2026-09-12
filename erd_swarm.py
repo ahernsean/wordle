@@ -755,6 +755,22 @@ class _BranchWorker:
         # see MAX_HELP_RECURSION_DEPTH.
         self._help_recursion_depth = 0
 
+    def _restart_coordination_window(self, origin=None):
+        """Move the coordination window to `origin` (now by default) and drop
+        the queue attribution that predates it.
+
+        The window and the queue's attribution counters are two clocks with
+        different reset points: the window restarts here, at every wait and at
+        every finalize, while _last_claim_busy_millis and its siblings are
+        cleared only when a telemetry row consumes them.  Moving one without
+        the other leaves lock waits and claim transactions from before the new
+        origin to be reported inside a window that excludes them, which makes
+        the phases exceed coordination_millis.  Every restart goes through
+        here so the two cannot drift apart.
+        """
+        self._last_claim_complete = time.time() if origin is None else origin
+        self.queue.discard_claim_attribution()
+
     def _idle_wait(self, seconds):
         """Sleep while this worker has no claimable work, then reopen the
         handoff window.
@@ -771,7 +787,7 @@ class _BranchWorker:
         coordination_window refuses one.
         """
         time.sleep(seconds)
-        self._last_claim_complete = time.time()
+        self._restart_coordination_window()
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -2001,8 +2017,10 @@ class _BranchWorker:
         # telescopes coordination_millis from the previous claim's completion,
         # so without this the finalize span would reappear as idle time on the
         # first claim of whatever branch this worker picks up next — a
-        # different, unrelated branch.
-        self._last_claim_complete = time.time()
+        # different, unrelated branch.  The finalize's own write transactions
+        # go with it: claim_telemetry does not carry finalize cost at all, and
+        # branch_finalize_log.cache_write_millis is where it belongs.
+        self._restart_coordination_window()
         return True
 
     def _hint_outcome(self, branch_key, best_guess, budget):
@@ -2312,9 +2330,9 @@ class _BranchWorker:
             # previous completion, which its candidate_evaluation_millis --
             # covering the nested work -- cancels correctly.
             enclosing_claim_window = self._last_claim_complete
-            self._last_claim_complete = time.time()
+            self._restart_coordination_window()
             context_stack.callback(
-                setattr, self, '_last_claim_complete', enclosing_claim_window)
+                self._restart_coordination_window, enclosing_claim_window)
             branch_key = encode_subset(words)
             n_words = len(words)
             # Already solved by someone? reuse without re-promoting.
@@ -2610,14 +2628,21 @@ class _BranchWorker:
             work = self._claim_one_uninstrumented()
             return work
         finally:
+            attributed = max(
+                0, self._queue_attributed_millis() - attributed_before)
             elapsed = max(
-                0, int((time.perf_counter() - scan_t0) * 1000)
-                - (self._queue_attributed_millis() - attributed_before))
+                0, int((time.perf_counter() - scan_t0) * 1000) - attributed)
             if work is None:
                 self._pending_scheduling_millis = 0
                 self._pending_scan_openers_walked = 0
                 if not self._scan_selected_work:
-                    self._pending_fruitless_scan_millis += elapsed
+                    # Gross, where scheduling_millis is net: a scan that
+                    # produced no row has no sibling columns to carry the lock
+                    # wait and claim transactions it took, so they belong in
+                    # this figure or nowhere.  Read here and discarded by the
+                    # window restart the caller is about to perform, which is
+                    # the single owner of that clearing.
+                    self._pending_fruitless_scan_millis += elapsed + attributed
                     self._pending_fruitless_scans += 1
                     self._pending_fruitless_scan_openers_walked += (
                         self._scan_openers_walked)
