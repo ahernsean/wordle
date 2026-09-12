@@ -123,21 +123,43 @@ never preempt requested work.
 is linear in them.** `_BranchWorker._opener_work_candidates` is a generator
 over `ERDQueue.opener_work_candidates(limit=1, after=...)`, so a claim served
 by the highest-priority opener issues one bounded query and returns. That is
-the steady-state case, and it is what makes a queue of every candidate viable.
+the steady-state case.
 
-`_claim_one_uninstrumented` appends every row it visits to `opener_work_rows`.
-When no opener offers an unoccupied branch or a promotable pending one, the
-loop runs to exhaustion and that list ends up holding every unfinished
-request — one cursor query, one `branches_in_progress`, and a
-`_promote_opener_work` attempt per opener, after which `_claim_paired_branch`
-walks the same list and issues `branches_in_progress` for each one again. The
-cursor does not bound this path; it is linear in queue size and costs several
-queries per opener.
+It is not enough to make a queue of every candidate viable, because roughly one
+claim in six finds nothing. `_claim_one_uninstrumented` records every opener it
+visits in `opener_work_rows`, together with that opener's open branches. When no
+opener offers an unoccupied branch or a promotable pending one, the loop runs to
+exhaustion and that list ends up holding every unfinished request — one cursor
+query, one `branches_in_progress` and a `_promote_opener_work` attempt per
+opener. The cursor does not bound this path; it is linear in queue size.
+
+**Measured on a synthetic queue of stuck openers: 74 ms for one scan at 506
+openers, 12.3 s at 14,000.** Statements are exactly `6N + 4`, and wall time is
+super-linear (~N^1.29) because the queue file outgrows cache. Folded into the
+observed 16.7% fallback rate, the 506-opener point reproduces epoch 17's
+measured coordination share to within a percentage point without being fitted
+to it; 14,000 predicts 98%, which is a swarm that does nothing but scan.
+
+**So the sweep must be queued a few hundred openers at a time. Nothing in the
+code enforces that, and exceeding it degrades throughput smoothly rather than
+failing.**
 
 Exhaustion means nothing anywhere is claimable, which is the drained or
 fully-occupied condition rather than the common one. Do not read the flat
-common case as a guarantee for the whole scheduler: at sweep scale the pairing
-fallback is the path to measure.
+common case as a guarantee for the whole scheduler.
+
+Three costs on that path are already removed and must not come back.
+`_claim_paired_branch` rewalks the branches the main loop recorded instead of
+re-reading them — sound because the scan reaches the pairing walk only when no
+claim succeeded, so nothing it would re-read can have changed. It passes
+`sweep_finalize=False`, because the main walk already swept those same branches
+for finalization and a repeat sweep costs a done-count query per branch to find
+what the first already found. And `_claim_active_branch` defers `decode_subset`
+and `WorkContext.from_branch_row` until a branch is actually claimed or
+finalized: at sweep scale most rows it walks are rejected on occupancy, and a
+rejected row needs neither. Together these took the 506-opener scan from 104 ms
+to 74 ms, and a scan over openers holding many open branches from 3.07 s to
+1.02 s.
 
 The shape to avoid elsewhere is a scan that returns *all* unfinished openers
 and loops over them on every claim — that spelling measured 0.6 ms per claim
