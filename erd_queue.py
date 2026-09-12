@@ -3000,7 +3000,8 @@ class ERDQueue:
                           republish_limit=DEFAULT_REPUBLISH_LIMIT,
                           expected_opener_work_id=None,
                           expected_opener_priority=None,
-                          max_other_workers=None):
+                          max_other_workers=None,
+                          expected_budget=None):
         """Atomically complete one-level ERD prunes and claim survivors.
 
         max_other_workers caps how many other workers may hold work on this
@@ -3008,6 +3009,16 @@ class ERDQueue:
         this transaction can decide it: occupancy is counted from live claims,
         which this call is about to create, so two workers that both saw an
         empty branch cannot both pass.  None disables the cap.
+
+        expected_budget is the budget the caller intends to evaluate at, and a
+        branch recorded at a different one is refused.  A finalized branch can
+        be re-created at another budget under the same opener work, so a caller
+        holding an active_branches row read earlier can be describing a branch
+        that no longer exists; its candidates would then be evaluated at the old
+        budget and folded into the new branch.  Ownership and priority do not
+        catch this — both survive the re-creation.  A row whose stored budget is
+        NULL predates the column and is admitted, matching how callers derive a
+        budget from the spine for those.
 
         Runs the exact-elimination classification from
         adaptive_claim_packing.md §5 inside one BEGIN IMMEDIATE transaction:
@@ -3099,10 +3110,14 @@ class ERDQueue:
             branch_id = self._intern_branch(branch_key)
             br = None if branch_id is None else self._conn.execute(
                 "SELECT status, best_erd, pack_cursor, ceiling, bulk_done_bound, "
-                "requires_opener_membership "
+                "requires_opener_membership, budget "
                 "FROM active_branches "
                 "WHERE branch_id = ?", (branch_id,)).fetchone()
             if br is None or br["status"] != "open":
+                self._commit_claim_transaction(_txn_t0)
+                return None
+            if (expected_budget is not None and br["budget"] is not None
+                    and br["budget"] != expected_budget):
                 self._commit_claim_transaction(_txn_t0)
                 return None
             if expected_opener_work_id is None:

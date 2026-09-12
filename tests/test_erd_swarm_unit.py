@@ -5134,6 +5134,51 @@ class TestExhaustedScanReadsEachOpenerOnce(BranchOccupancyFixture,
                           for call in finalize.call_args_list], keys)
         self.assertEqual(finalize.call_args.args[1], decode_subset(keys[0]))
 
+    def _recreate_at_budget(self, branch_key, opener_work_id, budget):
+        """Finalize a branch and re-create it under the same opener work at
+        another budget, the way a second spine of a different length reaching
+        the same answer set does."""
+        self.queue.requeue_pending(branch_key)
+        self.queue.delete_branch(branch_key)
+        claimed = self.queue.claim_next("promoter", opener_work_id)
+        self.queue.create_branch(
+            claimed["branch_key"], claimed["n_words"], len(CANDIDATES),
+            budget=budget, priority=claimed["priority"],
+            opener=claimed["opener"],
+            opener_pattern=claimed["opener_pattern"],
+            opener_work_id=claimed["opener_work_id"])
+
+    def test_recording_cannot_claim_a_branch_recreated_at_another_budget(self):
+        """Ownership and priority both survive a re-creation, so neither
+        catches this: the recorded row describes a branch that no longer
+        exists, and claiming through it would evaluate candidates at the old
+        budget and fold them into the new branch."""
+        self._queue_opener([BRANCH], opener="crane", priority=100)
+        branch_key, opener_work_id = self._promote("crane")
+        recorded = self.queue.branches_in_progress(opener_work_id)
+        self.assertEqual([bytes(row["branch_key"]) for row in recorded],
+                         [branch_key])
+        self._recreate_at_budget(branch_key, opener_work_id, ROOT_BUDGET - 1)
+
+        claim = self._worker(90)._claim_active_branch(
+            recorded, opener_work_id, SCHEDULING_ROLE_PREFERRED, occupancy={})
+
+        self.assertIsNone(claim)
+
+    def test_recording_still_claims_a_branch_recreated_at_its_own_budget(self):
+        """The control for the refusal above: re-creation is not itself
+        disqualifying, so a branch back at the recorded budget is claimable
+        through the recording."""
+        self._queue_opener([BRANCH], opener="crane", priority=100)
+        branch_key, opener_work_id = self._promote("crane")
+        recorded = self.queue.branches_in_progress(opener_work_id)
+        self._recreate_at_budget(branch_key, opener_work_id, ROOT_BUDGET)
+
+        claim = self._worker(90)._claim_active_branch(
+            recorded, opener_work_id, SCHEDULING_ROLE_PREFERRED, occupancy={})
+
+        self.assertEqual(self._claimed_key(claim), branch_key)
+
     def test_pairing_walk_makes_one_pass_when_no_branch_was_released(self):
         """The free-first pass is gated on occupancy having changed.  With every
         branch still held by the same workers it can find nothing, and running

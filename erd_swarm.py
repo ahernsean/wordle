@@ -1301,7 +1301,10 @@ class _BranchWorker:
         budget is the branch's own solve budget, and is required rather than
         defaulted because it selects the packing order's hint scope: a default
         would let a call site quietly fall back to the unrestricted one and
-        pass over every branch the artifact covers only at a budget.
+        pass over every branch the artifact covers only at a budget.  It is
+        also the claim transaction's precondition on the branch: a caller whose
+        active_branches row has since been replaced by one at another budget is
+        refused rather than evaluating at the budget it read.
 
         max_other_workers caps concurrent occupancy of the branch, checked
         inside the claim transaction.  Selection filters on occupancy first,
@@ -1331,7 +1334,8 @@ class _BranchWorker:
                 republish_limit=self.republish_limit,
                 expected_opener_work_id=expected_opener_work_id,
                 expected_opener_priority=expected_opener_priority,
-                max_other_workers=max_other_workers)
+                max_other_workers=max_other_workers,
+                expected_budget=budget)
             if result is not CLAIM_RETRY:
                 return result
         return None
