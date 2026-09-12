@@ -187,6 +187,24 @@ _PUBLISH_EMA_TAU = 86400.0      # half-life (s) for the coordination/node-time E
 _PUBLISH_EMA_MIN_WEIGHT = 5     # decayed samples before the adaptive threshold goes live
 PUBLISH_THRESHOLD_BOOTSTRAP = 5000  # cold-start prior until the EMAs warm
 
+# node_time is the MARGINAL cost of a search node, so only a claim that actually
+# searched contributes a sample.  A claim completed in a handful of nodes spends
+# nearly its whole span on fixed per-candidate overhead — the cache lookup, the
+# bookkeeping, the complete_candidate write — and cand_elapsed / nodes_delta
+# reports that overhead as the price of a node.  Such claims are the
+# overwhelming majority of a warm swarm's traffic, so admitting them pulls the
+# estimator onto the overhead; the coordination term measures overhead too, and
+# a ratio of overhead to overhead is a constant near SAFETY_FACTOR on any
+# hardware, which is a threshold low enough to promote every sub-branch offered.
+NODE_TIME_MIN_SAMPLE_NODES = 100
+
+# Fixed break-even in node-equivalents, used in place of the measured one when
+# set.  Sweeping this against swarm throughput is how the break-even is
+# calibrated; unset, the live estimators decide.
+PUBLISH_THRESHOLD_OVERRIDE = (
+    float(os.environ['PUBLISH_THRESHOLD_OVERRIDE'])
+    if os.environ.get('PUBLISH_THRESHOLD_OVERRIDE') else None)
+
 # Budget at the root — before any guess is played.  A branch's remaining budget
 # is ROOT_BUDGET minus its guess_depth (the guesses already played to reach it),
 # so a queued position after the opener (guess_depth 1) is solved at ROOT_BUDGET
@@ -722,6 +740,24 @@ class _BranchWorker:
         # see MAX_HELP_RECURSION_DEPTH.
         self._help_recursion_depth = 0
 
+    def _idle_wait(self, seconds):
+        """Sleep while this worker has no claimable work, then reopen the
+        handoff window.
+
+        Every wait in this class is starvation rather than coordination: a
+        checkpoint pause, a rival's finalize, a full recursion stack, a scan
+        that found nothing free.  full_coord_seconds telescopes from the
+        previous claim completion, so a wait left inside that window is charged
+        to the next completed claim as handoff cost -- and in the log domain a
+        single multi-minute sample dominates the five that warm the estimator.
+
+        Every sleep on this class goes through here; a bare time.sleep would
+        reopen the defect silently, so test_every_worker_wait_restarts_the_
+        coordination_window refuses one.
+        """
+        time.sleep(seconds)
+        self._last_claim_complete = time.time()
+
     # -- lifecycle ----------------------------------------------------------
 
     def close(self):
@@ -941,8 +977,11 @@ class _BranchWorker:
         """Adaptive 'worth-swarming' break-even in node-equivalents:
         SAFETY_FACTOR * coordination_time / node_time (both in seconds, so the
         unit cancels).  Falls back to PUBLISH_THRESHOLD_BOOTSTRAP until both live
-        estimators warm.
+        estimators warm, and reports PUBLISH_THRESHOLD_OVERRIDE whenever that is
+        set, which fixes the break-even for a calibration sweep.
         """
+        if PUBLISH_THRESHOLD_OVERRIDE is not None:
+            return PUBLISH_THRESHOLD_OVERRIDE
         coord = self._coord_ema.value()
         node_time = self._node_time_ema.value()
         if coord is None or node_time is None or node_time <= 0:
@@ -1022,7 +1061,7 @@ class _BranchWorker:
         if not self._checkpoint_pause_active():
             return
         while not self.cancel() and self.queue.checkpoint_paused():
-            time.sleep(PAUSE_POLL_SECONDS)
+            self._idle_wait(PAUSE_POLL_SECONDS)
         self._pause_active = False
 
     def _check_disk(self):
@@ -1326,7 +1365,6 @@ class _BranchWorker:
         shared_best = local_best
         last_refresh = time.time()
         claim_started = int(time.time())
-        t0 = time.time()
 
         def _bound_provider():
             # Refreshes shared_best from the queue at most every
@@ -1489,7 +1527,6 @@ class _BranchWorker:
         else:  # pragma: no cover
             self.n_useless += 1
 
-        elapsed = time.time() - t0
         self.queue.complete_candidate(branch_key, idx)
         # The outbound claim telemetry is required for branch ETA reporting,
         # regardless of whether this worker uses adaptive decomposition.
@@ -1498,9 +1535,12 @@ class _BranchWorker:
             0.0, (now_complete - self._last_claim_complete) - cand_elapsed)
         self._last_claim_complete = now_complete
         if self._adaptive:
-            coord_seconds = max(0.0, elapsed - cand_elapsed)
-            self._coord_ema.add(coord_seconds)
-            if nodes_delta > 0 and cand_elapsed > 0:
+            # The break-even is the cost of handing work to another worker, so
+            # the coordination term is the whole inter-claim span — the same
+            # quantity the telemetry records — not the residue inside one
+            # candidate's own call.
+            self._coord_ema.add(full_coord_seconds)
+            if nodes_delta >= NODE_TIME_MIN_SAMPLE_NODES and cand_elapsed > 0:
                 self._node_time_ema.add(cand_elapsed / nodes_delta)
             _record_candidate_accuracy()
         scheduling_millis = self._pending_scheduling_millis
@@ -1983,7 +2023,7 @@ class _BranchWorker:
                            'mid-finalize', self.name, n_words)
             self.maybe_finalize(branch_key, words, n_candidates)
             return
-        time.sleep(0.05)
+        self._idle_wait(0.05)
 
     # -- recursive cooperative solving --------------------------------------
 
@@ -2230,6 +2270,19 @@ class _BranchWorker:
         child_spine = self._promoted_spine(self.root_budget - budget)
         parent_context = self._work_context
         with ExitStack() as context_stack:
+            # Claims taken while helping a promoted sub-branch belong to their
+            # own coordination window.  The enclosing candidate's evaluation is
+            # still running, so telescoping from its last completion would
+            # charge that search time to the child as handoff cost, and the
+            # child's completion would then leave the enclosing claim
+            # reporting a span its child had already consumed.  Restoring on
+            # the way out keeps the enclosing claim measured from its own
+            # previous completion, which its candidate_evaluation_millis --
+            # covering the nested work -- cancels correctly.
+            enclosing_claim_window = self._last_claim_complete
+            self._last_claim_complete = time.time()
+            context_stack.callback(
+                setattr, self, '_last_claim_complete', enclosing_claim_window)
             branch_key = encode_subset(words)
             n_words = len(words)
             # Already solved by someone? reuse without re-promoting.
@@ -2367,7 +2420,7 @@ class _BranchWorker:
                     # _help_other_branch's capped-depth contract already
                     # promises its callers.
                     self._cur_candidate = None
-                    time.sleep(0.05)
+                    self._idle_wait(0.05)
                 else:
                     # No bundle: every candidate is claimed, or another worker
                     # holds the branch.  Try free or promotable work first —
@@ -2407,7 +2460,7 @@ class _BranchWorker:
                             self._evaluate_dependency_bundle(
                                 branch_key, words, n_words, paired, budget)
                         else:
-                            time.sleep(0.05)    # let claims land
+                            self._idle_wait(0.05)   # let claims land
 
             if self.cancel():  # pragma: no cover
                 return CANCEL_RECVD
@@ -2709,7 +2762,7 @@ class _BranchWorker:
                 self._cur_candidate = None      # idle, no candidate in flight
                 self._heartbeat(None, None, None, None,
                                 None, None, force=True)
-                time.sleep(0.5)
+                self._idle_wait(0.5)
                 continue
             idle_since = None
             context, branch, bundle_id, indices, forced = work
@@ -2783,7 +2836,7 @@ class _BranchWorker:
                 self._heartbeat(branch_key, branch['n_words'], None, None,
                                 None, None, force=True)
                 self.queue.reclaim_stale_claims(HB_TIMEOUT_SECONDS)
-                time.sleep(0.1)
+                self._idle_wait(0.1)
                 continue
             bundle_id, indices, forced = claim
             if self.evaluate_bundle(branch_key, words, branch['n_words'], bundle_id,
