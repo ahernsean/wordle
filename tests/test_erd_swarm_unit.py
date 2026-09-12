@@ -5134,6 +5134,55 @@ class TestExhaustedScanReadsEachOpenerOnce(BranchOccupancyFixture,
                           for call in finalize.call_args_list], keys)
         self.assertEqual(finalize.call_args.args[1], decode_subset(keys[0]))
 
+    def test_pairing_walk_makes_one_pass_when_no_branch_was_released(self):
+        """The free-first pass is gated on occupancy having changed.  With every
+        branch still held by the same workers it can find nothing, and running
+        it anyway would walk every recorded branch a second time."""
+        self._stuck_openers(3)
+        worker = self._worker(90)
+        caps = []
+        claim_active_branch = worker._claim_active_branch
+
+        def record_cap(*args, **kwargs):
+            caps.append(kwargs.get("max_other_workers", 0))
+            return claim_active_branch(*args, **kwargs)
+
+        worker._claim_active_branch = record_cap
+
+        self._exhausted_scan(worker)
+
+        # Three openers and the direct-branch check, walked once for free work
+        # and once for a branch to join.
+        self.assertEqual(caps, [0] * 4 + [MAX_WORKERS_PER_BRANCH - 1] * 4)
+
+    def test_branch_freed_during_the_scan_is_claimed_rather_than_paired(self):
+        """Occupancy is re-read before pairing, so a branch another worker
+        finished while the scan ran is taken outright rather than remembered as
+        occupied and passed over in favour of a pairing."""
+        self._queue_opener([BRANCH], opener="crane", priority=100)
+        busy_key, _ = self._promote("crane")
+        for holder in range(MAX_WORKERS_PER_BRANCH):
+            self._occupy(busy_key, 10 + holder)
+        self._queue_opener([BRANCH[:3]], opener="slate", priority=99)
+        freed_key, _ = self._promote("slate")
+        holders = [self._occupy(freed_key, 20 + holder)[0]
+                   for holder in range(MAX_WORKERS_PER_BRANCH)]
+
+        worker = self._worker(90)
+        promote_opener_work = worker._promote_opener_work
+
+        def finish_the_other_workers(*args, **kwargs):
+            """Stand in for workers completing their bundles mid-scan."""
+            for holder in holders:
+                worker.queue.reclaim_claims_of_worker(holder.name)
+            return promote_opener_work(*args, **kwargs)
+
+        worker._promote_opener_work = finish_the_other_workers
+
+        work = worker._claim_one_uninstrumented()
+
+        self.assertEqual(self._claimed_key(work), freed_key)
+
     def test_pairing_still_joins_a_branch_from_the_reused_list(self):
         """The reused list is the one the pairing walk judges, so a branch the
         main walk passed over for occupancy is still joinable through it."""

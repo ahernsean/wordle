@@ -150,16 +150,26 @@ common case as a guarantee for the whole scheduler.
 
 Three costs on that path are already removed and must not come back.
 `_claim_paired_branch` rewalks the branches the main loop recorded instead of
-re-reading them — sound because the scan reaches the pairing walk only when no
-claim succeeded, so nothing it would re-read can have changed. It passes
-`sweep_finalize=False`, because the main walk already swept those same branches
-for finalization and a repeat sweep costs a done-count query per branch to find
-what the first already found. And `_claim_active_branch` defers `decode_subset`
-and `WorkContext.from_branch_row` until a branch is actually claimed or
-finalized: at sweep scale most rows it walks are rejected on occupancy, and a
-rejected row needs neither. Together these took the 506-opener scan from 104 ms
-to 74 ms, and a scan over openers holding many open branches from 3.07 s to
-1.02 s.
+re-reading them. It passes `sweep_finalize=False`, because the main walk already
+swept those same branches for finalization and a repeat sweep costs a done-count
+query per branch to find what the first already found. And
+`_claim_active_branch` defers `decode_subset` and `WorkContext.from_branch_row`
+until a branch is actually claimed or finalized, because at sweep scale most
+rows it walks are rejected on occupancy and a rejected row needs neither.
+Together these take statements per opener from 8 to 6 and the 506-opener scan
+from ~104 ms to ~70 ms.
+
+**Reusing the recording is not the same as assuming nothing changed.** Other
+workers run while the scan does, and an exhausted scan is the long one, so the
+branches it walked first were judged against the oldest information it holds.
+`_claim_paired_branch` therefore re-reads *occupancy* — one query — and when the
+refreshed map differs from the one the scan opened with, it walks the recording
+for a branch nobody holds before it walks it for one to join. A branch another
+worker finished is free work, and free work outranks every pairing. The gate
+matters: without it that extra walk runs on every exhausted scan to find
+nothing. A branch another worker *opened* mid-scan is not in the recording at
+all; it keeps its place in the queue and is taken at the next claim boundary,
+where selection runs from a fresh read.
 
 The shape to avoid elsewhere is a scan that returns *all* unfinished openers
 and loops over them on every claim — that spelling measured 0.6 ms per claim

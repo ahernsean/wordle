@@ -2746,11 +2746,10 @@ class _BranchWorker:
             yield opener_work
             after = opener_work
 
-    def _claim_paired_branch(self, opener_work_rows, top_priority, occupancy):
-        """Join a branch already held by exactly one other worker, or None.
-
-        opener_work_rows pairs each opener the scan visited with the open
-        branches it read for that opener, so this walk reuses those reads.
+    def _claim_paired_branch(self, opener_work_rows, top_priority,
+                             scan_start_occupancy):
+        """Claim a branch freed while the scan ran, or join one held by
+        exactly one other worker, or None.
 
         The last resort of work selection, reached only when no opener offers
         an unoccupied branch or a promotable pending one.  Six workers with
@@ -2761,22 +2760,47 @@ class _BranchWorker:
 
         The cap of one other worker is what keeps this safe: the second worker
         on a branch is the only one whose marginal contribution is positive.
+
+        opener_work_rows pairs each opener the scan visited with the open
+        branches it read for that opener, so this walk reuses those reads.
+        Occupancy is read again, because the scan that reaches here is the long
+        one and the branches it walked first were judged against the oldest
+        information it holds.  A branch another worker finished in the meantime
+        is free work and outranks every pairing, so when the refreshed
+        map differs from the one the scan opened with, the recorded branches
+        are walked once for a branch nobody holds before they are walked for
+        one to join.
+
+        Both walks read from the recording, so a branch another worker OPENED
+        during the scan is not among them.  That branch keeps its place in the
+        queue and is taken at the next claim boundary, where selection runs
+        again from a fresh read.
         """
-        for opener_work, open_branches in opener_work_rows:
-            role = (SCHEDULING_ROLE_PREFERRED
-                   if opener_work['requested_priority'] == top_priority
-                   else SCHEDULING_ROLE_FALLBACK)
-            paired = self._claim_active_branch(
-                open_branches, opener_work['opener_work_id'], role,
-                occupancy=occupancy,
-                max_other_workers=MAX_WORKERS_PER_BRANCH - 1,
-                sweep_finalize=False)
-            if paired is not None:
-                return paired
-        return self._claim_active_branch(
-            self.queue.direct_branches_in_progress(), occupancy=occupancy,
-            max_other_workers=MAX_WORKERS_PER_BRANCH - 1,
-            sweep_finalize=False)
+        occupancy = self._branch_occupancy()
+        direct_branches = self.queue.direct_branches_in_progress()
+        # The free-first pass exists for branches released while the scan ran.
+        # Equal occupancy maps mean no branch changed hands, so that pass has
+        # nothing to find and the walk stays at one pass over the recording.
+        caps = ((0, MAX_WORKERS_PER_BRANCH - 1)
+                if occupancy != scan_start_occupancy
+                else (MAX_WORKERS_PER_BRANCH - 1,))
+        for max_other_workers in caps:
+            for opener_work, open_branches in opener_work_rows:
+                role = (SCHEDULING_ROLE_PREFERRED
+                       if opener_work['requested_priority'] == top_priority
+                       else SCHEDULING_ROLE_FALLBACK)
+                work = self._claim_active_branch(
+                    open_branches, opener_work['opener_work_id'], role,
+                    occupancy=occupancy, max_other_workers=max_other_workers,
+                    sweep_finalize=False)
+                if work is not None:
+                    return work
+            work = self._claim_active_branch(
+                direct_branches, occupancy=occupancy,
+                max_other_workers=max_other_workers, sweep_finalize=False)
+            if work is not None:
+                return work
+        return None
 
     # -- main loop ----------------------------------------------------------
 
