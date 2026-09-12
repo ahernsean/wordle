@@ -171,12 +171,14 @@ class TestTelemetryInserts(_TmpQueue):
         self.assertEqual(row["scheduling_millis"], 4)
         self.assertEqual(row["fruitless_scan_millis"], 1)
         self.assertEqual(row["fruitless_scans"], 2)
-        self.assertEqual(row["idle_millis"], 21 - 5 - 3 - 2 - 4 - 1)
-        # The six phases partition coordination_millis exactly.
+        # The fruitless scans lie outside the coordination window, so they do
+        # not reduce the remainder.
+        self.assertEqual(row["idle_millis"], 21 - 5 - 3 - 2 - 4)
+        # The five phases partition coordination_millis exactly.
         self.assertEqual(
             row["claim_transaction_millis"] + row["claim_commit_millis"]
             + row["busy_wait_millis"] + row["scheduling_millis"]
-            + row["fruitless_scan_millis"] + row["idle_millis"],
+            + row["idle_millis"],
             row["coordination_millis"])
         # Consumed and reset, same contract as busy_wait_millis/claim_retries.
         self.assertEqual(self.q._last_claim_transaction_millis, 0)

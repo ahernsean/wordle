@@ -713,8 +713,10 @@ class _BranchWorker:
         self._pending_fruitless_scans = 0
         self._pending_fruitless_scan_openers_walked = 0
         # Openers examined by the scan in flight, counted by
-        # _claim_one_uninstrumented and banked by claim_one.
+        # _claim_one_uninstrumented and banked by claim_one, and whether that
+        # scan selected a branch despite returning no bundle.
         self._scan_openers_walked = 0
+        self._scan_selected_work = False
         # Direct cooperative callers can create active branches without a
         # opener-work request.  Keep their tight claim loop free of the
         # opener-admission query used by queued opener work.
@@ -2583,16 +2585,26 @@ class _BranchWorker:
         stay disjoint, and banks the number of opener-work requests the scan
         examined so that time has a denominator.
 
-        A call that finds nothing has no branch to bill, so its cost goes to
-        _pending_fruitless_scan_millis instead of to the scheduling figure,
-        where it waits for the next claim that does succeed.  Charging it to
-        scheduling_millis would attribute a scan to a branch it did not
-        choose; leaving it untimed hides it inside that row's idle_millis,
-        where exhausted-scan work is indistinguishable from a starved worker.
+        A call that selects nothing has no branch to bill, so its cost goes to
+        _pending_fruitless_scan_millis and waits for the next claim that does
+        succeed.  Charging it to scheduling_millis would attribute a scan to a
+        branch it did not choose, and it cannot go to that row's idle_millis
+        either: run() follows every such call with an idle wait, which
+        restarts the coordination window, so the scan lies outside every
+        window and no phase of any row contains it.  Untimed here it is
+        recorded nowhere at all, which is what left the exhausted scan — the
+        one path whose cost grows with queue size — the only one invisible.
+
+        Selecting nothing is not the same as returning nothing.  A scan that
+        promotes a branch and loses its bundle to a racing worker also returns
+        None, having done the short work of the served path rather than the
+        walk to exhaustion; _scan_selected_work marks it so it is excluded
+        from both the count and the timing population.
         """
         scan_t0 = time.perf_counter()
         attributed_before = self._queue_attributed_millis()
         self._scan_openers_walked = 0
+        self._scan_selected_work = False
         work = None
         try:
             work = self._claim_one_uninstrumented()
@@ -2604,10 +2616,11 @@ class _BranchWorker:
             if work is None:
                 self._pending_scheduling_millis = 0
                 self._pending_scan_openers_walked = 0
-                self._pending_fruitless_scan_millis += elapsed
-                self._pending_fruitless_scans += 1
-                self._pending_fruitless_scan_openers_walked += (
-                    self._scan_openers_walked)
+                if not self._scan_selected_work:
+                    self._pending_fruitless_scan_millis += elapsed
+                    self._pending_fruitless_scans += 1
+                    self._pending_fruitless_scan_openers_walked += (
+                        self._scan_openers_walked)
             else:
                 self._pending_scheduling_millis = elapsed
                 self._pending_scan_openers_walked = self._scan_openers_walked
@@ -2762,7 +2775,13 @@ class _BranchWorker:
 
             promoted = self._promote_opener_work(opener_work_id, role)
             if promoted is not None:
-                return None if promoted is _PROMOTED_NO_BUNDLE else promoted
+                if promoted is not _PROMOTED_NO_BUNDLE:
+                    return promoted
+                # The scan selected an opener and promoted its branch; only
+                # the bundle went elsewhere.  It returns None like an
+                # exhausted scan and is nothing like one, so say which it was.
+                self._scan_selected_work = True
+                return None
         # A queue upgraded while active work is present can carry branches
         # from before opener lineage was recorded.  They remain claimable
         # until finalization; new work always follows opener-first order.

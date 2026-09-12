@@ -638,20 +638,24 @@ CREATE TABLE IF NOT EXISTS telemetry.cost_samples (
 -- the COMMIT itself; busy_wait_millis is the write-lock wait across the claim
 -- paths taken while coordinating; scheduling_millis is the work-selection scan
 -- that chose this branch (opener-work ordering, pending promotion, joining an
--- in-progress branch) excluding the phases already counted;
--- fruitless_scan_millis is the scans since the previous row that selected no
--- branch at all, which have no claim of their own to be billed to and so are
--- carried to the next claim that succeeds; idle_millis is what is left over.
--- Those six partition coordination_millis exactly, and idle_millis means
--- genuinely unaccounted wait -- both kinds of scan work are called out
--- separately so a large idle_millis cannot be misread as starved workers when
--- it is really scan cost.  All six span time BETWEEN candidate evaluations.
+-- in-progress branch) excluding the phases already counted; idle_millis is
+-- what is left over.  Those five partition coordination_millis exactly, and
+-- idle_millis means genuinely unaccounted wait -- scheduling work is called
+-- out separately so a large idle_millis cannot be misread as starved workers
+-- when it is really scan cost.  All five span time BETWEEN candidate
+-- evaluations.
+--
+-- fruitless_scan_millis is NOT one of those five and must not be added to
+-- them.  It measures the scans since the previous row that selected no branch
+-- at all, and those lie OUTSIDE every coordination window: each is followed by
+-- an idle wait, which restarts the window, so their cost was never inside any
+-- row's coordination_millis and subtracting it would drive idle_millis to its
+-- clamp.  It is separate worker time, reported here because it belongs to no
+-- claim and would otherwise be recorded nowhere.  fruitless_scans counts them,
+-- making the fraction of scans that select nothing measurable from this table.
 -- scan_openers_walked and fruitless_scan_openers_walked are the opener-work
--- requests those scans examined: the scan cost is linear in them on an
--- exhausted scan, so the millis columns are uninterpretable without them.
--- fruitless_scans counts the scans folded into fruitless_scan_millis, so the
--- fraction of scans that select nothing is COUNT-weighted from this table
--- alone.  candidate_evaluation_millis is the elapsed solver work for this
+-- requests each kind of scan examined: an exhausted scan's cost is linear in
+-- them, so the millis are uninterpretable without them.  candidate_evaluation_millis is the elapsed solver work for this
 -- candidate.  Queue work done
 -- during a candidate's own evaluation (sub-branch promotion taking the write
 -- lock) sits inside the evaluation span that coordination_millis excludes and
@@ -6521,19 +6525,20 @@ class ERDQueue:
         branch), already net of any lock wait and claim transaction it
         contained so the phases stay disjoint.
 
-        fruitless_scan_millis is the same measurement for the scans since the
-        previous telemetry row that selected nothing, with fruitless_scans
-        counting them.  Those scans belong to no claim, so the caller carries
-        them to the next claim that succeeds; they are separate from
-        scheduling_millis because a scan that chose no branch cannot be
-        attributed to the branch eventually claimed.  Both are reported with
-        the opener-work requests they examined (scan_openers_walked,
-        fruitless_scan_openers_walked), which is the quantity an exhausted
-        scan is linear in.
-
         idle_millis is coordination_millis minus every other timed phase, so
-        those six partition it exactly and idle_millis means genuinely
+        those five partition it exactly and idle_millis means genuinely
         unaccounted wait rather than unattributed scan work.
+
+        fruitless_scan_millis is deliberately NOT part of that partition.  It
+        measures the scans since the previous row that selected nothing, which
+        the caller carries forward because they belong to no claim -- and each
+        of them is followed by an idle wait that restarts the coordination
+        window, so their cost lies outside every window rather than inside
+        this row's.  Subtracting it would make the parts exceed the whole and
+        pin idle_millis to its clamp.  fruitless_scans counts those scans, and
+        scan_openers_walked / fruitless_scan_openers_walked report the
+        opener-work requests each kind of scan examined -- the quantity an
+        exhausted scan's cost is linear in.
 
         Every row is one candidate evaluation, so COUNT(*) over the table is a
         claim count.  Branch finalize cost is deliberately not recorded here —
@@ -6560,8 +6565,7 @@ class ERDQueue:
                           - self._last_claim_transaction_millis
                           - self._last_claim_commit_millis
                           - self._last_claim_busy_millis
-                          - scheduling_millis
-                          - fruitless_scan_millis)
+                          - scheduling_millis)
         self._conn.execute("""
             INSERT INTO telemetry.claim_telemetry
                 (n_words, coordination_millis, candidate_evaluation_millis,

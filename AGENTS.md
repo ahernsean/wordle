@@ -148,18 +148,26 @@ Exhaustion means nothing anywhere is claimable, which is the drained or
 fully-occupied condition rather than the common one. Do not read the flat
 common case as a guarantee for the whole scheduler.
 
-**A scan that finds nothing is billed to `fruitless_scan_millis`, never to
-`scheduling_millis`.** `scheduling_millis` is the scan that chose the branch
-the row belongs to; an exhausted scan chose nothing, so there is no claim to
-charge it to and it is carried to the next claim that succeeds. Before those
-columns existed it fell into `idle_millis`, where the expensive scan and a
-genuinely starved worker are one number — which is why a coordination share
-read off `idle_millis` alone cannot tell the two apart. `fruitless_scans`
-counts the scans, so the fallback rate is measured from this table rather than
-inferred, and `scan_openers_walked`/`fruitless_scan_openers_walked` carry the
-queue size each scan actually walked, which is the quantity the `6N + 4` cost
-is linear in. The six phases partition `coordination_millis` exactly; a row
-predating the columns holds NULL, not 0, because its split is unrecoverable.
+**A scan that selects nothing lands in `fruitless_scan_millis`, and that
+column is not a phase of `coordination_millis`.** `scheduling_millis` is the
+scan that chose the branch its row belongs to. An exhausted scan chose nothing,
+so no claim can carry it — and `run()` follows every such scan with an idle
+wait, which restarts the coordination window, so its cost is outside every
+window rather than inside the next row's. Before these columns it was recorded
+nowhere at all: the one scheduling path whose cost grows with queue size was
+the only one with no measurement. Do not add it to the five phases; the parts
+would exceed the whole and `idle_millis` would sit at its `max(0, …)` clamp.
+
+`fruitless_scans` counts those scans, so the fallback rate is measured here
+rather than inferred, and `scan_openers_walked`/`fruitless_scan_openers_walked`
+carry the queue depth each scan walked — the quantity the `6N + 4` cost is
+linear in, without which neither millis column can be read. A row predating the
+columns holds NULL, not 0, because its split is unrecoverable.
+
+**Returning None is not the same as selecting nothing.** A scan that promotes a
+branch and loses its bundle to a racing worker returns None from the short
+served path, never having walked to exhaustion; `_scan_selected_work` marks it
+so it stays out of both the count and the timing population.
 
 Three costs on that path are already removed and must not come back.
 `_claim_paired_branch` rewalks the branches the main loop recorded instead of
