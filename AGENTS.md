@@ -148,6 +148,19 @@ Exhaustion means nothing anywhere is claimable, which is the drained or
 fully-occupied condition rather than the common one. Do not read the flat
 common case as a guarantee for the whole scheduler.
 
+**A scan that finds nothing is billed to `fruitless_scan_millis`, never to
+`scheduling_millis`.** `scheduling_millis` is the scan that chose the branch
+the row belongs to; an exhausted scan chose nothing, so there is no claim to
+charge it to and it is carried to the next claim that succeeds. Before those
+columns existed it fell into `idle_millis`, where the expensive scan and a
+genuinely starved worker are one number — which is why a coordination share
+read off `idle_millis` alone cannot tell the two apart. `fruitless_scans`
+counts the scans, so the fallback rate is measured from this table rather than
+inferred, and `scan_openers_walked`/`fruitless_scan_openers_walked` carry the
+queue size each scan actually walked, which is the quantity the `6N + 4` cost
+is linear in. The six phases partition `coordination_millis` exactly; a row
+predating the columns holds NULL, not 0, because its split is unrecoverable.
+
 Three costs on that path are already removed and must not come back.
 `_claim_paired_branch` rewalks the branches the main loop recorded instead of
 re-reading them. It passes `sweep_finalize=False`, because the main walk already

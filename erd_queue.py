@@ -638,12 +638,20 @@ CREATE TABLE IF NOT EXISTS telemetry.cost_samples (
 -- the COMMIT itself; busy_wait_millis is the write-lock wait across the claim
 -- paths taken while coordinating; scheduling_millis is the work-selection scan
 -- that chose this branch (opener-work ordering, pending promotion, joining an
--- in-progress branch) excluding the phases already counted; idle_millis is
--- what is left over.  Those five partition coordination_millis exactly, and
--- idle_millis means genuinely unaccounted wait -- scheduling work is called
--- out separately so a large idle_millis cannot be misread as starved workers
--- when it is really scan cost.  All five span time BETWEEN candidate
--- evaluations.  candidate_evaluation_millis is the elapsed solver work for this
+-- in-progress branch) excluding the phases already counted;
+-- fruitless_scan_millis is the scans since the previous row that selected no
+-- branch at all, which have no claim of their own to be billed to and so are
+-- carried to the next claim that succeeds; idle_millis is what is left over.
+-- Those six partition coordination_millis exactly, and idle_millis means
+-- genuinely unaccounted wait -- both kinds of scan work are called out
+-- separately so a large idle_millis cannot be misread as starved workers when
+-- it is really scan cost.  All six span time BETWEEN candidate evaluations.
+-- scan_openers_walked and fruitless_scan_openers_walked are the opener-work
+-- requests those scans examined: the scan cost is linear in them on an
+-- exhausted scan, so the millis columns are uninterpretable without them.
+-- fruitless_scans counts the scans folded into fruitless_scan_millis, so the
+-- fraction of scans that select nothing is COUNT-weighted from this table
+-- alone.  candidate_evaluation_millis is the elapsed solver work for this
 -- candidate.  Queue work done
 -- during a candidate's own evaluation (sub-branch promotion taking the write
 -- lock) sits inside the evaluation span that coordination_millis excludes and
@@ -673,6 +681,10 @@ CREATE TABLE IF NOT EXISTS telemetry.claim_telemetry (
     claim_transaction_millis  INTEGER,
     claim_commit_millis       INTEGER,
     scheduling_millis         INTEGER,
+    scan_openers_walked       INTEGER,
+    fruitless_scan_millis     INTEGER,
+    fruitless_scans           INTEGER,
+    fruitless_scan_openers_walked INTEGER,
     idle_millis               INTEGER,
     epoch                     INTEGER NOT NULL DEFAULT 0,
     recorded_at               INTEGER NOT NULL
@@ -1310,6 +1322,17 @@ class ERDQueue:
             "idle_millis": "INTEGER",
             "branch_worker_count": "INTEGER",
             "evaluation_bound_erd": "REAL",
+        }, schema="telemetry")
+
+        # Fruitless-scan attribution.  A row predating these columns holds
+        # NULL rather than 0: its fruitless-scan cost was folded into
+        # idle_millis and cannot be recovered, so NULL states that the split
+        # is unknown for that row while 0 would assert there was none.
+        self._add_columns("claim_telemetry", {
+            "scan_openers_walked": "INTEGER",
+            "fruitless_scan_millis": "INTEGER",
+            "fruitless_scans": "INTEGER",
+            "fruitless_scan_openers_walked": "INTEGER",
         }, schema="telemetry")
 
         # Candidate-accuracy identity and lifecycle fields (issue #223).
@@ -6462,6 +6485,10 @@ class ERDQueue:
                             idx: int = None, bundle_start_idx: int = None,
                             bundle_end_idx: int = None,
                             scheduling_millis: int = 0,
+                            scan_openers_walked: int = 0,
+                            fruitless_scan_millis: int = 0,
+                            fruitless_scans: int = 0,
+                            fruitless_scan_openers_walked: int = 0,
                             candidate_evaluation_millis: int = None,
                             evaluation_bound_erd: float = None):
         """Append a claim coordination record to claim_telemetry for offline analysis.
@@ -6492,10 +6519,21 @@ class ERDQueue:
         scheduling_millis is the caller's work-selection scan for this claim
         (opener-work ordering, pending promotion, joining an in-progress
         branch), already net of any lock wait and claim transaction it
-        contained so the phases stay disjoint.  idle_millis is
-        coordination_millis minus every other timed phase, so those five
-        partition it exactly and idle_millis means genuinely unaccounted
-        wait rather than unattributed scan work.
+        contained so the phases stay disjoint.
+
+        fruitless_scan_millis is the same measurement for the scans since the
+        previous telemetry row that selected nothing, with fruitless_scans
+        counting them.  Those scans belong to no claim, so the caller carries
+        them to the next claim that succeeds; they are separate from
+        scheduling_millis because a scan that chose no branch cannot be
+        attributed to the branch eventually claimed.  Both are reported with
+        the opener-work requests they examined (scan_openers_walked,
+        fruitless_scan_openers_walked), which is the quantity an exhausted
+        scan is linear in.
+
+        idle_millis is coordination_millis minus every other timed phase, so
+        those six partition it exactly and idle_millis means genuinely
+        unaccounted wait rather than unattributed scan work.
 
         Every row is one candidate evaluation, so COUNT(*) over the table is a
         claim count.  Branch finalize cost is deliberately not recorded here —
@@ -6522,7 +6560,8 @@ class ERDQueue:
                           - self._last_claim_transaction_millis
                           - self._last_claim_commit_millis
                           - self._last_claim_busy_millis
-                          - scheduling_millis)
+                          - scheduling_millis
+                          - fruitless_scan_millis)
         self._conn.execute("""
             INSERT INTO telemetry.claim_telemetry
                 (n_words, coordination_millis, candidate_evaluation_millis,
@@ -6531,15 +6570,22 @@ class ERDQueue:
                  branch_worker_count, evaluation_bound_erd, bundle_id, idx, bundle_start_idx,
                  bundle_end_idx,
                  claim_transaction_millis, claim_commit_millis,
-                 scheduling_millis, idle_millis, epoch, recorded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 scheduling_millis, scan_openers_walked,
+                 fruitless_scan_millis, fruitless_scans,
+                 fruitless_scan_openers_walked,
+                 idle_millis, epoch, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?)
         """, (n_words, coordination_millis, candidate_evaluation_millis, work_nodes,
               self._last_claim_retries,
               self._last_claim_busy_millis, worker_count, branch_id, spine,
               worker_id, branch_worker_count, evaluation_bound_erd, bundle_id, idx, bundle_start_idx,
               bundle_end_idx,
               self._last_claim_transaction_millis, self._last_claim_commit_millis,
-              scheduling_millis, idle_millis, self.epoch, now))
+              scheduling_millis, scan_openers_walked,
+              fruitless_scan_millis, fruitless_scans,
+              fruitless_scan_openers_walked,
+              idle_millis, self.epoch, now))
         self._last_claim_retries = 0
         self._last_claim_busy_millis = 0
         self._last_claim_transaction_millis = 0

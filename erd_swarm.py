@@ -700,8 +700,21 @@ class _BranchWorker:
         self._work_context = WorkContext.empty()
         # Work-selection scan time for the claim currently in hand, set by
         # claim_one and consumed by the first candidate's telemetry row (the
-        # scan is paid once per claim, like the claim transaction itself).
+        # scan is paid once per claim, like the claim transaction itself),
+        # alongside the number of opener-work requests that scan examined.
         self._pending_scheduling_millis = 0
+        self._pending_scan_openers_walked = 0
+        # The scans since that telemetry row that found nothing.  A scan that
+        # claims nothing has no claim to be billed to, so these accumulate
+        # until a claim succeeds and are consumed by its row: they are the
+        # exhausted-scan cost, which would otherwise be indistinguishable from
+        # waiting inside idle_millis.
+        self._pending_fruitless_scan_millis = 0
+        self._pending_fruitless_scans = 0
+        self._pending_fruitless_scan_openers_walked = 0
+        # Openers examined by the scan in flight, counted by
+        # _claim_one_uninstrumented and banked by claim_one.
+        self._scan_openers_walked = 0
         # Direct cooperative callers can create active branches without a
         # opener-work request.  Keep their tight claim loop free of the
         # opener-admission query used by queued opener work.
@@ -1548,7 +1561,16 @@ class _BranchWorker:
                 self._node_time_ema.add(cand_elapsed / nodes_delta)
             _record_candidate_accuracy()
         scheduling_millis = self._pending_scheduling_millis
+        scan_openers_walked = self._pending_scan_openers_walked
+        fruitless_scan_millis = self._pending_fruitless_scan_millis
+        fruitless_scans = self._pending_fruitless_scans
+        fruitless_scan_openers_walked = (
+            self._pending_fruitless_scan_openers_walked)
         self._pending_scheduling_millis = 0
+        self._pending_scan_openers_walked = 0
+        self._pending_fruitless_scan_millis = 0
+        self._pending_fruitless_scans = 0
+        self._pending_fruitless_scan_openers_walked = 0
         self.queue.add_claim_telemetry(
             n_words, int(full_coord_seconds * 1e3), nodes_delta,
             self.n_workers, branch_key=branch_key,
@@ -1556,6 +1578,10 @@ class _BranchWorker:
             bundle_id=bundle_id, idx=idx,
             bundle_start_idx=bundle_start_idx, bundle_end_idx=bundle_end_idx,
             scheduling_millis=scheduling_millis,
+            scan_openers_walked=scan_openers_walked,
+            fruitless_scan_millis=fruitless_scan_millis,
+            fruitless_scans=fruitless_scans,
+            fruitless_scan_openers_walked=fruitless_scan_openers_walked,
             candidate_evaluation_millis=round(cand_elapsed * 1e3),
             evaluation_bound_erd=evaluation_bound_erd)
         self.claims_done += 1
@@ -2554,25 +2580,37 @@ class _BranchWorker:
         Times the work-selection scan into _pending_scheduling_millis for the
         resulting claim's telemetry row, net of the lock wait and claim
         transaction the queue already accounts for separately, so the phases
-        stay disjoint.  A call that finds nothing clears the figure rather
-        than carrying it forward: that scan chose no branch, so billing it to
-        whichever branch is claimed later would misattribute it (it stays in
-        that row's idle_millis, which is what a fruitless scan is).
+        stay disjoint, and banks the number of opener-work requests the scan
+        examined so that time has a denominator.
+
+        A call that finds nothing has no branch to bill, so its cost goes to
+        _pending_fruitless_scan_millis instead of to the scheduling figure,
+        where it waits for the next claim that does succeed.  Charging it to
+        scheduling_millis would attribute a scan to a branch it did not
+        choose; leaving it untimed hides it inside that row's idle_millis,
+        where exhausted-scan work is indistinguishable from a starved worker.
         """
         scan_t0 = time.perf_counter()
         attributed_before = self._queue_attributed_millis()
+        self._scan_openers_walked = 0
         work = None
         try:
             work = self._claim_one_uninstrumented()
             return work
         finally:
+            elapsed = max(
+                0, int((time.perf_counter() - scan_t0) * 1000)
+                - (self._queue_attributed_millis() - attributed_before))
             if work is None:
                 self._pending_scheduling_millis = 0
+                self._pending_scan_openers_walked = 0
+                self._pending_fruitless_scan_millis += elapsed
+                self._pending_fruitless_scans += 1
+                self._pending_fruitless_scan_openers_walked += (
+                    self._scan_openers_walked)
             else:
-                elapsed = int((time.perf_counter() - scan_t0) * 1000)
-                self._pending_scheduling_millis = max(
-                    0, elapsed - (self._queue_attributed_millis()
-                                  - attributed_before))
+                self._pending_scheduling_millis = elapsed
+                self._pending_scan_openers_walked = self._scan_openers_walked
 
     def _queue_attributed_millis(self):
         """Coordination time the queue has already attributed to a named phase
@@ -2696,6 +2734,7 @@ class _BranchWorker:
         candidate_rows = (self._opener_work_candidates()
                           if self._opener_work_enabled else ())
         for opener_work in candidate_rows:
+            self._scan_openers_walked += 1
             if top_priority is None:
                 top_priority = opener_work['requested_priority']
             opener_work_id = opener_work['opener_work_id']
