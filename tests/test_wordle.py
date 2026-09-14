@@ -31,7 +31,7 @@ from wordle_engine import (
     ERD_ANSWERS_UNFILTERED, cache_all_scores, verify_erd_cache,
     enumerate_branches, rank_candidates_by_max_group_size_then_entropy_gain, _cache_reuse,
     _solve_subset, max_solvable_within, evaluate_candidate,
-    SOLVED, OVER_ERD_LIMIT, NO_INFORMATION_GAINED,
+    SOLVED, OVER_ERD_LIMIT, NO_INFORMATION_GAINED, GAME_GUESSES,
 )
 from cache_sqlite import ScoreCache, MemoryScoreCache
 from wordle import (
@@ -45,7 +45,7 @@ from wordle import (
     print_colored_pattern, print_colored_word, ANSI_COLORS, ANSI_RESET,
     mark, render_markup, MARK_RESET, MARK_RED, MARK_GREEN, MARK_YELLOW,
     MARK_GRAY,
-    cmd_test, _live_candidate_erd, _erd_live_guesses,
+    cmd_test, _live_candidate_erd,
 )
 
 
@@ -4267,15 +4267,46 @@ class TestLiveCandidateERD(unittest.TestCase):
         soln = make_solution()
         with mock.patch('wordle.evaluate_candidate',
                         return_value=(SOLVED, 2.5, None, False)):
-            cost = _live_candidate_erd("heart", None, soln, ERD_ANSWERS, None)
+            cost = _live_candidate_erd("heart", soln, ERD_ANSWERS, None, GUESSES)
         self.assertAlmostEqual(cost, 2.5)
 
     def test_non_solved_status_returns_none(self):
+        """Covers both a candidate that gives no information at all and one
+        no strategy for which can finish within the position's budget —
+        evaluate_candidate reports both as a non-SOLVED status."""
         soln = make_solution()
         with mock.patch('wordle.evaluate_candidate',
                         return_value=(NO_INFORMATION_GAINED, None, None, False)):
-            cost = _live_candidate_erd("heart", None, soln, ERD_ANSWERS, None)
+            cost = _live_candidate_erd("heart", soln, ERD_ANSWERS, None, GUESSES)
         self.assertIsNone(cost)
+
+    def test_evaluates_at_the_positions_remaining_budget(self):
+        """A finite remaining budget must reach evaluate_candidate, not
+        None (unrestricted) — an unrestricted optimum can pick a strategy
+        with a sub-branch that cannot finish within the guesses actually
+        left in the game, and would write its children's cache entries
+        under the wrong (unrestricted) scope instead of the budget the
+        background solver uses for this position."""
+        soln = make_solution()
+        soln.guesses = [["salet", ["gray"] * 5]]  # one guess played
+        with mock.patch('wordle.evaluate_candidate',
+                        return_value=(SOLVED, 2.5, None, False)) as fake:
+            _live_candidate_erd("heart", soln, ERD_ANSWERS, None, GUESSES)
+        self.assertEqual(fake.call_args.kwargs['budget'], GAME_GUESSES - 1)
+
+    def test_uses_the_supplied_policy_cache_and_guesses_unchanged(self):
+        """The caller resolves policy/cache/guesses for the current grid
+        cell; this function must search exactly that vocabulary and write
+        into exactly that cache namespace, not re-derive either."""
+        soln = make_solution()
+        sentinel_cache = object()
+        with mock.patch('wordle.evaluate_candidate',
+                        return_value=(SOLVED, 2.5, None, False)) as fake:
+            _live_candidate_erd("heart", soln, ERD_ANSWERS_UNFILTERED,
+                                sentinel_cache, ["brain", "stove"])
+        self.assertEqual(fake.call_args.kwargs['policy'], ERD_ANSWERS_UNFILTERED)
+        self.assertIs(fake.call_args[0][3], sentinel_cache)
+        self.assertEqual(fake.call_args.kwargs['guesses'], ["brain", "stove"])
 
     def test_fast_computation_prints_nothing(self):
         """A computation that finishes quickly must not print any progress
@@ -4288,7 +4319,7 @@ class TestLiveCandidateERD(unittest.TestCase):
         with mock.patch('wordle.time.time', side_effect=itertools.count(0.0, 0.1)), \
              mock.patch('wordle.evaluate_candidate', side_effect=fake_evaluate_candidate), \
              redirect_stdout(io.StringIO()) as out:
-            cost = _live_candidate_erd("heart", None, soln, ERD_ANSWERS, None)
+            cost = _live_candidate_erd("heart", soln, ERD_ANSWERS, None, GUESSES)
 
         self.assertAlmostEqual(cost, 3.0)
         self.assertEqual(out.getvalue(), "")
@@ -4309,32 +4340,13 @@ class TestLiveCandidateERD(unittest.TestCase):
         with mock.patch('wordle.time.time', side_effect=itertools.count(0.0, 1.0)), \
              mock.patch('wordle.evaluate_candidate', side_effect=fake_evaluate_candidate), \
              redirect_stdout(io.StringIO()) as out:
-            cost = _live_candidate_erd("heart", None, soln, ERD_ANSWERS, None)
+            cost = _live_candidate_erd("heart", soln, ERD_ANSWERS, None, GUESSES)
 
         self.assertAlmostEqual(cost, 3.0)
         text = out.getvalue()
         self.assertIn("Computing ERD for HEART...", text)
         self.assertIn(".", text)
         self.assertRegex(text, r'\d+s')
-
-
-class TestErdLiveGuesses(unittest.TestCase):
-
-    def test_constrained_uses_constraint_compliant_vocabulary(self):
-        soln = make_solution()
-        gs = types.SimpleNamespace(all_words=GUESSES)
-        self.assertEqual(_erd_live_guesses(gs, soln, ERD_CONSTRAINED),
-                         soln.constraint_compliant_words(GUESSES))
-
-    def test_answers_policy_uses_current_words(self):
-        soln = make_solution()
-        self.assertEqual(_erd_live_guesses(None, soln, ERD_ANSWERS),
-                         soln.current_words)
-
-    def test_all_policy_uses_gs_all_words(self):
-        soln = make_solution()
-        gs = types.SimpleNamespace(all_words=GUESSES)
-        self.assertEqual(_erd_live_guesses(gs, soln, ERD_ALL), GUESSES)
 
 
 # ---------------------------------------------------------------------------
@@ -4352,11 +4364,11 @@ class TestCmdTestLiveERDWiring(unittest.TestCase):
         self.tmpdir.cleanup()
 
     @staticmethod
-    def _gs(soln):
+    def _gs(soln, universe=GuessUniverse.ALL_WORDS,
+            compliance=ComplianceFilter.UNFILTERED):
         return types.SimpleNamespace(
-            single=True, solutions=[soln], all_words=GUESSES,
-            universe=GuessUniverse.ALL_WORDS,
-            compliance=ComplianceFilter.UNFILTERED,
+            single=True, solutions=[soln], all_words=GUESSES, all_answers=ANSWERS,
+            universe=universe, compliance=compliance,
             constrained_erd_cache=None,
         )
 
@@ -4392,8 +4404,7 @@ class TestCmdTestLiveERDWiring(unittest.TestCase):
 
         fake_stats = dict(
             step1=4.0, step2=2.0, step3=1.0, wt_avg=2.5, max_group_size=10,
-            prob_finish=0.5, buckets=[1, 2, 3, 0, 0], erd=1.234,
-            erd_policy=ERD_ALL, erd_score_cache=None)
+            prob_finish=0.5, buckets=[1, 2, 3, 0, 0], erd=1.234)
         with mock.patch('wordle._multistep_stats', return_value=fake_stats), \
              mock.patch('wordle._live_candidate_erd') as fake_live, \
              redirect_stdout(io.StringIO()) as out:
@@ -4401,6 +4412,28 @@ class TestCmdTestLiveERDWiring(unittest.TestCase):
 
         fake_live.assert_not_called()
         self.assertIn("1.234 exp remaining depth", out.getvalue())
+
+    def test_answer_shaped_unfiltered_mode_uses_all_answers_and_its_own_policy(self):
+        """(ALL_ANSWERS, UNFILTERED) must search gs.all_answers under
+        ERD_ANSWERS_UNFILTERED. _multistep_stats' own internal policy
+        selection collapses this grid cell onto ERD_ALL (it only ever
+        distinguishes hard mode from everything else), so cmd_test must
+        resolve policy/cache/guesses itself from the actual grid cell
+        rather than trusting what _multistep_stats used for its cache
+        lookup."""
+        soln = self._mid_game_soln()
+        gs = self._gs(soln, universe=GuessUniverse.ALL_ANSWERS,
+                      compliance=ComplianceFilter.UNFILTERED)
+        set_display_context(soln)
+
+        with mock.patch('wordle._live_candidate_erd', return_value=3.25) as fake, \
+             redirect_stdout(io.StringIO()):
+            cmd_test(gs, inline="heart")
+
+        fake.assert_called_once()
+        _word, _soln, policy, _cache, guesses = fake.call_args[0]
+        self.assertEqual(policy, ERD_ANSWERS_UNFILTERED)
+        self.assertEqual(guesses, ANSWERS)
 
     def test_no_information_result_omits_erd_row(self):
         soln = self._mid_game_soln()

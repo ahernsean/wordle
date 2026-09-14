@@ -1759,13 +1759,7 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
     """
     Compute 3-step expected entropy and group stats for a single word.
     Returns a dict with keys: step1, step2, step3, max_group_size,
-    wt_avg, prob_finish, buckets, erd, erd_policy, erd_score_cache.
-
-    erd_policy/erd_score_cache are the ERD cache namespace and cache object
-    this call used to look erd up (None when erd wasn't attempted at all,
-    i.e. soln is the full game) — exposed so a caller that gets erd=None
-    from a cache miss can, if it wants to, go compute the value itself
-    against the exact same scope rather than re-deriving it.
+    wt_avg, prob_finish, buckets.
 
     step2_pool: candidate pool for step 2. If None and not constraint_compliant,
         uses only the branch (answers-only mode).
@@ -1934,8 +1928,6 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
     # solver keeps populating the cache in the background, more of these
     # lookups become hits for free.
     erd = None
-    erd_policy = None
-    erd_score_cache = None
     if not soln._is_full_game():
         if constraint_compliant:
             # Hard-mode ERD values are path-dependent (the eligible guess
@@ -1981,24 +1973,10 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
         'wt_avg': wt_avg, 'prob_finish': prob_fin,
         'buckets': buckets,
         'erd': erd,
-        'erd_policy': erd_policy,
-        'erd_score_cache': erd_score_cache,
     }
 
 
-def _erd_live_guesses(gs, soln, erd_policy):
-    """The guess vocabulary matching erd_policy, for a live evaluate_candidate
-    call — the same mapping _ERD_MODE_CONFIG uses to pick guesses_fn per
-    policy, inlined here since callers only have the policy, not the
-    (universe, compliance) cell it came from."""
-    if erd_policy == ERD_CONSTRAINED:
-        return soln.constraint_compliant_words(gs.all_words)
-    if erd_policy == ERD_ANSWERS:
-        return soln.current_words
-    return gs.all_words  # ERD_ALL
-
-
-def _live_candidate_erd(word, gs, soln, erd_policy, erd_score_cache):
+def _live_candidate_erd(word, soln, erd_policy, erd_score_cache, guesses):
     """Exact ERD for playing `word` against soln's current branch, computed
     on demand instead of read from cache.
 
@@ -2008,9 +1986,15 @@ def _live_candidate_erd(word, gs, soln, erd_policy, erd_score_cache):
     `word` as a candidate without ever computing its exact cost. An
     explicit test of this exact word has already asked for the extra
     computation, so evaluate_candidate runs here with that cutoff disabled
-    (best_erd=inf), writing every sub-branch it resolves back to
-    erd_score_cache same as the background solver would. The result renders
-    exactly like a cache hit — this only fills the gap, it doesn't annotate it.
+    (best_erd=inf), at the position's own remaining budget — the same
+    budget the background solver selects every child at (see
+    _current_erd_budget) — writing every sub-branch it resolves back to
+    erd_score_cache. erd_policy/erd_score_cache/guesses must be the triple
+    _erd_cache_and_policy and _erd_mode_config's guesses_fn produce for the
+    caller's current (universe, compliance) grid cell, so the vocabulary
+    searched and the cache namespace written match what the background
+    solver uses for this exact mode. The result renders exactly like a
+    cache hit — this only fills the gap, it doesn't annotate it.
 
     Shows the same delayed progress dots as any other slow foreground
     computation in this file (see the "Computing entropy..." dots in this
@@ -2021,12 +2005,13 @@ def _live_candidate_erd(word, gs, soln, erd_policy, erd_score_cache):
     advance.
 
     Returns the exact expected remaining depth, or None if `word` gives no
-    information at all (every remaining word would respond identically) —
-    the same case _multistep_stats' cache-only path would also report as
-    unavailable.
+    information at all (every remaining word would respond identically) or
+    no strategy playing it can finish within the position's remaining
+    budget — the same cases _multistep_stats' cache-only path would also
+    report as unavailable.
     """
     branch_words = soln.current_words
-    guesses = _erd_live_guesses(gs, soln, erd_policy)
+    budget = _current_erd_budget(soln)
 
     t0 = time.time()
     prog = {'on': False, 'next_dot': 2.0}
@@ -2042,9 +2027,9 @@ def _live_candidate_erd(word, gs, soln, erd_policy, erd_score_cache):
             print('.', end='', flush=True)
             prog['next_dot'] += 1.0
 
-    status, cost, _max_depth, _floor = evaluate_candidate(
+    status, cost, _max_remaining_depth, _floor = evaluate_candidate(
         branch_words, word, soln.cache, erd_score_cache,
-        best_erd=float('inf'), budget=None, policy=erd_policy,
+        best_erd=float('inf'), budget=budget, policy=erd_policy,
         guesses=guesses, heartbeat=_tick)
 
     if prog['on']:
@@ -2257,10 +2242,17 @@ def cmd_test(gs, inline=''):
             # this word being culled by the admissible-bound cutoff during
             # background search, never fully evaluated) is worth resolving
             # live rather than silently omitting the ERD row. Renders exactly
-            # like a cache hit either way.
-            if erd is None and st.get('erd_policy') is not None:
-                erd = _live_candidate_erd(
-                    word, gs, soln, st['erd_policy'], st['erd_score_cache'])
+            # like a cache hit either way. Policy/cache/guesses come from the
+            # current (universe, compliance) grid cell directly, not from
+            # _multistep_stats — its own policy selection there only ever
+            # distinguishes hard mode from everything else, which collapses
+            # two of the four grid cells onto the wrong namespace/vocabulary.
+            if erd is None and not soln._is_full_game():
+                erd_sc, erd_policy = _erd_cache_and_policy(gs, soln)
+                if erd_sc is not None:
+                    erd_guesses = _erd_mode_config(gs).guesses_fn(gs, soln)
+                    erd = _live_candidate_erd(
+                        word, soln, erd_policy, erd_sc, erd_guesses)
             chain_vals = [st['step1'], st['step2'], st['step3'], total]
             _vw = max(len(f'{v:.4f}') for v in chain_vals)
             _rows = []
