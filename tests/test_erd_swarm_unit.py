@@ -110,6 +110,7 @@ def _bare_worker():
     w._scan_openers_walked = 0
     w._scan_openers_walked_baseline = 0
     w._scan_opener_in_flight = False
+    w._scan_attributed_baseline = 0
     w._scan_selected_work = False
     w._adaptive = True
     w._erd_lower_bound_pruned_accuracy_n = 0
@@ -1479,6 +1480,70 @@ class TestSolveBranchFocusedClaimTelemetryAttribution(unittest.TestCase):
 
         self.assertEqual(w._pending_fruitless_scans, 1)
         self.assertGreaterEqual(w._pending_fruitless_scan_millis, 40)
+
+    def test_queue_time_after_a_mid_scan_restart_is_still_netted_off(self):
+        # The clamp subtracts the queue's share so the phases stay disjoint.
+        # A restart inside the scan zeroes the queue's counters, so a baseline
+        # taken at scan start can exceed them afterwards and collapse the delta
+        # to nothing -- and the lock wait and claim transaction taken AFTER the
+        # restart are then never subtracted, while still landing on the same
+        # row as busy_wait_millis and claim_transaction_millis.  The phases
+        # exceed the window by exactly that unsubtracted amount.
+        #
+        # Measured live on epoch 21: 1 row in 150,170, sched=111 against
+        # coord=111 with txn=4 and busy=18 added on top.
+        #
+        # Needs both halves of the production state: counters already carrying
+        # queue work when the scan starts (so the stale baseline is the larger
+        # number) and real time after the restart (so the window has room the
+        # unsubtracted figure can fill).  The amounts are scaled up from the
+        # live row so the two outcomes cannot overlap on timing jitter.
+        ScoreCache(self.cache_path, BRANCH).close()
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+
+        def scan_that_restarts_then_takes_the_lock():
+            time.sleep(0.02)
+            w._restart_coordination_window()     # zeroes the queue's counters
+            time.sleep(0.05)                     # window the scan must fit in
+            w.queue._last_claim_busy_millis += 250
+            return ("claimed",)
+        try:
+            # Queue work from before this scan, not yet consumed by a row.
+            w.queue._last_claim_busy_millis = 300
+            w._claim_one_uninstrumented = scan_that_restarts_then_takes_the_lock
+            self.assertIsNotNone(w.claim_one())
+        finally:
+            w.close()
+
+        # 250 ms of queue time against a ~50 ms window leaves the scheduling
+        # phase nothing.  Measuring the delta from the stale baseline instead
+        # nets off zero and hands it the whole window.
+        self.assertEqual(w._pending_scheduling_millis, 0)
+
+    def test_queue_time_from_before_the_scan_is_not_netted_off(self):
+        # The mirror.  The baseline is the queue's counters as the scan opens,
+        # not zero: residue from earlier queue work is not this scan's to
+        # subtract, and taking it off anyway shrinks the scheduling phase to
+        # nothing and hands the difference to idle_millis, which then reads as
+        # a starved worker.  No restart here, so the baseline must survive the
+        # whole scan.
+        ScoreCache(self.cache_path, BRANCH).close()
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+
+        def scan_that_takes_the_lock():
+            time.sleep(0.05)
+            w.queue._last_claim_busy_millis += 20
+            return ("claimed",)
+        try:
+            w.queue._last_claim_busy_millis = 300   # not this scan's doing
+            w._claim_one_uninstrumented = scan_that_takes_the_lock
+            self.assertIsNotNone(w.claim_one())
+        finally:
+            w.close()
+
+        # ~50 ms of scan less the 20 ms this scan spent on the lock.  Netting
+        # off all 320 would leave zero.
+        self.assertGreaterEqual(w._pending_scheduling_millis, 20)
 
     def test_a_scan_that_finalizes_mid_flight_reports_only_its_tail(self):
         # _claim_active_branch sweeps branches for finalization as it walks, and

@@ -217,6 +217,19 @@ cost per opener in the metric the count computes. `_scan_opener_in_flight`
 marks that case and is cleared when the loop ends, because the direct-branch
 and pairing fallback past it walk no openers and must credit none.
 
+**The queue-attribution baseline moves with the restart for the same reason.**
+`claim_one` subtracts the queue's share from the scheduling figure so the
+phases stay disjoint, measured as a delta against
+`_scan_attributed_baseline`. A restart calls `discard_claim_attribution()`,
+which zeroes those counters — so a baseline taken at scan start is then larger
+than they are, the delta clamps to zero, and the lock wait and claim
+transaction taken *after* the restart are never subtracted while still landing
+on the same row. `_restart_coordination_window` therefore resets the baseline
+to 0 alongside everything else, and `claim_one` sets it **last** in its
+prologue so nothing there moves it back. It is the queue's counters as the scan
+opens, never zero: residue from earlier queue work is not this scan's to
+subtract.
+
 So a restart that moves the window forward leaves attribution describing work
 that happened *before* the new origin, and the next row reports it as a phase
 of a window that excludes it. The parts then exceed the whole and
