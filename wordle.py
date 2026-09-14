@@ -44,6 +44,7 @@ from wordle_engine import (
     decode_response, max_entropy,
     answer_to_restriction, enumerate_branches,
     min_expected_guesses, verify_erd_cache, rank_candidates_by_max_group_size_then_entropy_gain,
+    evaluate_candidate, BranchFloorTable, SOLVED,
     ERD_ALL, ERD_ANSWERS, ERD_CONSTRAINED, ERD_ANSWERS_UNFILTERED,
     GAME_GUESSES,
 )
@@ -64,7 +65,7 @@ ANSWER_FILE = DEFAULT_ANSWER_LIST_PATH
 WORDS_FILE = DEFAULT_CANDIDATE_LIST_PATH
 ENGINE_PATH = wordle_engine.__file__
 LOG_FILE = DEFAULT_DEBUG_LOG_PATH
-BUILD = "b138"
+BUILD = "b140"
 
 # Diagnostic log for background solver threads (ERDSolver,
 # BranchPrecacheSolver) — periodic progress, lifecycle events, and any
@@ -1975,8 +1976,86 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
     }
 
 
+def _live_candidate_erd(word, soln, erd_policy, erd_score_cache, guesses,
+                         pattern_matrix):
+    """Exact ERD for playing `word` against soln's current branch, computed
+    on demand instead of read from cache.
+
+    _multistep_stats' erd field is cache-only by design (a passive display
+    must never block) — a miss there just means "not cached yet", most
+    often because the background solver's admissible-bound cutoff culled
+    `word` as a candidate without ever computing its exact cost. An
+    explicit test of this exact word has already asked for the extra
+    computation, so evaluate_candidate runs here with that cutoff disabled
+    (best_erd=inf), at the position's own remaining budget — the same
+    budget the background solver selects every child at (see
+    _current_erd_budget) — writing every sub-branch it resolves back to
+    erd_score_cache. erd_policy/erd_score_cache/guesses must be the triple
+    _erd_cache_and_policy and _erd_mode_config's guesses_fn produce for the
+    caller's current (universe, compliance) grid cell, so the vocabulary
+    searched and the cache namespace written match what the background
+    solver uses for this exact mode. The result renders exactly like a
+    cache hit — this only fills the gap, it doesn't annotate it.
+
+    pattern_matrix should be gs.pattern_matrix — the same vectorized kernel
+    ERDSolver._scan passes to min_expected_guesses. A fresh BranchFloorTable
+    is built from it for this one call, mirroring what min_expected_guesses
+    does internally when given guesses and no explicit table (it isn't
+    reused across calls because each call here is its own one-candidate
+    solve, not a shared multi-candidate search). Without both, every
+    recursive node in this search falls back to the pure-Python reference
+    path — negligible for a small branch, but on an all-words vocabulary of
+    roughly 15,000 candidates this is the difference the "Numba is
+    optional" section of AGENTS.md measures at up to ~4.5x, and this call
+    runs synchronously in the foreground.
+
+    Shows the same delayed progress dots as any other slow foreground
+    computation in this file (see the "Computing entropy..." dots in this
+    function's own step2/step3 loop above) once the computation has been
+    running long enough to be worth reporting on, ending with how long it
+    took — the honest substitute for an ETA, since the search's own
+    branch-and-bound pruning makes the total amount of work unknowable in
+    advance.
+
+    Returns the exact expected remaining depth, or None if `word` gives no
+    information at all (every remaining word would respond identically) or
+    no strategy playing it can finish within the position's remaining
+    budget — the same cases _multistep_stats' cache-only path would also
+    report as unavailable.
+    """
+    branch_words = soln.current_words
+    budget = _current_erd_budget(soln)
+    branch_floor_table = BranchFloorTable(
+        guesses, cache=soln.cache, pattern_matrix=pattern_matrix)
+
+    t0 = time.time()
+    prog = {'on': False, 'next_dot': 2.0}
+
+    def _tick():
+        elapsed = time.time() - t0
+        if elapsed < 2.0:
+            return
+        if not prog['on']:
+            print(f'  Computing ERD for {word.upper()}...', end='', flush=True)
+            prog['on'] = True
+        if elapsed >= prog['next_dot']:
+            print('.', end='', flush=True)
+            prog['next_dot'] += 1.0
+
+    status, cost, _max_remaining_depth, _floor = evaluate_candidate(
+        branch_words, word, soln.cache, erd_score_cache,
+        best_erd=float('inf'), budget=budget, policy=erd_policy,
+        guesses=guesses, heartbeat=_tick, pattern_matrix=pattern_matrix,
+        branch_floor_table=branch_floor_table)
+
+    if prog['on']:
+        print(f' {time.time() - t0:.0f}s')
+
+    return cost if status == SOLVED else None
+
+
 def _compare_words(words, soln, step2_pool=None, constraint_compliant=False,
-                   all_words=None, erd_cache=None):
+                   all_words=None, erd_cache=None, gs=None):
     """Compare 2–4 words side by side."""
     n = len(soln.current_words)
 
@@ -1992,10 +2071,26 @@ def _compare_words(words, soln, step2_pool=None, constraint_compliant=False,
 
     # Build all data rows up front so we can measure max column width
     totals = [s['step1'] + s['step2'] + s['step3'] for s in all_stats]
+    # Resolved independently of _multistep_stats' own erd field, exactly as
+    # cmd_test's single-word path does (see _live_candidate_erd's docstring):
+    # that field's policy selection only ever distinguishes hard mode from
+    # everything else, so it can surface a hit from the wrong grid cell's
+    # cache namespace. gs is None only for callers (tests) that don't care
+    # about ERD at all; a full-game position has no meaningful branch ERD.
     erd_vals = [s.get('erd') for s in all_stats]
+    if gs is not None and not soln._is_full_game():
+        erd_sc, erd_policy = _erd_cache_and_policy(gs, soln)
+        if erd_sc is not None:
+            erd_guesses = _erd_mode_config(gs).guesses_fn(gs, soln)
+            erd_vals = [
+                _live_candidate_erd(w, soln, erd_policy, erd_sc, erd_guesses,
+                                    gs.pattern_matrix)
+                for w in words
+            ]
     data_rows = [
         ('Wt avg',    [s['wt_avg']      for s in all_stats], '{:.2f}', False),
-        ('Max group size', [s['max_group_size']     for s in all_stats], '{:d}',   False),
+        (_METHOD_SHORT[ScoringMethod.MAX_GROUP_SIZE],
+         [s['max_group_size'] for s in all_stats], '{:d}', False),
         ('Solve%',    [s['prob_finish'] for s in all_stats], '{:.2%}', True),
     ]
     if any(v is not None for v in erd_vals):
@@ -2104,7 +2199,7 @@ def cmd_test(gs, inline=''):
     try:
         if 2 <= len(words) <= 4:
             assert all(len(w) == 5 for w in words)
-            _compare_words(words, soln, step2_pool, constraint_compliant, gs.all_words, erd_cache)
+            _compare_words(words, soln, step2_pool, constraint_compliant, gs.all_words, erd_cache, gs)
             return
         assert len(words) == 1 and len(words[0]) == 5
         word = words[0]
@@ -2173,7 +2268,25 @@ def cmd_test(gs, inline=''):
                     else (f'top {len(step2_pool)}' if step2_pool else 'possible answers'))
             print(f'\n  Multi-step lookahead ({mode}):')
             total = st['step1'] + st['step2'] + st['step3']
-            erd   = st.get('erd')
+            # Resolved independently of st['erd']: _multistep_stats' own
+            # policy selection there only ever distinguishes hard mode from
+            # everything else, so for either ALL_ANSWERS grid cell it reads
+            # (and would report a hit from) the unrelated ERD_ALL namespace
+            # instead of ERD_ANSWERS/ERD_ANSWERS_UNFILTERED. Going through
+            # _live_candidate_erd unconditionally for the actual current
+            # mode sidesteps that entirely — its own cache reuse (via
+            # evaluate_candidate/_solve_subset) is just as cheap as a plain
+            # read when the position is already fully cached under the
+            # right scope, and only computes live, with the delayed
+            # progress dots, on a genuine miss.
+            erd = None
+            if not soln._is_full_game():
+                erd_sc, erd_policy = _erd_cache_and_policy(gs, soln)
+                if erd_sc is not None:
+                    erd_guesses = _erd_mode_config(gs).guesses_fn(gs, soln)
+                    erd = _live_candidate_erd(
+                        word, soln, erd_policy, erd_sc, erd_guesses,
+                        gs.pattern_matrix)
             chain_vals = [st['step1'], st['step2'], st['step3'], total]
             _vw = max(len(f'{v:.4f}') for v in chain_vals)
             _rows = []

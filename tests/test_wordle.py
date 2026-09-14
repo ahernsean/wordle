@@ -30,8 +30,8 @@ from wordle_engine import (
     min_expected_guesses, ERD_ALL, ERD_ANSWERS, ERD_CONSTRAINED,
     ERD_ANSWERS_UNFILTERED, cache_all_scores, verify_erd_cache,
     enumerate_branches, rank_candidates_by_max_group_size_then_entropy_gain, _cache_reuse,
-    _solve_subset, max_solvable_within, evaluate_candidate,
-    SOLVED, OVER_ERD_LIMIT,
+    _solve_subset, max_solvable_within, evaluate_candidate, BranchFloorTable,
+    SOLVED, OVER_ERD_LIMIT, NO_INFORMATION_GAINED, GAME_GUESSES,
 )
 from cache_sqlite import ScoreCache, MemoryScoreCache
 from wordle import (
@@ -45,6 +45,7 @@ from wordle import (
     print_colored_pattern, print_colored_word, ANSI_COLORS, ANSI_RESET,
     mark, render_markup, MARK_RESET, MARK_RED, MARK_GREEN, MARK_YELLOW,
     MARK_GRAY,
+    cmd_test, _live_candidate_erd,
 )
 
 
@@ -4242,6 +4243,328 @@ class TestCompareWordsDisplay(unittest.TestCase):
         self.assertIn('CRANE*', header)
         self.assertIn('BRAIN ', header)
         self.assertNotIn('BRAIN*', header)
+
+
+# ---------------------------------------------------------------------------
+# _live_candidate_erd: on-demand exact ERD for an explicitly-tested word.
+#
+# _multistep_stats' erd field stays cache-only (see
+# TestMultistepStatsERDNonBlocking above) because it also backs the passive
+# display path, which must never block. An explicit `test` has already asked
+# for extra computation, though — so when the cache comes back empty (most
+# often because this exact word was culled by the admissible-bound cutoff
+# during background search and its own cost was never computed), cmd_test
+# falls back to _live_candidate_erd instead of just showing nothing. The
+# result renders exactly like a cache hit — no commentary. These tests
+# isolate that behavior (including the delayed progress dots for a slow
+# computation) with a mocked evaluate_candidate, since the engine's own
+# search correctness is covered elsewhere.
+# ---------------------------------------------------------------------------
+
+class TestLiveCandidateERD(unittest.TestCase):
+
+    def test_solved_returns_the_exact_cost(self):
+        soln = make_solution()
+        with mock.patch('wordle.evaluate_candidate',
+                        return_value=(SOLVED, 2.5, None, False)):
+            cost = _live_candidate_erd("heart", soln, ERD_ANSWERS, None, GUESSES, None)
+        self.assertAlmostEqual(cost, 2.5)
+
+    def test_non_solved_status_returns_none(self):
+        """Covers both a candidate that gives no information at all and one
+        no strategy for which can finish within the position's budget —
+        evaluate_candidate reports both as a non-SOLVED status."""
+        soln = make_solution()
+        with mock.patch('wordle.evaluate_candidate',
+                        return_value=(NO_INFORMATION_GAINED, None, None, False)):
+            cost = _live_candidate_erd("heart", soln, ERD_ANSWERS, None, GUESSES, None)
+        self.assertIsNone(cost)
+
+    def test_evaluates_at_the_positions_remaining_budget(self):
+        """A finite remaining budget must reach evaluate_candidate, not
+        None (unrestricted) — an unrestricted optimum can pick a strategy
+        with a sub-branch that cannot finish within the guesses actually
+        left in the game, and would write its children's cache entries
+        under the wrong (unrestricted) scope instead of the budget the
+        background solver uses for this position."""
+        soln = make_solution()
+        soln.guesses = [["salet", ["gray"] * 5]]  # one guess played
+        with mock.patch('wordle.evaluate_candidate',
+                        return_value=(SOLVED, 2.5, None, False)) as fake:
+            _live_candidate_erd("heart", soln, ERD_ANSWERS, None, GUESSES, None)
+        self.assertEqual(fake.call_args.kwargs['budget'], GAME_GUESSES - 1)
+
+    def test_uses_the_supplied_policy_cache_and_guesses_unchanged(self):
+        """The caller resolves policy/cache/guesses for the current grid
+        cell; this function must search exactly that vocabulary and write
+        into exactly that cache namespace, not re-derive either."""
+        soln = make_solution()
+        sentinel_cache = object()
+        with mock.patch('wordle.evaluate_candidate',
+                        return_value=(SOLVED, 2.5, None, False)) as fake:
+            _live_candidate_erd("heart", soln, ERD_ANSWERS_UNFILTERED,
+                                sentinel_cache, ["brain", "stove"], None)
+        self.assertEqual(fake.call_args.kwargs['policy'], ERD_ANSWERS_UNFILTERED)
+        self.assertIs(fake.call_args[0][3], sentinel_cache)
+        self.assertEqual(fake.call_args.kwargs['guesses'], ["brain", "stove"])
+
+    def test_threads_pattern_matrix_and_builds_a_matching_floor_table(self):
+        """Without pattern_matrix (and a floor table built from it), every
+        recursive node in this search falls back to the pure-Python
+        reference path — negligible for a small branch, but the whole
+        point of routing through it is the all-words vocabulary
+        (~15,000 candidates) case, where this call runs synchronously in
+        the foreground."""
+        soln = make_solution()
+        sentinel_matrix = mock.Mock()
+        sentinel_matrix.is_guess_pool.return_value = False
+        with mock.patch('wordle.evaluate_candidate',
+                        return_value=(SOLVED, 2.5, None, False)) as fake:
+            _live_candidate_erd("heart", soln, ERD_ANSWERS, None, GUESSES,
+                                sentinel_matrix)
+        self.assertIs(fake.call_args.kwargs['pattern_matrix'], sentinel_matrix)
+        table = fake.call_args.kwargs['branch_floor_table']
+        self.assertIsInstance(table, BranchFloorTable)
+        self.assertTrue(table.matches_pool(tuple(GUESSES)))
+
+    def test_fast_computation_prints_nothing(self):
+        """A computation that finishes quickly must not print any progress
+        — only a slow one is worth reporting on."""
+        soln = make_solution()
+
+        def fake_evaluate_candidate(*args, **kwargs):
+            return (SOLVED, 3.0, None, False)
+
+        with mock.patch('wordle.time.time', side_effect=itertools.count(0.0, 0.1)), \
+             mock.patch('wordle.evaluate_candidate', side_effect=fake_evaluate_candidate), \
+             redirect_stdout(io.StringIO()) as out:
+            cost = _live_candidate_erd("heart", soln, ERD_ANSWERS, None, GUESSES, None)
+
+        self.assertAlmostEqual(cost, 3.0)
+        self.assertEqual(out.getvalue(), "")
+
+    def test_slow_computation_shows_progress_dots_and_elapsed_time(self):
+        """A computation running long enough (here, simulated via a fake
+        clock advancing 1s per heartbeat) prints the same delayed
+        dots-then-duration progress used elsewhere in this file, driven by
+        evaluate_candidate's own heartbeat callback."""
+        soln = make_solution()
+
+        def fake_evaluate_candidate(*args, **kwargs):
+            heartbeat = kwargs['heartbeat']
+            for _ in range(5):
+                heartbeat()
+            return (SOLVED, 3.0, None, False)
+
+        with mock.patch('wordle.time.time', side_effect=itertools.count(0.0, 1.0)), \
+             mock.patch('wordle.evaluate_candidate', side_effect=fake_evaluate_candidate), \
+             redirect_stdout(io.StringIO()) as out:
+            cost = _live_candidate_erd("heart", soln, ERD_ANSWERS, None, GUESSES, None)
+
+        self.assertAlmostEqual(cost, 3.0)
+        text = out.getvalue()
+        self.assertIn("Computing ERD for HEART...", text)
+        self.assertIn(".", text)
+        self.assertRegex(text, r'\d+s')
+
+
+# ---------------------------------------------------------------------------
+# cmd_test wiring: falls back to _live_candidate_erd only on a genuine cache
+# miss, and renders its result exactly like a cache hit (no commentary).
+# ---------------------------------------------------------------------------
+
+class TestCmdTestLiveERDWiring(unittest.TestCase):
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.tmpdir.name, 'test.sqlite3')
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    @staticmethod
+    def _gs(soln, universe=GuessUniverse.ALL_WORDS,
+            compliance=ComplianceFilter.UNFILTERED, pattern_matrix=None):
+        return types.SimpleNamespace(
+            single=True, solutions=[soln], all_words=GUESSES, all_answers=ANSWERS,
+            universe=universe, compliance=compliance,
+            constrained_erd_cache=None, pattern_matrix=pattern_matrix,
+        )
+
+    def _mid_game_soln(self):
+        soln = make_solution(db_path=self.db)
+        pattern = calculate_response("piano", "slate")
+        soln.apply_guess("piano", pattern)
+        self.assertFalse(soln._is_full_game())
+        self.assertGreaterEqual(len(soln.current_words), 3)
+        return soln
+
+    def test_erd_row_comes_from_live_candidate_erd_and_renders_plainly(self):
+        soln = self._mid_game_soln()
+        gs = self._gs(soln)
+        set_display_context(soln)
+
+        with mock.patch('wordle._live_candidate_erd', return_value=3.25) as fake, \
+             redirect_stdout(io.StringIO()) as out:
+            cmd_test(gs, inline="heart")
+
+        fake.assert_called_once()
+        self.assertEqual(fake.call_args[0][0], "heart")
+        text = out.getvalue()
+        # Same format a cache hit would produce — no tied/worse commentary.
+        self.assertIn("3.250 exp remaining depth", text)
+        self.assertNotIn("worse than best", text)
+        self.assertNotIn("tied", text)
+
+    def test_ignores_multistep_stats_own_erd_even_when_it_has_a_value(self):
+        """_multistep_stats' own erd field can be a hit from the wrong grid
+        cell's cache namespace: its policy selection only ever distinguishes
+        hard mode from everything else (see TestMultistepStatsERDPolicy), so
+        in either ALL_ANSWERS mode it reads/folds ERD_ALL instead of
+        ERD_ANSWERS/ERD_ANSWERS_UNFILTERED. cmd_test must not trust that
+        value at all — it always resolves and calls _live_candidate_erd for
+        the actual current mode, which is cheap when already cached (its own
+        cache reuse) and correct either way."""
+        soln = self._mid_game_soln()
+        gs = self._gs(soln)
+        set_display_context(soln)
+
+        fake_stats = dict(
+            step1=4.0, step2=2.0, step3=1.0, wt_avg=2.5, max_group_size=10,
+            prob_finish=0.5, buckets=[1, 2, 3, 0, 0],
+            erd=9.999)  # a hit from some other (wrong) scope
+        with mock.patch('wordle._multistep_stats', return_value=fake_stats), \
+             mock.patch('wordle._live_candidate_erd', return_value=1.234) as fake_live, \
+             redirect_stdout(io.StringIO()) as out:
+            cmd_test(gs, inline="heart")
+
+        fake_live.assert_called_once()
+        text = out.getvalue()
+        self.assertIn("1.234 exp remaining depth", text)
+        self.assertNotIn("9.999", text)
+
+    def test_answer_shaped_unfiltered_mode_uses_all_answers_and_its_own_policy(self):
+        """(ALL_ANSWERS, UNFILTERED) must search gs.all_answers under
+        ERD_ANSWERS_UNFILTERED. _multistep_stats' own internal policy
+        selection collapses this grid cell onto ERD_ALL (it only ever
+        distinguishes hard mode from everything else), so cmd_test must
+        resolve policy/cache/guesses itself from the actual grid cell
+        rather than trusting what _multistep_stats used for its cache
+        lookup."""
+        soln = self._mid_game_soln()
+        sentinel_matrix = object()
+        gs = self._gs(soln, universe=GuessUniverse.ALL_ANSWERS,
+                      compliance=ComplianceFilter.UNFILTERED,
+                      pattern_matrix=sentinel_matrix)
+        set_display_context(soln)
+
+        with mock.patch('wordle._live_candidate_erd', return_value=3.25) as fake, \
+             redirect_stdout(io.StringIO()):
+            cmd_test(gs, inline="heart")
+
+        fake.assert_called_once()
+        _word, _soln, policy, _cache, guesses, pattern_matrix = fake.call_args[0]
+        self.assertEqual(policy, ERD_ANSWERS_UNFILTERED)
+        self.assertEqual(guesses, ANSWERS)
+        self.assertIs(pattern_matrix, sentinel_matrix)
+
+    def test_no_information_result_omits_erd_row(self):
+        soln = self._mid_game_soln()
+        gs = self._gs(soln)
+        set_display_context(soln)
+
+        with mock.patch('wordle._live_candidate_erd', return_value=None), \
+             redirect_stdout(io.StringIO()) as out:
+            cmd_test(gs, inline="heart")
+
+        self.assertNotIn("ERD:", out.getvalue())
+
+
+# ---------------------------------------------------------------------------
+# _compare_words gets the same live-ERD treatment as cmd_test's single-word
+# path. At the user level `test` is one command regardless of how many
+# words are given — there is no separate "compare mode" with weaker
+# guarantees, so a culled word must be resolved live here too.
+# ---------------------------------------------------------------------------
+
+class TestCompareWordsLiveERD(unittest.TestCase):
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.tmpdir.name, 'test.sqlite3')
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    @staticmethod
+    def _gs(soln, pattern_matrix=None):
+        return types.SimpleNamespace(
+            all_words=GUESSES, all_answers=ANSWERS,
+            universe=GuessUniverse.ALL_WORDS,
+            compliance=ComplianceFilter.UNFILTERED,
+            pattern_matrix=pattern_matrix,
+        )
+
+    def _mid_game_soln(self):
+        soln = make_solution(db_path=self.db)
+        pattern = calculate_response("piano", "slate")
+        soln.apply_guess("piano", pattern)
+        self.assertFalse(soln._is_full_game())
+        return soln
+
+    def test_resolves_live_erd_for_each_word_ignoring_multistep_stats(self):
+        soln = self._mid_game_soln()
+        gs = self._gs(soln)
+        set_display_context(soln)
+
+        fake_stats = dict(
+            step1=4.0, step2=2.0, step3=1.0, wt_avg=2.5, max_group_size=10,
+            prob_finish=0.5, buckets=[1, 2, 3, 0, 0],
+            erd=9.999)  # a hit from some other (wrong) scope
+        with mock.patch('wordle._multistep_stats', return_value=fake_stats), \
+             mock.patch('wordle._live_candidate_erd',
+                        side_effect=[1.1, 2.2]) as fake_live, \
+             redirect_stdout(io.StringIO()) as out:
+            _compare_words(["heart", "share"], soln, gs=gs)
+
+        self.assertEqual(fake_live.call_count, 2)
+        text = out.getvalue()
+        self.assertIn("1.100", text)
+        self.assertIn("2.200", text)
+        self.assertNotIn("9.999", text)
+
+    def test_skips_live_erd_when_gs_not_supplied(self):
+        """gs=None is the signal a caller (e.g. a test) doesn't want ERD at
+        all — _live_candidate_erd needs gs.pattern_matrix and can't resolve
+        the current grid cell without it."""
+        soln = self._mid_game_soln()
+        set_display_context(soln)
+
+        fake_stats = dict(
+            step1=4.0, step2=2.0, step3=1.0, wt_avg=2.5, max_group_size=10,
+            prob_finish=0.5, buckets=[1, 2, 3, 0, 0], erd=None)
+        with mock.patch('wordle._multistep_stats', return_value=fake_stats), \
+             mock.patch('wordle._live_candidate_erd') as fake_live, \
+             redirect_stdout(io.StringIO()):
+            _compare_words(["heart", "share"], soln)
+
+        fake_live.assert_not_called()
+
+    def test_skips_live_erd_for_the_full_game_position(self):
+        soln = make_solution()
+        self.assertTrue(soln._is_full_game())
+        set_display_context(soln)
+        gs = self._gs(soln)
+
+        fake_stats = dict(
+            step1=4.0, step2=2.0, step3=1.0, wt_avg=2.5, max_group_size=10,
+            prob_finish=0.5, buckets=[1, 2, 3, 0, 0], erd=None)
+        with mock.patch('wordle._multistep_stats', return_value=fake_stats), \
+             mock.patch('wordle._live_candidate_erd') as fake_live, \
+             redirect_stdout(io.StringIO()):
+            _compare_words(["crane", "slate"], soln, gs=gs)
+
+        fake_live.assert_not_called()
 
 
 if __name__ == "__main__":
