@@ -158,15 +158,21 @@ class TestTelemetryInserts(_TmpQueue):
         self.q._last_claim_busy_millis = 2
         self.q._last_claim_transaction_millis = 5
         self.q._last_claim_commit_millis = 3
-        self.q.add_claim_telemetry(40, 21, 1500, 6, scheduling_millis=4)
+        self.q.add_claim_telemetry(40, 21, 1500, 6, scheduling_millis=4,
+                                   fruitless_scan_millis=1, fruitless_scans=2)
         row = self.q._conn.execute(
             "SELECT coordination_millis, busy_wait_millis, "
             "claim_transaction_millis, claim_commit_millis, "
-            "scheduling_millis, idle_millis FROM claim_telemetry").fetchone()
+            "scheduling_millis, fruitless_scan_millis, fruitless_scans, "
+            "idle_millis FROM claim_telemetry").fetchone()
         self.assertEqual(row["busy_wait_millis"], 2)
         self.assertEqual(row["claim_transaction_millis"], 5)
         self.assertEqual(row["claim_commit_millis"], 3)
         self.assertEqual(row["scheduling_millis"], 4)
+        self.assertEqual(row["fruitless_scan_millis"], 1)
+        self.assertEqual(row["fruitless_scans"], 2)
+        # The fruitless scans lie outside the coordination window, so they do
+        # not reduce the remainder.
         self.assertEqual(row["idle_millis"], 21 - 5 - 3 - 2 - 4)
         # The five phases partition coordination_millis exactly.
         self.assertEqual(

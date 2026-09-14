@@ -77,6 +77,99 @@ class _TmpQueue(unittest.TestCase):
         return claim[1][0] if claim is not None else None
 
 
+class TestFruitlessScanColumnMigration(unittest.TestCase):
+    """A telemetry file written before the scan columns existed gains them on
+    open, and its existing rows say the split is unknown rather than absent."""
+
+    def _legacy_telemetry_file(self, queue_path):
+        """Write a claim_telemetry table in its pre-scan-column shape, holding
+        one row, at the telemetry path the queue will attach."""
+        telemetry_path = erd_queue.derive_telemetry_path(queue_path)
+        connection = sqlite3.connect(telemetry_path)
+        connection.execute("""
+            CREATE TABLE claim_telemetry (
+                id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+                n_words                   INTEGER NOT NULL,
+                coordination_millis       INTEGER NOT NULL,
+                candidate_evaluation_millis INTEGER,
+                work_nodes                INTEGER NOT NULL,
+                claim_retries             INTEGER,
+                busy_wait_millis          INTEGER,
+                worker_count              INTEGER,
+                branch_worker_count       INTEGER,
+                evaluation_bound_erd      REAL,
+                branch_id                 INTEGER,
+                spine                     TEXT,
+                worker_id                 TEXT,
+                bundle_id                 TEXT,
+                idx                       INTEGER,
+                bundle_start_idx          INTEGER,
+                bundle_end_idx            INTEGER,
+                claim_transaction_millis  INTEGER,
+                claim_commit_millis       INTEGER,
+                scheduling_millis         INTEGER,
+                idle_millis               INTEGER,
+                epoch                     INTEGER NOT NULL DEFAULT 0,
+                recorded_at               INTEGER NOT NULL
+            )
+        """)
+        connection.execute(
+            "INSERT INTO claim_telemetry (n_words, coordination_millis, "
+            "work_nodes, scheduling_millis, idle_millis, recorded_at) "
+            "VALUES (40, 21, 1500, 4, 10, 0)")
+        connection.commit()
+        connection.close()
+        return telemetry_path
+
+    def test_open_adds_the_scan_columns_and_leaves_old_rows_unknown(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            queue_path = os.path.join(temporary_directory, 'q.sqlite3')
+            telemetry_path = self._legacy_telemetry_file(queue_path)
+
+            ProductionERDQueue(queue_path).close()
+
+            connection = sqlite3.connect(telemetry_path)
+            connection.row_factory = sqlite3.Row
+            columns = [row[1] for row in connection.execute(
+                "PRAGMA table_info(claim_telemetry)")]
+            row = connection.execute(
+                "SELECT scan_openers_walked, fruitless_scan_millis, "
+                "fruitless_scans, fruitless_scan_openers_walked, idle_millis "
+                "FROM claim_telemetry").fetchone()
+            connection.close()
+            for column in ('scan_openers_walked', 'fruitless_scan_millis',
+                           'fruitless_scans',
+                           'fruitless_scan_openers_walked'):
+                self.assertIn(column, columns)
+            # A backfill of 0 would claim the row had no fruitless scans; its
+            # scan cost is in fact folded into idle_millis and unrecoverable,
+            # which is what NULL says.
+            self.assertEqual(tuple(row)[:4], (None, None, None, None))
+            self.assertEqual(row['idle_millis'], 10)
+
+    def test_reopening_a_migrated_file_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            queue_path = os.path.join(temporary_directory, 'q.sqlite3')
+            telemetry_path = self._legacy_telemetry_file(queue_path)
+
+            ProductionERDQueue(queue_path).close()
+            connection = sqlite3.connect(telemetry_path)
+            after_first = [row[1] for row in connection.execute(
+                "PRAGMA table_info(claim_telemetry)")]
+            connection.close()
+
+            ProductionERDQueue(queue_path).close()
+            connection = sqlite3.connect(telemetry_path)
+            after_second = [row[1] for row in connection.execute(
+                "PRAGMA table_info(claim_telemetry)")]
+            row_count = connection.execute(
+                "SELECT COUNT(*) FROM claim_telemetry").fetchone()[0]
+            connection.close()
+
+            self.assertEqual(after_first, after_second)
+            self.assertEqual(row_count, 1)
+
+
 class TestLegacyPriorityMigration(unittest.TestCase):
     def test_migration_neutralizes_only_unfinished_legacy_priorities(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
