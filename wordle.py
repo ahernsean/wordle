@@ -44,6 +44,7 @@ from wordle_engine import (
     decode_response, max_entropy,
     answer_to_restriction, enumerate_branches,
     min_expected_guesses, verify_erd_cache, rank_candidates_by_max_group_size_then_entropy_gain,
+    evaluate_candidate, SOLVED,
     ERD_ALL, ERD_ANSWERS, ERD_CONSTRAINED, ERD_ANSWERS_UNFILTERED,
     GAME_GUESSES,
 )
@@ -1758,7 +1759,13 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
     """
     Compute 3-step expected entropy and group stats for a single word.
     Returns a dict with keys: step1, step2, step3, max_group_size,
-    wt_avg, prob_finish, buckets.
+    wt_avg, prob_finish, buckets, erd, erd_policy, erd_score_cache.
+
+    erd_policy/erd_score_cache are the ERD cache namespace and cache object
+    this call used to look erd up (None when erd wasn't attempted at all,
+    i.e. soln is the full game) — exposed so a caller that gets erd=None
+    from a cache miss can, if it wants to, go compute the value itself
+    against the exact same scope rather than re-deriving it.
 
     step2_pool: candidate pool for step 2. If None and not constraint_compliant,
         uses only the branch (answers-only mode).
@@ -1927,6 +1934,8 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
     # solver keeps populating the cache in the background, more of these
     # lookups become hits for free.
     erd = None
+    erd_policy = None
+    erd_score_cache = None
     if not soln._is_full_game():
         if constraint_compliant:
             # Hard-mode ERD values are path-dependent (the eligible guess
@@ -1972,7 +1981,63 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
         'wt_avg': wt_avg, 'prob_finish': prob_fin,
         'buckets': buckets,
         'erd': erd,
+        'erd_policy': erd_policy,
+        'erd_score_cache': erd_score_cache,
     }
+
+
+def _erd_live_guesses(gs, soln, erd_policy):
+    """The guess vocabulary matching erd_policy, for a live evaluate_candidate
+    call — the same mapping _ERD_MODE_CONFIG uses to pick guesses_fn per
+    policy, inlined here since callers only have the policy, not the
+    (universe, compliance) cell it came from."""
+    if erd_policy == ERD_CONSTRAINED:
+        return soln.constraint_compliant_words(gs.all_words)
+    if erd_policy == ERD_ANSWERS:
+        return soln.current_words
+    return gs.all_words  # ERD_ALL
+
+
+def _live_candidate_erd(word, gs, soln, erd_policy, erd_score_cache):
+    """Exact ERD for playing `word` against soln's current branch, computed
+    on demand instead of read from cache.
+
+    _multistep_stats' erd field is cache-only by design (a passive display
+    must never block) — a miss there just means "not cached yet", and the
+    likeliest reason is that the background solver's admissible-bound cutoff
+    culled `word` as a candidate: it proved word can't beat the best guess
+    found so far without ever computing word's own exact cost. That leaves a
+    real question unanswered — tied with the best, or actually worse? — that
+    only an explicit `test` of this exact word asks. evaluate_candidate with
+    best_erd=inf disables that cutoff for this one candidate and recurses
+    exactly, writing every sub-branch it resolves back to erd_score_cache
+    same as the background solver would.
+
+    Returns (cost, note): cost is the exact expected remaining depth (None
+    if `word` gives no information at all — every remaining word would
+    respond identically), and note is a short parenthesized comparison
+    against the branch's own best known guess, or an explanatory string when
+    no comparison is possible.
+    """
+    branch_words = soln.current_words
+    guesses = _erd_live_guesses(gs, soln, erd_policy)
+    print('  Computing exact ERD for this word (missing from cache, possibly '
+          'culled during search)...', end='', flush=True)
+    status, cost, _max_depth, _floor = evaluate_candidate(
+        branch_words, word, soln.cache, erd_score_cache,
+        best_erd=float('inf'), budget=None, policy=erd_policy,
+        guesses=guesses)
+    print()
+    if status != SOLVED:
+        return None, '(gives no information — every remaining word responds identically)'
+    best = erd_score_cache.read(ScoreCache.encode_subset(branch_words), erd_policy)
+    if best is None:
+        return cost, ' (live; branch not fully solved yet, so no best to compare against)'
+    best_word, best_cost = best
+    if abs(cost - best_cost) < 1e-9:
+        tie = 'tied for best' if word == best_word else f'tied with best {best_word.upper()}'
+        return cost, f' ({tie})'
+    return cost, f' ({cost - best_cost:.3f} worse than best {best_word.upper()} {best_cost:.3f})'
 
 
 def _compare_words(words, soln, step2_pool=None, constraint_compliant=False,
@@ -2173,12 +2238,23 @@ def cmd_test(gs, inline=''):
                     else (f'top {len(step2_pool)}' if step2_pool else 'possible answers'))
             print(f'\n  Multi-step lookahead ({mode}):')
             total = st['step1'] + st['step2'] + st['step3']
-            erd   = st.get('erd')
+            erd      = st.get('erd')
+            erd_note = ''
+            # An explicit test asks for extra computation, unlike the passive
+            # cache-only display elsewhere — so a cache miss here (most often
+            # this word being culled by the admissible-bound cutoff during
+            # background search, never fully evaluated) is worth resolving
+            # live rather than silently omitting the ERD row.
+            if erd is None and st.get('erd_policy') is not None:
+                erd, erd_note = _live_candidate_erd(
+                    word, gs, soln, st['erd_policy'], st['erd_score_cache'])
             chain_vals = [st['step1'], st['step2'], st['step3'], total]
             _vw = max(len(f'{v:.4f}') for v in chain_vals)
             _rows = []
             if erd is not None:
-                _rows.append(('ERD:', f'{erd:>{_vw}.3f} exp remaining depth'))
+                _rows.append(('ERD:', f'{erd:>{_vw}.3f} exp remaining depth{erd_note}'))
+            elif erd_note:
+                _rows.append(('ERD:', erd_note))
             _rows += [
                 ('Entropy 1:', f'{st["step1"]:>{_vw}.4f}'),
                 ('+ ent. 2:',  f'{st["step2"]:>{_vw}.4f}'),

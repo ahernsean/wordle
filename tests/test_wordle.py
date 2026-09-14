@@ -31,7 +31,7 @@ from wordle_engine import (
     ERD_ANSWERS_UNFILTERED, cache_all_scores, verify_erd_cache,
     enumerate_branches, rank_candidates_by_max_group_size_then_entropy_gain, _cache_reuse,
     _solve_subset, max_solvable_within, evaluate_candidate,
-    SOLVED, OVER_ERD_LIMIT,
+    SOLVED, OVER_ERD_LIMIT, NO_INFORMATION_GAINED,
 )
 from cache_sqlite import ScoreCache, MemoryScoreCache
 from wordle import (
@@ -45,6 +45,7 @@ from wordle import (
     print_colored_pattern, print_colored_word, ANSI_COLORS, ANSI_RESET,
     mark, render_markup, MARK_RESET, MARK_RED, MARK_GREEN, MARK_YELLOW,
     MARK_GRAY,
+    cmd_test, _live_candidate_erd, _erd_live_guesses,
 )
 
 
@@ -4242,6 +4243,166 @@ class TestCompareWordsDisplay(unittest.TestCase):
         self.assertIn('CRANE*', header)
         self.assertIn('BRAIN ', header)
         self.assertNotIn('BRAIN*', header)
+
+
+# ---------------------------------------------------------------------------
+# _live_candidate_erd: on-demand exact ERD for an explicitly-tested word,
+# and the tied-vs-worse verdict against the branch's own best known guess.
+#
+# _multistep_stats' erd field stays cache-only (see
+# TestMultistepStatsERDNonBlocking above) because it also backs the passive
+# display path, which must never block. An explicit `test` has already asked
+# for extra computation, though — so when the cache comes back empty (most
+# often because this exact word was culled by the admissible-bound cutoff
+# during background search and its own cost was never computed), cmd_test
+# falls back to _live_candidate_erd instead of just showing nothing. These
+# tests isolate its message-construction logic with a mocked
+# evaluate_candidate and a minimal fake cache, since the engine's own
+# correctness is covered elsewhere.
+# ---------------------------------------------------------------------------
+
+class _FakeBestCache:
+    """Minimal score_cache stand-in exposing only .read(key, policy)."""
+
+    def __init__(self, best):
+        self._best = best
+
+    def read(self, branch_key, policy):
+        return self._best
+
+
+class TestLiveCandidateERD(unittest.TestCase):
+
+    def test_same_word_as_best_reports_tied_for_best(self):
+        soln = make_solution()
+        sc = _FakeBestCache(("heart", 2.5))
+        with mock.patch('wordle.evaluate_candidate',
+                        return_value=(SOLVED, 2.5, None, False)):
+            cost, note = _live_candidate_erd("heart", None, soln, ERD_ANSWERS, sc)
+        self.assertAlmostEqual(cost, 2.5)
+        self.assertIn("tied for best", note)
+
+    def test_different_word_tied_with_best_names_the_best_word(self):
+        soln = make_solution()
+        sc = _FakeBestCache(("crane", 2.5))
+        with mock.patch('wordle.evaluate_candidate',
+                        return_value=(SOLVED, 2.5, None, False)):
+            cost, note = _live_candidate_erd("heart", None, soln, ERD_ANSWERS, sc)
+        self.assertAlmostEqual(cost, 2.5)
+        self.assertIn("tied with best CRANE", note)
+        self.assertNotIn("tied for best", note)
+
+    def test_worse_than_best_reports_the_gap(self):
+        soln = make_solution()
+        sc = _FakeBestCache(("crane", 2.5))
+        with mock.patch('wordle.evaluate_candidate',
+                        return_value=(SOLVED, 3.0, None, False)):
+            cost, note = _live_candidate_erd("heart", None, soln, ERD_ANSWERS, sc)
+        self.assertAlmostEqual(cost, 3.0)
+        self.assertIn("0.500 worse than best CRANE 2.500", note)
+
+    def test_no_known_best_still_reports_the_computed_cost(self):
+        soln = make_solution()
+        sc = _FakeBestCache(None)
+        with mock.patch('wordle.evaluate_candidate',
+                        return_value=(SOLVED, 3.0, None, False)):
+            cost, note = _live_candidate_erd("heart", None, soln, ERD_ANSWERS, sc)
+        self.assertAlmostEqual(cost, 3.0)
+        self.assertIn("branch not fully solved yet", note)
+
+    def test_no_information_candidate_reports_no_cost(self):
+        soln = make_solution()
+        sc = _FakeBestCache(("crane", 2.5))
+        with mock.patch('wordle.evaluate_candidate',
+                        return_value=(NO_INFORMATION_GAINED, None, None, False)):
+            cost, note = _live_candidate_erd("heart", None, soln, ERD_ANSWERS, sc)
+        self.assertIsNone(cost)
+        self.assertIn("no information", note)
+
+
+class TestErdLiveGuesses(unittest.TestCase):
+
+    def test_constrained_uses_constraint_compliant_vocabulary(self):
+        soln = make_solution()
+        gs = types.SimpleNamespace(all_words=GUESSES)
+        self.assertEqual(_erd_live_guesses(gs, soln, ERD_CONSTRAINED),
+                         soln.constraint_compliant_words(GUESSES))
+
+    def test_answers_policy_uses_current_words(self):
+        soln = make_solution()
+        self.assertEqual(_erd_live_guesses(None, soln, ERD_ANSWERS),
+                         soln.current_words)
+
+    def test_all_policy_uses_gs_all_words(self):
+        soln = make_solution()
+        gs = types.SimpleNamespace(all_words=GUESSES)
+        self.assertEqual(_erd_live_guesses(gs, soln, ERD_ALL), GUESSES)
+
+
+# ---------------------------------------------------------------------------
+# cmd_test wiring: falls back to _live_candidate_erd only on a genuine cache
+# miss, and renders whatever note it returns.
+# ---------------------------------------------------------------------------
+
+class TestCmdTestLiveERDWiring(unittest.TestCase):
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.tmpdir.name, 'test.sqlite3')
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    @staticmethod
+    def _gs(soln):
+        return types.SimpleNamespace(
+            single=True, solutions=[soln], all_words=GUESSES,
+            universe=GuessUniverse.ALL_WORDS,
+            compliance=ComplianceFilter.UNFILTERED,
+            constrained_erd_cache=None,
+        )
+
+    def _mid_game_soln(self):
+        soln = make_solution(db_path=self.db)
+        pattern = calculate_response("piano", "slate")
+        soln.apply_guess("piano", pattern)
+        self.assertFalse(soln._is_full_game())
+        self.assertGreaterEqual(len(soln.current_words), 3)
+        return soln
+
+    def test_cache_miss_triggers_live_computation_and_shows_its_note(self):
+        soln = self._mid_game_soln()
+        gs = self._gs(soln)
+        set_display_context(soln)
+
+        with mock.patch(
+                'wordle._live_candidate_erd',
+                return_value=(3.25, ' (0.500 worse than best CRANE 2.750)')) as fake, \
+             redirect_stdout(io.StringIO()) as out:
+            cmd_test(gs, inline="heart")
+
+        fake.assert_called_once()
+        self.assertEqual(fake.call_args[0][0], "heart")
+        text = out.getvalue()
+        self.assertIn(
+            "3.250 exp remaining depth (0.500 worse than best CRANE 2.750)", text)
+
+    def test_cache_hit_never_invokes_live_computation(self):
+        soln = self._mid_game_soln()
+        gs = self._gs(soln)
+        set_display_context(soln)
+
+        fake_stats = dict(
+            step1=4.0, step2=2.0, step3=1.0, wt_avg=2.5, max_group_size=10,
+            prob_finish=0.5, buckets=[1, 2, 3, 0, 0], erd=1.234,
+            erd_policy=ERD_ALL, erd_score_cache=None)
+        with mock.patch('wordle._multistep_stats', return_value=fake_stats), \
+             mock.patch('wordle._live_candidate_erd') as fake_live, \
+             redirect_stdout(io.StringIO()) as out:
+            cmd_test(gs, inline="heart")
+
+        fake_live.assert_not_called()
+        self.assertIn("1.234 exp remaining depth", out.getvalue())
 
 
 if __name__ == "__main__":
