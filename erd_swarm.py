@@ -2614,6 +2614,12 @@ class _BranchWorker:
         stay disjoint, and banks the number of opener-work requests the scan
         examined so that time has a denominator.
 
+        The figure is clamped to the window it will be reported in: a finalize
+        swept during the scan restarts that window from inside the scan, and a
+        phase cannot be longer than the span it partitions.  The fruitless
+        figure is deliberately not clamped — it is a phase of no window, and
+        clamping it to one would discard the cost this measurement exists for.
+
         A call that selects nothing has no branch to bill, so its cost goes to
         _pending_fruitless_scan_millis and waits for the next claim that does
         succeed.  Charging it to scheduling_millis would attribute a scan to a
@@ -2641,8 +2647,7 @@ class _BranchWorker:
         finally:
             attributed = max(
                 0, self._queue_attributed_millis() - attributed_before)
-            elapsed = max(
-                0, int((time.perf_counter() - scan_t0) * 1000) - attributed)
+            scan_millis = int((time.perf_counter() - scan_t0) * 1000)
             if work is None:
                 self._pending_scheduling_millis = 0
                 self._pending_scan_openers_walked = 0
@@ -2653,12 +2658,20 @@ class _BranchWorker:
                     # this figure or nowhere.  Read here and discarded by the
                     # window restart the caller is about to perform, which is
                     # the single owner of that clearing.
-                    self._pending_fruitless_scan_millis += elapsed + attributed
+                    self._pending_fruitless_scan_millis += scan_millis
                     self._pending_fruitless_scans += 1
                     self._pending_fruitless_scan_openers_walked += (
                         self._scan_openers_walked)
             else:
-                self._pending_scheduling_millis = elapsed
+                # A branch swept to finalization during this scan restarts the
+                # coordination window from inside it, so the scan can be older
+                # than the window it is about to be reported in.  Only the part
+                # after the current origin is a phase of that window; the rest
+                # belongs to a window that has already closed.
+                in_window_millis = int(
+                    (time.time() - self._last_claim_complete) * 1000)
+                self._pending_scheduling_millis = max(
+                    0, min(scan_millis, in_window_millis) - attributed)
                 self._pending_scan_openers_walked = self._scan_openers_walked
 
     def _queue_attributed_millis(self):

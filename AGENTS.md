@@ -187,8 +187,18 @@ separate defects have come from moving one without the other.
   for that claim's first telemetry row.
 
 `_pending_fruitless_scan_*` is the exception and must **not** be cleared by a
-restart: it is a phase of no window at all, so no window ending can invalidate
-it, and it is still owed to whichever row reports it next.
+restart, nor clamped to a window: it is a phase of no window at all, so no
+window ending can invalidate it, and it is still owed to whichever row reports
+it next.
+
+**A scan can outlive the window it will be reported in.** `_claim_active_branch`
+sweeps branches for finalization as it walks, and `maybe_finalize` restarts the
+window — from *inside* `claim_one`. The scan is then older than the window its
+scheduling figure is a phase of, so `claim_one` clamps that figure to
+`time.time() - _last_claim_complete`: a phase cannot be longer than the span it
+partitions. Live on epoch 20 this was 8 rows in 28,030, every one a single-node
+claim on a large branch (`coord=17` against `sched=308`), which is the shape a
+finalize sweep leaves behind.
 
 So a restart that moves the window forward leaves attribution describing work
 that happened *before* the new origin, and the next row reports it as a phase
