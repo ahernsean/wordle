@@ -44,7 +44,7 @@ from wordle_engine import (
     decode_response, max_entropy,
     answer_to_restriction, enumerate_branches,
     min_expected_guesses, verify_erd_cache, rank_candidates_by_max_group_size_then_entropy_gain,
-    evaluate_candidate, SOLVED,
+    evaluate_candidate, BranchFloorTable, SOLVED,
     ERD_ALL, ERD_ANSWERS, ERD_CONSTRAINED, ERD_ANSWERS_UNFILTERED,
     GAME_GUESSES,
 )
@@ -1976,7 +1976,8 @@ def _multistep_stats(word, soln, step2_pool=None, constraint_compliant=False,
     }
 
 
-def _live_candidate_erd(word, soln, erd_policy, erd_score_cache, guesses):
+def _live_candidate_erd(word, soln, erd_policy, erd_score_cache, guesses,
+                         pattern_matrix):
     """Exact ERD for playing `word` against soln's current branch, computed
     on demand instead of read from cache.
 
@@ -1996,6 +1997,18 @@ def _live_candidate_erd(word, soln, erd_policy, erd_score_cache, guesses):
     solver uses for this exact mode. The result renders exactly like a
     cache hit — this only fills the gap, it doesn't annotate it.
 
+    pattern_matrix should be gs.pattern_matrix — the same vectorized kernel
+    ERDSolver._scan passes to min_expected_guesses. A fresh BranchFloorTable
+    is built from it for this one call, mirroring what min_expected_guesses
+    does internally when given guesses and no explicit table (it isn't
+    reused across calls because each call here is its own one-candidate
+    solve, not a shared multi-candidate search). Without both, every
+    recursive node in this search falls back to the pure-Python reference
+    path — negligible for a small branch, but on an all-words vocabulary of
+    roughly 15,000 candidates this is the difference the "Numba is
+    optional" section of AGENTS.md measures at up to ~4.5x, and this call
+    runs synchronously in the foreground.
+
     Shows the same delayed progress dots as any other slow foreground
     computation in this file (see the "Computing entropy..." dots in this
     function's own step2/step3 loop above) once the computation has been
@@ -2012,6 +2025,8 @@ def _live_candidate_erd(word, soln, erd_policy, erd_score_cache, guesses):
     """
     branch_words = soln.current_words
     budget = _current_erd_budget(soln)
+    branch_floor_table = BranchFloorTable(
+        guesses, cache=soln.cache, pattern_matrix=pattern_matrix)
 
     t0 = time.time()
     prog = {'on': False, 'next_dot': 2.0}
@@ -2030,7 +2045,8 @@ def _live_candidate_erd(word, soln, erd_policy, erd_score_cache, guesses):
     status, cost, _max_remaining_depth, _floor = evaluate_candidate(
         branch_words, word, soln.cache, erd_score_cache,
         best_erd=float('inf'), budget=budget, policy=erd_policy,
-        guesses=guesses, heartbeat=_tick)
+        guesses=guesses, heartbeat=_tick, pattern_matrix=pattern_matrix,
+        branch_floor_table=branch_floor_table)
 
     if prog['on']:
         print(f' {time.time() - t0:.0f}s')
@@ -2252,7 +2268,8 @@ def cmd_test(gs, inline=''):
                 if erd_sc is not None:
                     erd_guesses = _erd_mode_config(gs).guesses_fn(gs, soln)
                     erd = _live_candidate_erd(
-                        word, soln, erd_policy, erd_sc, erd_guesses)
+                        word, soln, erd_policy, erd_sc, erd_guesses,
+                        gs.pattern_matrix)
             chain_vals = [st['step1'], st['step2'], st['step3'], total]
             _vw = max(len(f'{v:.4f}') for v in chain_vals)
             _rows = []

@@ -30,7 +30,7 @@ from wordle_engine import (
     min_expected_guesses, ERD_ALL, ERD_ANSWERS, ERD_CONSTRAINED,
     ERD_ANSWERS_UNFILTERED, cache_all_scores, verify_erd_cache,
     enumerate_branches, rank_candidates_by_max_group_size_then_entropy_gain, _cache_reuse,
-    _solve_subset, max_solvable_within, evaluate_candidate,
+    _solve_subset, max_solvable_within, evaluate_candidate, BranchFloorTable,
     SOLVED, OVER_ERD_LIMIT, NO_INFORMATION_GAINED, GAME_GUESSES,
 )
 from cache_sqlite import ScoreCache, MemoryScoreCache
@@ -4267,7 +4267,7 @@ class TestLiveCandidateERD(unittest.TestCase):
         soln = make_solution()
         with mock.patch('wordle.evaluate_candidate',
                         return_value=(SOLVED, 2.5, None, False)):
-            cost = _live_candidate_erd("heart", soln, ERD_ANSWERS, None, GUESSES)
+            cost = _live_candidate_erd("heart", soln, ERD_ANSWERS, None, GUESSES, None)
         self.assertAlmostEqual(cost, 2.5)
 
     def test_non_solved_status_returns_none(self):
@@ -4277,7 +4277,7 @@ class TestLiveCandidateERD(unittest.TestCase):
         soln = make_solution()
         with mock.patch('wordle.evaluate_candidate',
                         return_value=(NO_INFORMATION_GAINED, None, None, False)):
-            cost = _live_candidate_erd("heart", soln, ERD_ANSWERS, None, GUESSES)
+            cost = _live_candidate_erd("heart", soln, ERD_ANSWERS, None, GUESSES, None)
         self.assertIsNone(cost)
 
     def test_evaluates_at_the_positions_remaining_budget(self):
@@ -4291,7 +4291,7 @@ class TestLiveCandidateERD(unittest.TestCase):
         soln.guesses = [["salet", ["gray"] * 5]]  # one guess played
         with mock.patch('wordle.evaluate_candidate',
                         return_value=(SOLVED, 2.5, None, False)) as fake:
-            _live_candidate_erd("heart", soln, ERD_ANSWERS, None, GUESSES)
+            _live_candidate_erd("heart", soln, ERD_ANSWERS, None, GUESSES, None)
         self.assertEqual(fake.call_args.kwargs['budget'], GAME_GUESSES - 1)
 
     def test_uses_the_supplied_policy_cache_and_guesses_unchanged(self):
@@ -4303,10 +4303,29 @@ class TestLiveCandidateERD(unittest.TestCase):
         with mock.patch('wordle.evaluate_candidate',
                         return_value=(SOLVED, 2.5, None, False)) as fake:
             _live_candidate_erd("heart", soln, ERD_ANSWERS_UNFILTERED,
-                                sentinel_cache, ["brain", "stove"])
+                                sentinel_cache, ["brain", "stove"], None)
         self.assertEqual(fake.call_args.kwargs['policy'], ERD_ANSWERS_UNFILTERED)
         self.assertIs(fake.call_args[0][3], sentinel_cache)
         self.assertEqual(fake.call_args.kwargs['guesses'], ["brain", "stove"])
+
+    def test_threads_pattern_matrix_and_builds_a_matching_floor_table(self):
+        """Without pattern_matrix (and a floor table built from it), every
+        recursive node in this search falls back to the pure-Python
+        reference path — negligible for a small branch, but the whole
+        point of routing through it is the all-words vocabulary
+        (~15,000 candidates) case, where this call runs synchronously in
+        the foreground."""
+        soln = make_solution()
+        sentinel_matrix = mock.Mock()
+        sentinel_matrix.is_guess_pool.return_value = False
+        with mock.patch('wordle.evaluate_candidate',
+                        return_value=(SOLVED, 2.5, None, False)) as fake:
+            _live_candidate_erd("heart", soln, ERD_ANSWERS, None, GUESSES,
+                                sentinel_matrix)
+        self.assertIs(fake.call_args.kwargs['pattern_matrix'], sentinel_matrix)
+        table = fake.call_args.kwargs['branch_floor_table']
+        self.assertIsInstance(table, BranchFloorTable)
+        self.assertTrue(table.matches_pool(tuple(GUESSES)))
 
     def test_fast_computation_prints_nothing(self):
         """A computation that finishes quickly must not print any progress
@@ -4319,7 +4338,7 @@ class TestLiveCandidateERD(unittest.TestCase):
         with mock.patch('wordle.time.time', side_effect=itertools.count(0.0, 0.1)), \
              mock.patch('wordle.evaluate_candidate', side_effect=fake_evaluate_candidate), \
              redirect_stdout(io.StringIO()) as out:
-            cost = _live_candidate_erd("heart", soln, ERD_ANSWERS, None, GUESSES)
+            cost = _live_candidate_erd("heart", soln, ERD_ANSWERS, None, GUESSES, None)
 
         self.assertAlmostEqual(cost, 3.0)
         self.assertEqual(out.getvalue(), "")
@@ -4340,7 +4359,7 @@ class TestLiveCandidateERD(unittest.TestCase):
         with mock.patch('wordle.time.time', side_effect=itertools.count(0.0, 1.0)), \
              mock.patch('wordle.evaluate_candidate', side_effect=fake_evaluate_candidate), \
              redirect_stdout(io.StringIO()) as out:
-            cost = _live_candidate_erd("heart", soln, ERD_ANSWERS, None, GUESSES)
+            cost = _live_candidate_erd("heart", soln, ERD_ANSWERS, None, GUESSES, None)
 
         self.assertAlmostEqual(cost, 3.0)
         text = out.getvalue()
@@ -4365,11 +4384,11 @@ class TestCmdTestLiveERDWiring(unittest.TestCase):
 
     @staticmethod
     def _gs(soln, universe=GuessUniverse.ALL_WORDS,
-            compliance=ComplianceFilter.UNFILTERED):
+            compliance=ComplianceFilter.UNFILTERED, pattern_matrix=None):
         return types.SimpleNamespace(
             single=True, solutions=[soln], all_words=GUESSES, all_answers=ANSWERS,
             universe=universe, compliance=compliance,
-            constrained_erd_cache=None,
+            constrained_erd_cache=None, pattern_matrix=pattern_matrix,
         )
 
     def _mid_game_soln(self):
@@ -4422,8 +4441,10 @@ class TestCmdTestLiveERDWiring(unittest.TestCase):
         rather than trusting what _multistep_stats used for its cache
         lookup."""
         soln = self._mid_game_soln()
+        sentinel_matrix = object()
         gs = self._gs(soln, universe=GuessUniverse.ALL_ANSWERS,
-                      compliance=ComplianceFilter.UNFILTERED)
+                      compliance=ComplianceFilter.UNFILTERED,
+                      pattern_matrix=sentinel_matrix)
         set_display_context(soln)
 
         with mock.patch('wordle._live_candidate_erd', return_value=3.25) as fake, \
@@ -4431,9 +4452,10 @@ class TestCmdTestLiveERDWiring(unittest.TestCase):
             cmd_test(gs, inline="heart")
 
         fake.assert_called_once()
-        _word, _soln, policy, _cache, guesses = fake.call_args[0]
+        _word, _soln, policy, _cache, guesses, pattern_matrix = fake.call_args[0]
         self.assertEqual(policy, ERD_ANSWERS_UNFILTERED)
         self.assertEqual(guesses, ANSWERS)
+        self.assertIs(pattern_matrix, sentinel_matrix)
 
     def test_no_information_result_omits_erd_row(self):
         soln = self._mid_game_soln()
