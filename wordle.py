@@ -2003,41 +2003,54 @@ def _live_candidate_erd(word, gs, soln, erd_policy, erd_score_cache):
     on demand instead of read from cache.
 
     _multistep_stats' erd field is cache-only by design (a passive display
-    must never block) — a miss there just means "not cached yet", and the
-    likeliest reason is that the background solver's admissible-bound cutoff
-    culled `word` as a candidate: it proved word can't beat the best guess
-    found so far without ever computing word's own exact cost. That leaves a
-    real question unanswered — tied with the best, or actually worse? — that
-    only an explicit `test` of this exact word asks. evaluate_candidate with
-    best_erd=inf disables that cutoff for this one candidate and recurses
-    exactly, writing every sub-branch it resolves back to erd_score_cache
-    same as the background solver would.
+    must never block) — a miss there just means "not cached yet", most
+    often because the background solver's admissible-bound cutoff culled
+    `word` as a candidate without ever computing its exact cost. An
+    explicit test of this exact word has already asked for the extra
+    computation, so evaluate_candidate runs here with that cutoff disabled
+    (best_erd=inf), writing every sub-branch it resolves back to
+    erd_score_cache same as the background solver would. The result renders
+    exactly like a cache hit — this only fills the gap, it doesn't annotate it.
 
-    Returns (cost, note): cost is the exact expected remaining depth (None
-    if `word` gives no information at all — every remaining word would
-    respond identically), and note is a short parenthesized comparison
-    against the branch's own best known guess, or an explanatory string when
-    no comparison is possible.
+    Shows the same delayed progress dots as any other slow foreground
+    computation in this file (see the "Computing entropy..." dots in this
+    function's own step2/step3 loop above) once the computation has been
+    running long enough to be worth reporting on, ending with how long it
+    took — the honest substitute for an ETA, since the search's own
+    branch-and-bound pruning makes the total amount of work unknowable in
+    advance.
+
+    Returns the exact expected remaining depth, or None if `word` gives no
+    information at all (every remaining word would respond identically) —
+    the same case _multistep_stats' cache-only path would also report as
+    unavailable.
     """
     branch_words = soln.current_words
     guesses = _erd_live_guesses(gs, soln, erd_policy)
-    print('  Computing exact ERD for this word (missing from cache, possibly '
-          'culled during search)...', end='', flush=True)
+
+    t0 = time.time()
+    prog = {'on': False, 'next_dot': 2.0}
+
+    def _tick():
+        elapsed = time.time() - t0
+        if elapsed < 2.0:
+            return
+        if not prog['on']:
+            print(f'  Computing ERD for {word.upper()}...', end='', flush=True)
+            prog['on'] = True
+        if elapsed >= prog['next_dot']:
+            print('.', end='', flush=True)
+            prog['next_dot'] += 1.0
+
     status, cost, _max_depth, _floor = evaluate_candidate(
         branch_words, word, soln.cache, erd_score_cache,
         best_erd=float('inf'), budget=None, policy=erd_policy,
-        guesses=guesses)
-    print()
-    if status != SOLVED:
-        return None, '(gives no information — every remaining word responds identically)'
-    best = erd_score_cache.read(ScoreCache.encode_subset(branch_words), erd_policy)
-    if best is None:
-        return cost, ' (live; branch not fully solved yet, so no best to compare against)'
-    best_word, best_cost = best
-    if abs(cost - best_cost) < 1e-9:
-        tie = 'tied for best' if word == best_word else f'tied with best {best_word.upper()}'
-        return cost, f' ({tie})'
-    return cost, f' ({cost - best_cost:.3f} worse than best {best_word.upper()} {best_cost:.3f})'
+        guesses=guesses, heartbeat=_tick)
+
+    if prog['on']:
+        print(f' {time.time() - t0:.0f}s')
+
+    return cost if status == SOLVED else None
 
 
 def _compare_words(words, soln, step2_pool=None, constraint_compliant=False,
@@ -2238,23 +2251,21 @@ def cmd_test(gs, inline=''):
                     else (f'top {len(step2_pool)}' if step2_pool else 'possible answers'))
             print(f'\n  Multi-step lookahead ({mode}):')
             total = st['step1'] + st['step2'] + st['step3']
-            erd      = st.get('erd')
-            erd_note = ''
+            erd = st.get('erd')
             # An explicit test asks for extra computation, unlike the passive
             # cache-only display elsewhere — so a cache miss here (most often
             # this word being culled by the admissible-bound cutoff during
             # background search, never fully evaluated) is worth resolving
-            # live rather than silently omitting the ERD row.
+            # live rather than silently omitting the ERD row. Renders exactly
+            # like a cache hit either way.
             if erd is None and st.get('erd_policy') is not None:
-                erd, erd_note = _live_candidate_erd(
+                erd = _live_candidate_erd(
                     word, gs, soln, st['erd_policy'], st['erd_score_cache'])
             chain_vals = [st['step1'], st['step2'], st['step3'], total]
             _vw = max(len(f'{v:.4f}') for v in chain_vals)
             _rows = []
             if erd is not None:
-                _rows.append(('ERD:', f'{erd:>{_vw}.3f} exp remaining depth{erd_note}'))
-            elif erd_note:
-                _rows.append(('ERD:', erd_note))
+                _rows.append(('ERD:', f'{erd:>{_vw}.3f} exp remaining depth'))
             _rows += [
                 ('Entropy 1:', f'{st["step1"]:>{_vw}.4f}'),
                 ('+ ent. 2:',  f'{st["step2"]:>{_vw}.4f}'),

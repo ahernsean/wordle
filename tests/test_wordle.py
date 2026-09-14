@@ -4246,8 +4246,7 @@ class TestCompareWordsDisplay(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# _live_candidate_erd: on-demand exact ERD for an explicitly-tested word,
-# and the tied-vs-worse verdict against the branch's own best known guess.
+# _live_candidate_erd: on-demand exact ERD for an explicitly-tested word.
 #
 # _multistep_stats' erd field stays cache-only (see
 # TestMultistepStatsERDNonBlocking above) because it also backs the passive
@@ -4255,69 +4254,68 @@ class TestCompareWordsDisplay(unittest.TestCase):
 # for extra computation, though — so when the cache comes back empty (most
 # often because this exact word was culled by the admissible-bound cutoff
 # during background search and its own cost was never computed), cmd_test
-# falls back to _live_candidate_erd instead of just showing nothing. These
-# tests isolate its message-construction logic with a mocked
-# evaluate_candidate and a minimal fake cache, since the engine's own
-# correctness is covered elsewhere.
+# falls back to _live_candidate_erd instead of just showing nothing. The
+# result renders exactly like a cache hit — no commentary. These tests
+# isolate that behavior (including the delayed progress dots for a slow
+# computation) with a mocked evaluate_candidate, since the engine's own
+# search correctness is covered elsewhere.
 # ---------------------------------------------------------------------------
-
-class _FakeBestCache:
-    """Minimal score_cache stand-in exposing only .read(key, policy)."""
-
-    def __init__(self, best):
-        self._best = best
-
-    def read(self, branch_key, policy):
-        return self._best
-
 
 class TestLiveCandidateERD(unittest.TestCase):
 
-    def test_same_word_as_best_reports_tied_for_best(self):
+    def test_solved_returns_the_exact_cost(self):
         soln = make_solution()
-        sc = _FakeBestCache(("heart", 2.5))
         with mock.patch('wordle.evaluate_candidate',
                         return_value=(SOLVED, 2.5, None, False)):
-            cost, note = _live_candidate_erd("heart", None, soln, ERD_ANSWERS, sc)
+            cost = _live_candidate_erd("heart", None, soln, ERD_ANSWERS, None)
         self.assertAlmostEqual(cost, 2.5)
-        self.assertIn("tied for best", note)
 
-    def test_different_word_tied_with_best_names_the_best_word(self):
+    def test_non_solved_status_returns_none(self):
         soln = make_solution()
-        sc = _FakeBestCache(("crane", 2.5))
-        with mock.patch('wordle.evaluate_candidate',
-                        return_value=(SOLVED, 2.5, None, False)):
-            cost, note = _live_candidate_erd("heart", None, soln, ERD_ANSWERS, sc)
-        self.assertAlmostEqual(cost, 2.5)
-        self.assertIn("tied with best CRANE", note)
-        self.assertNotIn("tied for best", note)
-
-    def test_worse_than_best_reports_the_gap(self):
-        soln = make_solution()
-        sc = _FakeBestCache(("crane", 2.5))
-        with mock.patch('wordle.evaluate_candidate',
-                        return_value=(SOLVED, 3.0, None, False)):
-            cost, note = _live_candidate_erd("heart", None, soln, ERD_ANSWERS, sc)
-        self.assertAlmostEqual(cost, 3.0)
-        self.assertIn("0.500 worse than best CRANE 2.500", note)
-
-    def test_no_known_best_still_reports_the_computed_cost(self):
-        soln = make_solution()
-        sc = _FakeBestCache(None)
-        with mock.patch('wordle.evaluate_candidate',
-                        return_value=(SOLVED, 3.0, None, False)):
-            cost, note = _live_candidate_erd("heart", None, soln, ERD_ANSWERS, sc)
-        self.assertAlmostEqual(cost, 3.0)
-        self.assertIn("branch not fully solved yet", note)
-
-    def test_no_information_candidate_reports_no_cost(self):
-        soln = make_solution()
-        sc = _FakeBestCache(("crane", 2.5))
         with mock.patch('wordle.evaluate_candidate',
                         return_value=(NO_INFORMATION_GAINED, None, None, False)):
-            cost, note = _live_candidate_erd("heart", None, soln, ERD_ANSWERS, sc)
+            cost = _live_candidate_erd("heart", None, soln, ERD_ANSWERS, None)
         self.assertIsNone(cost)
-        self.assertIn("no information", note)
+
+    def test_fast_computation_prints_nothing(self):
+        """A computation that finishes quickly must not print any progress
+        — only a slow one is worth reporting on."""
+        soln = make_solution()
+
+        def fake_evaluate_candidate(*args, **kwargs):
+            return (SOLVED, 3.0, None, False)
+
+        with mock.patch('wordle.time.time', side_effect=itertools.count(0.0, 0.1)), \
+             mock.patch('wordle.evaluate_candidate', side_effect=fake_evaluate_candidate), \
+             redirect_stdout(io.StringIO()) as out:
+            cost = _live_candidate_erd("heart", None, soln, ERD_ANSWERS, None)
+
+        self.assertAlmostEqual(cost, 3.0)
+        self.assertEqual(out.getvalue(), "")
+
+    def test_slow_computation_shows_progress_dots_and_elapsed_time(self):
+        """A computation running long enough (here, simulated via a fake
+        clock advancing 1s per heartbeat) prints the same delayed
+        dots-then-duration progress used elsewhere in this file, driven by
+        evaluate_candidate's own heartbeat callback."""
+        soln = make_solution()
+
+        def fake_evaluate_candidate(*args, **kwargs):
+            heartbeat = kwargs['heartbeat']
+            for _ in range(5):
+                heartbeat()
+            return (SOLVED, 3.0, None, False)
+
+        with mock.patch('wordle.time.time', side_effect=itertools.count(0.0, 1.0)), \
+             mock.patch('wordle.evaluate_candidate', side_effect=fake_evaluate_candidate), \
+             redirect_stdout(io.StringIO()) as out:
+            cost = _live_candidate_erd("heart", None, soln, ERD_ANSWERS, None)
+
+        self.assertAlmostEqual(cost, 3.0)
+        text = out.getvalue()
+        self.assertIn("Computing ERD for HEART...", text)
+        self.assertIn(".", text)
+        self.assertRegex(text, r'\d+s')
 
 
 class TestErdLiveGuesses(unittest.TestCase):
@@ -4341,7 +4339,7 @@ class TestErdLiveGuesses(unittest.TestCase):
 
 # ---------------------------------------------------------------------------
 # cmd_test wiring: falls back to _live_candidate_erd only on a genuine cache
-# miss, and renders whatever note it returns.
+# miss, and renders its result exactly like a cache hit (no commentary).
 # ---------------------------------------------------------------------------
 
 class TestCmdTestLiveERDWiring(unittest.TestCase):
@@ -4370,22 +4368,22 @@ class TestCmdTestLiveERDWiring(unittest.TestCase):
         self.assertGreaterEqual(len(soln.current_words), 3)
         return soln
 
-    def test_cache_miss_triggers_live_computation_and_shows_its_note(self):
+    def test_cache_miss_triggers_live_computation_and_renders_it_plainly(self):
         soln = self._mid_game_soln()
         gs = self._gs(soln)
         set_display_context(soln)
 
-        with mock.patch(
-                'wordle._live_candidate_erd',
-                return_value=(3.25, ' (0.500 worse than best CRANE 2.750)')) as fake, \
+        with mock.patch('wordle._live_candidate_erd', return_value=3.25) as fake, \
              redirect_stdout(io.StringIO()) as out:
             cmd_test(gs, inline="heart")
 
         fake.assert_called_once()
         self.assertEqual(fake.call_args[0][0], "heart")
         text = out.getvalue()
-        self.assertIn(
-            "3.250 exp remaining depth (0.500 worse than best CRANE 2.750)", text)
+        # Same format a cache hit would produce — no tied/worse commentary.
+        self.assertIn("3.250 exp remaining depth", text)
+        self.assertNotIn("worse than best", text)
+        self.assertNotIn("tied", text)
 
     def test_cache_hit_never_invokes_live_computation(self):
         soln = self._mid_game_soln()
@@ -4403,6 +4401,17 @@ class TestCmdTestLiveERDWiring(unittest.TestCase):
 
         fake_live.assert_not_called()
         self.assertIn("1.234 exp remaining depth", out.getvalue())
+
+    def test_no_information_result_omits_erd_row(self):
+        soln = self._mid_game_soln()
+        gs = self._gs(soln)
+        set_display_context(soln)
+
+        with mock.patch('wordle._live_candidate_erd', return_value=None), \
+             redirect_stdout(io.StringIO()) as out:
+            cmd_test(gs, inline="heart")
+
+        self.assertNotIn("ERD:", out.getvalue())
 
 
 if __name__ == "__main__":
