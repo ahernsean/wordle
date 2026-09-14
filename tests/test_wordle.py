@@ -4399,7 +4399,7 @@ class TestCmdTestLiveERDWiring(unittest.TestCase):
         self.assertGreaterEqual(len(soln.current_words), 3)
         return soln
 
-    def test_cache_miss_triggers_live_computation_and_renders_it_plainly(self):
+    def test_erd_row_comes_from_live_candidate_erd_and_renders_plainly(self):
         soln = self._mid_game_soln()
         gs = self._gs(soln)
         set_display_context(soln)
@@ -4416,21 +4416,32 @@ class TestCmdTestLiveERDWiring(unittest.TestCase):
         self.assertNotIn("worse than best", text)
         self.assertNotIn("tied", text)
 
-    def test_cache_hit_never_invokes_live_computation(self):
+    def test_ignores_multistep_stats_own_erd_even_when_it_has_a_value(self):
+        """_multistep_stats' own erd field can be a hit from the wrong grid
+        cell's cache namespace: its policy selection only ever distinguishes
+        hard mode from everything else (see TestMultistepStatsERDPolicy), so
+        in either ALL_ANSWERS mode it reads/folds ERD_ALL instead of
+        ERD_ANSWERS/ERD_ANSWERS_UNFILTERED. cmd_test must not trust that
+        value at all — it always resolves and calls _live_candidate_erd for
+        the actual current mode, which is cheap when already cached (its own
+        cache reuse) and correct either way."""
         soln = self._mid_game_soln()
         gs = self._gs(soln)
         set_display_context(soln)
 
         fake_stats = dict(
             step1=4.0, step2=2.0, step3=1.0, wt_avg=2.5, max_group_size=10,
-            prob_finish=0.5, buckets=[1, 2, 3, 0, 0], erd=1.234)
+            prob_finish=0.5, buckets=[1, 2, 3, 0, 0],
+            erd=9.999)  # a hit from some other (wrong) scope
         with mock.patch('wordle._multistep_stats', return_value=fake_stats), \
-             mock.patch('wordle._live_candidate_erd') as fake_live, \
+             mock.patch('wordle._live_candidate_erd', return_value=1.234) as fake_live, \
              redirect_stdout(io.StringIO()) as out:
             cmd_test(gs, inline="heart")
 
-        fake_live.assert_not_called()
-        self.assertIn("1.234 exp remaining depth", out.getvalue())
+        fake_live.assert_called_once()
+        text = out.getvalue()
+        self.assertIn("1.234 exp remaining depth", text)
+        self.assertNotIn("9.999", text)
 
     def test_answer_shaped_unfiltered_mode_uses_all_answers_and_its_own_policy(self):
         """(ALL_ANSWERS, UNFILTERED) must search gs.all_answers under

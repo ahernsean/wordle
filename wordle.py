@@ -2252,18 +2252,19 @@ def cmd_test(gs, inline=''):
                     else (f'top {len(step2_pool)}' if step2_pool else 'possible answers'))
             print(f'\n  Multi-step lookahead ({mode}):')
             total = st['step1'] + st['step2'] + st['step3']
-            erd = st.get('erd')
-            # An explicit test asks for extra computation, unlike the passive
-            # cache-only display elsewhere — so a cache miss here (most often
-            # this word being culled by the admissible-bound cutoff during
-            # background search, never fully evaluated) is worth resolving
-            # live rather than silently omitting the ERD row. Renders exactly
-            # like a cache hit either way. Policy/cache/guesses come from the
-            # current (universe, compliance) grid cell directly, not from
-            # _multistep_stats — its own policy selection there only ever
-            # distinguishes hard mode from everything else, which collapses
-            # two of the four grid cells onto the wrong namespace/vocabulary.
-            if erd is None and not soln._is_full_game():
+            # Resolved independently of st['erd']: _multistep_stats' own
+            # policy selection there only ever distinguishes hard mode from
+            # everything else, so for either ALL_ANSWERS grid cell it reads
+            # (and would report a hit from) the unrelated ERD_ALL namespace
+            # instead of ERD_ANSWERS/ERD_ANSWERS_UNFILTERED. Going through
+            # _live_candidate_erd unconditionally for the actual current
+            # mode sidesteps that entirely — its own cache reuse (via
+            # evaluate_candidate/_solve_subset) is just as cheap as a plain
+            # read when the position is already fully cached under the
+            # right scope, and only computes live, with the delayed
+            # progress dots, on a genuine miss.
+            erd = None
+            if not soln._is_full_game():
                 erd_sc, erd_policy = _erd_cache_and_policy(gs, soln)
                 if erd_sc is not None:
                     erd_guesses = _erd_mode_config(gs).guesses_fn(gs, soln)
