@@ -200,6 +200,13 @@ partitions. Live on epoch 20 this was 8 rows in 28,030, every one a single-node
 claim on a large branch (`coord=17` against `sched=308`), which is the shape a
 finalize sweep leaves behind.
 
+**The opener count must cover the same span as the duration it is banked
+with.** `scan_openers_walked` is counted from the current window origin, so it
+pairs with the clamped `scheduling_millis`; `fruitless_scan_openers_walked`
+counts the whole walk, because the fruitless duration is unclamped. Pairing a
+full walk with a clamped duration reports a per-opener scan cost the scan never
+achieved — and cost against queue depth is the only reason the counts exist.
+
 So a restart that moves the window forward leaves attribution describing work
 that happened *before* the new origin, and the next row reports it as a phase
 of a window that excludes it. The parts then exceed the whole and

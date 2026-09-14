@@ -1399,6 +1399,62 @@ class TestSolveBranchFocusedClaimTelemetryAttribution(unittest.TestCase):
         finally:
             w.close()
 
+    def _scan_that_walks_then_restarts_then_walks(self, worker, before, after,
+                                                  result):
+        """Stand in for a scan that finalizes a branch partway through.
+
+        Walks `before` openers, restarts the coordination window the way
+        maybe_finalize does from inside _claim_active_branch's sweep, then
+        walks `after` more and returns `result`.
+        """
+        def scan():
+            for _ in range(before):
+                worker._scan_openers_walked += 1
+                worker._scan_openers_walked_in_window += 1
+            time.sleep(0.05)
+            worker._restart_coordination_window()
+            for _ in range(after):
+                worker._scan_openers_walked += 1
+                worker._scan_openers_walked_in_window += 1
+            return result
+        return scan
+
+    def test_a_claims_opener_count_covers_the_same_span_as_its_duration(self):
+        # scheduling_millis is clamped to the part of the scan inside the
+        # current window, so the opener count banked with it must be clamped
+        # the same way.  A full walk against a partial duration reports a
+        # per-opener scan cost the scan never achieved -- and cost against
+        # queue depth is the whole reason the count is recorded.
+        ScoreCache(self.cache_path, BRANCH).close()
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        try:
+            w._claim_one_uninstrumented = (
+                self._scan_that_walks_then_restarts_then_walks(
+                    w, before=9, after=2, result=("claimed",)))
+            self.assertIsNotNone(w.claim_one())
+        finally:
+            w.close()
+
+        self.assertEqual(w._pending_scan_openers_walked, 2)
+        self.assertLess(w._pending_scheduling_millis, 40)
+
+    def test_a_fruitless_scans_opener_count_covers_its_whole_walk(self):
+        # The mirror: the fruitless duration is not clamped, so its count must
+        # not be either.  Clamping one and not the other is the same defect in
+        # the opposite direction.
+        ScoreCache(self.cache_path, BRANCH).close()
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        try:
+            w._claim_one_uninstrumented = (
+                self._scan_that_walks_then_restarts_then_walks(
+                    w, before=9, after=2, result=None))
+            self.assertIsNone(w.claim_one())
+        finally:
+            w.close()
+
+        self.assertEqual(w._pending_fruitless_scan_openers_walked, 11)
+        self.assertGreaterEqual(w._pending_fruitless_scan_millis, 40)
+
     def test_a_fruitless_scan_is_not_clamped_to_a_window_it_is_not_in(self):
         # The mirror of the clamp: scheduling_millis is a phase of the window
         # and must fit inside it, but the fruitless figure is a phase of no

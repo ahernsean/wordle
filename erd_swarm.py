@@ -714,8 +714,12 @@ class _BranchWorker:
         self._pending_fruitless_scan_openers_walked = 0
         # Openers examined by the scan in flight, counted by
         # _claim_one_uninstrumented and banked by claim_one, and whether that
-        # scan selected a branch despite returning no bundle.
+        # scan selected a branch despite returning no bundle.  Two counts,
+        # because the two figures they pair with have different spans: the
+        # whole scan for the fruitless cost, and only the part inside the
+        # current coordination window for the scheduling phase.
         self._scan_openers_walked = 0
+        self._scan_openers_walked_in_window = 0
         self._scan_selected_work = False
         # Direct cooperative callers can create active branches without a
         # opener-work request.  Keep their tight claim loop free of the
@@ -781,6 +785,10 @@ class _BranchWorker:
         # at all, and are still owed to whichever row reports them.
         self._pending_scheduling_millis = 0
         self._pending_scan_openers_walked = 0
+        # A scan in flight across this restart keeps only the openers it walks
+        # from here, so the count it banks describes the same span as the
+        # duration it is clamped to.
+        self._scan_openers_walked_in_window = 0
 
     def _idle_wait(self, seconds):
         """Sleep while this worker has no claimable work, then reopen the
@@ -2639,6 +2647,7 @@ class _BranchWorker:
         scan_t0 = time.perf_counter()
         attributed_before = self._queue_attributed_millis()
         self._scan_openers_walked = 0
+        self._scan_openers_walked_in_window = 0
         self._scan_selected_work = False
         work = None
         try:
@@ -2672,7 +2681,11 @@ class _BranchWorker:
                     (time.time() - self._last_claim_complete) * 1000)
                 self._pending_scheduling_millis = max(
                     0, min(scan_millis, in_window_millis) - attributed)
-                self._pending_scan_openers_walked = self._scan_openers_walked
+                # Paired with the clamped duration, so the two describe the
+                # same span: a full walk against a partial duration would
+                # report a per-opener cost the scan never achieved.
+                self._pending_scan_openers_walked = (
+                    self._scan_openers_walked_in_window)
 
     def _queue_attributed_millis(self):
         """Coordination time the queue has already attributed to a named phase
@@ -2797,6 +2810,7 @@ class _BranchWorker:
                           if self._opener_work_enabled else ())
         for opener_work in candidate_rows:
             self._scan_openers_walked += 1
+            self._scan_openers_walked_in_window += 1
             if top_priority is None:
                 top_priority = opener_work['requested_priority']
             opener_work_id = opener_work['opener_work_id']
