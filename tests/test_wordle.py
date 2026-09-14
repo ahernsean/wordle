@@ -4480,5 +4480,92 @@ class TestCmdTestLiveERDWiring(unittest.TestCase):
         self.assertNotIn("ERD:", out.getvalue())
 
 
+# ---------------------------------------------------------------------------
+# _compare_words gets the same live-ERD treatment as cmd_test's single-word
+# path. At the user level `test` is one command regardless of how many
+# words are given — there is no separate "compare mode" with weaker
+# guarantees, so a culled word must be resolved live here too.
+# ---------------------------------------------------------------------------
+
+class TestCompareWordsLiveERD(unittest.TestCase):
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.tmpdir.name, 'test.sqlite3')
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    @staticmethod
+    def _gs(soln, pattern_matrix=None):
+        return types.SimpleNamespace(
+            all_words=GUESSES, all_answers=ANSWERS,
+            universe=GuessUniverse.ALL_WORDS,
+            compliance=ComplianceFilter.UNFILTERED,
+            pattern_matrix=pattern_matrix,
+        )
+
+    def _mid_game_soln(self):
+        soln = make_solution(db_path=self.db)
+        pattern = calculate_response("piano", "slate")
+        soln.apply_guess("piano", pattern)
+        self.assertFalse(soln._is_full_game())
+        return soln
+
+    def test_resolves_live_erd_for_each_word_ignoring_multistep_stats(self):
+        soln = self._mid_game_soln()
+        gs = self._gs(soln)
+        set_display_context(soln)
+
+        fake_stats = dict(
+            step1=4.0, step2=2.0, step3=1.0, wt_avg=2.5, max_group_size=10,
+            prob_finish=0.5, buckets=[1, 2, 3, 0, 0],
+            erd=9.999)  # a hit from some other (wrong) scope
+        with mock.patch('wordle._multistep_stats', return_value=fake_stats), \
+             mock.patch('wordle._live_candidate_erd',
+                        side_effect=[1.1, 2.2]) as fake_live, \
+             redirect_stdout(io.StringIO()) as out:
+            _compare_words(["heart", "share"], soln, gs=gs)
+
+        self.assertEqual(fake_live.call_count, 2)
+        text = out.getvalue()
+        self.assertIn("1.100", text)
+        self.assertIn("2.200", text)
+        self.assertNotIn("9.999", text)
+
+    def test_skips_live_erd_when_gs_not_supplied(self):
+        """gs=None is the signal a caller (e.g. a test) doesn't want ERD at
+        all — _live_candidate_erd needs gs.pattern_matrix and can't resolve
+        the current grid cell without it."""
+        soln = self._mid_game_soln()
+        set_display_context(soln)
+
+        fake_stats = dict(
+            step1=4.0, step2=2.0, step3=1.0, wt_avg=2.5, max_group_size=10,
+            prob_finish=0.5, buckets=[1, 2, 3, 0, 0], erd=None)
+        with mock.patch('wordle._multistep_stats', return_value=fake_stats), \
+             mock.patch('wordle._live_candidate_erd') as fake_live, \
+             redirect_stdout(io.StringIO()):
+            _compare_words(["heart", "share"], soln)
+
+        fake_live.assert_not_called()
+
+    def test_skips_live_erd_for_the_full_game_position(self):
+        soln = make_solution()
+        self.assertTrue(soln._is_full_game())
+        set_display_context(soln)
+        gs = self._gs(soln)
+
+        fake_stats = dict(
+            step1=4.0, step2=2.0, step3=1.0, wt_avg=2.5, max_group_size=10,
+            prob_finish=0.5, buckets=[1, 2, 3, 0, 0], erd=None)
+        with mock.patch('wordle._multistep_stats', return_value=fake_stats), \
+             mock.patch('wordle._live_candidate_erd') as fake_live, \
+             redirect_stdout(io.StringIO()):
+            _compare_words(["crane", "slate"], soln, gs=gs)
+
+        fake_live.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

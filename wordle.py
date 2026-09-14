@@ -65,7 +65,7 @@ ANSWER_FILE = DEFAULT_ANSWER_LIST_PATH
 WORDS_FILE = DEFAULT_CANDIDATE_LIST_PATH
 ENGINE_PATH = wordle_engine.__file__
 LOG_FILE = DEFAULT_DEBUG_LOG_PATH
-BUILD = "b138"
+BUILD = "b139"
 
 # Diagnostic log for background solver threads (ERDSolver,
 # BranchPrecacheSolver) — periodic progress, lifecycle events, and any
@@ -2055,7 +2055,7 @@ def _live_candidate_erd(word, soln, erd_policy, erd_score_cache, guesses,
 
 
 def _compare_words(words, soln, step2_pool=None, constraint_compliant=False,
-                   all_words=None, erd_cache=None):
+                   all_words=None, erd_cache=None, gs=None):
     """Compare 2–4 words side by side."""
     n = len(soln.current_words)
 
@@ -2071,7 +2071,22 @@ def _compare_words(words, soln, step2_pool=None, constraint_compliant=False,
 
     # Build all data rows up front so we can measure max column width
     totals = [s['step1'] + s['step2'] + s['step3'] for s in all_stats]
+    # Resolved independently of _multistep_stats' own erd field, exactly as
+    # cmd_test's single-word path does (see _live_candidate_erd's docstring):
+    # that field's policy selection only ever distinguishes hard mode from
+    # everything else, so it can surface a hit from the wrong grid cell's
+    # cache namespace. gs is None only for callers (tests) that don't care
+    # about ERD at all; a full-game position has no meaningful branch ERD.
     erd_vals = [s.get('erd') for s in all_stats]
+    if gs is not None and not soln._is_full_game():
+        erd_sc, erd_policy = _erd_cache_and_policy(gs, soln)
+        if erd_sc is not None:
+            erd_guesses = _erd_mode_config(gs).guesses_fn(gs, soln)
+            erd_vals = [
+                _live_candidate_erd(w, soln, erd_policy, erd_sc, erd_guesses,
+                                    gs.pattern_matrix)
+                for w in words
+            ]
     data_rows = [
         ('Wt avg',    [s['wt_avg']      for s in all_stats], '{:.2f}', False),
         ('Max group size', [s['max_group_size']     for s in all_stats], '{:d}',   False),
@@ -2183,7 +2198,7 @@ def cmd_test(gs, inline=''):
     try:
         if 2 <= len(words) <= 4:
             assert all(len(w) == 5 for w in words)
-            _compare_words(words, soln, step2_pool, constraint_compliant, gs.all_words, erd_cache)
+            _compare_words(words, soln, step2_pool, constraint_compliant, gs.all_words, erd_cache, gs)
             return
         assert len(words) == 1 and len(words[0]) == 5
         word = words[0]
