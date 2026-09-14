@@ -108,6 +108,8 @@ def _bare_worker():
     w._pending_fruitless_scans = 0
     w._pending_fruitless_scan_openers_walked = 0
     w._scan_openers_walked = 0
+    w._scan_openers_walked_baseline = 0
+    w._scan_opener_in_flight = False
     w._scan_selected_work = False
     w._adaptive = True
     w._erd_lower_bound_pruned_accuracy_n = 0
@@ -1405,17 +1407,17 @@ class TestSolveBranchFocusedClaimTelemetryAttribution(unittest.TestCase):
 
         Walks `before` openers, restarts the coordination window the way
         maybe_finalize does from inside _claim_active_branch's sweep, then
-        walks `after` more and returns `result`.
+        walks `after` more and returns `result`.  The restart lands between
+        openers, so no walk is in flight across it -- see
+        TestOpenerStraddlingAWindowRestart for the case where one is.
         """
         def scan():
             for _ in range(before):
                 worker._scan_openers_walked += 1
-                worker._scan_openers_walked_in_window += 1
             time.sleep(0.05)
             worker._restart_coordination_window()
             for _ in range(after):
                 worker._scan_openers_walked += 1
-                worker._scan_openers_walked_in_window += 1
             return result
         return scan
 
@@ -5489,6 +5491,69 @@ if __name__ == "__main__":
         self.assertEqual(self.queue.claim_holders_by_branch().get(taken[0]), 1,
                          "paired onto a recursion-capped dependency while a "
                          "branch was free")
+
+
+class TestOpenerStraddlingAWindowRestart(BranchOccupancyFixture,
+                                         unittest.TestCase):
+    """An opener whose own finalize restarts the coordination window is still
+    walked by the window that restart opens.
+
+    _claim_active_branch sweeps for finalization while processing an opener, so
+    the restart lands after that opener's loop increment and before the same
+    iteration promotes and claims.  Resetting the count to zero there reports
+    scan time against no openers at all -- an infinite cost per opener, in the
+    metric the count exists to compute.
+    """
+
+    def _opener_that_finalizes_then_claims(self):
+        """One opener with two branches: the first open and swept, the second
+        still pending for the same iteration to promote."""
+        self._queue_opener([BRANCH, BRANCH[:4]], opener=CANDIDATES[0])
+        self._promote(CANDIDATES[0])
+
+    def test_the_opener_whose_finalize_restarted_the_window_still_counts(self):
+        self._opener_that_finalizes_then_claims()
+        worker = self._worker(90)
+        real_claim_active = worker._claim_active_branch
+
+        def sweep_that_finalizes(*args, **kwargs):
+            # What maybe_finalize does from inside the sweep, on the branch of
+            # the opener this iteration is already counting.
+            time.sleep(0.05)
+            worker._restart_coordination_window()
+            return real_claim_active(*args, **kwargs)
+        worker._claim_active_branch = sweep_that_finalizes
+
+        work = worker.claim_one()
+
+        self.assertIsNotNone(
+            work, "fixture claimed nothing, so no row would carry the count")
+        self.assertGreaterEqual(
+            worker._pending_scan_openers_walked, 1,
+            "the opener that restarted the window was dropped from its own "
+            "window, so this row reports scan time against no openers")
+
+
+    def test_no_opener_is_in_flight_once_the_walk_is_over(self):
+        # The mirror of the case above.  Past the opener loop the scan is in
+        # the direct-branch and pairing fallback, which walks no openers, so a
+        # restart there must credit none.  A flag left set would hand that
+        # window an opener it never examined.
+        self._queue_opener([BRANCH], opener=CANDIDATES[0])
+        branch_key, _ = self._promote(CANDIDATES[0])
+        for holder in range(MAX_WORKERS_PER_BRANCH):
+            self._occupy(branch_key, 10 + holder)
+        worker = self._worker(91)
+
+        self.assertIsNone(
+            worker._claim_one_uninstrumented(),
+            "fixture is not stuck: the loop returned early, so it never ran "
+            "to completion and the flag was never due to clear")
+
+        self.assertFalse(worker._scan_opener_in_flight)
+        worker._restart_coordination_window()
+        self.assertEqual(worker._scan_openers_walked_baseline,
+                         worker._scan_openers_walked)
 
 
 class TestPromotedWithoutBundleIsNotAFruitlessScan(BranchOccupancyFixture,

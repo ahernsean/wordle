@@ -714,12 +714,14 @@ class _BranchWorker:
         self._pending_fruitless_scan_openers_walked = 0
         # Openers examined by the scan in flight, counted by
         # _claim_one_uninstrumented and banked by claim_one, and whether that
-        # scan selected a branch despite returning no bundle.  Two counts,
-        # because the two figures they pair with have different spans: the
-        # whole scan for the fruitless cost, and only the part inside the
-        # current coordination window for the scheduling phase.
+        # scan selected a branch despite returning no bundle.  The count is
+        # monotonic across the scan and the baseline marks where the current
+        # coordination window opened, because the two figures they pair with
+        # have different spans: the whole scan for the fruitless cost, and only
+        # the part inside the current window for the scheduling phase.
         self._scan_openers_walked = 0
-        self._scan_openers_walked_in_window = 0
+        self._scan_openers_walked_baseline = 0
+        self._scan_opener_in_flight = False
         self._scan_selected_work = False
         # Direct cooperative callers can create active branches without a
         # opener-work request.  Keep their tight claim loop free of the
@@ -787,8 +789,13 @@ class _BranchWorker:
         self._pending_scan_openers_walked = 0
         # A scan in flight across this restart keeps only the openers it walks
         # from here, so the count it banks describes the same span as the
-        # duration it is clamped to.
-        self._scan_openers_walked_in_window = 0
+        # duration it is clamped to.  The opener being processed is kept: its
+        # own finalize is what restarted the window, and the same iteration can
+        # still promote and claim, which would otherwise report scan time
+        # against no openers at all.
+        self._scan_openers_walked_baseline = max(
+            0, self._scan_openers_walked
+            - (1 if self._scan_opener_in_flight else 0))
 
     def _idle_wait(self, seconds):
         """Sleep while this worker has no claimable work, then reopen the
@@ -2647,7 +2654,8 @@ class _BranchWorker:
         scan_t0 = time.perf_counter()
         attributed_before = self._queue_attributed_millis()
         self._scan_openers_walked = 0
-        self._scan_openers_walked_in_window = 0
+        self._scan_openers_walked_baseline = 0
+        self._scan_opener_in_flight = False
         self._scan_selected_work = False
         work = None
         try:
@@ -2684,8 +2692,9 @@ class _BranchWorker:
                 # Paired with the clamped duration, so the two describe the
                 # same span: a full walk against a partial duration would
                 # report a per-opener cost the scan never achieved.
-                self._pending_scan_openers_walked = (
-                    self._scan_openers_walked_in_window)
+                self._pending_scan_openers_walked = max(
+                    0, self._scan_openers_walked
+                    - self._scan_openers_walked_baseline)
 
     def _queue_attributed_millis(self):
         """Coordination time the queue has already attributed to a named phase
@@ -2810,7 +2819,10 @@ class _BranchWorker:
                           if self._opener_work_enabled else ())
         for opener_work in candidate_rows:
             self._scan_openers_walked += 1
-            self._scan_openers_walked_in_window += 1
+            # This opener's work spans the rest of the iteration, including any
+            # finalize that restarts the window from inside it, so a restart
+            # here keeps it rather than dropping a walk still under way.
+            self._scan_opener_in_flight = True
             if top_priority is None:
                 top_priority = opener_work['requested_priority']
             opener_work_id = opener_work['opener_work_id']
@@ -2845,6 +2857,7 @@ class _BranchWorker:
                 # exhausted scan and is nothing like one, so say which it was.
                 self._scan_selected_work = True
                 return None
+        self._scan_opener_in_flight = False
         # A queue upgraded while active work is present can carry branches
         # from before opener lineage was recorded.  They remain claimable
         # until finalization; new work always follows opener-first order.

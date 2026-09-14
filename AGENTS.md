@@ -207,6 +207,16 @@ counts the whole walk, because the fruitless duration is unclamped. Pairing a
 full walk with a clamped duration reports a per-opener scan cost the scan never
 achieved — and cost against queue depth is the only reason the counts exist.
 
+The count is a monotonic total plus a baseline marking where the current window
+opened, not a second counter, because **the opener being processed when the
+restart fires is still in that window**. `_claim_active_branch` sweeps for
+finalization while processing an opener, so the restart lands after that
+opener's loop increment and before the same iteration promotes and claims;
+dropping it reports scan time against no openers at all, which is an infinite
+cost per opener in the metric the count computes. `_scan_opener_in_flight`
+marks that case and is cleared when the loop ends, because the direct-branch
+and pairing fallback past it walk no openers and must credit none.
+
 So a restart that moves the window forward leaves attribution describing work
 that happened *before* the new origin, and the next row reports it as a phase
 of a window that excludes it. The parts then exceed the whole and
