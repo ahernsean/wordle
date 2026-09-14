@@ -65,7 +65,7 @@ ANSWER_FILE = DEFAULT_ANSWER_LIST_PATH
 WORDS_FILE = DEFAULT_CANDIDATE_LIST_PATH
 ENGINE_PATH = wordle_engine.__file__
 LOG_FILE = DEFAULT_DEBUG_LOG_PATH
-BUILD = "b139"
+BUILD = "b140"
 
 # Diagnostic log for background solver threads (ERDSolver,
 # BranchPrecacheSolver) — periodic progress, lifecycle events, and any
@@ -2089,7 +2089,8 @@ def _compare_words(words, soln, step2_pool=None, constraint_compliant=False,
             ]
     data_rows = [
         ('Wt avg',    [s['wt_avg']      for s in all_stats], '{:.2f}', False),
-        ('Max group size', [s['max_group_size']     for s in all_stats], '{:d}',   False),
+        (_METHOD_SHORT[ScoringMethod.MAX_GROUP_SIZE],
+         [s['max_group_size'] for s in all_stats], '{:d}', False),
         ('Solve%',    [s['prob_finish'] for s in all_stats], '{:.2%}', True),
     ]
     if any(v is not None for v in erd_vals):
