@@ -108,6 +108,8 @@ def _bare_worker():
     w._pending_fruitless_scans = 0
     w._pending_fruitless_scan_openers_walked = 0
     w._scan_openers_walked = 0
+    w._scan_openers_walked_baseline = 0
+    w._scan_opener_in_flight = False
     w._scan_selected_work = False
     w._adaptive = True
     w._erd_lower_bound_pruned_accuracy_n = 0
@@ -1354,14 +1356,15 @@ class TestSolveBranchFocusedClaimTelemetryAttribution(unittest.TestCase):
         # produced no row has no such sibling, and the window restart that
         # follows discards the accumulator, so time left out here is lost.
         #
-        # A unit test cannot schedule real lock contention and sub-millisecond
-        # waits round to zero, so the scan is stood in for by one that leaves
-        # the same accumulator behind -- which is all a contended scan does.
+        # A unit test cannot schedule real lock contention, so the scan is
+        # stood in for by one that spends the wall time and leaves the same
+        # accumulator behind -- which is all a contended scan does.
         ScoreCache(self.cache_path, BRANCH).close()
         w = _BranchWorker(0, self.cache_path, self.queue_path, None)
 
         def scan_that_waited_on_the_lock():
-            w.queue._last_claim_busy_millis += 7
+            time.sleep(0.05)                        # the wait itself ...
+            w.queue._last_claim_busy_millis += 50   # ... which the queue bills
             return None
         try:
             w._claim_one_uninstrumented = scan_that_waited_on_the_lock
@@ -1370,7 +1373,9 @@ class TestSolveBranchFocusedClaimTelemetryAttribution(unittest.TestCase):
             w.close()
 
         self.assertEqual(w._pending_fruitless_scans, 1)
-        self.assertGreaterEqual(w._pending_fruitless_scan_millis, 7)
+        # Netting the queue's share off, the way scheduling_millis does, would
+        # leave nearly nothing here.
+        self.assertGreaterEqual(w._pending_fruitless_scan_millis, 40)
 
     def test_restarting_the_window_drops_the_attribution_that_predates_it(self):
         # The contract the structural guard relies on.  Every window restart --
@@ -1395,6 +1400,134 @@ class TestSolveBranchFocusedClaimTelemetryAttribution(unittest.TestCase):
             self.assertEqual(w.queue._last_claim_commit_millis, 0)
         finally:
             w.close()
+
+    def _scan_that_walks_then_restarts_then_walks(self, worker, before, after,
+                                                  result):
+        """Stand in for a scan that finalizes a branch partway through.
+
+        Walks `before` openers, restarts the coordination window the way
+        maybe_finalize does from inside _claim_active_branch's sweep, then
+        walks `after` more and returns `result`.  The restart lands between
+        openers, so no walk is in flight across it -- see
+        TestOpenerStraddlingAWindowRestart for the case where one is.
+        """
+        def scan():
+            for _ in range(before):
+                worker._scan_openers_walked += 1
+            time.sleep(0.05)
+            worker._restart_coordination_window()
+            for _ in range(after):
+                worker._scan_openers_walked += 1
+            return result
+        return scan
+
+    def test_a_claims_opener_count_covers_the_same_span_as_its_duration(self):
+        # scheduling_millis is clamped to the part of the scan inside the
+        # current window, so the opener count banked with it must be clamped
+        # the same way.  A full walk against a partial duration reports a
+        # per-opener scan cost the scan never achieved -- and cost against
+        # queue depth is the whole reason the count is recorded.
+        ScoreCache(self.cache_path, BRANCH).close()
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        try:
+            w._claim_one_uninstrumented = (
+                self._scan_that_walks_then_restarts_then_walks(
+                    w, before=9, after=2, result=("claimed",)))
+            self.assertIsNotNone(w.claim_one())
+        finally:
+            w.close()
+
+        self.assertEqual(w._pending_scan_openers_walked, 2)
+        self.assertLess(w._pending_scheduling_millis, 40)
+
+    def test_a_fruitless_scans_opener_count_covers_its_whole_walk(self):
+        # The mirror: the fruitless duration is not clamped, so its count must
+        # not be either.  Clamping one and not the other is the same defect in
+        # the opposite direction.
+        ScoreCache(self.cache_path, BRANCH).close()
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        try:
+            w._claim_one_uninstrumented = (
+                self._scan_that_walks_then_restarts_then_walks(
+                    w, before=9, after=2, result=None))
+            self.assertIsNone(w.claim_one())
+        finally:
+            w.close()
+
+        self.assertEqual(w._pending_fruitless_scan_openers_walked, 11)
+        self.assertGreaterEqual(w._pending_fruitless_scan_millis, 40)
+
+    def test_a_fruitless_scan_is_not_clamped_to_a_window_it_is_not_in(self):
+        # The mirror of the clamp: scheduling_millis is a phase of the window
+        # and must fit inside it, but the fruitless figure is a phase of no
+        # window at all.  A fruitless scan can also finalize a branch as it
+        # sweeps, restarting the window from inside itself -- and clamping to
+        # that window would discard nearly all of the cost this measurement
+        # exists to record, in exactly the case where the scan was longest.
+        ScoreCache(self.cache_path, BRANCH).close()
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+
+        def scan_that_finalizes_then_finds_nothing():
+            time.sleep(0.05)                     # the walk ...
+            w._restart_coordination_window()     # ... which finalized a branch
+            return None
+        try:
+            w._claim_one_uninstrumented = scan_that_finalizes_then_finds_nothing
+            self.assertIsNone(w.claim_one())
+        finally:
+            w.close()
+
+        self.assertEqual(w._pending_fruitless_scans, 1)
+        self.assertGreaterEqual(w._pending_fruitless_scan_millis, 40)
+
+    def test_a_scan_that_finalizes_mid_flight_reports_only_its_tail(self):
+        # _claim_active_branch sweeps branches for finalization as it walks, and
+        # maybe_finalize restarts the coordination window.  That happens INSIDE
+        # claim_one, so the scan can be older than the window it is reported
+        # in, and a figure measured from scan start then exceeds the whole span
+        # its phases partition.
+        #
+        # Measured live on epoch 20: 8 of 28,030 rows, every one of them a
+        # single-node claim on a large branch -- coord=17 against sched=308 --
+        # which is the shape a finalize sweep leaves.
+        ScoreCache(self.cache_path, BRANCH).close()
+        branch_key = ScoreCache.encode_subset(BRANCH)
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        real_scan = w.queue.direct_branches_in_progress
+
+        def scan_that_finalizes_something(*args, **kwargs):
+            time.sleep(0.05)                     # scan work before the sweep
+            w._restart_coordination_window()     # what maybe_finalize does
+            return real_scan(*args, **kwargs)
+        try:
+            w.queue.create_branch(branch_key, len(BRANCH), len(CANDIDATES),
+                                  budget=ROOT_BUDGET, spine="CRANE -----")
+            w.queue.direct_branches_in_progress = scan_that_finalizes_something
+            work = w.claim_one()
+            self.assertIsNotNone(work)
+            w.queue.direct_branches_in_progress = real_scan
+            context, branch, _bundle_id, indices, _forced = work
+            with w._entered(context):
+                w.evaluate_claim(branch_key, decode_subset(branch_key),
+                                 branch['n_words'], indices[0],
+                                 budget=ROOT_BUDGET)
+        finally:
+            w.close()
+
+        q = ERDQueue(self.queue_path)
+        row = q._conn.execute(
+            "SELECT coordination_millis, scheduling_millis, "
+            "claim_transaction_millis, claim_commit_millis, busy_wait_millis, "
+            "idle_millis FROM claim_telemetry ORDER BY id LIMIT 1").fetchone()
+        q.close()
+        # The 50 ms before the restart belongs to a window that has closed.
+        self.assertLess(row["scheduling_millis"], 40)
+        self.assertLessEqual(
+            row["claim_transaction_millis"] + row["claim_commit_millis"]
+            + row["busy_wait_millis"] + row["scheduling_millis"]
+            + row["idle_millis"],
+            row["coordination_millis"])
 
     def test_a_scan_is_not_reported_across_a_window_restart(self):
         # The scan that chose a claim is banked when the claim is taken and
@@ -5358,6 +5491,69 @@ if __name__ == "__main__":
         self.assertEqual(self.queue.claim_holders_by_branch().get(taken[0]), 1,
                          "paired onto a recursion-capped dependency while a "
                          "branch was free")
+
+
+class TestOpenerStraddlingAWindowRestart(BranchOccupancyFixture,
+                                         unittest.TestCase):
+    """An opener whose own finalize restarts the coordination window is still
+    walked by the window that restart opens.
+
+    _claim_active_branch sweeps for finalization while processing an opener, so
+    the restart lands after that opener's loop increment and before the same
+    iteration promotes and claims.  Resetting the count to zero there reports
+    scan time against no openers at all -- an infinite cost per opener, in the
+    metric the count exists to compute.
+    """
+
+    def _opener_that_finalizes_then_claims(self):
+        """One opener with two branches: the first open and swept, the second
+        still pending for the same iteration to promote."""
+        self._queue_opener([BRANCH, BRANCH[:4]], opener=CANDIDATES[0])
+        self._promote(CANDIDATES[0])
+
+    def test_the_opener_whose_finalize_restarted_the_window_still_counts(self):
+        self._opener_that_finalizes_then_claims()
+        worker = self._worker(90)
+        real_claim_active = worker._claim_active_branch
+
+        def sweep_that_finalizes(*args, **kwargs):
+            # What maybe_finalize does from inside the sweep, on the branch of
+            # the opener this iteration is already counting.
+            time.sleep(0.05)
+            worker._restart_coordination_window()
+            return real_claim_active(*args, **kwargs)
+        worker._claim_active_branch = sweep_that_finalizes
+
+        work = worker.claim_one()
+
+        self.assertIsNotNone(
+            work, "fixture claimed nothing, so no row would carry the count")
+        self.assertGreaterEqual(
+            worker._pending_scan_openers_walked, 1,
+            "the opener that restarted the window was dropped from its own "
+            "window, so this row reports scan time against no openers")
+
+
+    def test_no_opener_is_in_flight_once_the_walk_is_over(self):
+        # The mirror of the case above.  Past the opener loop the scan is in
+        # the direct-branch and pairing fallback, which walks no openers, so a
+        # restart there must credit none.  A flag left set would hand that
+        # window an opener it never examined.
+        self._queue_opener([BRANCH], opener=CANDIDATES[0])
+        branch_key, _ = self._promote(CANDIDATES[0])
+        for holder in range(MAX_WORKERS_PER_BRANCH):
+            self._occupy(branch_key, 10 + holder)
+        worker = self._worker(91)
+
+        self.assertIsNone(
+            worker._claim_one_uninstrumented(),
+            "fixture is not stuck: the loop returned early, so it never ran "
+            "to completion and the flag was never due to clear")
+
+        self.assertFalse(worker._scan_opener_in_flight)
+        worker._restart_coordination_window()
+        self.assertEqual(worker._scan_openers_walked_baseline,
+                         worker._scan_openers_walked)
 
 
 class TestPromotedWithoutBundleIsNotAFruitlessScan(BranchOccupancyFixture,

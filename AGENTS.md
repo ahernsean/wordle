@@ -187,8 +187,35 @@ separate defects have come from moving one without the other.
   for that claim's first telemetry row.
 
 `_pending_fruitless_scan_*` is the exception and must **not** be cleared by a
-restart: it is a phase of no window at all, so no window ending can invalidate
-it, and it is still owed to whichever row reports it next.
+restart, nor clamped to a window: it is a phase of no window at all, so no
+window ending can invalidate it, and it is still owed to whichever row reports
+it next.
+
+**A scan can outlive the window it will be reported in.** `_claim_active_branch`
+sweeps branches for finalization as it walks, and `maybe_finalize` restarts the
+window — from *inside* `claim_one`. The scan is then older than the window its
+scheduling figure is a phase of, so `claim_one` clamps that figure to
+`time.time() - _last_claim_complete`: a phase cannot be longer than the span it
+partitions. Live on epoch 20 this was 8 rows in 28,030, every one a single-node
+claim on a large branch (`coord=17` against `sched=308`), which is the shape a
+finalize sweep leaves behind.
+
+**The opener count must cover the same span as the duration it is banked
+with.** `scan_openers_walked` is counted from the current window origin, so it
+pairs with the clamped `scheduling_millis`; `fruitless_scan_openers_walked`
+counts the whole walk, because the fruitless duration is unclamped. Pairing a
+full walk with a clamped duration reports a per-opener scan cost the scan never
+achieved — and cost against queue depth is the only reason the counts exist.
+
+The count is a monotonic total plus a baseline marking where the current window
+opened, not a second counter, because **the opener being processed when the
+restart fires is still in that window**. `_claim_active_branch` sweeps for
+finalization while processing an opener, so the restart lands after that
+opener's loop increment and before the same iteration promotes and claims;
+dropping it reports scan time against no openers at all, which is an infinite
+cost per opener in the metric the count computes. `_scan_opener_in_flight`
+marks that case and is cleared when the loop ends, because the direct-branch
+and pairing fallback past it walk no openers and must credit none.
 
 So a restart that moves the window forward leaves attribution describing work
 that happened *before* the new origin, and the next row reports it as a phase
