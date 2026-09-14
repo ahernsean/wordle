@@ -759,17 +759,28 @@ class _BranchWorker:
         """Move the coordination window to `origin` (now by default) and drop
         the queue attribution that predates it.
 
-        The window and the queue's attribution counters are two clocks with
-        different reset points: the window restarts here, at every wait and at
-        every finalize, while _last_claim_busy_millis and its siblings are
-        cleared only when a telemetry row consumes them.  Moving one without
-        the other leaves lock waits and claim transactions from before the new
-        origin to be reported inside a window that excludes them, which makes
-        the phases exceed coordination_millis.  Every restart goes through
-        here so the two cannot drift apart.
+        The window and the counters attributed to it have different reset
+        points: the window restarts here, at every wait and at every finalize,
+        while the queue's _last_claim_busy_millis and its siblings are cleared
+        only when a telemetry row consumes them, and this worker's carried
+        scheduling figure waits for that same row.  Moving the window without
+        them leaves lock waits, claim transactions and the work-selection scan
+        from before the new origin to be reported as phases of a window that
+        excludes them, which makes the phases exceed coordination_millis.
+        Every restart goes through here so they cannot drift apart.
+
+        Measured on epoch 19 before the scheduling figure was included: 259 of
+        393,923 rows reported a scan longer than the whole window it was billed
+        to.
         """
         self._last_claim_complete = time.time() if origin is None else origin
         self.queue.discard_claim_attribution()
+        # The scan that chose the claim in hand belongs to the window that just
+        # ended, so it cannot be reported as a phase of the next one.  The
+        # fruitless counters deliberately stay: they are a phase of no window
+        # at all, and are still owed to whichever row reports them.
+        self._pending_scheduling_millis = 0
+        self._pending_scan_openers_walked = 0
 
     def _idle_wait(self, seconds):
         """Sleep while this worker has no claimable work, then reopen the

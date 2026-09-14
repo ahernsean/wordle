@@ -1396,6 +1396,60 @@ class TestSolveBranchFocusedClaimTelemetryAttribution(unittest.TestCase):
         finally:
             w.close()
 
+    def test_a_scan_is_not_reported_across_a_window_restart(self):
+        # The scan that chose a claim is banked when the claim is taken and
+        # consumed by that claim's first telemetry row.  Anything that restarts
+        # the window in between -- a finalize, a dependency wait inside
+        # evaluate_bundle -- ends the window the scan belongs to, and the row
+        # then reports a scan longer than the whole span it partitions.
+        #
+        # Measured on epoch 19: 259 of 393,923 production rows, every one of
+        # them with scheduling_millis as the oversized phase and idle_millis
+        # pinned to its clamp.
+        ScoreCache(self.cache_path, BRANCH).close()
+        branch_key = ScoreCache.encode_subset(BRANCH)
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        real_scan = w.queue.direct_branches_in_progress
+
+        def slow_scan(*args, **kwargs):
+            time.sleep(0.05)          # inside claim_one's scan, no lock held
+            return real_scan(*args, **kwargs)
+        try:
+            w.queue.create_branch(branch_key, len(BRANCH), len(CANDIDATES),
+                                  budget=ROOT_BUDGET, spine="CRANE -----")
+            w.queue.direct_branches_in_progress = slow_scan
+            work = w.claim_one()
+            self.assertIsNotNone(work)
+            w.queue.direct_branches_in_progress = real_scan
+            self.assertGreaterEqual(
+                w._pending_scheduling_millis, 40,
+                "fixture banked no scan time, so the restart under test would "
+                "have nothing to drop")
+            context, branch, _bundle_id, indices, _forced = work
+            w._restart_coordination_window()   # a finalize or a wait in between
+            with w._entered(context):
+                w.evaluate_claim(branch_key, decode_subset(branch_key),
+                                 branch['n_words'], indices[0],
+                                 budget=ROOT_BUDGET)
+        finally:
+            w.close()
+
+        q = ERDQueue(self.queue_path)
+        row = q._conn.execute(
+            "SELECT coordination_millis, scheduling_millis, "
+            "scan_openers_walked, claim_transaction_millis, "
+            "claim_commit_millis, busy_wait_millis, idle_millis "
+            "FROM claim_telemetry ORDER BY id LIMIT 1").fetchone()
+        q.close()
+        self.assertEqual(row["scheduling_millis"], 0)
+        self.assertEqual(row["scan_openers_walked"], 0)
+        self.assertLessEqual(
+            row["claim_transaction_millis"] + row["claim_commit_millis"]
+            + row["busy_wait_millis"] + row["scheduling_millis"]
+            + row["idle_millis"],
+            row["coordination_millis"])
+
     def test_restoring_an_enclosing_window_drops_attribution_too(self):
         # _help_other_branch restores the enclosing claim's window on the way
         # out.  The helped branch's own queue writes happened inside the

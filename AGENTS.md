@@ -182,6 +182,13 @@ separate defects have come from moving one without the other.
   `_last_claim_commit_millis` on the `ERDQueue` connection. The first two
   accumulate with `+=`. Nothing clears any of them except
   `add_claim_telemetry`, when a row consumes them.
+- The worker's **carried scheduling figure** — `_pending_scheduling_millis`
+  and `_pending_scan_openers_walked`, banked when a claim is taken and waiting
+  for that claim's first telemetry row.
+
+`_pending_fruitless_scan_*` is the exception and must **not** be cleared by a
+restart: it is a phase of no window at all, so no window ending can invalidate
+it, and it is still owed to whichever row reports it next.
 
 So a restart that moves the window forward leaves attribution describing work
 that happened *before* the new origin, and the next row reports it as a phase
@@ -190,7 +197,11 @@ of a window that excludes it. The parts then exceed the whole and
 which is why unit tests miss it.
 
 **Every window restart goes through `_restart_coordination_window`**, which
-moves the origin and calls `queue.discard_claim_attribution()` together.
+moves the origin, calls `queue.discard_claim_attribution()`, and drops the
+carried scheduling figure, all together. Epoch 19 measured what happens when
+only part of that is done: fixing the queue's counters alone took production
+partition violations from 0.182% to 0.066% of rows, and every one of the 259
+that survived named `scheduling_millis` as the oversized phase.
 `test_every_window_restart_drops_the_queue_attribution_with_it` is an AST guard
 that refuses a bare `_last_claim_complete` assignment, because the defect keeps
 arriving at sites nobody wrote a behavioural test for. Two sites assign
