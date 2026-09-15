@@ -722,6 +722,7 @@ class _BranchWorker:
         self._scan_openers_walked = 0
         self._scan_openers_walked_baseline = 0
         self._scan_opener_in_flight = False
+        self._scan_attributed_baseline = 0
         self._scan_selected_work = False
         # Direct cooperative callers can create active branches without a
         # opener-work request.  Keep their tight claim loop free of the
@@ -796,6 +797,13 @@ class _BranchWorker:
         self._scan_openers_walked_baseline = max(
             0, self._scan_openers_walked
             - (1 if self._scan_opener_in_flight else 0))
+        # discard_claim_attribution has just zeroed the queue's counters, so a
+        # scan in flight must measure its own attribution from zero too.  Left
+        # at its scan-start value the baseline exceeds the counters, the delta
+        # clamps to 0, and the scheduling figure is never reduced by the lock
+        # wait and claim transaction that follow this restart -- which are then
+        # added to it as phases of the same row.
+        self._scan_attributed_baseline = 0
 
     def _idle_wait(self, seconds):
         """Sleep while this worker has no claimable work, then reopen the
@@ -2652,18 +2660,21 @@ class _BranchWorker:
         from both the count and the timing population.
         """
         scan_t0 = time.perf_counter()
-        attributed_before = self._queue_attributed_millis()
         self._scan_openers_walked = 0
         self._scan_openers_walked_baseline = 0
         self._scan_opener_in_flight = False
         self._scan_selected_work = False
+        # Last, so a restart inside the scan can move it and nothing here
+        # moves it back.
+        self._scan_attributed_baseline = self._queue_attributed_millis()
         work = None
         try:
             work = self._claim_one_uninstrumented()
             return work
         finally:
             attributed = max(
-                0, self._queue_attributed_millis() - attributed_before)
+                0, self._queue_attributed_millis()
+                - self._scan_attributed_baseline)
             scan_millis = int((time.perf_counter() - scan_t0) * 1000)
             if work is None:
                 self._pending_scheduling_millis = 0
