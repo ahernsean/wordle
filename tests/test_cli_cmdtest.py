@@ -68,7 +68,7 @@ class TestCmdTestCompare(CliTestCase):
         self.assertIn("Computing", out)
         self.assertIn("Entropy 1", out)
         self.assertIn("Wt avg", out)
-        self.assertIn("Max group size", out)
+        self.assertIn("max-grp", out)
         self.assertIn("Solve%", out)
         # n == 2 path: the "+ ent. 2/3"/"Total ent" rows are gated on n > 2,
         # which holds here (n = 10), so they should appear.
@@ -90,6 +90,26 @@ class TestCmdTestCompare(CliTestCase):
         # Bucket rows (1:, 2-4:, etc.) print when any bucket is non-empty.
         out = self.run_cmd(cmd_test, inputs=["crane slate"])
         self.assertTrue(any(lbl in out for lbl in ("1:", "2-4:", "5-9:")))
+
+    def test_compare_columns_stay_aligned(self):
+        """Every data row is built from the same fixed-width label field
+        plus values right-justified to a shared column width, so every
+        row's printed line comes out the same total length. A label
+        longer than the reserved width (lw) isn't truncated — it just
+        widens that one row's prefix, throwing its line length, and
+        therefore its columns, out of step with every other row. This is
+        the exact defect a too-long "Max group size" label caused."""
+        out = self.run_cmd(cmd_test, inputs=["crane slate"])
+        labels = ["Wt avg", "max-grp", "Solve%", "Entropy 1"]
+        lengths = {}
+        for line in out.splitlines():
+            for label in labels:
+                if line.startswith('  ' + label):
+                    lengths[label] = len(line)
+                    break
+        self.assertEqual(set(lengths), set(labels))
+        self.assertEqual(len(set(lengths.values())), 1,
+                         f"columns misaligned, row lengths: {lengths}")
 
 
 class TestCmdTestModes(CliTestCase):

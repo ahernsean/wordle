@@ -942,6 +942,16 @@ and its related paths. Use `python3.13`; for example:
 python3.13 -m unittest tests.test_report_model tests.test_report_terminal
 ```
 
+**Bump `BUILD` in `wordle.py` whenever a change alters the interactive
+experience** — a command's output, a prompt, a status line, a new or changed
+command, anything the person running the app can see or interact with
+differently. `BUILD` (e.g. `"b138"`) is the only way to tell, from the
+running app itself, which code is actually in front of you: the startup
+banner and every session's debug log print it. A change confined to
+`wordle_engine.py`, `cache_sqlite.py`, or another non-interactive module
+doesn't need a bump on its own. Increment by exactly one from the current
+value — never skip or reuse a number.
+
 **Your tests should be specific, then push and open the pull request.** A local
 full-suite pass can cost about twenty minutes and could spend nearly all of it
 running tests your change doesn't reach. That latency is not free: it delays
