@@ -6144,6 +6144,31 @@ class TestDependencyWaitAttribution(unittest.TestCase):
         self.assertEqual(
             w.queue.branch_unclaimed_candidates(key, w.n_candidates), 0)
 
+    def test_unclaimed_reads_liveness_and_claims_in_one_snapshot(self):
+        """Two autocommit selects are two snapshots, and the gap is a race.
+
+        A rival finalizing between them leaves the branch present and its
+        claim rows already deleted, which reports a completed branch as fully
+        claimable — the deleted-branch error reached by timing rather than by
+        order, and not reproducible from a sequential fixture.  Pinned
+        structurally instead: the count must come from one statement.
+        """
+        w = self._worker()
+        key = ScoreCache.encode_subset(BRANCH[:3])
+        w.queue.create_branch(key, 3, w.n_candidates, budget=5)
+        w.queue.branch_unclaimed_candidates(key, w.n_candidates)  # warm the id
+
+        statements = []
+        w.queue._conn.set_trace_callback(statements.append)
+        try:
+            w.queue.branch_unclaimed_candidates(key, w.n_candidates)
+        finally:
+            w.queue._conn.set_trace_callback(None)
+        selects = [q for q in statements if q.lstrip().upper().startswith("SELECT")]
+        self.assertEqual(len(selects), 1, selects)
+        self.assertIn("active_branches", selects[0])
+        self.assertIn("candidate_claims", selects[0])
+
     def test_losing_the_finalize_race_is_attributed_as_blocked(self):
         """The wait-for-finalize case must not report zero blocked time.
 

@@ -3867,14 +3867,17 @@ class ERDQueue:
         branch_id = self._intern_branch(branch_key)
         if branch_id is None:
             return 0
-        live = self._conn.execute(
-            "SELECT 1 FROM active_branches WHERE branch_id = ?",
-            (branch_id,)).fetchone()
-        if live is None:
+        # Liveness and the claim count come from ONE statement, so they
+        # describe one snapshot.  Read separately they do not: these are
+        # autocommit selects, and a rival finalizing between them leaves the
+        # branch present and its claim rows already deleted — which is the
+        # deleted-branch error again, reached by a race instead of by order.
+        live, taken = self._conn.execute(
+            "SELECT EXISTS(SELECT 1 FROM active_branches WHERE branch_id = ?),"
+            "       (SELECT COUNT(*) FROM candidate_claims WHERE branch_id = ?)",
+            (branch_id, branch_id)).fetchone()
+        if not live:
             return 0
-        taken = self._conn.execute(
-            "SELECT COUNT(*) FROM candidate_claims WHERE branch_id = ?",
-            (branch_id,)).fetchone()[0]
         return max(0, n_candidates - taken)
 
     def branch_bulk_done_candidates(self, branch_key) -> int:
