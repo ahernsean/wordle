@@ -100,10 +100,15 @@ to hand out and the wait is for its finalize, which no cap change reaches.
 Those are different problems with different fixes, and `idle_millis` cannot
 tell them apart.
 
-They are sampled once, at the first blocked iteration, because that path
-already runs every 50 ms on a starving worker and two more queries per turn
-would be paid by the branch everyone is waiting for. An episode that never
-reached the loop writes no row.
+They are sampled once, at the first blocked iteration and before the poll that
+follows it, because that path already runs every 50 ms on a starving worker and
+another query per turn would be paid by the branch everyone is waiting for.
+`branch_block_snapshot` returns **both counters and branch liveness from one
+statement**: they are read against each other, so a holder count from one state
+beside an unclaimed count from another misclassifies the block, and a branch
+present at a liveness lookup whose claim rows are gone by the count reports
+finished work as fully claimable. An episode that never reached the loop writes
+no row.
 
 ### Priority ladders, and the fan-out they prevent
 

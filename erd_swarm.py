@@ -2417,10 +2417,8 @@ class _BranchWorker:
         """
         if wait.holders_at_first_block is not None:
             return
-        holders = self.queue.branch_claim_holders(
-            branch_key, exclude_worker_id=self.name)
-        unclaimed = self.queue.branch_unclaimed_candidates(
-            branch_key, self.n_candidates)
+        holders, unclaimed = self.queue.branch_block_snapshot(
+            branch_key, self.n_candidates, exclude_worker_id=self.name)
         wait.note_first_block(holders, unclaimed)
 
     def _record_dependency_wait(self, wait):

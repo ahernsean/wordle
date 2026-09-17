@@ -6118,10 +6118,10 @@ class TestDependencyWaitAttribution(unittest.TestCase):
         self.assertIsNotNone(
             self._rival_claims(w, key, count_cap=w.n_candidates))
         self.assertEqual(
-            w.queue.branch_unclaimed_candidates(key, w.n_candidates), 0)
+            w.queue.branch_block_snapshot(key, w.n_candidates)[1], 0)
         w.queue.reclaim_claims_of_worker("rival")
         self.assertEqual(
-            w.queue.branch_unclaimed_candidates(key, w.n_candidates),
+            w.queue.branch_block_snapshot(key, w.n_candidates)[1],
             w.n_candidates)
 
     def test_a_deleted_branch_has_no_unclaimed_slots(self):
@@ -6137,31 +6137,35 @@ class TestDependencyWaitAttribution(unittest.TestCase):
         key = ScoreCache.encode_subset(BRANCH[:3])
         w.queue.create_branch(key, 3, w.n_candidates, budget=5)
         self.assertEqual(
-            w.queue.branch_unclaimed_candidates(key, w.n_candidates),
-            w.n_candidates)
+            w.queue.branch_block_snapshot(key, w.n_candidates),
+            (0, w.n_candidates))
         w.queue.delete_branch(key)
         self.assertIsNone(w.queue.get_branch(key))
         self.assertEqual(
-            w.queue.branch_unclaimed_candidates(key, w.n_candidates), 0)
+            w.queue.branch_block_snapshot(key, w.n_candidates), (0, 0))
 
-    def test_unclaimed_reads_liveness_and_claims_in_one_snapshot(self):
-        """Two autocommit selects are two snapshots, and the gap is a race.
+    def test_both_counters_and_liveness_come_from_one_snapshot(self):
+        """Separate autocommit selects are separate snapshots.
 
-        A rival finalizing between them leaves the branch present and its
-        claim rows already deleted, which reports a completed branch as fully
-        claimable — the deleted-branch error reached by timing rather than by
-        order, and not reproducible from a sequential fixture.  Pinned
-        structurally instead: the count must come from one statement.
+        The two counters are compared against each other — holders at the cap
+        versus nothing left to claim — so reading them apart lets a rival
+        finish, reclaim or finalize in between and yields a holder count from
+        one state beside an unclaimed count from another, misclassifying the
+        block.  Liveness has the same problem: a branch present at the lookup
+        whose claim rows are gone by the count reports a finished branch as
+        fully claimable.  None of that is reproducible from a sequential
+        fixture, so the guard is structural: one statement, one snapshot.
         """
         w = self._worker()
         key = ScoreCache.encode_subset(BRANCH[:3])
         w.queue.create_branch(key, 3, w.n_candidates, budget=5)
-        w.queue.branch_unclaimed_candidates(key, w.n_candidates)  # warm the id
+        w.queue.branch_block_snapshot(key, w.n_candidates)  # warm the id
 
         statements = []
         w.queue._conn.set_trace_callback(statements.append)
         try:
-            w.queue.branch_unclaimed_candidates(key, w.n_candidates)
+            w.queue.branch_block_snapshot(key, w.n_candidates,
+                                          exclude_worker_id="worker-0")
         finally:
             w.queue._conn.set_trace_callback(None)
         selects = [q for q in statements if q.lstrip().upper().startswith("SELECT")]
@@ -6227,30 +6231,26 @@ class TestDependencyWaitAttribution(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["blocked_millis"], 0)
 
-    def test_unclaimed_of_an_unknown_branch_is_zero(self):
-        """A branch the registry never saw has nothing left to claim."""
+    def test_an_unknown_branch_snapshots_as_empty(self):
+        """A branch the registry never saw holds nobody and owes nothing."""
         w = self._worker()
         self.assertEqual(
-            w.queue.branch_unclaimed_candidates(
-                ScoreCache.encode_subset(BRANCH), w.n_candidates), 0)
+            w.queue.branch_block_snapshot(
+                ScoreCache.encode_subset(BRANCH), w.n_candidates), (0, 0))
 
-    def test_branch_claim_holders_of_an_unknown_branch_is_zero(self):
-        """A branch the queue has never interned holds nobody."""
-        w = self._worker()
-        self.assertEqual(
-            w.queue.branch_claim_holders(ScoreCache.encode_subset(BRANCH)), 0)
-
-    def test_branch_claim_holders_agrees_with_the_map(self):
-        """The single-branch count must not drift from the map scheduling uses."""
+    def test_snapshot_holders_agree_with_the_map(self):
+        """The snapshot's holder count must not drift from the map scheduling uses."""
         w = self._worker()
         key = ScoreCache.encode_subset(BRANCH[:3])
         w.queue.create_branch(key, 3, w.n_candidates, budget=5)
-        self.assertEqual(w.queue.branch_claim_holders(key), 0)
+        self.assertEqual(w.queue.branch_block_snapshot(key, w.n_candidates)[0], 0)
         self.assertIsNotNone(self._rival_claims(w, key))
         self.assertEqual(
-            w.queue.branch_claim_holders(key, exclude_worker_id="rival"), 0)
-        self.assertEqual(w.queue.branch_claim_holders(key), 1)
+            w.queue.branch_block_snapshot(
+                key, w.n_candidates, exclude_worker_id="rival")[0], 0)
+        self.assertEqual(w.queue.branch_block_snapshot(key, w.n_candidates)[0], 1)
         self.assertEqual(
-            w.queue.branch_claim_holders(key, exclude_worker_id=w.name),
+            w.queue.branch_block_snapshot(
+                key, w.n_candidates, exclude_worker_id=w.name)[0],
             w.queue.claim_holders_by_branch(
                 exclude_worker_id=w.name).get(bytes(key), 0))

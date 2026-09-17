@@ -3826,59 +3826,47 @@ class ERDQueue:
             "SELECT COUNT(*) FROM candidate_claims WHERE branch_id = ? AND done = 1",
             (branch_id,)).fetchone()[0]
 
-    def branch_claim_holders(self, branch_key, exclude_worker_id=None) -> int:
-        """Workers other than exclude_worker_id holding unfinished claims on
-        one branch.
+    def branch_block_snapshot(self, branch_key, n_candidates,
+                              exclude_worker_id=None):
+        """(holders, unclaimed) for one branch, from ONE statement.
 
-        The single-branch form of claim_holders_by_branch, for a caller that
-        wants occupancy for the branch it is already looking at rather than a
-        map of every branch.  Occupancy is unfinished claims, never heartbeats:
-        the claim row is written by the transaction that hands out the bundle,
-        so a branch reads as taken the instant it is taken.
-        """
-        branch_id = self._intern_branch(branch_key)
-        if branch_id is None:
-            return 0
-        if exclude_worker_id is None:
-            return self._conn.execute(
-                "SELECT COUNT(DISTINCT claimed_by) FROM candidate_claims "
-                "WHERE branch_id = ? AND done = 0", (branch_id,)).fetchone()[0]
-        return self._conn.execute(
-            "SELECT COUNT(DISTINCT claimed_by) FROM candidate_claims "
-            "WHERE branch_id = ? AND done = 0 AND claimed_by IS NOT ?",
-            (branch_id, exclude_worker_id)).fetchone()[0]
+        holders is the workers other than exclude_worker_id holding unfinished
+        claims; unclaimed is the candidate slots no claim row covers.  A caller
+        that reads them separately gets a holder count from one state and an
+        unclaimed count from another — a rival can finish, reclaim or finalize
+        in between — and these two are compared against each other to decide
+        whether the cap or a pending finalize caused a block, so a mismatched
+        pair misclassifies it.  One statement sees one snapshot.
 
-    def branch_unclaimed_candidates(self, branch_key, n_candidates) -> int:
-        """Candidate slots on this branch that no claim row covers.
+        Occupancy is unfinished claims, never heartbeats: the claim row is
+        written by the transaction that hands out the bundle, so a branch reads
+        as taken the instant it is taken.
 
-        NOT `n_candidates - done`: a candidate held in an unfinished claim is
-        taken, not available, so counting it as unclaimed would report work the
-        packer cannot hand out — which is the normal finalize-wait shape, with
-        one rival holding every remaining slot.  A freed position (reclaim or
-        republish) has no row and is correctly counted as available again.
+        unclaimed is NOT `n_candidates - done`: a candidate held in an
+        unfinished claim is taken, not available, and one rival holding every
+        remaining slot is the ordinary finalize-wait shape.  A position freed
+        by a reclaim or republish has no row and counts as claimable again.
 
-        Zero for a branch that is not open.  A registry id is not evidence the
-        branch exists: delete_branch deliberately keeps the append-only
+        (0, 0) for a branch that is not open.  A registry id is not evidence
+        the branch exists: delete_branch deliberately keeps the append-only
         branches row (branch_id must stay stable across a re-promotion) while
         dropping every candidate_claims row, so a finished branch would
-        otherwise count zero claims and report all n_candidates as claimable —
-        describing completed work as untouched.
+        otherwise report no holders and every slot claimable.
         """
         branch_id = self._intern_branch(branch_key)
         if branch_id is None:
-            return 0
-        # Liveness and the claim count come from ONE statement, so they
-        # describe one snapshot.  Read separately they do not: these are
-        # autocommit selects, and a rival finalizing between them leaves the
-        # branch present and its claim rows already deleted — which is the
-        # deleted-branch error again, reached by a race instead of by order.
-        live, taken = self._conn.execute(
+            return (0, 0)
+        live, holders, taken = self._conn.execute(
             "SELECT EXISTS(SELECT 1 FROM active_branches WHERE branch_id = ?),"
+            "       (SELECT COUNT(DISTINCT claimed_by) FROM candidate_claims"
+            "          WHERE branch_id = ? AND done = 0"
+            "            AND (? IS NULL OR claimed_by IS NOT ?)),"
             "       (SELECT COUNT(*) FROM candidate_claims WHERE branch_id = ?)",
-            (branch_id, branch_id)).fetchone()
+            (branch_id, branch_id, exclude_worker_id, exclude_worker_id,
+             branch_id)).fetchone()
         if not live:
-            return 0
-        return max(0, n_candidates - taken)
+            return (0, 0)
+        return (holders, max(0, n_candidates - taken))
 
     def branch_bulk_done_candidates(self, branch_key) -> int:
         """Return the legacy combined count completed by ERD pruning."""
