@@ -2166,7 +2166,12 @@ class _BranchWorker:
         silently at full CPU.  Heartbeat first (this wait must stay visible
         and must not get this worker's parent claims reclaimed), then reopen
         the row once it has been 'finalized' past FINALIZE_TAKEOVER_SECONDS
-        and complete the finalize from its intact claims and meta."""
+        and complete the finalize from its intact claims and meta.
+
+        Returns True when it polled and False when it took the finalize over:
+        only the poll is time this worker spent waiting, and a caller
+        attributing blocked time must not charge the takeover, which is work.
+        """
         self._cur_candidate = None      # coordinating, no candidate in flight
         self._heartbeat(branch_key, n_words, None, None, None, None,
                         force=True)
@@ -2175,8 +2180,9 @@ class _BranchWorker:
             logger.warning('%s reopened branch (%d words): finalizer died '
                            'mid-finalize', self.name, n_words)
             self.maybe_finalize(branch_key, words, n_candidates)
-            return
+            return False
         self._idle_wait(0.05)
+        return True
 
     # -- recursive cooperative solving --------------------------------------
 
@@ -2608,8 +2614,17 @@ class _BranchWorker:
                 elif self.queue.branch_done_candidates(branch_key) >= self.n_candidates:
                     if not self.maybe_finalize(branch_key, words,
                                                self.n_candidates):
-                        self._await_rival_finalize(branch_key, words, n_words,
-                                                   self.n_candidates)
+                        # Every candidate is done and a rival holds the
+                        # finalize: the wait-for-finalize case these columns
+                        # exist to name, so it is sampled here rather than left
+                        # NULL with its poll unattributed.
+                        self._record_first_block(wait, branch_key)
+                        blocked_at = time.perf_counter()
+                        if self._await_rival_finalize(branch_key, words,
+                                                      n_words,
+                                                      self.n_candidates):
+                            wait.note_blocked(
+                                int((time.perf_counter() - blocked_at) * 1000))
                 elif self._help_recursion_depth >= MAX_HELP_RECURSION_DEPTH:
                     # _help_other_branch would refuse to scan at all here (see
                     # its own docstring): False from it below would mean

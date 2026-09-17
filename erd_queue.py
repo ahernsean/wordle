@@ -3857,11 +3857,20 @@ class ERDQueue:
         one rival holding every remaining slot.  A freed position (reclaim or
         republish) has no row and is correctly counted as available again.
 
-        Zero for a branch the registry does not know: there is nothing left to
-        claim on a branch that no longer exists.
+        Zero for a branch that is not open.  A registry id is not evidence the
+        branch exists: delete_branch deliberately keeps the append-only
+        branches row (branch_id must stay stable across a re-promotion) while
+        dropping every candidate_claims row, so a finished branch would
+        otherwise count zero claims and report all n_candidates as claimable —
+        describing completed work as untouched.
         """
         branch_id = self._intern_branch(branch_key)
         if branch_id is None:
+            return 0
+        live = self._conn.execute(
+            "SELECT 1 FROM active_branches WHERE branch_id = ?",
+            (branch_id,)).fetchone()
+        if live is None:
             return 0
         taken = self._conn.execute(
             "SELECT COUNT(*) FROM candidate_claims WHERE branch_id = ?",

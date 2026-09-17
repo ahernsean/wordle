@@ -6124,6 +6124,84 @@ class TestDependencyWaitAttribution(unittest.TestCase):
             w.queue.branch_unclaimed_candidates(key, w.n_candidates),
             w.n_candidates)
 
+    def test_a_deleted_branch_has_no_unclaimed_slots(self):
+        """delete_branch keeps the registry row; that is not existence.
+
+        branch_id stays stable across a re-promotion, so the append-only
+        branches row survives while every candidate_claims row is dropped.
+        Counting from the id alone would see zero claims on a finished branch
+        and report all n_candidates as claimable — completed work described as
+        untouched, and a cap refusal where there is nothing left to claim.
+        """
+        w = self._worker()
+        key = ScoreCache.encode_subset(BRANCH[:3])
+        w.queue.create_branch(key, 3, w.n_candidates, budget=5)
+        self.assertEqual(
+            w.queue.branch_unclaimed_candidates(key, w.n_candidates),
+            w.n_candidates)
+        w.queue.delete_branch(key)
+        self.assertIsNone(w.queue.get_branch(key))
+        self.assertEqual(
+            w.queue.branch_unclaimed_candidates(key, w.n_candidates), 0)
+
+    def test_losing_the_finalize_race_is_attributed_as_blocked(self):
+        """The wait-for-finalize case must not report zero blocked time.
+
+        Every candidate is done and a rival holds the finalize, so the worker
+        polls in _await_rival_finalize.  That poll is the commonest wait these
+        columns exist to name; leaving it outside the accounting would put the
+        sleep in episode_millis while blocked_millis read zero and both
+        first-block counters stayed NULL.
+        """
+        w = self._worker()
+        words = BRANCH[:3]
+        key = ScoreCache.encode_subset(words)
+        w.queue.create_branch(key, len(words), w.n_candidates,
+                              budget=ROOT_BUDGET)
+        w.queue.mark_claims_done(key, list(range(w.n_candidates)))
+
+        def _lose_then_stop(*_a, **_kw):
+            w.request_stop()
+            return False
+
+        with mock.patch.object(w, "maybe_finalize", side_effect=_lose_then_stop), \
+                mock.patch.object(w, "_await_rival_finalize",
+                                  return_value=True) as await_rival:
+            w.cooperative_solve(words, ROOT_BUDGET)
+
+        await_rival.assert_called()
+        rows = self._wait_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["unclaimed_at_first_block"], 0)
+        self.assertIsNotNone(rows[0]["holders_at_first_block"])
+
+    def test_a_finalize_takeover_is_not_charged_as_blocked_time(self):
+        """Taking the finalize over is work, not waiting.
+
+        _await_rival_finalize returns False when it reopened a dead
+        finalizer's row and completed the finalize itself; charging that span
+        to blocked_millis would inflate the stuck figure with real work.
+        """
+        w = self._worker()
+        words = BRANCH[:3]
+        key = ScoreCache.encode_subset(words)
+        w.queue.create_branch(key, len(words), w.n_candidates,
+                              budget=ROOT_BUDGET)
+        w.queue.mark_claims_done(key, list(range(w.n_candidates)))
+
+        def _lose_then_stop(*_a, **_kw):
+            w.request_stop()
+            return False
+
+        with mock.patch.object(w, "maybe_finalize", side_effect=_lose_then_stop), \
+                mock.patch.object(w, "_await_rival_finalize",
+                                  return_value=False):
+            w.cooperative_solve(words, ROOT_BUDGET)
+
+        rows = self._wait_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["blocked_millis"], 0)
+
     def test_unclaimed_of_an_unknown_branch_is_zero(self):
         """A branch the registry never saw has nothing left to claim."""
         w = self._worker()
