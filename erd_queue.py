@@ -3843,6 +3843,26 @@ class ERDQueue:
             "WHERE branch_id = ? AND done = 0 AND claimed_by IS NOT ?",
             (branch_id, exclude_worker_id)).fetchone()[0]
 
+    def branch_unclaimed_candidates(self, branch_key, n_candidates) -> int:
+        """Candidate slots on this branch that no claim row covers.
+
+        NOT `n_candidates - done`: a candidate held in an unfinished claim is
+        taken, not available, so counting it as unclaimed would report work the
+        packer cannot hand out — which is the normal finalize-wait shape, with
+        one rival holding every remaining slot.  A freed position (reclaim or
+        republish) has no row and is correctly counted as available again.
+
+        Zero for a branch the registry does not know: there is nothing left to
+        claim on a branch that no longer exists.
+        """
+        branch_id = self._intern_branch(branch_key)
+        if branch_id is None:
+            return 0
+        taken = self._conn.execute(
+            "SELECT COUNT(*) FROM candidate_claims WHERE branch_id = ?",
+            (branch_id,)).fetchone()[0]
+        return max(0, n_candidates - taken)
+
     def branch_bulk_done_candidates(self, branch_key) -> int:
         """Return the legacy combined count completed by ERD pruning."""
         branch_id = self._intern_branch(branch_key)

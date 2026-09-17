@@ -2404,13 +2404,18 @@ class _BranchWorker:
         counts answer why: holders at MAX_WORKERS_PER_BRANCH means the cap
         refused the pair, while zero unclaimed candidates means the branch had
         nothing left to hand out and the wait is for its finalize.
+
+        Taken before the poll that follows it on every path, so the snapshot
+        describes the state that caused the block rather than whatever the
+        branch became while this worker slept.
         """
         if wait.holders_at_first_block is not None:
             return
         holders = self.queue.branch_claim_holders(
             branch_key, exclude_worker_id=self.name)
-        done = self.queue.branch_done_candidates(branch_key)
-        wait.note_first_block(holders, max(0, self.n_candidates - done))
+        unclaimed = self.queue.branch_unclaimed_candidates(
+            branch_key, self.n_candidates)
+        wait.note_first_block(holders, unclaimed)
 
     def _record_dependency_wait(self, wait):
         """Persist one wait episode, unless it never reached the wait loop."""
@@ -2613,11 +2618,11 @@ class _BranchWorker:
                     # _help_other_branch's capped-depth contract already
                     # promises its callers.
                     self._cur_candidate = None
+                    self._record_first_block(wait, branch_key)
                     blocked_at = time.perf_counter()
                     self._idle_wait(0.05)
                     wait.note_blocked(
                         int((time.perf_counter() - blocked_at) * 1000))
-                    self._record_first_block(wait, branch_key)
                 else:
                     # No bundle: every candidate is claimed, or another worker
                     # holds the branch.  Try free or promotable work first —

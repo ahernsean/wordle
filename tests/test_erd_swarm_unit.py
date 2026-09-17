@@ -5954,13 +5954,13 @@ class TestDependencyWaitAttribution(unittest.TestCase):
         self.addCleanup(w.close)
         return w
 
-    def _rival_claims(self, w, key):
+    def _rival_claims(self, w, key, count_cap=1):
         """A rival worker takes a bundle, the way production leaves occupancy:
         an unfinished claim row written by the transaction that handed it out."""
         order = list(range(w.n_candidates))
         return w.queue.claim_next_bundle(
             key, "rival", w.n_candidates, order, [0.0] * w.n_candidates,
-            small_count=1, count_cap=1)
+            small_count=count_cap, count_cap=count_cap)
 
     def _wait_rows(self):
         path = erd_queue.derive_telemetry_path(self.queue_path)
@@ -6055,6 +6055,81 @@ class TestDependencyWaitAttribution(unittest.TestCase):
         exhausted = erd_swarm._DependencyWait("SPINE -----", 3, 5, 0)
         w._record_first_block(exhausted, key)
         self.assertEqual(exhausted.unclaimed_at_first_block, 0)
+
+    def test_the_capped_path_snapshots_before_it_sleeps(self):
+        """The snapshot must describe the state that caused the block.
+
+        On the recursion-capped path the worker polls instead of scanning.  If
+        the sample were taken after the 50 ms sleep it would observe whatever
+        the branch became while this worker slept — a holder that finished
+        reads as zero holders — and both diagnostic columns would describe a
+        moment that never blocked anything.
+        """
+        w = self._worker()
+        words = BRANCH[:3]
+        key = ScoreCache.encode_subset(words)
+        w.queue.create_branch(key, len(words), w.n_candidates,
+                              budget=ROOT_BUDGET)
+        self.assertIsNotNone(
+            self._rival_claims(w, key, count_cap=w.n_candidates))
+
+        def _sleep_that_changes_the_branch(_seconds):
+            # The rival finishes mid-sleep: holders drop to zero, so a sample
+            # taken afterwards would report nobody was on the branch.
+            w.queue.mark_claims_done(key, list(range(w.n_candidates)))
+            w.request_stop()
+
+        with mock.patch.object(erd_swarm, "MAX_HELP_RECURSION_DEPTH", 0), \
+                mock.patch.object(w, "_idle_wait",
+                                  side_effect=_sleep_that_changes_the_branch):
+            w.cooperative_solve(words, ROOT_BUDGET)
+
+        rows = self._wait_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["holders_at_first_block"], 1)
+        self.assertEqual(rows[0]["unclaimed_at_first_block"], 0)
+
+    def test_candidates_held_in_flight_do_not_read_as_unclaimed(self):
+        """A slot inside an unfinished claim is taken, not available.
+
+        This is the ordinary finalize-wait shape: one rival holds every
+        remaining candidate, so the pair attempt finds no bundle.  Counting
+        those slots as unclaimed would report a cap refusal on a branch that
+        simply has nothing left to hand out, which is precisely the distinction
+        these columns exist to draw.
+        """
+        w = self._worker()
+        key = ScoreCache.encode_subset(BRANCH[:3])
+        w.queue.create_branch(key, 3, w.n_candidates, budget=5)
+        self.assertIsNotNone(
+            self._rival_claims(w, key, count_cap=w.n_candidates))
+        self.assertEqual(w.queue.branch_done_candidates(key), 0)
+
+        wait = erd_swarm._DependencyWait("SPINE -----", 3, 5, 0)
+        w._record_first_block(wait, key)
+        self.assertEqual(wait.unclaimed_at_first_block, 0)
+        self.assertGreaterEqual(wait.holders_at_first_block, 1)
+
+    def test_a_freed_position_counts_as_claimable_again(self):
+        """A reclaimed or republished slot has no row and is available."""
+        w = self._worker()
+        key = ScoreCache.encode_subset(BRANCH[:3])
+        w.queue.create_branch(key, 3, w.n_candidates, budget=5)
+        self.assertIsNotNone(
+            self._rival_claims(w, key, count_cap=w.n_candidates))
+        self.assertEqual(
+            w.queue.branch_unclaimed_candidates(key, w.n_candidates), 0)
+        w.queue.reclaim_claims_of_worker("rival")
+        self.assertEqual(
+            w.queue.branch_unclaimed_candidates(key, w.n_candidates),
+            w.n_candidates)
+
+    def test_unclaimed_of_an_unknown_branch_is_zero(self):
+        """A branch the registry never saw has nothing left to claim."""
+        w = self._worker()
+        self.assertEqual(
+            w.queue.branch_unclaimed_candidates(
+                ScoreCache.encode_subset(BRANCH), w.n_candidates), 0)
 
     def test_branch_claim_holders_of_an_unknown_branch_is_zero(self):
         """A branch the queue has never interned holds nobody."""
