@@ -585,6 +585,75 @@ class _MidLoopPublisher:
             buf[key] = (log_n, log_n * log_n, 1)
 
 
+class _DependencyWait:
+    """One cooperative_solve wait episode, accumulated for telemetry.
+
+    `claim_telemetry.idle_millis` is a residual — whatever is left of a
+    coordination window after the four measured phases — so it totals waiting
+    without saying what was waited on.  This carries the attribution: the
+    dependency, how the episode divided between working on it, helping
+    elsewhere, and being stuck, and what the worker's alternatives were the
+    first time it had none.
+
+    `blocked_millis` is the stuck state alone, entered only after the worker
+    has failed to claim the branch by itself, failed to find work anywhere
+    else, and failed to pair onto the branch.  `holders_at_first_block` and
+    `unclaimed_at_first_block` are sampled once at that moment, which is what
+    separates "the cap refused the pair" from "the branch had nothing left to
+    claim".
+    """
+
+    __slots__ = ("spine", "n_words", "budget", "help_depth", "outcome",
+                 "_started", "iterations", "blocked_millis", "empty_scans",
+                 "helped_scans", "bundles_claimed", "pair_attempts",
+                 "pair_successes", "holders_at_first_block",
+                 "unclaimed_at_first_block")
+
+    def __init__(self, spine, n_words, budget, help_depth):
+        self.spine = spine
+        self.n_words = n_words
+        self.budget = budget
+        self.help_depth = help_depth
+        self.outcome = None
+        self._started = time.perf_counter()
+        self.iterations = 0
+        self.blocked_millis = 0
+        self.empty_scans = 0
+        self.helped_scans = 0
+        self.bundles_claimed = 0
+        self.pair_attempts = 0
+        self.pair_successes = 0
+        self.holders_at_first_block = None
+        self.unclaimed_at_first_block = None
+
+    @property
+    def episode_millis(self):
+        return int((time.perf_counter() - self._started) * 1000)
+
+    def note_first_block(self, holders, unclaimed):
+        """Record the alternatives once, on the first blocked iteration.
+
+        Sampled once rather than per poll: the blocked path already runs every
+        50 ms on a starving worker, and two more queries per turn of it would
+        be paid by the branch everyone is waiting for.
+        """
+        if self.holders_at_first_block is None:
+            self.holders_at_first_block = holders
+            self.unclaimed_at_first_block = unclaimed
+
+    def note_blocked(self, millis):
+        self.blocked_millis += millis
+
+    def should_record(self):
+        """True when the episode reached the wait loop at all.
+
+        An episode answered from cache before the loop has nothing to
+        attribute, and writing a row for it would put queue traffic on the
+        path that is already free.
+        """
+        return self.iterations > 0
+
+
 class _BranchWorker:
     """One worker process's state and operations on branches and candidates."""
 
@@ -2327,6 +2396,35 @@ class _BranchWorker:
                 return (OVER_ERD_LIMIT, cut_bound, None, cut_tainted)
         return None
 
+    def _record_first_block(self, wait, branch_key):
+        """Sample the worker's alternatives the first time it has none.
+
+        Reached only after the sole-worker claim, the scan for work elsewhere,
+        and (on the uncapped path) the pair attempt have all failed, so the two
+        counts answer why: holders at MAX_WORKERS_PER_BRANCH means the cap
+        refused the pair, while zero unclaimed candidates means the branch had
+        nothing left to hand out and the wait is for its finalize.
+        """
+        if wait.holders_at_first_block is not None:
+            return
+        holders = self.queue.branch_claim_holders(
+            branch_key, exclude_worker_id=self.name)
+        done = self.queue.branch_done_candidates(branch_key)
+        wait.note_first_block(holders, max(0, self.n_candidates - done))
+
+    def _record_dependency_wait(self, wait):
+        """Persist one wait episode, unless it never reached the wait loop."""
+        if not wait.should_record():
+            return
+        self.queue.add_dependency_wait(
+            self.name, wait.spine, wait.n_words, wait.budget,
+            wait.episode_millis, wait.blocked_millis, wait.iterations,
+            wait.empty_scans, wait.helped_scans, wait.bundles_claimed,
+            wait.pair_attempts, wait.pair_successes,
+            holders_at_first_block=wait.holders_at_first_block,
+            unclaimed_at_first_block=wait.unclaimed_at_first_block,
+            help_depth=wait.help_depth, outcome=wait.outcome)
+
     def cooperative_solve(self, words, budget, ceiling=float('inf')):
         """Solve sub-branch `words` at `budget` cooperatively, returning the
         engine's (status, cost, max_depth, floor) tuple.
@@ -2454,20 +2552,27 @@ class _BranchWorker:
             context_stack.enter_context(self._entered(
                 parent_context.descend(branch_key, child_spine)))
 
+            wait = _DependencyWait(child_spine, n_words, budget,
+                                   self._help_recursion_depth)
+            context_stack.callback(self._record_dependency_wait, wait)
             while not self.cancel():
+                wait.iterations += 1
                 # Finished?  Check before claiming so we never touch a branch that
                 # another worker just finalized and deleted.
                 reuse = _cache_reuse(
                     self.score_cache.read_for_budget(branch_key, ERD_ALL, budget),
                     budget)
                 if reuse is not None:
+                    wait.outcome = 'solved'
                     return (SOLVED, *reuse)
                 loss_budget = self.score_cache.read_loss(
                     branch_key, ERD_ALL, refresh=True)
                 if loss_budget is not None and budget <= loss_budget:
+                    wait.outcome = 'loss'
                     return (OVER_DEPTH_BUDGET, float('inf'), None, True)
                 cut = self._read_satisfying_cut(branch_key, budget, ceiling, n_words)
                 if cut is not None:
+                    wait.outcome = 'cut'
                     return cut
                 if self.queue.get_branch(branch_key) is None:
                     # Finalized + deleted: a cut lands in cut_results and a
@@ -2476,10 +2581,13 @@ class _BranchWorker:
                     loss_budget = self.score_cache.read_loss(
                         branch_key, ERD_ALL, refresh=True)
                     if loss_budget is not None and budget <= loss_budget:
+                        wait.outcome = 'loss'
                         return (OVER_DEPTH_BUDGET, float('inf'), None, True)
                     cut = self._read_satisfying_cut(branch_key, budget, ceiling, n_words)
                     if cut is not None:
+                        wait.outcome = 'cut'
                         return cut
+                    wait.outcome = 'deleted'
                     break                       # finalized as a loss + deleted
                 # Sole worker only: a dependency someone else already holds is
                 # being worked, and this worker is worth far more opening a
@@ -2489,6 +2597,7 @@ class _BranchWorker:
                     expected_opener_work_id=self._work_context.opener_work_id,
                     max_other_workers=0)
                 if claim is not None:
+                    wait.bundles_claimed += 1
                     self._evaluate_dependency_bundle(
                         branch_key, words, n_words, claim, budget)
                 elif self.queue.branch_done_candidates(branch_key) >= self.n_candidates:
@@ -2504,7 +2613,11 @@ class _BranchWorker:
                     # _help_other_branch's capped-depth contract already
                     # promises its callers.
                     self._cur_candidate = None
+                    blocked_at = time.perf_counter()
                     self._idle_wait(0.05)
+                    wait.note_blocked(
+                        int((time.perf_counter() - blocked_at) * 1000))
+                    self._record_first_block(wait, branch_key)
                 else:
                     # No bundle: every candidate is claimed, or another worker
                     # holds the branch.  Try free or promotable work first —
@@ -2519,7 +2632,10 @@ class _BranchWorker:
                     # contends against the very lock every other worker's
                     # writes need too.
                     self._cur_candidate = None  # coordinating, no candidate in flight
-                    if not self._help_other_branch(branch_key):
+                    if self._help_other_branch(branch_key):
+                        wait.helped_scans += 1
+                    else:
+                        wait.empty_scans += 1
                         # A completed scan found nothing free or promotable
                         # anywhere (the recursion cap is ruled out by the
                         # branch above, so this really is an empty scan, not a
@@ -2535,20 +2651,33 @@ class _BranchWorker:
                         self._heartbeat(branch_key, n_words, None, None,
                                         None, None, force=True)
                         self.queue.reclaim_stale_claims(HB_TIMEOUT_SECONDS)
+                        wait.pair_attempts += 1
                         paired = self._claim_bundle(
                             branch_key, self.n_candidates, words, budget,
                             expected_opener_work_id=(
                                 self._work_context.opener_work_id),
                             max_other_workers=MAX_WORKERS_PER_BRANCH - 1)
                         if paired is not None:
+                            wait.pair_successes += 1
+                            wait.bundles_claimed += 1
                             self._evaluate_dependency_bundle(
                                 branch_key, words, n_words, paired, budget)
                         else:
+                            # Nothing claimable anywhere, no pair available on
+                            # the dependency: the stuck state idle_millis
+                            # totals without naming.
+                            self._record_first_block(wait, branch_key)
+                            blocked_at = time.perf_counter()
                             self._idle_wait(0.05)   # let claims land
+                            wait.note_blocked(
+                                int((time.perf_counter() - blocked_at) * 1000))
 
             if self.cancel():  # pragma: no cover
+                wait.outcome = 'cancelled'
                 return CANCEL_RECVD
             # Finalized as a loss: proven unsolvable within budget (not a cutoff).
+            if wait.outcome is None:  # pragma: no cover
+                wait.outcome = 'loss'
             return (OVER_DEPTH_BUDGET, float('inf'), None, True)  # pragma: no cover
 
     # -- scheduling: claim one candidate from the best available branch ------

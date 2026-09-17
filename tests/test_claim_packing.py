@@ -221,7 +221,7 @@ class TestSchemaMigration(unittest.TestCase):
             "bundle_stats", "cost_samples", "claim_telemetry",
             "branch_finalize_log", "candidate_accuracy",
             "backstop_telemetry", "cut_reuse_misses",
-            "two_level_prune_telemetry"})
+            "two_level_prune_telemetry", "dependency_wait"})
 
 
 N_CANDIDATES = 40

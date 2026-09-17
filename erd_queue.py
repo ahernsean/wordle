@@ -846,6 +846,53 @@ CREATE TABLE IF NOT EXISTS telemetry.backstop_telemetry (
     epoch                INTEGER NOT NULL DEFAULT 0,
     recorded_at          INTEGER NOT NULL
 );
+
+-- One row per cooperative_solve that had to wait on a dependency: the worker
+-- needed a sub-branch it could not simply claim, and spent time in the wait
+-- loop before the branch produced an answer.
+--
+-- claim_telemetry's idle_millis is a RESIDUAL — the part of a coordination
+-- window left after the four measured phases — so it says how much waiting
+-- happened but nothing about what was waited on.  This table is the
+-- attribution: which branch, for how long, and what the worker's alternatives
+-- were at the moment it stalled.
+--
+-- The distinction the columns exist to draw: a worker in this loop first tries
+-- to claim the branch alone, then to help anywhere else, then to pair onto the
+-- branch, and only then sleeps.  blocked_millis covers that last state alone,
+-- and holders/unclaimed at first block say whether the pair was refused
+-- because the branch was already at MAX_WORKERS_PER_BRANCH or because there
+-- was nothing left on it to claim.  Those are different problems with
+-- different fixes, and idle_millis cannot tell them apart.
+CREATE TABLE IF NOT EXISTS telemetry.dependency_wait (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    worker_id            TEXT,
+    spine                TEXT,               -- the dependency, not the waiter
+    n_words              INTEGER,
+    budget               INTEGER,
+    -- Whole time inside the wait loop, and the part of it spent asleep with no
+    -- claim held and nothing claimable: episode >= blocked always.
+    episode_millis       INTEGER NOT NULL,
+    blocked_millis       INTEGER NOT NULL,
+    iterations           INTEGER NOT NULL,
+    -- _help_other_branch outcomes: a completed scan that found nothing free or
+    -- promotable anywhere, versus one that sent this worker off to real work.
+    empty_scans          INTEGER NOT NULL,
+    helped_scans         INTEGER NOT NULL,
+    -- Bundles this worker claimed on the dependency itself, sole or paired.
+    bundles_claimed      INTEGER NOT NULL,
+    pair_attempts        INTEGER NOT NULL,
+    pair_successes       INTEGER NOT NULL,
+    -- Sampled once, at the first blocked iteration: re-reading them every
+    -- 50 ms poll would put a query on the one path that is already starving.
+    holders_at_first_block   INTEGER,
+    unclaimed_at_first_block INTEGER,
+    help_depth           INTEGER,
+    -- How the wait ended: 'solved', 'loss', 'cut', 'deleted', 'cancelled'.
+    outcome              TEXT,
+    epoch                INTEGER NOT NULL DEFAULT 0,
+    recorded_at          INTEGER NOT NULL
+);
 """
 
 # Every table _TELEMETRY_SCHEMA_SQL creates, used to detect a queue file that
@@ -853,7 +900,7 @@ CREATE TABLE IF NOT EXISTS telemetry.backstop_telemetry (
 _TELEMETRY_TABLES = (
     "bundle_stats", "cost_samples", "claim_telemetry",
     "branch_finalize_log", "candidate_accuracy", "backstop_telemetry",
-    "cut_reuse_misses",
+    "cut_reuse_misses", "dependency_wait",
 )
 
 
@@ -3773,6 +3820,28 @@ class ERDQueue:
         return self._conn.execute(
             "SELECT COUNT(*) FROM candidate_claims WHERE branch_id = ? AND done = 1",
             (branch_id,)).fetchone()[0]
+
+    def branch_claim_holders(self, branch_key, exclude_worker_id=None) -> int:
+        """Workers other than exclude_worker_id holding unfinished claims on
+        one branch.
+
+        The single-branch form of claim_holders_by_branch, for a caller that
+        wants occupancy for the branch it is already looking at rather than a
+        map of every branch.  Occupancy is unfinished claims, never heartbeats:
+        the claim row is written by the transaction that hands out the bundle,
+        so a branch reads as taken the instant it is taken.
+        """
+        branch_id = self._intern_branch(branch_key)
+        if branch_id is None:
+            return 0
+        if exclude_worker_id is None:
+            return self._conn.execute(
+                "SELECT COUNT(DISTINCT claimed_by) FROM candidate_claims "
+                "WHERE branch_id = ? AND done = 0", (branch_id,)).fetchone()[0]
+        return self._conn.execute(
+            "SELECT COUNT(DISTINCT claimed_by) FROM candidate_claims "
+            "WHERE branch_id = ? AND done = 0 AND claimed_by IS NOT ?",
+            (branch_id, exclude_worker_id)).fetchone()[0]
 
     def branch_bulk_done_candidates(self, branch_key) -> int:
         """Return the legacy combined count completed by ERD pruning."""
@@ -6797,6 +6866,36 @@ class ERDQueue:
               None if hint_was_winner is None else int(hint_was_winner),
               first_best_at, nodes_at_first_best,
               now))
+
+    def add_dependency_wait(self, worker_id, spine, n_words, budget,
+                            episode_millis, blocked_millis, iterations,
+                            empty_scans, helped_scans, bundles_claimed,
+                            pair_attempts, pair_successes,
+                            holders_at_first_block=None,
+                            unclaimed_at_first_block=None,
+                            help_depth=None, outcome=None):
+        """Record one cooperative_solve wait episode.
+
+        Attributes what claim_telemetry's idle_millis can only total: which
+        dependency the worker waited on, how much of the episode it was asleep
+        rather than helping or claiming, and what its alternatives were when it
+        first stalled.  A caller that never blocked has nothing to attribute
+        and should not write a row.
+        """
+        now = int(time.time())
+        self._conn.execute("""
+            INSERT INTO telemetry.dependency_wait
+                (worker_id, spine, n_words, budget, episode_millis,
+                 blocked_millis, iterations, empty_scans, helped_scans,
+                 bundles_claimed, pair_attempts, pair_successes,
+                 holders_at_first_block, unclaimed_at_first_block,
+                 help_depth, outcome, epoch, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (worker_id, spine, n_words, budget, episode_millis,
+              blocked_millis, iterations, empty_scans, helped_scans,
+              bundles_claimed, pair_attempts, pair_successes,
+              holders_at_first_block, unclaimed_at_first_block,
+              help_depth, outcome, self.epoch, now))
 
     def add_cut_reuse_miss(self, branch_key, n_words, budget, wanted_ceiling,
                            available_bound, available_budget):

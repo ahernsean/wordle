@@ -5918,3 +5918,161 @@ class TestExhaustedScanReadsEachOpenerOnce(BranchOccupancyFixture,
         work = self._worker(90)._claim_one_uninstrumented()
 
         self.assertEqual(self._claimed_key(work), joinable_key)
+
+
+class TestDependencyWaitAttribution(unittest.TestCase):
+    """cooperative_solve records what it waited on, so idle time has a subject.
+
+    `claim_telemetry.idle_millis` is a residual and totals waiting without
+    naming it.  These pin the attribution: which dependency, how much of the
+    episode was spent stuck rather than working or helping, and — the field the
+    worker-cap question turns on — whether anything was claimable when the
+    worker first had nothing to do.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.answer_file = self._write("answers.txt", BRANCH)
+        self.words_file = self._write("words.txt", CANDIDATES)
+        for attr, path in [("ANSWER_FILE", self.answer_file),
+                           ("WORDS_FILE", self.words_file)]:
+            p = mock.patch.object(erd_swarm, attr, path)
+            p.start()
+            self.addCleanup(p.stop)
+        self.cache_path = os.path.join(self._tmp.name, "cache.sqlite3")
+        self.queue_path = os.path.join(self._tmp.name, "queue.sqlite3")
+
+    def _write(self, name, words):
+        p = os.path.join(self._tmp.name, name)
+        with open(p, "w") as f:
+            f.write("\n".join(words) + "\n")
+        return p
+
+    def _worker(self):
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        self.addCleanup(w.close)
+        return w
+
+    def _rival_claims(self, w, key):
+        """A rival worker takes a bundle, the way production leaves occupancy:
+        an unfinished claim row written by the transaction that handed it out."""
+        order = list(range(w.n_candidates))
+        return w.queue.claim_next_bundle(
+            key, "rival", w.n_candidates, order, [0.0] * w.n_candidates,
+            small_count=1, count_cap=1)
+
+    def _wait_rows(self):
+        path = erd_queue.derive_telemetry_path(self.queue_path)
+        conn = sqlite3.connect(path)
+        conn.row_factory = sqlite3.Row
+        try:
+            return [dict(r) for r in
+                    conn.execute("SELECT * FROM dependency_wait ORDER BY id")]
+        finally:
+            conn.close()
+
+    def test_cache_hit_writes_no_wait_row(self):
+        """An episode answered before the wait loop never opens an episode."""
+        words = BRANCH[:3]
+        sc = ScoreCache(self.cache_path, BRANCH)
+        sc.write(ScoreCache.encode_subset(words), ERD_ALL, "crane", 1.5,
+                 max_depth=2, solve_budget=None)
+        sc.close()
+        w = self._worker()
+        self.assertEqual(w.cooperative_solve(words, ROOT_BUDGET)[0], SOLVED)
+        self.assertEqual(self._wait_rows(), [])
+
+    def test_an_episode_that_never_iterates_writes_no_row(self):
+        """A worker asked to stop before the first iteration attributed nothing.
+
+        The wait object exists by then — it is built immediately before the
+        loop — so only should_record keeps this row out.  Distinct from the
+        cache-hit path above, which returns before the episode is opened at
+        all.
+        """
+        w = self._worker()
+        w.request_stop()
+        self.assertEqual(w.cooperative_solve(BRANCH[:3], ROOT_BUDGET),
+                         erd_swarm.CANCEL_RECVD)
+        self.assertEqual(self._wait_rows(), [])
+
+    def test_a_solved_dependency_names_the_branch_it_waited_on(self):
+        words = BRANCH[:3]
+        w = self._worker()
+        status, _cost, _md, _taint = w.cooperative_solve(words, ROOT_BUDGET)
+        self.assertEqual(status, SOLVED)
+        rows = self._wait_rows()
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["n_words"], len(words))
+        self.assertEqual(row["budget"], ROOT_BUDGET)
+        self.assertEqual(row["outcome"], "solved")
+        self.assertGreaterEqual(row["iterations"], 1)
+        self.assertGreaterEqual(row["bundles_claimed"], 1)
+
+    def test_blocked_time_never_exceeds_the_episode(self):
+        """blocked_millis is a part of the episode, not a separate clock."""
+        w = self._worker()
+        w.cooperative_solve(BRANCH[:3], ROOT_BUDGET)
+        for row in self._wait_rows():
+            self.assertLessEqual(row["blocked_millis"], row["episode_millis"])
+            self.assertGreaterEqual(row["blocked_millis"], 0)
+
+    def test_first_block_is_sampled_once(self):
+        """Re-sampling would put two queries on every 50 ms poll of a stall."""
+        w = self._worker()
+        wait = erd_swarm._DependencyWait("SPINE -----", 3, 5, 0)
+        key = ScoreCache.encode_subset(BRANCH[:3])
+        w.queue.create_branch(key, 3, w.n_candidates, budget=5)
+        w._record_first_block(wait, key)
+        first = (wait.holders_at_first_block, wait.unclaimed_at_first_block)
+        w.queue.mark_claims_done(key, list(range(w.n_candidates)))
+        w._record_first_block(wait, key)
+        self.assertEqual(
+            (wait.holders_at_first_block, wait.unclaimed_at_first_block), first)
+
+    def test_cap_refusal_is_distinguishable_from_an_exhausted_branch(self):
+        """The two reasons a pair fails must not read alike.
+
+        A branch another worker holds with candidates left is a cap refusal —
+        raising MAX_WORKERS_PER_BRANCH would admit this worker.  A branch with
+        nothing left to claim is waiting on its own finalize, which no cap
+        change reaches.  idle_millis cannot tell these apart; these columns
+        must.
+        """
+        w = self._worker()
+        key = ScoreCache.encode_subset(BRANCH[:3])
+        w.queue.create_branch(key, 3, w.n_candidates, budget=5)
+        self.assertIsNotNone(self._rival_claims(w, key))
+
+        occupied = erd_swarm._DependencyWait("SPINE -----", 3, 5, 0)
+        w._record_first_block(occupied, key)
+        self.assertGreaterEqual(occupied.holders_at_first_block, 1)
+        self.assertGreater(occupied.unclaimed_at_first_block, 0)
+
+        w.queue.mark_claims_done(key, list(range(w.n_candidates)))
+        exhausted = erd_swarm._DependencyWait("SPINE -----", 3, 5, 0)
+        w._record_first_block(exhausted, key)
+        self.assertEqual(exhausted.unclaimed_at_first_block, 0)
+
+    def test_branch_claim_holders_of_an_unknown_branch_is_zero(self):
+        """A branch the queue has never interned holds nobody."""
+        w = self._worker()
+        self.assertEqual(
+            w.queue.branch_claim_holders(ScoreCache.encode_subset(BRANCH)), 0)
+
+    def test_branch_claim_holders_agrees_with_the_map(self):
+        """The single-branch count must not drift from the map scheduling uses."""
+        w = self._worker()
+        key = ScoreCache.encode_subset(BRANCH[:3])
+        w.queue.create_branch(key, 3, w.n_candidates, budget=5)
+        self.assertEqual(w.queue.branch_claim_holders(key), 0)
+        self.assertIsNotNone(self._rival_claims(w, key))
+        self.assertEqual(
+            w.queue.branch_claim_holders(key, exclude_worker_id="rival"), 0)
+        self.assertEqual(w.queue.branch_claim_holders(key), 1)
+        self.assertEqual(
+            w.queue.branch_claim_holders(key, exclude_worker_id=w.name),
+            w.queue.claim_holders_by_branch(
+                exclude_worker_id=w.name).get(bytes(key), 0))
