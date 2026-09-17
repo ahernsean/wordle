@@ -5967,6 +5967,13 @@ class ERDQueue:
         direct_branch_count counts the branches the requests asked for
         directly; a branch acquired later by promotion carries a
         parent_branch_id and is counted only in branch_count.
+
+        requested_priority is the priority of the word's outstanding
+        requests, not the highest priority it was ever requested at: an
+        earlier request that has already completed does not describe what
+        priority is governing the word's remaining queued work. It falls
+        back to the priority of the completed requests only once none are
+        outstanding.
         """
         opener_work_columns = {
             row["name"] for row in self._conn.execute(
@@ -5980,7 +5987,10 @@ class ERDQueue:
             SELECT s.opener,
                    MIN(s.requested_at) AS requested_at,
                    {started_at} AS started_at,
-                   MAX(s.requested_priority) AS requested_priority,
+                   COALESCE(
+                       MAX(CASE WHEN s.state != 'complete'
+                                THEN s.requested_priority END),
+                       MAX(s.requested_priority)) AS requested_priority,
                    MAX(m.resolved_at) AS completed_at,
                    COUNT(DISTINCT s.opener_work_id) AS request_count,
                    MAX(s.state = 'active') AS has_active_request,
@@ -5998,7 +6008,7 @@ class ERDQueue:
               ON m.opener_work_id = s.opener_work_id
             LEFT JOIN pending_branches p ON p.branch_id = m.branch_id
             GROUP BY s.opener
-            ORDER BY MAX(s.requested_priority) DESC, s.opener
+            ORDER BY requested_priority DESC, s.opener
         """).fetchall()
 
     def distinct_branch_count_for_words(self, openers):

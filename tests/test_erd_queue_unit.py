@@ -1786,6 +1786,41 @@ class TestReladderUnfinishedOpenerPriorities(_TmpQueue):
             OPENER_PRIORITY_MAX - 2)
 
 
+class TestOpenerRowsRequestedPriority(_TmpQueue):
+    """opener_rows()'s requested_priority column.
+
+    A word can hold more than one opener_work request, and their priorities
+    are unrelated: a re-request does not renumber what an earlier, already
+    finished request was queued at."""
+
+    def _mark_opener_work_complete(self, branch_key):
+        self.q.claim_next("worker-0")
+        self.q.mark_done(branch_key)
+
+    def test_reflects_the_outstanding_request_not_a_finished_one(self):
+        other_key = ScoreCache.encode_subset(WORDS[:4])
+        self.q.add_pending_many([(self.key, len(WORDS), 50, "crane", 0)])
+        self._mark_opener_work_complete(self.key)
+
+        self.q.add_pending_many([(other_key, 4, 10, "crane", 0)])
+
+        row = {r["opener"]: r for r in self.q.opener_rows()}["crane"]
+        self.assertEqual(row["requested_priority"], 10)
+        self.assertEqual(row["request_count"], 2)
+        self.assertTrue(row["has_incomplete_request"])
+
+    def test_falls_back_to_the_completed_priority_once_nothing_is_outstanding(self):
+        other_key = ScoreCache.encode_subset(WORDS[:4])
+        self.q.add_pending_many([(self.key, len(WORDS), 50, "crane", 0)])
+        self._mark_opener_work_complete(self.key)
+        self.q.add_pending_many([(other_key, 4, 10, "crane", 0)])
+        self._mark_opener_work_complete(other_key)
+
+        row = {r["opener"]: r for r in self.q.opener_rows()}["crane"]
+        self.assertEqual(row["requested_priority"], 50)
+        self.assertFalse(row["has_incomplete_request"])
+
+
 class TestOpenerWorkConcurrency(_TmpQueue):
     def test_interleaved_opener_lifecycle_preserves_invariants(self):
         worker_count = 4
