@@ -17,7 +17,7 @@ import sqlite3
 import tempfile
 import unittest
 
-from erd_queue import ERDQueue, cost_size_bucket
+from erd_queue import ERDQueue, cost_size_bucket, _COST_MODEL_MIN_WEIGHT
 from wordle_engine import (estimate_candidate_work, estimate_candidate_work_cutoff,
                            evaluate_candidate, ERD_ANSWERS, ERD_ALL)
 
@@ -52,8 +52,10 @@ class TestEpochBaseline(_TmpQueue):
 
 class TestCostModelBudgetKey(_TmpQueue):
     def test_specific_budget_cell_isolated_from_other_budget(self):
-        self.q.update_cost_model(ERD_ALL, 100, 1000, budget=3)
-        self.q.update_cost_model(ERD_ALL, 100, 1_000_000, budget=5)
+        self.q.update_cost_model(ERD_ALL, 100, 1000,
+                                 weight=_COST_MODEL_MIN_WEIGHT, budget=3)
+        self.q.update_cost_model(ERD_ALL, 100, 1_000_000,
+                                 weight=_COST_MODEL_MIN_WEIGHT, budget=5)
         self.assertAlmostEqual(
             self.q.get_cost_typical(ERD_ALL, 100, budget=3), 1000, delta=1)
         self.assertAlmostEqual(
@@ -61,7 +63,11 @@ class TestCostModelBudgetKey(_TmpQueue):
 
     def test_cold_specific_cell_stays_cold(self):
         # Warm budget=3 only; an unseen budget=4 has no fallback and reads cold.
-        self.q.update_cost_model(ERD_ALL, 100, 1000, budget=3)
+        # budget=3 is seeded past the warmth gate so budget=4 reading cold is
+        # evidence of budget keying rather than of both cells being unmeasured.
+        self.q.update_cost_model(ERD_ALL, 100, 1000,
+                                 weight=_COST_MODEL_MIN_WEIGHT, budget=3)
+        self.assertIsNotNone(self.q.get_cost_typical(ERD_ALL, 100, budget=3))
         self.assertIsNone(self.q.get_cost_typical(ERD_ALL, 100, budget=4))
 
     def test_budget_is_required(self):

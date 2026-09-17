@@ -27,6 +27,7 @@ from erd_queue import (
     OPENER_PRIORITY_MIN,
     ERDQueue as ProductionERDQueue,
     cost_size_bucket,
+    _COST_MODEL_MIN_WEIGHT,
 )
 from tests.queue_invariants import OpenerWorkInvariantCheckMixin
 
@@ -1916,9 +1917,22 @@ class TestCostModel(_TmpQueue):
     def test_cold_read_returns_none(self):
         self.assertIsNone(self.q.get_cost_typical("erd_all", 10, budget=COST_MODEL_BUDGET))
 
-    def test_single_sample_round_trips(self):
-        import math
+    def test_single_sample_leaves_the_cell_cold(self):
+        """One observation must not make a cell authoritative for its bucket."""
         self.q.update_cost_model("erd_all", 10, 1000, budget=COST_MODEL_BUDGET)
+        self.assertIsNone(self.q.get_cost_typical("erd_all", 10, budget=COST_MODEL_BUDGET))
+
+    def test_weight_just_below_the_threshold_reads_cold(self):
+        self.q.update_cost_model("erd_all", 10, 1000,
+                                 weight=_COST_MODEL_MIN_WEIGHT - 0.01,
+                                 budget=COST_MODEL_BUDGET)
+        self.assertIsNone(self.q.get_cost_typical("erd_all", 10, budget=COST_MODEL_BUDGET))
+        self.assertIsNone(self.q.get_cost_spread("erd_all", 10, budget=COST_MODEL_BUDGET))
+
+    def test_weight_at_the_threshold_reads_warm(self):
+        self.q.update_cost_model("erd_all", 10, 1000,
+                                 weight=_COST_MODEL_MIN_WEIGHT,
+                                 budget=COST_MODEL_BUDGET)
         result = self.q.get_cost_typical("erd_all", 10, budget=COST_MODEL_BUDGET)
         self.assertIsNotNone(result)
         self.assertAlmostEqual(result, 1000.0, delta=1.0)
@@ -1926,31 +1940,39 @@ class TestCostModel(_TmpQueue):
     def test_geometric_mean_not_arithmetic(self):
         import math
         # Two samples: 100 and 10000.  Geometric mean = 1000; arithmetic = 5050.
-        self.q.update_cost_model("erd_all", 5, 100, budget=COST_MODEL_BUDGET)
-        self.q.update_cost_model("erd_all", 5, 10000, budget=COST_MODEL_BUDGET)
+        # Equal weights leave the geometric mean where a sample pair puts it.
+        self.q.update_cost_model("erd_all", 5, 100,
+                                 weight=_COST_MODEL_MIN_WEIGHT, budget=COST_MODEL_BUDGET)
+        self.q.update_cost_model("erd_all", 5, 10000,
+                                 weight=_COST_MODEL_MIN_WEIGHT, budget=COST_MODEL_BUDGET)
         result = self.q.get_cost_typical("erd_all", 5, budget=COST_MODEL_BUDGET)
         self.assertIsNotNone(result)
         self.assertAlmostEqual(result, 1000.0, delta=50.0)
 
     def test_weighted_batch_update(self):
-        # weight=3 is equivalent to adding the sample 3 times.
-        import math
-        self.q.update_cost_model("erd_all", 8, 500, weight=3.0, budget=COST_MODEL_BUDGET)
+        # weight=W is equivalent to adding the sample W times.
+        self.q.update_cost_model("erd_all", 8, 500,
+                                 weight=3.0 * _COST_MODEL_MIN_WEIGHT,
+                                 budget=COST_MODEL_BUDGET)
         result = self.q.get_cost_typical("erd_all", 8, budget=COST_MODEL_BUDGET)
         self.assertIsNotNone(result)
         self.assertAlmostEqual(result, 500.0, delta=5.0)
 
     def test_policy_isolation(self):
-        self.q.update_cost_model("erd_all", 12, 200, budget=COST_MODEL_BUDGET)
-        self.q.update_cost_model("max_group_size", 12, 9999, budget=COST_MODEL_BUDGET)
+        self.q.update_cost_model("erd_all", 12, 200,
+                                 weight=_COST_MODEL_MIN_WEIGHT, budget=COST_MODEL_BUDGET)
+        self.q.update_cost_model("max_group_size", 12, 9999,
+                                 weight=_COST_MODEL_MIN_WEIGHT, budget=COST_MODEL_BUDGET)
         erd = self.q.get_cost_typical("erd_all", 12, budget=COST_MODEL_BUDGET)
         mgs = self.q.get_cost_typical("max_group_size", 12, budget=COST_MODEL_BUDGET)
         self.assertAlmostEqual(erd, 200.0, delta=5.0)
         self.assertAlmostEqual(mgs, 9999.0, delta=5.0)
 
     def test_size_bucket_isolation(self):
-        self.q.update_cost_model("erd_all", 10, 100, budget=COST_MODEL_BUDGET)
-        self.q.update_cost_model("erd_all", 20, 999, budget=COST_MODEL_BUDGET)
+        self.q.update_cost_model("erd_all", 10, 100,
+                                 weight=_COST_MODEL_MIN_WEIGHT, budget=COST_MODEL_BUDGET)
+        self.q.update_cost_model("erd_all", 20, 999,
+                                 weight=_COST_MODEL_MIN_WEIGHT, budget=COST_MODEL_BUDGET)
         r10 = self.q.get_cost_typical("erd_all", 10, budget=COST_MODEL_BUDGET)
         r20 = self.q.get_cost_typical("erd_all", 20, budget=COST_MODEL_BUDGET)
         self.assertAlmostEqual(r10, 100.0, delta=5.0)
