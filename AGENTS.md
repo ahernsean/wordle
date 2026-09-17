@@ -942,15 +942,23 @@ and its related paths. Use `python3.13`; for example:
 python3.13 -m unittest tests.test_report_model tests.test_report_terminal
 ```
 
-**Bump `BUILD` in `wordle.py` whenever a change alters the interactive
-experience** — a command's output, a prompt, a status line, a new or changed
-command, anything the person running the app can see or interact with
-differently. `BUILD` (e.g. `"b138"`) is the only way to tell, from the
-running app itself, which code is actually in front of you: the startup
-banner and every session's debug log print it. A change confined to
-`wordle_engine.py`, `cache_sqlite.py`, or another non-interactive module
-doesn't need a bump on its own. Increment by exactly one from the current
-value — never skip or reuse a number.
+**Bump `BUILD` in `wordle.py` whenever a change alters wordle.py's own
+interactive session** — a command's output, a prompt, a status line, a new or
+changed command, anything the person playing the game can see or interact
+with differently. `BUILD` (e.g. `"b138"`) is the only way to tell, from the
+running game itself, which code is actually in front of you: the startup
+banner and every session's debug log print it.
+
+The scope is wordle.py's session, not "anything interactive in this
+codebase." `erd_search.py view` is its own interactive CLI — TTY hotkeys,
+`--watch`, its own reports — with a user who never runs wordle.py to see any
+of it, so a change to it carries no information for wordle.py's BUILD to
+report. A change confined to `wordle_engine.py`, `cache_sqlite.py`,
+`erd_queue.py`, `report_model.py`, `report_terminal.py`, `erd_search.py`,
+`report_server.py`, or `report_client.html` doesn't need a bump on its own —
+however visibly its own output changes — unless the change also reaches
+wordle.py's session through an import wordle.py actually makes. Increment by
+exactly one from the current value — never skip or reuse a number.
 
 **Your tests should be specific, then push and open the pull request.** A local
 full-suite pass can cost about twenty minutes and could spend nearly all of it
