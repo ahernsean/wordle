@@ -7,7 +7,7 @@ pruning.  Branches built from whole families are the workload shape where
 the adaptive-decomposition layer earns or wastes its keep — unlike small
 random branches, whose wall time is dominated by per-claim coordination.
 """
-from erd_queue import ERDQueue
+from erd_queue import ERDQueue, _COST_MODEL_MIN_WEIGHT
 from wordle_engine import ERD_ALL
 
 
@@ -54,12 +54,17 @@ def seed_cost_model(queue_path, max_n_words=40, budgets=(3, 4)):
     with a ~200-word candidate vocabulary), so the gate behaves as it would
     mid-production: sub-branches of ~11+ words predict above the bootstrap
     publish threshold and promote; smaller ones inline.
+
+    Each write carries _COST_MODEL_MIN_WEIGHT so every seeded cell clears the
+    warmth gate on its own.  A uniform weight leaves the seeded curve's
+    geometric mean where single samples would have put it.
     """
     queue = ERDQueue(queue_path)
     try:
         for budget in budgets:
             for n_words in range(3, max_n_words + 1):
                 queue.update_cost_model(ERD_ALL, n_words, 45 * n_words * n_words,
+                                        weight=_COST_MODEL_MIN_WEIGHT,
                                         budget=budget)
     finally:
         queue.close()

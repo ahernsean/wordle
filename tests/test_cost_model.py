@@ -26,10 +26,16 @@ import unittest
 
 from erd_queue import (
     ERDQueue, cost_size_bucket, _COST_MODEL_TAU, _COST_MODEL_BUCKET_BASE,
+    _COST_MODEL_MIN_WEIGHT,
 )
 
 POLICY = "erd_all"
 BUDGET = 5
+# Per-sample weight for tests that assert on estimator mechanics rather than on
+# the warmth gate.  Scaling every sample by one constant leaves the geometric
+# mean and the log-normal sigma unchanged, and carries a handful of samples over
+# the effective weight a cell needs before it will answer at all.
+WARM = _COST_MODEL_MIN_WEIGHT
 
 
 def _lognormal_samples(mu, sigma, count, seed):
@@ -68,7 +74,7 @@ class TestSizeBucketing(_TmpQueue):
         # A sample at size 100 warms its whole bucket: an unseen 105 (same
         # bucket) reads warm with the same estimate; a distant 130 stays cold.
         self.assertIsNone(self.q.get_cost_typical(POLICY, 100, budget=BUDGET))
-        self.q.update_cost_model(POLICY, 100, 4000, budget=BUDGET)
+        self.q.update_cost_model(POLICY, 100, 4000, weight=WARM, budget=BUDGET)
         self.assertIsNotNone(self.q.get_cost_typical(POLICY, 105, budget=BUDGET))
         self.assertEqual(self.q.get_cost_typical(POLICY, 100, budget=BUDGET),
                          self.q.get_cost_typical(POLICY, 105, budget=BUDGET))
@@ -120,7 +126,8 @@ class TestTimeDecay(_TmpQueue):
         # Samples sharing one timestamp accumulate without decay (elapsed 0).
         now = 5_000
         for _ in range(10):
-            self.q.update_cost_model(POLICY, 80, 500, now=now, budget=BUDGET)
+            self.q.update_cost_model(POLICY, 80, 500, weight=WARM, now=now,
+                                     budget=BUDGET)
         self.assertAlmostEqual(
             self.q.get_cost_typical(POLICY, 80, budget=BUDGET), 500, delta=2)
 
@@ -130,8 +137,8 @@ class TestSpread(_TmpQueue):
         # Two values a, b: sigma of ln is |ln a - ln b| / 2.
         now = 1_000_000
         a, b = 100, 10_000
-        self.q.update_cost_model(POLICY, 60, a, now=now, budget=BUDGET)
-        self.q.update_cost_model(POLICY, 60, b, now=now, budget=BUDGET)
+        self.q.update_cost_model(POLICY, 60, a, weight=WARM, now=now, budget=BUDGET)
+        self.q.update_cost_model(POLICY, 60, b, weight=WARM, now=now, budget=BUDGET)
         expected = abs(math.log(a) - math.log(b)) / 2
         self.assertAlmostEqual(self.q.get_cost_spread(POLICY, 60, budget=BUDGET),
                                expected, places=6)
@@ -139,7 +146,8 @@ class TestSpread(_TmpQueue):
     def test_zero_spread_for_identical_samples(self):
         now = 1_000_000
         for _ in range(5):
-            self.q.update_cost_model(POLICY, 60, 777, now=now, budget=BUDGET)
+            self.q.update_cost_model(POLICY, 60, 777, weight=WARM, now=now,
+                                     budget=BUDGET)
         self.assertAlmostEqual(
             self.q.get_cost_spread(POLICY, 60, budget=BUDGET), 0.0, places=6)
 
@@ -182,8 +190,8 @@ class TestBatchEqualsIndividual(_TmpQueue):
         log_sum = sum(math.log(x) for x in samples)
         log_sq_sum = sum(math.log(x) ** 2 for x in samples)
         self.q.update_cost_model_logsums(
-            POLICY, 12, log_sum, log_sq_sum, float(len(samples)), now=now,
-            budget=BUDGET)
+            POLICY, 12, log_sum * WARM, log_sq_sum * WARM,
+            float(len(samples)) * WARM, now=now, budget=BUDGET)
         typical = self.q.get_cost_typical(POLICY, 12, budget=BUDGET)
         self.assertGreater(typical, 1.0)
         self.assertAlmostEqual(typical, math.exp(log_sum / len(samples)),
@@ -193,8 +201,10 @@ class TestBatchEqualsIndividual(_TmpQueue):
 class TestPolicyAndBucketIsolation(_TmpQueue):
     def test_policy_keeps_models_separate(self):
         now = 1_000_000
-        self.q.update_cost_model("erd_all", 100, 200, now=now, budget=BUDGET)
-        self.q.update_cost_model("erd_answers", 100, 9000, now=now, budget=BUDGET)
+        self.q.update_cost_model("erd_all", 100, 200, weight=WARM, now=now,
+                                 budget=BUDGET)
+        self.q.update_cost_model("erd_answers", 100, 9000, weight=WARM, now=now,
+                                 budget=BUDGET)
         self.assertAlmostEqual(
             self.q.get_cost_typical("erd_all", 100, budget=BUDGET), 200, delta=1)
         self.assertAlmostEqual(
