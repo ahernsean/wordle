@@ -41,7 +41,12 @@ WORKER_LIVENESS_SECONDS = 30
 # Time-weighted geometric mean EMA: half-life for the cost model.
 _COST_MODEL_TAU = 86400.0          # seconds (≈ 1 day)
 # Effective-weight below which a cost-model bucket reads cold (no prediction).
-_COST_MODEL_MIN_WEIGHT = 1.0
+# A cell speaks for every sub-branch whose size and budget land in it, so "warm"
+# has to mean "measured": below this the geometric mean — and the sigma recovered
+# from the second log-moment, which needs more data than the mean — rest on too
+# few decayed samples to assert a cost.  A cold cell falls back to
+# PROMOTE_MIN_SIZE, a size heuristic that is at least honest about being one.
+_COST_MODEL_MIN_WEIGHT = 25.0
 
 # Geometric size bucketing.  Sub-branch sizes are sparse and heavy-tailed, so a
 # bucket per exact word-count would almost never accumulate enough samples to
