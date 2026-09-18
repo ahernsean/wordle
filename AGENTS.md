@@ -101,9 +101,17 @@ only then sleeps:
 | `blocks_no_candidates` | nothing left to hand out | nothing the cap can do |
 | `blocks_awaiting_finalize` | every candidate done, a rival finalizing | nothing the cap can do |
 | `blocks_help_capped` | `MAX_HELP_RECURSION_DEPTH` forbade scanning | raising that cap |
+| `blocks_other` | the dependency changed identity, or a retry ran out | nothing; it keeps the sum honest |
 
 Those are different problems with different fixes, and `idle_millis` cannot
 tell them apart.
+
+**Every sleep increments exactly one counter, so the five sum to the episode's
+sleep count.** That is what `blocks_other` is for — a claim transaction can
+decline for reasons with no column of their own, and dropping those would leave
+`blocked_millis` holding time no counter accounts for, which is precisely the
+defect `idle_millis` has. A counter that is a partition can be audited; a
+counter that is a selection cannot.
 
 **Every reason is reported by the code that decided it, never sampled
 afterwards.** The two claim outcomes come from `ERDQueue.last_claim_decline()`,

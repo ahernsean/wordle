@@ -6042,6 +6042,20 @@ class TestDependencyWaitAttribution(unittest.TestCase):
         finally:
             conn.close()
 
+    _BLOCK_COLUMNS = ("blocks_worker_cap", "blocks_no_candidates",
+                      "blocks_awaiting_finalize", "blocks_help_capped",
+                      "blocks_other")
+
+    def _assert_blocks(self, row, **expected):
+        """Assert the whole partition, not just the counter under test.
+
+        Every column is checked, unnamed ones defaulting to zero, so a change
+        that double-counts a sleep into two columns fails here rather than
+        passing because the test only looked at the one it cared about.
+        """
+        for column in self._BLOCK_COLUMNS:
+            self.assertEqual(row[column], expected.get(column, 0), column)
+
     def _stall_once(self, w, key, words, cap):
         """Drive one blocked iteration of the wait loop, then stop the worker.
 
@@ -6110,9 +6124,8 @@ class TestDependencyWaitAttribution(unittest.TestCase):
         w.queue.create_branch(key, len(words), w.n_candidates,
                               budget=ROOT_BUDGET)
         self.assertIsNotNone(self._rival_claims(w, key, count_cap=1))
-        row = self._stall_once(w, key, words, cap=1)
-        self.assertEqual(row["blocks_worker_cap"], 1)
-        self.assertEqual(row["blocks_no_candidates"], 0)
+        self._assert_blocks(self._stall_once(w, key, words, cap=1),
+                            blocks_worker_cap=1)
 
     def test_a_pair_refused_for_want_of_candidates_is_not_worker_cap(self):
         """An exhausted branch must not read as a cap refusal."""
@@ -6123,9 +6136,8 @@ class TestDependencyWaitAttribution(unittest.TestCase):
                               budget=ROOT_BUDGET)
         self.assertIsNotNone(
             self._rival_claims(w, key, count_cap=w.n_candidates))
-        row = self._stall_once(w, key, words, cap=9)
-        self.assertEqual(row["blocks_no_candidates"], 1)
-        self.assertEqual(row["blocks_worker_cap"], 0)
+        self._assert_blocks(self._stall_once(w, key, words, cap=9),
+                            blocks_no_candidates=1)
 
     def test_the_recursion_cap_names_its_own_block(self):
         """The capped path polls without ever asking the claim transaction."""
@@ -6141,8 +6153,7 @@ class TestDependencyWaitAttribution(unittest.TestCase):
             w.cooperative_solve(words, ROOT_BUDGET)
         rows = self._wait_rows()
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["blocks_help_capped"], 1)
-        self.assertEqual(rows[0]["blocks_worker_cap"], 0)
+        self._assert_blocks(rows[0], blocks_help_capped=1)
 
     def test_losing_the_finalize_race_is_attributed_as_blocked(self):
         """The commonest wait: every candidate done, a rival finalizing."""
@@ -6162,8 +6173,56 @@ class TestDependencyWaitAttribution(unittest.TestCase):
             w.cooperative_solve(words, ROOT_BUDGET)
         rows = self._wait_rows()
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["blocks_awaiting_finalize"], 1)
-        self.assertEqual(rows[0]["blocks_worker_cap"], 0)
+        self._assert_blocks(rows[0], blocks_awaiting_finalize=1)
+
+    def test_an_unnamed_reason_still_lands_in_a_counter(self):
+        """The counters must partition the episode's sleeps.
+
+        A claim transaction can decline for reasons with no column of their own
+        — a dependency whose identity changed under the waiter, or a retry loop
+        that ran out and reported nothing.  Dropping those would leave
+        blocked_millis holding time no counter accounts for, which is exactly
+        the defect idle_millis has and this table exists to avoid repeating.
+        """
+        w = self._worker()
+        words = BRANCH[:3]
+        key = ScoreCache.encode_subset(words)
+        w.queue.create_branch(key, len(words), w.n_candidates,
+                              budget=ROOT_BUDGET)
+        self.assertIsNotNone(self._rival_claims(w, key, count_cap=1))
+
+        with mock.patch.object(erd_swarm, "MAX_WORKERS_PER_BRANCH", 1), \
+                mock.patch.object(w, "_help_other_branch", return_value=False), \
+                mock.patch.object(w.queue, "last_claim_decline",
+                                  return_value=erd_queue.CLAIM_DECLINE_BRANCH_GONE), \
+                mock.patch.object(w, "_idle_wait",
+                                  side_effect=lambda *_a: w.request_stop()):
+            w.cooperative_solve(words, ROOT_BUDGET)
+
+        rows = self._wait_rows()
+        self.assertEqual(len(rows), 1)
+        self._assert_blocks(rows[0], blocks_other=1)
+
+    def test_a_retry_exhausted_claim_is_still_counted(self):
+        """A claim that reports no reason at all must not vanish from the sum."""
+        w = self._worker()
+        words = BRANCH[:3]
+        key = ScoreCache.encode_subset(words)
+        w.queue.create_branch(key, len(words), w.n_candidates,
+                              budget=ROOT_BUDGET)
+        self.assertIsNotNone(self._rival_claims(w, key, count_cap=1))
+
+        with mock.patch.object(erd_swarm, "MAX_WORKERS_PER_BRANCH", 1), \
+                mock.patch.object(w, "_help_other_branch", return_value=False), \
+                mock.patch.object(w.queue, "last_claim_decline",
+                                  return_value=None), \
+                mock.patch.object(w, "_idle_wait",
+                                  side_effect=lambda *_a: w.request_stop()):
+            w.cooperative_solve(words, ROOT_BUDGET)
+
+        rows = self._wait_rows()
+        self.assertEqual(len(rows), 1)
+        self._assert_blocks(rows[0], blocks_other=1)
 
     def test_a_finalize_takeover_is_not_charged_as_blocked_time(self):
         """Taking the finalize over is work, not waiting."""
@@ -6184,4 +6243,4 @@ class TestDependencyWaitAttribution(unittest.TestCase):
         rows = self._wait_rows()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["blocked_millis"], 0)
-        self.assertEqual(rows[0]["blocks_awaiting_finalize"], 0)
+        self._assert_blocks(rows[0])

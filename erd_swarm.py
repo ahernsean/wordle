@@ -636,10 +636,28 @@ class _DependencyWait:
     def episode_millis(self):
         return int((time.perf_counter() - self._started) * 1000)
 
+    #: The reasons with a column of their own.  Anything else a claim
+    #: transaction can report — a dependency whose identity changed under the
+    #: waiter, or a retry loop that ran out — is summed into blocks_other.
+    NAMED_BLOCK_REASONS = frozenset((
+        CLAIM_DECLINE_WORKER_CAP, CLAIM_DECLINE_NO_CANDIDATES,
+        BLOCK_AWAITING_FINALIZE, BLOCK_HELP_CAPPED))
+
     def note_blocked(self, reason, millis):
         """Charge one sleep, against the reason the deciding code gave for it."""
         self.blocked_millis += millis
         self.blocks[reason] += 1
+
+    def other_blocks(self):
+        """Sleeps whose reason has no column of its own.
+
+        Keeps the counters a partition of the episode's sleeps: without it a
+        reason nobody anticipated would leave blocked_millis holding time no
+        counter accounts for, which is the shape of defect idle_millis already
+        has and this table exists to avoid repeating.
+        """
+        return sum(count for reason, count in self.blocks.items()
+                   if reason not in self.NAMED_BLOCK_REASONS)
 
     def should_record(self):
         """True when the episode reached the wait loop at all.
@@ -2412,6 +2430,7 @@ class _BranchWorker:
             blocks_no_candidates=wait.blocks[CLAIM_DECLINE_NO_CANDIDATES],
             blocks_awaiting_finalize=wait.blocks[BLOCK_AWAITING_FINALIZE],
             blocks_help_capped=wait.blocks[BLOCK_HELP_CAPPED],
+            blocks_other=wait.other_blocks(),
             help_depth=wait.help_depth, outcome=wait.outcome)
 
     def cooperative_solve(self, words, budget, ceiling=float('inf')):

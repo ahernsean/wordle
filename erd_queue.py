@@ -904,10 +904,18 @@ CREATE TABLE IF NOT EXISTS telemetry.dependency_wait (
     pair_successes       INTEGER NOT NULL,
     -- Why this episode's sleeps happened, one count per cause.  Raising
     -- MAX_WORKERS_PER_BRANCH reaches blocks_worker_cap and nothing else.
+    -- Every sleep increments exactly one of these, so they sum to the
+    -- episode's sleep count and blocked_millis is never time no counter
+    -- accounts for.  blocks_other carries the reasons that are neither
+    -- actionable nor common -- a dependency that changed identity under the
+    -- waiter (branch_gone, budget_mismatch, owner_mismatch) and a claim whose
+    -- retry loop ran out -- which exist to keep that sum honest rather than to
+    -- be read on their own.
     blocks_worker_cap        INTEGER NOT NULL DEFAULT 0,
     blocks_no_candidates     INTEGER NOT NULL DEFAULT 0,
     blocks_awaiting_finalize INTEGER NOT NULL DEFAULT 0,
     blocks_help_capped       INTEGER NOT NULL DEFAULT 0,
+    blocks_other             INTEGER NOT NULL DEFAULT 0,
     help_depth           INTEGER,
     -- How the wait ended: 'solved', 'loss', 'cut', 'deleted', 'cancelled'.
     outcome              TEXT,
@@ -6895,7 +6903,7 @@ class ERDQueue:
                             pair_attempts, pair_successes,
                             blocks_worker_cap=0, blocks_no_candidates=0,
                             blocks_awaiting_finalize=0, blocks_help_capped=0,
-                            help_depth=None, outcome=None):
+                            blocks_other=0, help_depth=None, outcome=None):
         """Record one cooperative_solve wait episode.
 
         Attributes what claim_telemetry's idle_millis can only total: which
@@ -6910,14 +6918,15 @@ class ERDQueue:
                  blocked_millis, iterations, empty_scans, helped_scans,
                  bundles_claimed, pair_attempts, pair_successes,
                  blocks_worker_cap, blocks_no_candidates,
-                 blocks_awaiting_finalize, blocks_help_capped,
+                 blocks_awaiting_finalize, blocks_help_capped, blocks_other,
                  help_depth, outcome, epoch, recorded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?)
         """, (worker_id, spine, n_words, budget, episode_millis,
               blocked_millis, iterations, empty_scans, helped_scans,
               bundles_claimed, pair_attempts, pair_successes,
               blocks_worker_cap, blocks_no_candidates,
-              blocks_awaiting_finalize, blocks_help_capped,
+              blocks_awaiting_finalize, blocks_help_capped, blocks_other,
               help_depth, outcome, self.epoch, now))
 
     def add_cut_reuse_miss(self, branch_key, n_words, budget, wanted_ceiling,
