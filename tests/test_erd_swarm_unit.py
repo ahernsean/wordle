@@ -5918,3 +5918,329 @@ class TestExhaustedScanReadsEachOpenerOnce(BranchOccupancyFixture,
         work = self._worker(90)._claim_one_uninstrumented()
 
         self.assertEqual(self._claimed_key(work), joinable_key)
+
+
+class TestClaimDeclineReason(unittest.TestCase):
+    """The claim transaction reports why it handed out no bundle.
+
+    The cap counts occupancy against the very claims the transaction is about
+    to create, so only that transaction can say whether the cap refused a
+    claim.  A caller asking afterwards is asking a system that has moved.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.q = erd_queue.ERDQueue(os.path.join(self._tmp.name, "q.sqlite3"))
+        self.addCleanup(self.q.close)
+        self.key = ScoreCache.encode_subset(BRANCH)
+        self.n = len(CANDIDATES)
+        self.order = list(range(self.n))
+        self.bounds = [0.0] * self.n
+
+    def _claim(self, worker, **kw):
+        return self.q.claim_next_bundle(
+            self.key, worker, self.n, self.order, self.bounds, **kw)
+
+    def test_a_served_claim_clears_the_previous_decline(self):
+        """A stale reason would be charged to whatever blocks next.
+
+        The clear has to be observed after a decline, not on a fresh
+        connection where the field is already None and nothing is proven.
+        """
+        self.q.create_branch(self.key, len(BRANCH), self.n, budget=5)
+        self.assertIsNone(self._claim("w0", small_count=1, count_cap=1,
+                                      expected_budget=4))
+        self.assertEqual(self.q.last_claim_decline(),
+                         erd_queue.CLAIM_DECLINE_BUDGET_MISMATCH)
+        self.assertIsNotNone(self._claim("w0", small_count=1, count_cap=1))
+        self.assertIsNone(self.q.last_claim_decline())
+
+    def test_the_worker_cap_is_named_as_the_reason(self):
+        """The signal the cap question turns on."""
+        self.q.create_branch(self.key, len(BRANCH), self.n, budget=5)
+        self.assertIsNotNone(self._claim("rival", small_count=1, count_cap=1))
+        self.assertIsNone(self._claim("w0", small_count=1, count_cap=1,
+                                      max_other_workers=0))
+        self.assertEqual(self.q.last_claim_decline(),
+                         erd_queue.CLAIM_DECLINE_WORKER_CAP)
+
+    def test_an_exhausted_branch_is_not_reported_as_capped(self):
+        """Nothing left to hand out is a different problem from the cap."""
+        self.q.create_branch(self.key, len(BRANCH), self.n, budget=5)
+        self.assertIsNotNone(
+            self._claim("rival", small_count=self.n, count_cap=self.n))
+        self.assertIsNone(self._claim("w0", small_count=1, count_cap=1,
+                                      max_other_workers=9))
+        self.assertEqual(self.q.last_claim_decline(),
+                         erd_queue.CLAIM_DECLINE_NO_CANDIDATES)
+
+    def test_a_missing_branch_is_named(self):
+        self.q.create_branch(self.key, len(BRANCH), self.n, budget=5)
+        self.q.delete_branch(self.key)
+        self.assertIsNone(self._claim("w0", small_count=1, count_cap=1))
+        self.assertEqual(self.q.last_claim_decline(),
+                         erd_queue.CLAIM_DECLINE_BRANCH_GONE)
+
+    def test_a_budget_mismatch_is_named(self):
+        self.q.create_branch(self.key, len(BRANCH), self.n, budget=5)
+        self.assertIsNone(self._claim("w0", small_count=1, count_cap=1,
+                                      expected_budget=4))
+        self.assertEqual(self.q.last_claim_decline(),
+                         erd_queue.CLAIM_DECLINE_BUDGET_MISMATCH)
+
+
+class TestDependencyWaitAttribution(unittest.TestCase):
+    """cooperative_solve records what it waited on, so idle time has a subject.
+
+    `claim_telemetry.idle_millis` is a residual and totals waiting without
+    naming it.  These pin the attribution: which dependency, how much of the
+    episode was spent stuck rather than working or helping, and why each sleep
+    happened.  Every reason is reported by the code that decided it, so no
+    counter can disagree with the moment it describes.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.answer_file = self._write("answers.txt", BRANCH)
+        self.words_file = self._write("words.txt", CANDIDATES)
+        for attr, path in [("ANSWER_FILE", self.answer_file),
+                           ("WORDS_FILE", self.words_file)]:
+            p = mock.patch.object(erd_swarm, attr, path)
+            p.start()
+            self.addCleanup(p.stop)
+        self.cache_path = os.path.join(self._tmp.name, "cache.sqlite3")
+        self.queue_path = os.path.join(self._tmp.name, "queue.sqlite3")
+
+    def _write(self, name, words):
+        p = os.path.join(self._tmp.name, name)
+        with open(p, "w") as f:
+            f.write("\n".join(words) + "\n")
+        return p
+
+    def _worker(self):
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        self.addCleanup(w.close)
+        return w
+
+    def _rival_claims(self, w, key, count_cap=1):
+        """A rival worker takes a bundle, the way production leaves occupancy:
+        an unfinished claim row written by the transaction that handed it out."""
+        order = list(range(w.n_candidates))
+        return w.queue.claim_next_bundle(
+            key, "rival", w.n_candidates, order, [0.0] * w.n_candidates,
+            small_count=count_cap, count_cap=count_cap)
+
+    def _wait_rows(self):
+        path = erd_queue.derive_telemetry_path(self.queue_path)
+        conn = sqlite3.connect(path)
+        conn.row_factory = sqlite3.Row
+        try:
+            return [dict(r) for r in
+                    conn.execute("SELECT * FROM dependency_wait ORDER BY id")]
+        finally:
+            conn.close()
+
+    _BLOCK_COLUMNS = ("blocks_worker_cap", "blocks_no_candidates",
+                      "blocks_awaiting_finalize", "blocks_help_capped",
+                      "blocks_other")
+
+    def _assert_blocks(self, row, **expected):
+        """Assert the whole partition, not just the counter under test.
+
+        Every column is checked, unnamed ones defaulting to zero, so a change
+        that double-counts a sleep into two columns fails here rather than
+        passing because the test only looked at the one it cared about.
+        """
+        for column in self._BLOCK_COLUMNS:
+            self.assertEqual(row[column], expected.get(column, 0), column)
+
+    def _stall_once(self, w, key, words, cap):
+        """Drive one blocked iteration of the wait loop, then stop the worker.
+
+        _help_other_branch is forced to report an empty scan so the loop
+        reaches its pair attempt, which is the decision under test.
+        """
+        with mock.patch.object(erd_swarm, "MAX_WORKERS_PER_BRANCH", cap), \
+                mock.patch.object(w, "_help_other_branch", return_value=False), \
+                mock.patch.object(w, "_idle_wait",
+                                  side_effect=lambda *_a: w.request_stop()):
+            w.cooperative_solve(words, ROOT_BUDGET)
+        rows = self._wait_rows()
+        self.assertEqual(len(rows), 1)
+        return rows[0]
+
+    def test_cache_hit_writes_no_wait_row(self):
+        """An episode answered before the wait loop never opens an episode."""
+        words = BRANCH[:3]
+        sc = ScoreCache(self.cache_path, BRANCH)
+        sc.write(ScoreCache.encode_subset(words), ERD_ALL, "crane", 1.5,
+                 max_depth=2, solve_budget=None)
+        sc.close()
+        w = self._worker()
+        self.assertEqual(w.cooperative_solve(words, ROOT_BUDGET)[0], SOLVED)
+        self.assertEqual(self._wait_rows(), [])
+
+    def test_an_episode_that_never_iterates_writes_no_row(self):
+        """A worker asked to stop before the first iteration attributed nothing."""
+        w = self._worker()
+        w.request_stop()
+        self.assertEqual(w.cooperative_solve(BRANCH[:3], ROOT_BUDGET),
+                         erd_swarm.CANCEL_RECVD)
+        self.assertEqual(self._wait_rows(), [])
+
+    def test_a_solved_dependency_names_the_branch_it_waited_on(self):
+        words = BRANCH[:3]
+        w = self._worker()
+        status, _cost, _md, _taint = w.cooperative_solve(words, ROOT_BUDGET)
+        self.assertEqual(status, SOLVED)
+        rows = self._wait_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["n_words"], len(words))
+        self.assertEqual(rows[0]["budget"], ROOT_BUDGET)
+        self.assertEqual(rows[0]["outcome"], "solved")
+        self.assertGreaterEqual(rows[0]["bundles_claimed"], 1)
+
+    def test_blocked_time_never_exceeds_the_episode(self):
+        """blocked_millis is a part of the episode, not a separate clock."""
+        w = self._worker()
+        w.cooperative_solve(BRANCH[:3], ROOT_BUDGET)
+        for row in self._wait_rows():
+            self.assertLessEqual(row["blocked_millis"], row["episode_millis"])
+            self.assertGreaterEqual(row["blocked_millis"], 0)
+
+    def test_a_pair_refused_by_the_cap_is_recorded_as_worker_cap(self):
+        """The measurement the worker-cap decision rests on.
+
+        A rival holds the branch and candidates remain, so the pair attempt is
+        refused by the cap alone.  Raising MAX_WORKERS_PER_BRANCH reaches this
+        block and no other, which is why it must not be conflated with a
+        branch that has simply run out of work.
+        """
+        w = self._worker()
+        words = BRANCH[:3]
+        key = ScoreCache.encode_subset(words)
+        w.queue.create_branch(key, len(words), w.n_candidates,
+                              budget=ROOT_BUDGET)
+        self.assertIsNotNone(self._rival_claims(w, key, count_cap=1))
+        self._assert_blocks(self._stall_once(w, key, words, cap=1),
+                            blocks_worker_cap=1)
+
+    def test_a_pair_refused_for_want_of_candidates_is_not_worker_cap(self):
+        """An exhausted branch must not read as a cap refusal."""
+        w = self._worker()
+        words = BRANCH[:3]
+        key = ScoreCache.encode_subset(words)
+        w.queue.create_branch(key, len(words), w.n_candidates,
+                              budget=ROOT_BUDGET)
+        self.assertIsNotNone(
+            self._rival_claims(w, key, count_cap=w.n_candidates))
+        self._assert_blocks(self._stall_once(w, key, words, cap=9),
+                            blocks_no_candidates=1)
+
+    def test_the_recursion_cap_names_its_own_block(self):
+        """The capped path polls without ever asking the claim transaction."""
+        w = self._worker()
+        words = BRANCH[:3]
+        key = ScoreCache.encode_subset(words)
+        w.queue.create_branch(key, len(words), w.n_candidates,
+                              budget=ROOT_BUDGET)
+        self.assertIsNotNone(self._rival_claims(w, key, count_cap=1))
+        with mock.patch.object(erd_swarm, "MAX_HELP_RECURSION_DEPTH", 0), \
+                mock.patch.object(w, "_idle_wait",
+                                  side_effect=lambda *_a: w.request_stop()):
+            w.cooperative_solve(words, ROOT_BUDGET)
+        rows = self._wait_rows()
+        self.assertEqual(len(rows), 1)
+        self._assert_blocks(rows[0], blocks_help_capped=1)
+
+    def test_losing_the_finalize_race_is_attributed_as_blocked(self):
+        """The commonest wait: every candidate done, a rival finalizing."""
+        w = self._worker()
+        words = BRANCH[:3]
+        key = ScoreCache.encode_subset(words)
+        w.queue.create_branch(key, len(words), w.n_candidates,
+                              budget=ROOT_BUDGET)
+        w.queue.mark_claims_done(key, list(range(w.n_candidates)))
+
+        def _lose_then_stop(*_a, **_kw):
+            w.request_stop()
+            return False
+
+        with mock.patch.object(w, "maybe_finalize", side_effect=_lose_then_stop), \
+                mock.patch.object(w, "_await_rival_finalize", return_value=True):
+            w.cooperative_solve(words, ROOT_BUDGET)
+        rows = self._wait_rows()
+        self.assertEqual(len(rows), 1)
+        self._assert_blocks(rows[0], blocks_awaiting_finalize=1)
+
+    def test_an_unnamed_reason_still_lands_in_a_counter(self):
+        """The counters must partition the episode's sleeps.
+
+        A claim transaction can decline for reasons with no column of their own
+        — a dependency whose identity changed under the waiter, or a retry loop
+        that ran out and reported nothing.  Dropping those would leave
+        blocked_millis holding time no counter accounts for, which is exactly
+        the defect idle_millis has and this table exists to avoid repeating.
+        """
+        w = self._worker()
+        words = BRANCH[:3]
+        key = ScoreCache.encode_subset(words)
+        w.queue.create_branch(key, len(words), w.n_candidates,
+                              budget=ROOT_BUDGET)
+        self.assertIsNotNone(self._rival_claims(w, key, count_cap=1))
+
+        with mock.patch.object(erd_swarm, "MAX_WORKERS_PER_BRANCH", 1), \
+                mock.patch.object(w, "_help_other_branch", return_value=False), \
+                mock.patch.object(w.queue, "last_claim_decline",
+                                  return_value=erd_queue.CLAIM_DECLINE_BRANCH_GONE), \
+                mock.patch.object(w, "_idle_wait",
+                                  side_effect=lambda *_a: w.request_stop()):
+            w.cooperative_solve(words, ROOT_BUDGET)
+
+        rows = self._wait_rows()
+        self.assertEqual(len(rows), 1)
+        self._assert_blocks(rows[0], blocks_other=1)
+
+    def test_a_retry_exhausted_claim_is_still_counted(self):
+        """A claim that reports no reason at all must not vanish from the sum."""
+        w = self._worker()
+        words = BRANCH[:3]
+        key = ScoreCache.encode_subset(words)
+        w.queue.create_branch(key, len(words), w.n_candidates,
+                              budget=ROOT_BUDGET)
+        self.assertIsNotNone(self._rival_claims(w, key, count_cap=1))
+
+        with mock.patch.object(erd_swarm, "MAX_WORKERS_PER_BRANCH", 1), \
+                mock.patch.object(w, "_help_other_branch", return_value=False), \
+                mock.patch.object(w.queue, "last_claim_decline",
+                                  return_value=None), \
+                mock.patch.object(w, "_idle_wait",
+                                  side_effect=lambda *_a: w.request_stop()):
+            w.cooperative_solve(words, ROOT_BUDGET)
+
+        rows = self._wait_rows()
+        self.assertEqual(len(rows), 1)
+        self._assert_blocks(rows[0], blocks_other=1)
+
+    def test_a_finalize_takeover_is_not_charged_as_blocked_time(self):
+        """Taking the finalize over is work, not waiting."""
+        w = self._worker()
+        words = BRANCH[:3]
+        key = ScoreCache.encode_subset(words)
+        w.queue.create_branch(key, len(words), w.n_candidates,
+                              budget=ROOT_BUDGET)
+        w.queue.mark_claims_done(key, list(range(w.n_candidates)))
+
+        def _lose_then_stop(*_a, **_kw):
+            w.request_stop()
+            return False
+
+        with mock.patch.object(w, "maybe_finalize", side_effect=_lose_then_stop), \
+                mock.patch.object(w, "_await_rival_finalize", return_value=False):
+            w.cooperative_solve(words, ROOT_BUDGET)
+        rows = self._wait_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["blocked_millis"], 0)
+        self._assert_blocks(rows[0])

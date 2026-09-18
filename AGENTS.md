@@ -79,6 +79,53 @@ missing in CI. The `scaling` job deliberately keeps its explicit
 `coverage numpy`: every assertion it makes is a wall-clock ratio, and a
 first-call JIT compile would land inside the measurement.
 
+### idle_millis is a residual; dependency_wait is its attribution
+
+`idle_millis` is not measured. It is whatever remains of a coordination window
+after the four measured phases, so it totals waiting without saying what was
+waited on — and it is the swarm's largest single cost (61.5% of all worker time
+on epoch 21, against 3.4% for the scan and 2.3% for lock waits).
+
+`telemetry.dependency_wait` carries one row per `cooperative_solve` episode that
+reached the wait loop: the dependency's spine, size and budget, how the episode
+divided between claiming that branch, helping elsewhere, and being stuck, and
+how it ended.
+
+**The `blocks_*` counters say why each sleep happened.** A worker in that loop
+tries the branch alone, then anywhere else, then a pair onto the branch, and
+only then sleeps:
+
+| counter | cause | reached by |
+|---|---|---|
+| `blocks_worker_cap` | the branch is at `MAX_WORKERS_PER_BRANCH` | raising the cap |
+| `blocks_no_candidates` | nothing left to hand out | nothing the cap can do |
+| `blocks_awaiting_finalize` | every candidate done, a rival finalizing | nothing the cap can do |
+| `blocks_help_capped` | `MAX_HELP_RECURSION_DEPTH` forbade scanning | raising that cap |
+| `blocks_other` | the dependency changed identity, or a retry ran out | nothing; it keeps the sum honest |
+
+Those are different problems with different fixes, and `idle_millis` cannot
+tell them apart.
+
+**Every sleep increments exactly one counter, so the five sum to the episode's
+sleep count.** That is what `blocks_other` is for — a claim transaction can
+decline for reasons with no column of their own, and dropping those would leave
+`blocked_millis` holding time no counter accounts for, which is precisely the
+defect `idle_millis` has. A counter that is a partition can be audited; a
+counter that is a selection cannot.
+
+**Every reason is reported by the code that decided it, never sampled
+afterwards.** The two claim outcomes come from `ERDQueue.last_claim_decline()`,
+set inside the claim transaction at each of its `return None` sites; the other
+two are the branch condition the worker is standing in. Nothing on this path
+reads live state, so no counter can disagree with the moment it describes.
+
+That property is the design, not an optimization. **Occupancy is counted
+against the claims the claim transaction is about to create, so only that
+transaction can say whether the cap refused a claim** — anything reconstructing
+it afterwards is reading a system that has already moved, and a holder count
+from one instant beside an availability count from another does not blur the
+answer, it inverts it. An episode that never reached the loop writes no row.
+
 ### Priority ladders, and the fan-out they prevent
 
 **Openers tied at one priority all become eligible at once, and the swarm
@@ -1166,7 +1213,8 @@ successful merge unless `--keep-source` is given.
 Swarm telemetry lives in a **separate** Linux-only file,
 `runtime/erd_queue_telemetry.sqlite3` (`<stem>_telemetry<ext>`, computed by
 `derive_telemetry_path`), which `ERDQueue` opens as an attached schema named
-`telemetry`. The `claim_telemetry` and `branch_finalize_log` tables are there, not
+`telemetry`. The `claim_telemetry`, `branch_finalize_log` and `dependency_wait`
+tables are there, not
 in the main queue file — `add_claim_telemetry` and `add_branch_finalize_log` write
 `telemetry.<table>`, and reads join through the `telemetry.` prefix. Because
 attached-schema tables do not appear in the main file's `sqlite_master`, running

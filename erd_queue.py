@@ -38,6 +38,16 @@ logger = logging.getLogger(__name__)
 # excluded from live-worker totals.
 WORKER_LIVENESS_SECONDS = 30
 
+# Why a claim transaction handed out no bundle.  These are decided inside the
+# transaction, which is the only place that can decide them: the cap counts
+# occupancy against the very claims the transaction is about to create, so a
+# caller asking afterwards is asking a system that has already moved on.
+CLAIM_DECLINE_BRANCH_GONE = "branch_gone"
+CLAIM_DECLINE_BUDGET_MISMATCH = "budget_mismatch"
+CLAIM_DECLINE_OWNER_MISMATCH = "owner_mismatch"
+CLAIM_DECLINE_WORKER_CAP = "worker_cap"        # branch at MAX_WORKERS_PER_BRANCH
+CLAIM_DECLINE_NO_CANDIDATES = "no_candidates"  # nothing left to hand out
+
 # Time-weighted geometric mean EMA: half-life for the cost model.
 _COST_MODEL_TAU = 86400.0          # seconds (≈ 1 day)
 # Effective-weight below which a cost-model bucket reads cold (no prediction).
@@ -851,6 +861,67 @@ CREATE TABLE IF NOT EXISTS telemetry.backstop_telemetry (
     epoch                INTEGER NOT NULL DEFAULT 0,
     recorded_at          INTEGER NOT NULL
 );
+
+-- One row per cooperative_solve that had to wait on a dependency: the worker
+-- needed a sub-branch it could not simply claim, and spent time in the wait
+-- loop before the branch produced an answer.
+--
+-- claim_telemetry's idle_millis is a RESIDUAL — the part of a coordination
+-- window left after the four measured phases — so it says how much waiting
+-- happened but nothing about what was waited on.  This table is the
+-- attribution: which branch, for how long, and what the worker's alternatives
+-- were at the moment it stalled.
+--
+-- The distinction the columns exist to draw: a worker in this loop first tries
+-- to claim the branch alone, then to help anywhere else, then to pair onto the
+-- branch, and only then sleeps.  blocked_millis covers that last state alone,
+-- and the blocks_* counters say WHY each sleep happened.  Those are different
+-- problems with different fixes, and idle_millis cannot tell them apart.
+--
+-- Every reason is reported by the code that decided it rather than sampled
+-- afterwards: blocks_worker_cap and blocks_no_candidates come from the claim
+-- transaction that enforces the cap, the other two from the branch condition
+-- the worker is standing in.  Nothing here reads live state, so no counter can
+-- disagree with the moment it describes.
+CREATE TABLE IF NOT EXISTS telemetry.dependency_wait (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    worker_id            TEXT,
+    spine                TEXT,               -- the dependency, not the waiter
+    n_words              INTEGER,
+    budget               INTEGER,
+    -- Whole time inside the wait loop, and the part of it spent asleep with no
+    -- claim held and nothing claimable: episode >= blocked always.
+    episode_millis       INTEGER NOT NULL,
+    blocked_millis       INTEGER NOT NULL,
+    iterations           INTEGER NOT NULL,
+    -- _help_other_branch outcomes: a completed scan that found nothing free or
+    -- promotable anywhere, versus one that sent this worker off to real work.
+    empty_scans          INTEGER NOT NULL,
+    helped_scans         INTEGER NOT NULL,
+    -- Bundles this worker claimed on the dependency itself, sole or paired.
+    bundles_claimed      INTEGER NOT NULL,
+    pair_attempts        INTEGER NOT NULL,
+    pair_successes       INTEGER NOT NULL,
+    -- Why this episode's sleeps happened, one count per cause.  Raising
+    -- MAX_WORKERS_PER_BRANCH reaches blocks_worker_cap and nothing else.
+    -- Every sleep increments exactly one of these, so they sum to the
+    -- episode's sleep count and blocked_millis is never time no counter
+    -- accounts for.  blocks_other carries the reasons that are neither
+    -- actionable nor common -- a dependency that changed identity under the
+    -- waiter (branch_gone, budget_mismatch, owner_mismatch) and a claim whose
+    -- retry loop ran out -- which exist to keep that sum honest rather than to
+    -- be read on their own.
+    blocks_worker_cap        INTEGER NOT NULL DEFAULT 0,
+    blocks_no_candidates     INTEGER NOT NULL DEFAULT 0,
+    blocks_awaiting_finalize INTEGER NOT NULL DEFAULT 0,
+    blocks_help_capped       INTEGER NOT NULL DEFAULT 0,
+    blocks_other             INTEGER NOT NULL DEFAULT 0,
+    help_depth           INTEGER,
+    -- How the wait ended: 'solved', 'loss', 'cut', 'deleted', 'cancelled'.
+    outcome              TEXT,
+    epoch                INTEGER NOT NULL DEFAULT 0,
+    recorded_at          INTEGER NOT NULL
+);
 """
 
 # Every table _TELEMETRY_SCHEMA_SQL creates, used to detect a queue file that
@@ -858,7 +929,7 @@ CREATE TABLE IF NOT EXISTS telemetry.backstop_telemetry (
 _TELEMETRY_TABLES = (
     "bundle_stats", "cost_samples", "claim_telemetry",
     "branch_finalize_log", "candidate_accuracy", "backstop_telemetry",
-    "cut_reuse_misses",
+    "cut_reuse_misses", "dependency_wait",
 )
 
 
@@ -937,6 +1008,12 @@ class ERDQueue:
         self._last_claim_retries = 0
         self._last_claim_transaction_millis = 0
         self._last_claim_commit_millis = 0
+        # Why the last claim_next_bundle declined, or None when it handed out a
+        # bundle.  Decided inside the claim transaction, which is the only
+        # place that can decide it: occupancy is counted against claims the
+        # same transaction is about to create.  A caller reconstructing this
+        # afterwards is reading a system that has already moved.
+        self._last_claim_decline = None
         # Monotonic per-connection counter for bundle_id generation: paired
         # with worker_id and this process's pid, it is unique without a
         # timestamp-collision risk (two bundles claimed by the same worker
@@ -3146,10 +3223,12 @@ class ERDQueue:
                 "FROM active_branches "
                 "WHERE branch_id = ?", (branch_id,)).fetchone()
             if br is None or br["status"] != "open":
+                self._last_claim_decline = CLAIM_DECLINE_BRANCH_GONE
                 self._commit_claim_transaction(_txn_t0)
                 return None
             if (expected_budget is not None and br["budget"] is not None
                     and br["budget"] != expected_budget):
+                self._last_claim_decline = CLAIM_DECLINE_BUDGET_MISMATCH
                 self._commit_claim_transaction(_txn_t0)
                 return None
             if expected_opener_work_id is None:
@@ -3171,11 +3250,13 @@ class ERDQueue:
                     """, (branch_id, expected_opener_work_id,
                           expected_opener_priority)).fetchone() is not None
             if not owner_matches:
+                self._last_claim_decline = CLAIM_DECLINE_OWNER_MISMATCH
                 self._commit_claim_transaction(_txn_t0)
                 return None
             if (max_other_workers is not None
                     and self._other_claim_holders(branch_id, worker_id)
                         > max_other_workers):
+                self._last_claim_decline = CLAIM_DECLINE_WORKER_CAP
                 self._commit_claim_transaction(_txn_t0)
                 return None
             # The branch ceiling is a bound like any achieved best: candidates
@@ -3278,8 +3359,10 @@ class ERDQueue:
                     packed = self._pack_recorded_holes(
                         branch_id, bound, cost_lower_bound, survivor_limit)
             if not packed:
+                self._last_claim_decline = CLAIM_DECLINE_NO_CANDIDATES
                 self._commit_claim_transaction(_txn_t0)
                 return None
+            self._last_claim_decline = None
             bundle = [idx for idx, _position in packed]
             bundle_id = f"{worker_id}:{self._pid}:{self._bundle_seq}"
             self._bundle_seq += 1
@@ -3778,6 +3861,17 @@ class ERDQueue:
         return self._conn.execute(
             "SELECT COUNT(*) FROM candidate_claims WHERE branch_id = ? AND done = 1",
             (branch_id,)).fetchone()[0]
+
+    def last_claim_decline(self):
+        """Why the last claim_next_bundle on this connection declined, or None
+        when it handed out a bundle.
+
+        Read straight after a claim that returned None.  This is an observation
+        of the decision, not a reconstruction of it: the transaction that
+        enforces the cap is the same one that reports it, so the answer cannot
+        disagree with the state the cap was enforced against.
+        """
+        return self._last_claim_decline
 
     def branch_bulk_done_candidates(self, branch_key) -> int:
         """Return the legacy combined count completed by ERD pruning."""
@@ -6802,6 +6896,38 @@ class ERDQueue:
               None if hint_was_winner is None else int(hint_was_winner),
               first_best_at, nodes_at_first_best,
               now))
+
+    def add_dependency_wait(self, worker_id, spine, n_words, budget,
+                            episode_millis, blocked_millis, iterations,
+                            empty_scans, helped_scans, bundles_claimed,
+                            pair_attempts, pair_successes,
+                            blocks_worker_cap=0, blocks_no_candidates=0,
+                            blocks_awaiting_finalize=0, blocks_help_capped=0,
+                            blocks_other=0, help_depth=None, outcome=None):
+        """Record one cooperative_solve wait episode.
+
+        Attributes what claim_telemetry's idle_millis can only total: which
+        dependency the worker waited on, how much of the episode it was asleep
+        rather than helping or claiming, and why each sleep happened.  A caller
+        that never blocked has nothing to attribute and should not write a row.
+        """
+        now = int(time.time())
+        self._conn.execute("""
+            INSERT INTO telemetry.dependency_wait
+                (worker_id, spine, n_words, budget, episode_millis,
+                 blocked_millis, iterations, empty_scans, helped_scans,
+                 bundles_claimed, pair_attempts, pair_successes,
+                 blocks_worker_cap, blocks_no_candidates,
+                 blocks_awaiting_finalize, blocks_help_capped, blocks_other,
+                 help_depth, outcome, epoch, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?)
+        """, (worker_id, spine, n_words, budget, episode_millis,
+              blocked_millis, iterations, empty_scans, helped_scans,
+              bundles_claimed, pair_attempts, pair_successes,
+              blocks_worker_cap, blocks_no_candidates,
+              blocks_awaiting_finalize, blocks_help_capped, blocks_other,
+              help_depth, outcome, self.epoch, now))
 
     def add_cut_reuse_miss(self, branch_key, n_words, budget, wanted_ceiling,
                            available_bound, available_budget):

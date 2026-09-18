@@ -58,7 +58,8 @@ from erd_queue import (ERDQueue, decode_subset, encode_subset,
                        DEFAULT_SMALL_COUNT, DEFAULT_COUNT_CAP,
                        DEFAULT_REPUBLISH_LIMIT, CLAIM_RETRY,
                        SCHEDULING_ROLE_PREFERRED, SCHEDULING_ROLE_FALLBACK,
-                       SCHEDULING_ROLE_DIRECT)
+                       SCHEDULING_ROLE_DIRECT,
+                       CLAIM_DECLINE_WORKER_CAP, CLAIM_DECLINE_NO_CANDIDATES)
 from wordle_ui import fmt_pattern
 
 from runtime_paths import (
@@ -265,6 +266,12 @@ MAX_WORKERS_PER_BRANCH = 2   # workers sharing a branch race a stale best_erd
                              # more than it returns.  A second worker joins only
                              # when it has no unoccupied branch to take instead.
 MAX_HELP_RECURSION_DEPTH = 4
+
+# Why a dependency wait slept, for the two sleeps no claim transaction decides.
+# The other two reasons come from ERDQueue's CLAIM_DECLINE_* constants, reported
+# by the transaction that refused the pair.
+BLOCK_AWAITING_FINALIZE = "awaiting_finalize"  # every candidate done, rival finalizing
+BLOCK_HELP_CAPPED = "help_capped"              # recursion cap forbade scanning
 
 # _promote_opener_work sentinel: a pending branch was promoted (or found
 # already solved and marked done) but no bundle is claimable from it right
@@ -583,6 +590,83 @@ class _MidLoopPublisher:
             buf[key] = (s + log_n, sq + log_n * log_n, c + 1)
         else:
             buf[key] = (log_n, log_n * log_n, 1)
+
+
+class _DependencyWait:
+    """One cooperative_solve wait episode, accumulated for telemetry.
+
+    `claim_telemetry.idle_millis` is a residual — whatever is left of a
+    coordination window after the four measured phases — so it totals waiting
+    without saying what was waited on.  This carries the attribution: the
+    dependency, how the episode divided between working on it, helping
+    elsewhere, and being stuck, and what the worker's alternatives were the
+    first time it had none.
+
+    `blocked_millis` is the stuck state alone, entered only after the worker
+    has failed to claim the branch by itself, failed to find work anywhere
+    else, and failed to pair onto the branch.  The `blocks_*` counters say why
+    each of those sleeps happened, and every one of them is reported by the
+    code that made the decision — the claim transaction for the two claim
+    outcomes, the branch condition for the other two — so none of them can
+    disagree with the moment it describes.
+    """
+
+    __slots__ = ("spine", "n_words", "budget", "help_depth", "outcome",
+                 "_started", "iterations", "blocked_millis", "empty_scans",
+                 "helped_scans", "bundles_claimed", "pair_attempts",
+                 "pair_successes", "blocks")
+
+    def __init__(self, spine, n_words, budget, help_depth):
+        self.spine = spine
+        self.n_words = n_words
+        self.budget = budget
+        self.help_depth = help_depth
+        self.outcome = None
+        self._started = time.perf_counter()
+        self.iterations = 0
+        self.blocked_millis = 0
+        self.empty_scans = 0
+        self.helped_scans = 0
+        self.bundles_claimed = 0
+        self.pair_attempts = 0
+        self.pair_successes = 0
+        self.blocks = collections.Counter()
+
+    @property
+    def episode_millis(self):
+        return int((time.perf_counter() - self._started) * 1000)
+
+    #: The reasons with a column of their own.  Anything else a claim
+    #: transaction can report — a dependency whose identity changed under the
+    #: waiter, or a retry loop that ran out — is summed into blocks_other.
+    NAMED_BLOCK_REASONS = frozenset((
+        CLAIM_DECLINE_WORKER_CAP, CLAIM_DECLINE_NO_CANDIDATES,
+        BLOCK_AWAITING_FINALIZE, BLOCK_HELP_CAPPED))
+
+    def note_blocked(self, reason, millis):
+        """Charge one sleep, against the reason the deciding code gave for it."""
+        self.blocked_millis += millis
+        self.blocks[reason] += 1
+
+    def other_blocks(self):
+        """Sleeps whose reason has no column of its own.
+
+        Keeps the counters a partition of the episode's sleeps: without it a
+        reason nobody anticipated would leave blocked_millis holding time no
+        counter accounts for, which is the shape of defect idle_millis already
+        has and this table exists to avoid repeating.
+        """
+        return sum(count for reason, count in self.blocks.items()
+                   if reason not in self.NAMED_BLOCK_REASONS)
+
+    def should_record(self):
+        """True when the episode reached the wait loop at all.
+
+        An episode answered from cache before the loop has nothing to
+        attribute, and writing a row for it would put queue traffic on the
+        path that is already free.
+        """
+        return self.iterations > 0
 
 
 class _BranchWorker:
@@ -2097,7 +2181,12 @@ class _BranchWorker:
         silently at full CPU.  Heartbeat first (this wait must stay visible
         and must not get this worker's parent claims reclaimed), then reopen
         the row once it has been 'finalized' past FINALIZE_TAKEOVER_SECONDS
-        and complete the finalize from its intact claims and meta."""
+        and complete the finalize from its intact claims and meta.
+
+        Returns True when it polled and False when it took the finalize over:
+        only the poll is time this worker spent waiting, and a caller
+        attributing blocked time must not charge the takeover, which is work.
+        """
         self._cur_candidate = None      # coordinating, no candidate in flight
         self._heartbeat(branch_key, n_words, None, None, None, None,
                         force=True)
@@ -2106,8 +2195,9 @@ class _BranchWorker:
             logger.warning('%s reopened branch (%d words): finalizer died '
                            'mid-finalize', self.name, n_words)
             self.maybe_finalize(branch_key, words, n_candidates)
-            return
+            return False
         self._idle_wait(0.05)
+        return True
 
     # -- recursive cooperative solving --------------------------------------
 
@@ -2327,6 +2417,22 @@ class _BranchWorker:
                 return (OVER_ERD_LIMIT, cut_bound, None, cut_tainted)
         return None
 
+    def _record_dependency_wait(self, wait):
+        """Persist one wait episode, unless it never reached the wait loop."""
+        if not wait.should_record():
+            return
+        self.queue.add_dependency_wait(
+            self.name, wait.spine, wait.n_words, wait.budget,
+            wait.episode_millis, wait.blocked_millis, wait.iterations,
+            wait.empty_scans, wait.helped_scans, wait.bundles_claimed,
+            wait.pair_attempts, wait.pair_successes,
+            blocks_worker_cap=wait.blocks[CLAIM_DECLINE_WORKER_CAP],
+            blocks_no_candidates=wait.blocks[CLAIM_DECLINE_NO_CANDIDATES],
+            blocks_awaiting_finalize=wait.blocks[BLOCK_AWAITING_FINALIZE],
+            blocks_help_capped=wait.blocks[BLOCK_HELP_CAPPED],
+            blocks_other=wait.other_blocks(),
+            help_depth=wait.help_depth, outcome=wait.outcome)
+
     def cooperative_solve(self, words, budget, ceiling=float('inf')):
         """Solve sub-branch `words` at `budget` cooperatively, returning the
         engine's (status, cost, max_depth, floor) tuple.
@@ -2454,20 +2560,27 @@ class _BranchWorker:
             context_stack.enter_context(self._entered(
                 parent_context.descend(branch_key, child_spine)))
 
+            wait = _DependencyWait(child_spine, n_words, budget,
+                                   self._help_recursion_depth)
+            context_stack.callback(self._record_dependency_wait, wait)
             while not self.cancel():
+                wait.iterations += 1
                 # Finished?  Check before claiming so we never touch a branch that
                 # another worker just finalized and deleted.
                 reuse = _cache_reuse(
                     self.score_cache.read_for_budget(branch_key, ERD_ALL, budget),
                     budget)
                 if reuse is not None:
+                    wait.outcome = 'solved'
                     return (SOLVED, *reuse)
                 loss_budget = self.score_cache.read_loss(
                     branch_key, ERD_ALL, refresh=True)
                 if loss_budget is not None and budget <= loss_budget:
+                    wait.outcome = 'loss'
                     return (OVER_DEPTH_BUDGET, float('inf'), None, True)
                 cut = self._read_satisfying_cut(branch_key, budget, ceiling, n_words)
                 if cut is not None:
+                    wait.outcome = 'cut'
                     return cut
                 if self.queue.get_branch(branch_key) is None:
                     # Finalized + deleted: a cut lands in cut_results and a
@@ -2476,10 +2589,13 @@ class _BranchWorker:
                     loss_budget = self.score_cache.read_loss(
                         branch_key, ERD_ALL, refresh=True)
                     if loss_budget is not None and budget <= loss_budget:
+                        wait.outcome = 'loss'
                         return (OVER_DEPTH_BUDGET, float('inf'), None, True)
                     cut = self._read_satisfying_cut(branch_key, budget, ceiling, n_words)
                     if cut is not None:
+                        wait.outcome = 'cut'
                         return cut
+                    wait.outcome = 'deleted'
                     break                       # finalized as a loss + deleted
                 # Sole worker only: a dependency someone else already holds is
                 # being worked, and this worker is worth far more opening a
@@ -2489,13 +2605,23 @@ class _BranchWorker:
                     expected_opener_work_id=self._work_context.opener_work_id,
                     max_other_workers=0)
                 if claim is not None:
+                    wait.bundles_claimed += 1
                     self._evaluate_dependency_bundle(
                         branch_key, words, n_words, claim, budget)
                 elif self.queue.branch_done_candidates(branch_key) >= self.n_candidates:
                     if not self.maybe_finalize(branch_key, words,
                                                self.n_candidates):
-                        self._await_rival_finalize(branch_key, words, n_words,
-                                                   self.n_candidates)
+                        # Every candidate is done and a rival holds the
+                        # finalize: the wait-for-finalize case these columns
+                        # exist to name, so it is sampled here rather than left
+                        # NULL with its poll unattributed.
+                        blocked_at = time.perf_counter()
+                        if self._await_rival_finalize(branch_key, words,
+                                                      n_words,
+                                                      self.n_candidates):
+                            wait.note_blocked(
+                                BLOCK_AWAITING_FINALIZE,
+                                int((time.perf_counter() - blocked_at) * 1000))
                 elif self._help_recursion_depth >= MAX_HELP_RECURSION_DEPTH:
                     # _help_other_branch would refuse to scan at all here (see
                     # its own docstring): False from it below would mean
@@ -2504,7 +2630,11 @@ class _BranchWorker:
                     # _help_other_branch's capped-depth contract already
                     # promises its callers.
                     self._cur_candidate = None
+                    blocked_at = time.perf_counter()
                     self._idle_wait(0.05)
+                    wait.note_blocked(
+                        BLOCK_HELP_CAPPED,
+                        int((time.perf_counter() - blocked_at) * 1000))
                 else:
                     # No bundle: every candidate is claimed, or another worker
                     # holds the branch.  Try free or promotable work first —
@@ -2519,7 +2649,10 @@ class _BranchWorker:
                     # contends against the very lock every other worker's
                     # writes need too.
                     self._cur_candidate = None  # coordinating, no candidate in flight
-                    if not self._help_other_branch(branch_key):
+                    if self._help_other_branch(branch_key):
+                        wait.helped_scans += 1
+                    else:
+                        wait.empty_scans += 1
                         # A completed scan found nothing free or promotable
                         # anywhere (the recursion cap is ruled out by the
                         # branch above, so this really is an empty scan, not a
@@ -2535,20 +2668,36 @@ class _BranchWorker:
                         self._heartbeat(branch_key, n_words, None, None,
                                         None, None, force=True)
                         self.queue.reclaim_stale_claims(HB_TIMEOUT_SECONDS)
+                        wait.pair_attempts += 1
                         paired = self._claim_bundle(
                             branch_key, self.n_candidates, words, budget,
                             expected_opener_work_id=(
                                 self._work_context.opener_work_id),
                             max_other_workers=MAX_WORKERS_PER_BRANCH - 1)
                         if paired is not None:
+                            wait.pair_successes += 1
+                            wait.bundles_claimed += 1
                             self._evaluate_dependency_bundle(
                                 branch_key, words, n_words, paired, budget)
                         else:
+                            # Nothing claimable anywhere, no pair available on
+                            # the dependency: the stuck state idle_millis
+                            # totals without naming.  The claim transaction
+                            # that just refused the pair reports why, so this
+                            # is the decision itself rather than a re-read of
+                            # the state it was made against.
+                            blocked_at = time.perf_counter()
                             self._idle_wait(0.05)   # let claims land
+                            wait.note_blocked(
+                                self.queue.last_claim_decline(),
+                                int((time.perf_counter() - blocked_at) * 1000))
 
             if self.cancel():  # pragma: no cover
+                wait.outcome = 'cancelled'
                 return CANCEL_RECVD
             # Finalized as a loss: proven unsolvable within budget (not a cutoff).
+            if wait.outcome is None:  # pragma: no cover
+                wait.outcome = 'loss'
             return (OVER_DEPTH_BUDGET, float('inf'), None, True)  # pragma: no cover
 
     # -- scheduling: claim one candidate from the best available branch ------
