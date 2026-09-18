@@ -5920,14 +5920,84 @@ class TestExhaustedScanReadsEachOpenerOnce(BranchOccupancyFixture,
         self.assertEqual(self._claimed_key(work), joinable_key)
 
 
+class TestClaimDeclineReason(unittest.TestCase):
+    """The claim transaction reports why it handed out no bundle.
+
+    The cap counts occupancy against the very claims the transaction is about
+    to create, so only that transaction can say whether the cap refused a
+    claim.  A caller asking afterwards is asking a system that has moved.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.q = erd_queue.ERDQueue(os.path.join(self._tmp.name, "q.sqlite3"))
+        self.addCleanup(self.q.close)
+        self.key = ScoreCache.encode_subset(BRANCH)
+        self.n = len(CANDIDATES)
+        self.order = list(range(self.n))
+        self.bounds = [0.0] * self.n
+
+    def _claim(self, worker, **kw):
+        return self.q.claim_next_bundle(
+            self.key, worker, self.n, self.order, self.bounds, **kw)
+
+    def test_a_served_claim_clears_the_previous_decline(self):
+        """A stale reason would be charged to whatever blocks next.
+
+        The clear has to be observed after a decline, not on a fresh
+        connection where the field is already None and nothing is proven.
+        """
+        self.q.create_branch(self.key, len(BRANCH), self.n, budget=5)
+        self.assertIsNone(self._claim("w0", small_count=1, count_cap=1,
+                                      expected_budget=4))
+        self.assertEqual(self.q.last_claim_decline(),
+                         erd_queue.CLAIM_DECLINE_BUDGET_MISMATCH)
+        self.assertIsNotNone(self._claim("w0", small_count=1, count_cap=1))
+        self.assertIsNone(self.q.last_claim_decline())
+
+    def test_the_worker_cap_is_named_as_the_reason(self):
+        """The signal the cap question turns on."""
+        self.q.create_branch(self.key, len(BRANCH), self.n, budget=5)
+        self.assertIsNotNone(self._claim("rival", small_count=1, count_cap=1))
+        self.assertIsNone(self._claim("w0", small_count=1, count_cap=1,
+                                      max_other_workers=0))
+        self.assertEqual(self.q.last_claim_decline(),
+                         erd_queue.CLAIM_DECLINE_WORKER_CAP)
+
+    def test_an_exhausted_branch_is_not_reported_as_capped(self):
+        """Nothing left to hand out is a different problem from the cap."""
+        self.q.create_branch(self.key, len(BRANCH), self.n, budget=5)
+        self.assertIsNotNone(
+            self._claim("rival", small_count=self.n, count_cap=self.n))
+        self.assertIsNone(self._claim("w0", small_count=1, count_cap=1,
+                                      max_other_workers=9))
+        self.assertEqual(self.q.last_claim_decline(),
+                         erd_queue.CLAIM_DECLINE_NO_CANDIDATES)
+
+    def test_a_missing_branch_is_named(self):
+        self.q.create_branch(self.key, len(BRANCH), self.n, budget=5)
+        self.q.delete_branch(self.key)
+        self.assertIsNone(self._claim("w0", small_count=1, count_cap=1))
+        self.assertEqual(self.q.last_claim_decline(),
+                         erd_queue.CLAIM_DECLINE_BRANCH_GONE)
+
+    def test_a_budget_mismatch_is_named(self):
+        self.q.create_branch(self.key, len(BRANCH), self.n, budget=5)
+        self.assertIsNone(self._claim("w0", small_count=1, count_cap=1,
+                                      expected_budget=4))
+        self.assertEqual(self.q.last_claim_decline(),
+                         erd_queue.CLAIM_DECLINE_BUDGET_MISMATCH)
+
+
 class TestDependencyWaitAttribution(unittest.TestCase):
     """cooperative_solve records what it waited on, so idle time has a subject.
 
     `claim_telemetry.idle_millis` is a residual and totals waiting without
     naming it.  These pin the attribution: which dependency, how much of the
-    episode was spent stuck rather than working or helping, and — the field the
-    worker-cap question turns on — whether anything was claimable when the
-    worker first had nothing to do.
+    episode was spent stuck rather than working or helping, and why each sleep
+    happened.  Every reason is reported by the code that decided it, so no
+    counter can disagree with the moment it describes.
     """
 
     def setUp(self):
@@ -5972,6 +6042,21 @@ class TestDependencyWaitAttribution(unittest.TestCase):
         finally:
             conn.close()
 
+    def _stall_once(self, w, key, words, cap):
+        """Drive one blocked iteration of the wait loop, then stop the worker.
+
+        _help_other_branch is forced to report an empty scan so the loop
+        reaches its pair attempt, which is the decision under test.
+        """
+        with mock.patch.object(erd_swarm, "MAX_WORKERS_PER_BRANCH", cap), \
+                mock.patch.object(w, "_help_other_branch", return_value=False), \
+                mock.patch.object(w, "_idle_wait",
+                                  side_effect=lambda *_a: w.request_stop()):
+            w.cooperative_solve(words, ROOT_BUDGET)
+        rows = self._wait_rows()
+        self.assertEqual(len(rows), 1)
+        return rows[0]
+
     def test_cache_hit_writes_no_wait_row(self):
         """An episode answered before the wait loop never opens an episode."""
         words = BRANCH[:3]
@@ -5984,13 +6069,7 @@ class TestDependencyWaitAttribution(unittest.TestCase):
         self.assertEqual(self._wait_rows(), [])
 
     def test_an_episode_that_never_iterates_writes_no_row(self):
-        """A worker asked to stop before the first iteration attributed nothing.
-
-        The wait object exists by then — it is built immediately before the
-        loop — so only should_record keeps this row out.  Distinct from the
-        cache-hit path above, which returns before the episode is opened at
-        all.
-        """
+        """A worker asked to stop before the first iteration attributed nothing."""
         w = self._worker()
         w.request_stop()
         self.assertEqual(w.cooperative_solve(BRANCH[:3], ROOT_BUDGET),
@@ -6004,12 +6083,10 @@ class TestDependencyWaitAttribution(unittest.TestCase):
         self.assertEqual(status, SOLVED)
         rows = self._wait_rows()
         self.assertEqual(len(rows), 1)
-        row = rows[0]
-        self.assertEqual(row["n_words"], len(words))
-        self.assertEqual(row["budget"], ROOT_BUDGET)
-        self.assertEqual(row["outcome"], "solved")
-        self.assertGreaterEqual(row["iterations"], 1)
-        self.assertGreaterEqual(row["bundles_claimed"], 1)
+        self.assertEqual(rows[0]["n_words"], len(words))
+        self.assertEqual(rows[0]["budget"], ROOT_BUDGET)
+        self.assertEqual(rows[0]["outcome"], "solved")
+        self.assertGreaterEqual(rows[0]["bundles_claimed"], 1)
 
     def test_blocked_time_never_exceeds_the_episode(self):
         """blocked_millis is a part of the episode, not a separate clock."""
@@ -6019,52 +6096,26 @@ class TestDependencyWaitAttribution(unittest.TestCase):
             self.assertLessEqual(row["blocked_millis"], row["episode_millis"])
             self.assertGreaterEqual(row["blocked_millis"], 0)
 
-    def test_first_block_is_sampled_once(self):
-        """Re-sampling would put two queries on every 50 ms poll of a stall."""
-        w = self._worker()
-        wait = erd_swarm._DependencyWait("SPINE -----", 3, 5, 0)
-        key = ScoreCache.encode_subset(BRANCH[:3])
-        w.queue.create_branch(key, 3, w.n_candidates, budget=5)
-        w._record_first_block(wait, key)
-        first = (wait.holders_at_first_block, wait.unclaimed_at_first_block)
-        w.queue.mark_claims_done(key, list(range(w.n_candidates)))
-        w._record_first_block(wait, key)
-        self.assertEqual(
-            (wait.holders_at_first_block, wait.unclaimed_at_first_block), first)
+    def test_a_pair_refused_by_the_cap_is_recorded_as_worker_cap(self):
+        """The measurement the worker-cap decision rests on.
 
-    def test_cap_refusal_is_distinguishable_from_an_exhausted_branch(self):
-        """The two reasons a pair fails must not read alike.
-
-        A branch another worker holds with candidates left is a cap refusal —
-        raising MAX_WORKERS_PER_BRANCH would admit this worker.  A branch with
-        nothing left to claim is waiting on its own finalize, which no cap
-        change reaches.  idle_millis cannot tell these apart; these columns
-        must.
+        A rival holds the branch and candidates remain, so the pair attempt is
+        refused by the cap alone.  Raising MAX_WORKERS_PER_BRANCH reaches this
+        block and no other, which is why it must not be conflated with a
+        branch that has simply run out of work.
         """
         w = self._worker()
-        key = ScoreCache.encode_subset(BRANCH[:3])
-        w.queue.create_branch(key, 3, w.n_candidates, budget=5)
-        self.assertIsNotNone(self._rival_claims(w, key))
+        words = BRANCH[:3]
+        key = ScoreCache.encode_subset(words)
+        w.queue.create_branch(key, len(words), w.n_candidates,
+                              budget=ROOT_BUDGET)
+        self.assertIsNotNone(self._rival_claims(w, key, count_cap=1))
+        row = self._stall_once(w, key, words, cap=1)
+        self.assertEqual(row["blocks_worker_cap"], 1)
+        self.assertEqual(row["blocks_no_candidates"], 0)
 
-        occupied = erd_swarm._DependencyWait("SPINE -----", 3, 5, 0)
-        w._record_first_block(occupied, key)
-        self.assertGreaterEqual(occupied.holders_at_first_block, 1)
-        self.assertGreater(occupied.unclaimed_at_first_block, 0)
-
-        w.queue.mark_claims_done(key, list(range(w.n_candidates)))
-        exhausted = erd_swarm._DependencyWait("SPINE -----", 3, 5, 0)
-        w._record_first_block(exhausted, key)
-        self.assertEqual(exhausted.unclaimed_at_first_block, 0)
-
-    def test_the_capped_path_snapshots_before_it_sleeps(self):
-        """The snapshot must describe the state that caused the block.
-
-        On the recursion-capped path the worker polls instead of scanning.  If
-        the sample were taken after the 50 ms sleep it would observe whatever
-        the branch became while this worker slept — a holder that finished
-        reads as zero holders — and both diagnostic columns would describe a
-        moment that never blocked anything.
-        """
+    def test_a_pair_refused_for_want_of_candidates_is_not_worker_cap(self):
+        """An exhausted branch must not read as a cap refusal."""
         w = self._worker()
         words = BRANCH[:3]
         key = ScoreCache.encode_subset(words)
@@ -6072,116 +6123,29 @@ class TestDependencyWaitAttribution(unittest.TestCase):
                               budget=ROOT_BUDGET)
         self.assertIsNotNone(
             self._rival_claims(w, key, count_cap=w.n_candidates))
+        row = self._stall_once(w, key, words, cap=9)
+        self.assertEqual(row["blocks_no_candidates"], 1)
+        self.assertEqual(row["blocks_worker_cap"], 0)
 
-        def _sleep_that_changes_the_branch(_seconds):
-            # The rival finishes mid-sleep: holders drop to zero, so a sample
-            # taken afterwards would report nobody was on the branch.
-            w.queue.mark_claims_done(key, list(range(w.n_candidates)))
-            w.request_stop()
-
+    def test_the_recursion_cap_names_its_own_block(self):
+        """The capped path polls without ever asking the claim transaction."""
+        w = self._worker()
+        words = BRANCH[:3]
+        key = ScoreCache.encode_subset(words)
+        w.queue.create_branch(key, len(words), w.n_candidates,
+                              budget=ROOT_BUDGET)
+        self.assertIsNotNone(self._rival_claims(w, key, count_cap=1))
         with mock.patch.object(erd_swarm, "MAX_HELP_RECURSION_DEPTH", 0), \
                 mock.patch.object(w, "_idle_wait",
-                                  side_effect=_sleep_that_changes_the_branch):
+                                  side_effect=lambda *_a: w.request_stop()):
             w.cooperative_solve(words, ROOT_BUDGET)
-
         rows = self._wait_rows()
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["holders_at_first_block"], 1)
-        self.assertEqual(rows[0]["unclaimed_at_first_block"], 0)
-
-    def test_candidates_held_in_flight_do_not_read_as_unclaimed(self):
-        """A slot inside an unfinished claim is taken, not available.
-
-        This is the ordinary finalize-wait shape: one rival holds every
-        remaining candidate, so the pair attempt finds no bundle.  Counting
-        those slots as unclaimed would report a cap refusal on a branch that
-        simply has nothing left to hand out, which is precisely the distinction
-        these columns exist to draw.
-        """
-        w = self._worker()
-        key = ScoreCache.encode_subset(BRANCH[:3])
-        w.queue.create_branch(key, 3, w.n_candidates, budget=5)
-        self.assertIsNotNone(
-            self._rival_claims(w, key, count_cap=w.n_candidates))
-        self.assertEqual(w.queue.branch_done_candidates(key), 0)
-
-        wait = erd_swarm._DependencyWait("SPINE -----", 3, 5, 0)
-        w._record_first_block(wait, key)
-        self.assertEqual(wait.unclaimed_at_first_block, 0)
-        self.assertGreaterEqual(wait.holders_at_first_block, 1)
-
-    def test_a_freed_position_counts_as_claimable_again(self):
-        """A reclaimed or republished slot has no row and is available."""
-        w = self._worker()
-        key = ScoreCache.encode_subset(BRANCH[:3])
-        w.queue.create_branch(key, 3, w.n_candidates, budget=5)
-        self.assertIsNotNone(
-            self._rival_claims(w, key, count_cap=w.n_candidates))
-        self.assertEqual(
-            w.queue.branch_block_snapshot(key, w.n_candidates)[1], 0)
-        w.queue.reclaim_claims_of_worker("rival")
-        self.assertEqual(
-            w.queue.branch_block_snapshot(key, w.n_candidates)[1],
-            w.n_candidates)
-
-    def test_a_deleted_branch_has_no_unclaimed_slots(self):
-        """delete_branch keeps the registry row; that is not existence.
-
-        branch_id stays stable across a re-promotion, so the append-only
-        branches row survives while every candidate_claims row is dropped.
-        Counting from the id alone would see zero claims on a finished branch
-        and report all n_candidates as claimable — completed work described as
-        untouched, and a cap refusal where there is nothing left to claim.
-        """
-        w = self._worker()
-        key = ScoreCache.encode_subset(BRANCH[:3])
-        w.queue.create_branch(key, 3, w.n_candidates, budget=5)
-        self.assertEqual(
-            w.queue.branch_block_snapshot(key, w.n_candidates),
-            (0, w.n_candidates))
-        w.queue.delete_branch(key)
-        self.assertIsNone(w.queue.get_branch(key))
-        self.assertEqual(
-            w.queue.branch_block_snapshot(key, w.n_candidates), (0, 0))
-
-    def test_both_counters_and_liveness_come_from_one_snapshot(self):
-        """Separate autocommit selects are separate snapshots.
-
-        The two counters are compared against each other — holders at the cap
-        versus nothing left to claim — so reading them apart lets a rival
-        finish, reclaim or finalize in between and yields a holder count from
-        one state beside an unclaimed count from another, misclassifying the
-        block.  Liveness has the same problem: a branch present at the lookup
-        whose claim rows are gone by the count reports a finished branch as
-        fully claimable.  None of that is reproducible from a sequential
-        fixture, so the guard is structural: one statement, one snapshot.
-        """
-        w = self._worker()
-        key = ScoreCache.encode_subset(BRANCH[:3])
-        w.queue.create_branch(key, 3, w.n_candidates, budget=5)
-        w.queue.branch_block_snapshot(key, w.n_candidates)  # warm the id
-
-        statements = []
-        w.queue._conn.set_trace_callback(statements.append)
-        try:
-            w.queue.branch_block_snapshot(key, w.n_candidates,
-                                          exclude_worker_id="worker-0")
-        finally:
-            w.queue._conn.set_trace_callback(None)
-        selects = [q for q in statements if q.lstrip().upper().startswith("SELECT")]
-        self.assertEqual(len(selects), 1, selects)
-        self.assertIn("active_branches", selects[0])
-        self.assertIn("candidate_claims", selects[0])
+        self.assertEqual(rows[0]["blocks_help_capped"], 1)
+        self.assertEqual(rows[0]["blocks_worker_cap"], 0)
 
     def test_losing_the_finalize_race_is_attributed_as_blocked(self):
-        """The wait-for-finalize case must not report zero blocked time.
-
-        Every candidate is done and a rival holds the finalize, so the worker
-        polls in _await_rival_finalize.  That poll is the commonest wait these
-        columns exist to name; leaving it outside the accounting would put the
-        sleep in episode_millis while blocked_millis read zero and both
-        first-block counters stayed NULL.
-        """
+        """The commonest wait: every candidate done, a rival finalizing."""
         w = self._worker()
         words = BRANCH[:3]
         key = ScoreCache.encode_subset(words)
@@ -6194,23 +6158,15 @@ class TestDependencyWaitAttribution(unittest.TestCase):
             return False
 
         with mock.patch.object(w, "maybe_finalize", side_effect=_lose_then_stop), \
-                mock.patch.object(w, "_await_rival_finalize",
-                                  return_value=True) as await_rival:
+                mock.patch.object(w, "_await_rival_finalize", return_value=True):
             w.cooperative_solve(words, ROOT_BUDGET)
-
-        await_rival.assert_called()
         rows = self._wait_rows()
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["unclaimed_at_first_block"], 0)
-        self.assertIsNotNone(rows[0]["holders_at_first_block"])
+        self.assertEqual(rows[0]["blocks_awaiting_finalize"], 1)
+        self.assertEqual(rows[0]["blocks_worker_cap"], 0)
 
     def test_a_finalize_takeover_is_not_charged_as_blocked_time(self):
-        """Taking the finalize over is work, not waiting.
-
-        _await_rival_finalize returns False when it reopened a dead
-        finalizer's row and completed the finalize itself; charging that span
-        to blocked_millis would inflate the stuck figure with real work.
-        """
+        """Taking the finalize over is work, not waiting."""
         w = self._worker()
         words = BRANCH[:3]
         key = ScoreCache.encode_subset(words)
@@ -6223,34 +6179,9 @@ class TestDependencyWaitAttribution(unittest.TestCase):
             return False
 
         with mock.patch.object(w, "maybe_finalize", side_effect=_lose_then_stop), \
-                mock.patch.object(w, "_await_rival_finalize",
-                                  return_value=False):
+                mock.patch.object(w, "_await_rival_finalize", return_value=False):
             w.cooperative_solve(words, ROOT_BUDGET)
-
         rows = self._wait_rows()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["blocked_millis"], 0)
-
-    def test_an_unknown_branch_snapshots_as_empty(self):
-        """A branch the registry never saw holds nobody and owes nothing."""
-        w = self._worker()
-        self.assertEqual(
-            w.queue.branch_block_snapshot(
-                ScoreCache.encode_subset(BRANCH), w.n_candidates), (0, 0))
-
-    def test_snapshot_holders_agree_with_the_map(self):
-        """The snapshot's holder count must not drift from the map scheduling uses."""
-        w = self._worker()
-        key = ScoreCache.encode_subset(BRANCH[:3])
-        w.queue.create_branch(key, 3, w.n_candidates, budget=5)
-        self.assertEqual(w.queue.branch_block_snapshot(key, w.n_candidates)[0], 0)
-        self.assertIsNotNone(self._rival_claims(w, key))
-        self.assertEqual(
-            w.queue.branch_block_snapshot(
-                key, w.n_candidates, exclude_worker_id="rival")[0], 0)
-        self.assertEqual(w.queue.branch_block_snapshot(key, w.n_candidates)[0], 1)
-        self.assertEqual(
-            w.queue.branch_block_snapshot(
-                key, w.n_candidates, exclude_worker_id=w.name)[0],
-            w.queue.claim_holders_by_branch(
-                exclude_worker_id=w.name).get(bytes(key), 0))
+        self.assertEqual(rows[0]["blocks_awaiting_finalize"], 0)

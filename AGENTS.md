@@ -91,24 +91,32 @@ reached the wait loop: the dependency's spine, size and budget, how the episode
 divided between claiming that branch, helping elsewhere, and being stuck, and
 how it ended.
 
-**The two columns that matter are `holders_at_first_block` and
-`unclaimed_at_first_block`.** A worker in that loop tries the branch alone,
-then anywhere else, then a pair onto the branch, and only then sleeps. Holders
-at `MAX_WORKERS_PER_BRANCH` means the cap refused the pair — raising it would
-admit this worker. Zero unclaimed candidates means the branch had nothing left
-to hand out and the wait is for its finalize, which no cap change reaches.
+**The `blocks_*` counters say why each sleep happened.** A worker in that loop
+tries the branch alone, then anywhere else, then a pair onto the branch, and
+only then sleeps:
+
+| counter | cause | reached by |
+|---|---|---|
+| `blocks_worker_cap` | the branch is at `MAX_WORKERS_PER_BRANCH` | raising the cap |
+| `blocks_no_candidates` | nothing left to hand out | nothing the cap can do |
+| `blocks_awaiting_finalize` | every candidate done, a rival finalizing | nothing the cap can do |
+| `blocks_help_capped` | `MAX_HELP_RECURSION_DEPTH` forbade scanning | raising that cap |
+
 Those are different problems with different fixes, and `idle_millis` cannot
 tell them apart.
 
-They are sampled once, at the first blocked iteration and before the poll that
-follows it, because that path already runs every 50 ms on a starving worker and
-another query per turn would be paid by the branch everyone is waiting for.
-`branch_block_snapshot` returns **both counters and branch liveness from one
-statement**: they are read against each other, so a holder count from one state
-beside an unclaimed count from another misclassifies the block, and a branch
-present at a liveness lookup whose claim rows are gone by the count reports
-finished work as fully claimable. An episode that never reached the loop writes
-no row.
+**Every reason is reported by the code that decided it, never sampled
+afterwards.** The two claim outcomes come from `ERDQueue.last_claim_decline()`,
+set inside the claim transaction at each of its `return None` sites; the other
+two are the branch condition the worker is standing in. Nothing on this path
+reads live state, so no counter can disagree with the moment it describes.
+
+That property is the design, not an optimization. **Occupancy is counted
+against the claims the claim transaction is about to create, so only that
+transaction can say whether the cap refused a claim** — anything reconstructing
+it afterwards is reading a system that has already moved, and a holder count
+from one instant beside an availability count from another does not blur the
+answer, it inverts it. An episode that never reached the loop writes no row.
 
 ### Priority ladders, and the fan-out they prevent
 

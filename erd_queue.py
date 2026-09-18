@@ -38,6 +38,16 @@ logger = logging.getLogger(__name__)
 # excluded from live-worker totals.
 WORKER_LIVENESS_SECONDS = 30
 
+# Why a claim transaction handed out no bundle.  These are decided inside the
+# transaction, which is the only place that can decide them: the cap counts
+# occupancy against the very claims the transaction is about to create, so a
+# caller asking afterwards is asking a system that has already moved on.
+CLAIM_DECLINE_BRANCH_GONE = "branch_gone"
+CLAIM_DECLINE_BUDGET_MISMATCH = "budget_mismatch"
+CLAIM_DECLINE_OWNER_MISMATCH = "owner_mismatch"
+CLAIM_DECLINE_WORKER_CAP = "worker_cap"        # branch at MAX_WORKERS_PER_BRANCH
+CLAIM_DECLINE_NO_CANDIDATES = "no_candidates"  # nothing left to hand out
+
 # Time-weighted geometric mean EMA: half-life for the cost model.
 _COST_MODEL_TAU = 86400.0          # seconds (≈ 1 day)
 # Effective-weight below which a cost-model bucket reads cold (no prediction).
@@ -865,10 +875,14 @@ CREATE TABLE IF NOT EXISTS telemetry.backstop_telemetry (
 -- The distinction the columns exist to draw: a worker in this loop first tries
 -- to claim the branch alone, then to help anywhere else, then to pair onto the
 -- branch, and only then sleeps.  blocked_millis covers that last state alone,
--- and holders/unclaimed at first block say whether the pair was refused
--- because the branch was already at MAX_WORKERS_PER_BRANCH or because there
--- was nothing left on it to claim.  Those are different problems with
--- different fixes, and idle_millis cannot tell them apart.
+-- and the blocks_* counters say WHY each sleep happened.  Those are different
+-- problems with different fixes, and idle_millis cannot tell them apart.
+--
+-- Every reason is reported by the code that decided it rather than sampled
+-- afterwards: blocks_worker_cap and blocks_no_candidates come from the claim
+-- transaction that enforces the cap, the other two from the branch condition
+-- the worker is standing in.  Nothing here reads live state, so no counter can
+-- disagree with the moment it describes.
 CREATE TABLE IF NOT EXISTS telemetry.dependency_wait (
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,
     worker_id            TEXT,
@@ -888,10 +902,12 @@ CREATE TABLE IF NOT EXISTS telemetry.dependency_wait (
     bundles_claimed      INTEGER NOT NULL,
     pair_attempts        INTEGER NOT NULL,
     pair_successes       INTEGER NOT NULL,
-    -- Sampled once, at the first blocked iteration: re-reading them every
-    -- 50 ms poll would put a query on the one path that is already starving.
-    holders_at_first_block   INTEGER,
-    unclaimed_at_first_block INTEGER,
+    -- Why this episode's sleeps happened, one count per cause.  Raising
+    -- MAX_WORKERS_PER_BRANCH reaches blocks_worker_cap and nothing else.
+    blocks_worker_cap        INTEGER NOT NULL DEFAULT 0,
+    blocks_no_candidates     INTEGER NOT NULL DEFAULT 0,
+    blocks_awaiting_finalize INTEGER NOT NULL DEFAULT 0,
+    blocks_help_capped       INTEGER NOT NULL DEFAULT 0,
     help_depth           INTEGER,
     -- How the wait ended: 'solved', 'loss', 'cut', 'deleted', 'cancelled'.
     outcome              TEXT,
@@ -984,6 +1000,12 @@ class ERDQueue:
         self._last_claim_retries = 0
         self._last_claim_transaction_millis = 0
         self._last_claim_commit_millis = 0
+        # Why the last claim_next_bundle declined, or None when it handed out a
+        # bundle.  Decided inside the claim transaction, which is the only
+        # place that can decide it: occupancy is counted against claims the
+        # same transaction is about to create.  A caller reconstructing this
+        # afterwards is reading a system that has already moved.
+        self._last_claim_decline = None
         # Monotonic per-connection counter for bundle_id generation: paired
         # with worker_id and this process's pid, it is unique without a
         # timestamp-collision risk (two bundles claimed by the same worker
@@ -3193,10 +3215,12 @@ class ERDQueue:
                 "FROM active_branches "
                 "WHERE branch_id = ?", (branch_id,)).fetchone()
             if br is None or br["status"] != "open":
+                self._last_claim_decline = CLAIM_DECLINE_BRANCH_GONE
                 self._commit_claim_transaction(_txn_t0)
                 return None
             if (expected_budget is not None and br["budget"] is not None
                     and br["budget"] != expected_budget):
+                self._last_claim_decline = CLAIM_DECLINE_BUDGET_MISMATCH
                 self._commit_claim_transaction(_txn_t0)
                 return None
             if expected_opener_work_id is None:
@@ -3218,11 +3242,13 @@ class ERDQueue:
                     """, (branch_id, expected_opener_work_id,
                           expected_opener_priority)).fetchone() is not None
             if not owner_matches:
+                self._last_claim_decline = CLAIM_DECLINE_OWNER_MISMATCH
                 self._commit_claim_transaction(_txn_t0)
                 return None
             if (max_other_workers is not None
                     and self._other_claim_holders(branch_id, worker_id)
                         > max_other_workers):
+                self._last_claim_decline = CLAIM_DECLINE_WORKER_CAP
                 self._commit_claim_transaction(_txn_t0)
                 return None
             # The branch ceiling is a bound like any achieved best: candidates
@@ -3325,8 +3351,10 @@ class ERDQueue:
                     packed = self._pack_recorded_holes(
                         branch_id, bound, cost_lower_bound, survivor_limit)
             if not packed:
+                self._last_claim_decline = CLAIM_DECLINE_NO_CANDIDATES
                 self._commit_claim_transaction(_txn_t0)
                 return None
+            self._last_claim_decline = None
             bundle = [idx for idx, _position in packed]
             bundle_id = f"{worker_id}:{self._pid}:{self._bundle_seq}"
             self._bundle_seq += 1
@@ -3826,47 +3854,16 @@ class ERDQueue:
             "SELECT COUNT(*) FROM candidate_claims WHERE branch_id = ? AND done = 1",
             (branch_id,)).fetchone()[0]
 
-    def branch_block_snapshot(self, branch_key, n_candidates,
-                              exclude_worker_id=None):
-        """(holders, unclaimed) for one branch, from ONE statement.
+    def last_claim_decline(self):
+        """Why the last claim_next_bundle on this connection declined, or None
+        when it handed out a bundle.
 
-        holders is the workers other than exclude_worker_id holding unfinished
-        claims; unclaimed is the candidate slots no claim row covers.  A caller
-        that reads them separately gets a holder count from one state and an
-        unclaimed count from another — a rival can finish, reclaim or finalize
-        in between — and these two are compared against each other to decide
-        whether the cap or a pending finalize caused a block, so a mismatched
-        pair misclassifies it.  One statement sees one snapshot.
-
-        Occupancy is unfinished claims, never heartbeats: the claim row is
-        written by the transaction that hands out the bundle, so a branch reads
-        as taken the instant it is taken.
-
-        unclaimed is NOT `n_candidates - done`: a candidate held in an
-        unfinished claim is taken, not available, and one rival holding every
-        remaining slot is the ordinary finalize-wait shape.  A position freed
-        by a reclaim or republish has no row and counts as claimable again.
-
-        (0, 0) for a branch that is not open.  A registry id is not evidence
-        the branch exists: delete_branch deliberately keeps the append-only
-        branches row (branch_id must stay stable across a re-promotion) while
-        dropping every candidate_claims row, so a finished branch would
-        otherwise report no holders and every slot claimable.
+        Read straight after a claim that returned None.  This is an observation
+        of the decision, not a reconstruction of it: the transaction that
+        enforces the cap is the same one that reports it, so the answer cannot
+        disagree with the state the cap was enforced against.
         """
-        branch_id = self._intern_branch(branch_key)
-        if branch_id is None:
-            return (0, 0)
-        live, holders, taken = self._conn.execute(
-            "SELECT EXISTS(SELECT 1 FROM active_branches WHERE branch_id = ?),"
-            "       (SELECT COUNT(DISTINCT claimed_by) FROM candidate_claims"
-            "          WHERE branch_id = ? AND done = 0"
-            "            AND (? IS NULL OR claimed_by IS NOT ?)),"
-            "       (SELECT COUNT(*) FROM candidate_claims WHERE branch_id = ?)",
-            (branch_id, branch_id, exclude_worker_id, exclude_worker_id,
-             branch_id)).fetchone()
-        if not live:
-            return (0, 0)
-        return (holders, max(0, n_candidates - taken))
+        return self._last_claim_decline
 
     def branch_bulk_done_candidates(self, branch_key) -> int:
         """Return the legacy combined count completed by ERD pruning."""
@@ -6896,16 +6893,15 @@ class ERDQueue:
                             episode_millis, blocked_millis, iterations,
                             empty_scans, helped_scans, bundles_claimed,
                             pair_attempts, pair_successes,
-                            holders_at_first_block=None,
-                            unclaimed_at_first_block=None,
+                            blocks_worker_cap=0, blocks_no_candidates=0,
+                            blocks_awaiting_finalize=0, blocks_help_capped=0,
                             help_depth=None, outcome=None):
         """Record one cooperative_solve wait episode.
 
         Attributes what claim_telemetry's idle_millis can only total: which
         dependency the worker waited on, how much of the episode it was asleep
-        rather than helping or claiming, and what its alternatives were when it
-        first stalled.  A caller that never blocked has nothing to attribute
-        and should not write a row.
+        rather than helping or claiming, and why each sleep happened.  A caller
+        that never blocked has nothing to attribute and should not write a row.
         """
         now = int(time.time())
         self._conn.execute("""
@@ -6913,13 +6909,15 @@ class ERDQueue:
                 (worker_id, spine, n_words, budget, episode_millis,
                  blocked_millis, iterations, empty_scans, helped_scans,
                  bundles_claimed, pair_attempts, pair_successes,
-                 holders_at_first_block, unclaimed_at_first_block,
+                 blocks_worker_cap, blocks_no_candidates,
+                 blocks_awaiting_finalize, blocks_help_capped,
                  help_depth, outcome, epoch, recorded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (worker_id, spine, n_words, budget, episode_millis,
               blocked_millis, iterations, empty_scans, helped_scans,
               bundles_claimed, pair_attempts, pair_successes,
-              holders_at_first_block, unclaimed_at_first_block,
+              blocks_worker_cap, blocks_no_candidates,
+              blocks_awaiting_finalize, blocks_help_capped,
               help_depth, outcome, self.epoch, now))
 
     def add_cut_reuse_miss(self, branch_key, n_words, budget, wanted_ceiling,
