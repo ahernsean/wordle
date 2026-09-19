@@ -364,6 +364,31 @@ class MigrationTest(_CacheTest):
         self.addCleanup(writable.close)
         self.assertNotIn("candidate_erd_by_policy", self._tables(writable))
 
+    def test_the_memo_table_is_dropped_again_after_something_recreates_it(self):
+        # A process running code from before the memo was removed recreates the
+        # table on its own open.  The drop is not a one-shot migration, so the
+        # next writable open removes it again rather than recording itself as
+        # already done and never looking.
+        path = self.legacy_cache("recreated.sqlite3")
+        migrated = ScoreCache(path, WORDS, checkpoint_on_close=False)
+        self.assertNotIn("candidate_erd_by_policy", self._tables(migrated))
+        migrated._conn.execute(
+            "CREATE TABLE candidate_erd_by_policy ("
+            " subset_hash TEXT NOT NULL, candidate_word TEXT NOT NULL,"
+            " policy TEXT NOT NULL, answer_list_id TEXT NOT NULL,"
+            " erd REAL NOT NULL, max_remaining_depth INTEGER NOT NULL,"
+            " response_group_count INTEGER NOT NULL, updated_at INTEGER NOT NULL,"
+            " PRIMARY KEY (subset_hash, candidate_word, policy, answer_list_id))")
+        migrated._conn.execute(
+            "INSERT INTO candidate_erd_by_policy VALUES"
+            " ('h', 'crane', ?, ?, 2.0, 3, 2, 100)",
+            (ERD_ALL, migrated.answer_list_id))
+        migrated.close()
+
+        reopened = ScoreCache(path, WORDS, checkpoint_on_close=False)
+        self.addCleanup(reopened.close)
+        self.assertNotIn("candidate_erd_by_policy", self._tables(reopened))
+
     def test_reopening_is_idempotent(self):
         path = self.legacy_cache()
         ScoreCache(path, WORDS, checkpoint_on_close=False).close()
@@ -421,6 +446,47 @@ class ReportingTest(_CacheTest):
         self.assertEqual(
             score_cache.report_branch_state(self.key, ERD_ALL, budget=2)
             ["cache_state"], "missing")
+
+    def test_the_lean_facts_agree_with_a_single_lookup_at_every_budget(self):
+        # report_reusable_branch_facts decides in SQL what
+        # _report_cache_state_from_rows decides per branch in Python.  Two
+        # spellings of one rule drift, so the test asserts they agree rather
+        # than restating either: a branch carrying an unrestricted result, a
+        # budget-specific one and a proven loss exercises every arm of the
+        # precedence at once.
+        score_cache = self.cache()
+        other_key = ScoreCache.encode_subset(WORDS[:2])
+        loss_key = ScoreCache.encode_subset(WORDS[:3])
+        score_cache.write(self.key, ERD_ALL, "crane", 2.0, max_depth=4)
+        score_cache.write(self.key, ERD_ALL, "slate", 2.5, max_depth=3,
+                          solve_budget=3)
+        # Both results apply at budget 5: the unrestricted one fits there, and
+        # a budget-specific row is stored at exactly that budget.  Without this
+        # pair no budget exercises the precedence, and a loader that let the
+        # budget-specific row displace the unrestricted one would agree with a
+        # single lookup everywhere the fixture looked.
+        score_cache.write(self.key, ERD_ALL, "trace", 2.9, max_depth=5,
+                          solve_budget=5)
+        score_cache.write(other_key, ERD_ALL, "trace", 2.2, max_depth=2,
+                          solve_budget=2)
+        score_cache.write_loss(loss_key, ERD_ALL, 4)
+        keys = [self.key, other_key, loss_key]
+
+        for budget in range(0, 7):
+            erd_by_key, loss_keys = score_cache.report_reusable_branch_facts(
+                ERD_ALL, budget)
+            states = score_cache.report_branch_states(keys, ERD_ALL, budget)
+            for key in keys:
+                state = states[key]
+                with self.subTest(budget=budget, key=key.hex()):
+                    if state["cache_state"] == "exact":
+                        self.assertEqual(
+                            erd_by_key.get(key),
+                            (state["best_erd"], state["max_remaining_depth"]))
+                    else:
+                        self.assertNotIn(key, erd_by_key)
+                    self.assertEqual(
+                        key in loss_keys, state["cache_state"] == "loss")
 
     def test_the_bulk_maps_select_the_same_result_as_a_single_lookup(self):
         score_cache = self.cache()

@@ -297,6 +297,13 @@ class ScoreCache:
                 # closing here is impossible.
                 pass
 
+    def _table_exists(self, name):
+        """Return True if `name` is a table in this database."""
+        return self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (name,)
+        ).fetchone() is not None
+
     def _is_migration_done(self, name):
         """Return True if migration `name` has been recorded as complete."""
         return self._conn.execute(
@@ -521,6 +528,28 @@ class ScoreCache:
             self._conn.execute(
                 "ALTER TABLE completed_opener_summaries "
                 "ADD COLUMN telemetry_epochs TEXT NOT NULL DEFAULT ''")
+        # An opener's own ERD, folded over its top-level response groups once
+        # every one of them holds a reusable exact result.  Unlike a candidate's
+        # ERD at an arbitrary branch, this is bounded at one row per candidate
+        # word and is revalidated on every read: the reader rescreens each
+        # opener's groups against current branch results and deletes the rows
+        # whose openers no longer screen complete, so a repair or requeue that
+        # removes a branch result removes the folds that read it on the next
+        # read rather than leaving them asserting a tree that is gone.
+        #
+        # response_group_count is how many response groups the fold covered,
+        # which is the opener's split against the answer list it was folded
+        # over.
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS opener_erd_by_policy (
+                opener TEXT NOT NULL, policy TEXT NOT NULL,
+                answer_list_id TEXT NOT NULL, erd REAL NOT NULL,
+                max_remaining_depth INTEGER NOT NULL,
+                response_group_count INTEGER NOT NULL,
+                folded_at INTEGER NOT NULL,
+                PRIMARY KEY (opener, policy, answer_list_id)
+            )
+        """)
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS opener_response_group_summaries (
                 opener TEXT NOT NULL, response_pattern TEXT NOT NULL,
@@ -751,13 +780,17 @@ class ScoreCache:
         # branch, keyed by a hash of the branch's word set.  Given a branch
         # result there was no way to ask which folds had read it, so deleting
         # one — a repair, a reverification, a requeue — left every fold over it
-        # asserting a candidate complete whose groups were gone.  The fold is
-        # now derived on each read from branch results already in memory, so
-        # the table is derived data with no reader: drop it outright rather
-        # than carry rows nothing consults.
-        if not self._is_migration_done('drop_candidate_erd_memo'):  # pragma: migration
+        # asserting a candidate complete whose groups were gone.  A candidate's
+        # ERD at an arbitrary branch is derived on each read instead, so the
+        # table has no reader and must not exist.
+        #
+        # Checked on every writable open rather than once behind a migration
+        # flag: a process running code from before the table was removed
+        # recreates it, and a one-shot migration that has already recorded
+        # itself as done will never look again.  The check is a sqlite_master
+        # lookup, so carrying it permanently costs a single indexed read.
+        if self._table_exists('candidate_erd_by_policy'):
             self._conn.execute("DROP TABLE IF EXISTS candidate_erd_by_policy")
-            self._mark_migration_done('drop_candidate_erd_memo')
 
     def _purge_legacy_rows(self, where, params, migration_name=None):
         """One-time cleanup of stale branch_best_by_policy rows.
@@ -1308,6 +1341,121 @@ class ScoreCache:
         except Exception:
             self._conn.execute("ROLLBACK")
             raise
+
+    def report_reusable_branch_facts(self, policy, budget):
+        """Branch results reusable at exactly one budget, as lean maps.
+
+        Returns (erd_by_key, loss_keys): a branch_key -> (best_erd,
+        max_remaining_depth) map of the results a search at `budget` would
+        reuse, and the set of keys proven a loss within it.  Both apply the
+        same gate `report_branch_states` does, decided in SQL rather than by
+        loading every row and filtering in Python.
+
+        `report_branch_row_maps` is the other bulk loader, and it is the one to
+        use when a caller needs a branch's *facts* — its budget-specific rows,
+        update times, and which table each came from.  This one answers only
+        "is this branch settled at this budget, and at what cost", which is
+        everything a fold over response groups reads.  Folding a whole
+        vocabulary that way loads the qualifying keys and three columns instead
+        of every row and six, which on a production cache is several times
+        less work for an identical fold.
+
+        An unrestricted result wins whenever its own worst case fits the
+        budget, so the budget-specific table only fills in keys the
+        unrestricted one did not settle — the precedence `_exact_row_for_budget`
+        applies per branch, expressed here over whole tables.
+        """
+        erd_by_key = {}
+        for branch_key, best_score, max_depth in self._conn.execute(
+            """SELECT branch_key, best_score, max_depth
+                 FROM branch_best_by_policy
+                WHERE policy = ? AND answer_list_id = ?
+                  AND solve_budget IS NULL AND max_depth <= ?""",
+            (policy, self.answer_list_id, budget),
+        ):
+            erd_by_key[bytes(branch_key)] = (best_score, max_depth)
+        for branch_key, best_score, max_depth in self._conn.execute(
+            """SELECT branch_key, best_score, max_depth
+                 FROM branch_best_by_policy_and_budget
+                WHERE policy = ? AND answer_list_id = ?
+                  AND solve_budget = ? AND max_depth IS NOT NULL""",
+            (policy, self.answer_list_id, budget),
+        ):
+            erd_by_key.setdefault(bytes(branch_key), (best_score, max_depth))
+        loss_keys = {
+            bytes(row[0]) for row in self._conn.execute(
+                """SELECT branch_key FROM branch_loss_by_policy
+                    WHERE policy = ? AND answer_list_id = ?
+                      AND loss_budget >= ?""",
+                (policy, self.answer_list_id, budget),
+            )
+        }
+        return erd_by_key, loss_keys
+
+    def opener_erd_map(self, policy):
+        """Stored opener folds for this answer list, keyed by opener word."""
+        return {
+            row["opener"]: {
+                "erd": row["erd"],
+                "max_remaining_depth": row["max_remaining_depth"],
+                "response_group_count": row["response_group_count"],
+                "folded_at": row["folded_at"],
+            }
+            for row in self._conn.execute(
+                """SELECT opener, erd, max_remaining_depth,
+                          response_group_count, folded_at
+                     FROM opener_erd_by_policy
+                    WHERE policy = ? AND answer_list_id = ?""",
+                (policy, self.answer_list_id),
+            )
+        }
+
+    def write_opener_erds(self, rows, policy, folded_at=None):
+        """Store folds for openers whose whole tree is solved.
+
+        `rows` is an iterable of (opener, erd, max_remaining_depth,
+        response_group_count).  Replaces any stored fold for the same opener,
+        because the caller has just rescreened it against current branch
+        results and its value is the newer of the two.
+        """
+        rows = list(rows)
+        if not rows:
+            return
+        now = int(time.time()) if folded_at is None else folded_at
+        try:
+            self._conn.executemany(
+                """INSERT OR REPLACE INTO opener_erd_by_policy
+                       (opener, policy, answer_list_id, erd,
+                        max_remaining_depth, response_group_count, folded_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                [(opener.lower(), policy, self.answer_list_id, erd,
+                  max_remaining_depth, response_group_count, now)
+                 for opener, erd, max_remaining_depth, response_group_count
+                 in rows],
+            )
+        except sqlite3.OperationalError as exc:
+            if not _is_disk_io_error(exc):
+                raise
+            logger.warning("write_opener_erds(%d rows, %s) failed: %s",
+                           len(rows), policy, exc)
+
+    def delete_opener_erds(self, openers, policy):
+        """Drop stored folds for openers that no longer screen complete."""
+        openers = list(openers)
+        if not openers:
+            return
+        try:
+            self._conn.executemany(
+                """DELETE FROM opener_erd_by_policy
+                    WHERE opener = ? AND policy = ? AND answer_list_id = ?""",
+                [(opener.lower(), policy, self.answer_list_id)
+                 for opener in openers],
+            )
+        except sqlite3.OperationalError as exc:
+            if not _is_disk_io_error(exc):
+                raise
+            logger.warning("delete_opener_erds(%d rows, %s) failed: %s",
+                           len(openers), policy, exc)
 
     def completed_opener_summary_map(self, policy):
         return {row["opener"].lower(): dict(row) for row in self._conn.execute("""
