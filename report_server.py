@@ -97,10 +97,11 @@ class InFlightReport:
 
 
 #: Report kinds served from the revalidating cache.  A kind belongs here only
-#: if its answer is a function of the branch results `branch_result_watermark`
-#: covers.  The queue-backed reports are deliberately absent: their subject is
-#: what the swarm is doing right now, so serving one a few seconds old would
-#: make a liveness dashboard report a liveness it no longer has.
+#: if its answer is a function of what `opener_completion_signal` covers — the
+#: set of openers whose tree is finished.  The queue-backed reports are
+#: deliberately absent: their subject is what the swarm is doing right now, so
+#: serving one a few seconds old would make a liveness dashboard report a
+#: liveness it no longer has.
 REVALIDATED_REPORT_KINDS = frozenset({"leaderboard"})
 
 #: How long a cached report may be served while its signal stands still.  The
