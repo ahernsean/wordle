@@ -15,6 +15,8 @@ from erd_queue import ERDQueue
 import erd_search
 import report_model
 from report_model import (
+    _collection_summary,
+    NO_WORKER_STATUS_BUCKET,
     ReportFilters,
     ReportRequest,
     ReportOpeners,
@@ -1855,6 +1857,24 @@ class ReportModelTest(unittest.TestCase):
             candidate_list_path=candidate_path,
             telemetry_path=self.telemetry_path,
         )
+
+    def test_a_summary_of_branches_with_no_worker_status_stays_serializable(self):
+        # branch_worker_status is NULL for a done or unqueued branch, and a
+        # None key cannot be ordered against the string keys beside it.  The
+        # server encodes with sort_keys, so one such branch made the whole
+        # queue report unserializable rather than merely oddly labelled -- and
+        # a queue holding any finished branch has one.
+        summary = _collection_summary([
+            {"branch_status": "evaluating", "branch_worker_status": "active"},
+            {"branch_status": "done", "branch_worker_status": None},
+            {"branch_status": "queued", "branch_worker_status": "waiting"},
+        ])
+        self.assertEqual(
+            summary["branch_count_by_worker_status"],
+            {"active": 1, NO_WORKER_STATUS_BUCKET: 1, "waiting": 1},
+        )
+        self.assertNotIn(None, summary["branch_count_by_worker_status"])
+        json.dumps(summary, sort_keys=True)
 
     def test_leaderboard_ranks_complete_openers_by_erd(self):
         # With two answers, an opener that separates them into singletons is
