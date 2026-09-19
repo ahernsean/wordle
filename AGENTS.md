@@ -430,13 +430,13 @@ Only `branch_best_by_policy` is the "one row per branch" table.  Any count,
 report, or query that means branches must not union the two: a branch with
 results at three budgets is one branch.
 
-### A candidate's own ERD is derived, never stored
+### A candidate's own ERD is derived; an opener's is stored and rescreened
 
 A branch result is a certificate; a **candidate's** ERD at a branch is a *fold*
 over the results of that candidate's response groups, and the two are not
 alike.  `report_model._candidate_erd_summary` is the only thing that produces
 one, and it produces it on every read from the group facts the caller has
-already materialized.  Nothing persists it.
+already materialized.
 
 The reason is that a fold has no way to defend itself.  It asserts "every one
 of my response groups is an exact result", and every path that deletes a branch
@@ -456,8 +456,53 @@ applies `_exact_row_for_budget` and the same reusability gate `read_for_budget`
 does.  A child whose only exact result was solved at some other budget arrives
 as `missing`, and the candidate reads `pending` — never folded in.
 
-Do not reintroduce a durable memo for this value, and do not add one to
+Do not reintroduce a durable memo keyed by branch, and do not add one to
 `EXPORT_TABLES`/`TABLES`.
+
+**One fold is stored, and only because it can be rechecked for less than it
+costs to keep honest.**  `opener_erd_by_policy` holds each completed opener's
+own ERD: one row per candidate word, bounded at the vocabulary rather than at
+every (branch, candidate) pair the dropped `candidate_erd_by_policy` was keyed
+by.  That bound is what makes the difference.  A reader does not trust a stored
+row — `_screen_and_fold_openers` rescreens every opener's groups against
+current branch results on every build, and `_store_opener_folds` deletes the
+rows whose openers no longer screen complete.  So a repair or a requeue that
+removes a branch result removes the folds that read it at the next read, which
+is the guarantee a branch-keyed memo could not give.
+
+The screen is what makes rescreening affordable.  Folding a whole vocabulary
+builds a state dict per response group — about 1.4 million of them, nearly all
+belonging to openers still being searched.  The screen reads the same facts as
+two set lookups per group through `ScoreCache.report_reusable_branch_facts`,
+which decides the reusability gate in SQL and loads three columns of the
+qualifying rows instead of six columns of every row.  Measured on the
+production cache at 872 completed openers, a full leaderboard build went from
+25.3s to 3.0s, returning byte-identical rows.
+
+**The screen visits every group; it must not stop at the first unsettled one.**
+A candidate holding both an unsettled group and a proven loss is `infeasible`,
+because `_candidate_erd_summary` decides infeasibility ahead of pendency — and
+an early exit can return before reaching the loss that decides it.  That is the
+one wrong answer that still looks plausible, so
+`test_a_screened_candidate_holding_a_loss_and_a_gap_is_infeasible` pins it
+against its pending-only twin: a screen cannot pass both by calling every
+unsettled candidate one thing or the other.
+
+Groups of fewer than two answers hold no branch result and never will — the
+fold solves them from the response pattern — so the screen must skip them
+rather than ask the cache about them.
+
+`opener_erd_by_policy` is local to each machine and travels in neither
+`EXPORT_TABLES` nor `TABLES`: it is derived from branch results the export
+already carries, and the other side rescreens against its own cache.
+
+**The obsolete `candidate_erd_by_policy` is dropped on every writable open, not
+once behind a migration flag.**  A process running code from before the table
+was removed recreates it, and a one-shot migration that has already recorded
+itself as done never looks again — which is exactly what happened on the
+production cache, where the table reappeared after its migration was marked
+complete.  The check is a `sqlite_master` lookup, so carrying it permanently
+costs one indexed read per open.
 
 ### A hint cache names a word and nothing else
 

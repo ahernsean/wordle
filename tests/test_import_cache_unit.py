@@ -464,6 +464,7 @@ class TestObsoleteCandidateErdMemo(_TmpDB):
 
     def test_the_memo_is_not_in_the_tables_that_travel(self):
         self.assertNotIn("candidate_erd_by_policy", import_cache.TABLES)
+        self.assertNotIn("opener_erd_by_policy", import_cache.TABLES)
 
     def test_an_older_source_merges_without_reintroducing_the_memo(self):
         source_path = self._source_with_the_memo()

@@ -797,10 +797,13 @@ for a branch count — a branch with results at three budgets is one branch.
 **Migration.**  Opening a pre-split cache moves its `solve_budget IS NOT NULL`
 rows into the budget table.  The canonical table is not rebuilt, so the
 migration is a row move on the minority rather than a rewrite of a multi-GB
-file.  A second migration drops `candidate_erd_by_policy` outright: it memoised
-a candidate's folded ERD, which is now derived on every read, so the table is
-derived data with no reader.  An audit-only pass opens the cache read-only and
-skips both, which is what lets it run against a live file.
+file.  Every writable open also drops `candidate_erd_by_policy`: it memoised
+a candidate's folded ERD at an arbitrary branch, which is now derived on every
+read, so the table is derived data with no reader.  The drop is not recorded as
+a migration, because a process running older code recreates the table and a
+migration already marked done would never look again.  An audit-only pass opens
+the cache read-only and skips both, which is what lets it run against a live
+file.
 
 **Deploy before syncing.**  The canonical table's shape is unchanged, so an
 older reader handed a newer export still consumes the unrestricted rows it
