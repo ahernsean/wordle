@@ -119,6 +119,12 @@ class TestExportCandidateScores(unittest.TestCase):
         conn.execute(
             "INSERT INTO candidate_erd_by_policy VALUES "
             "('h', 'crane', 'erd_all', 'x', 3.5, 5, 120, 100)")
+        # An opener's stored fold is derived from branch results the export
+        # already carries, and each machine rescreens it against its own cache,
+        # so it is rebuilt there rather than shipped.
+        conn.execute(
+            "INSERT INTO opener_erd_by_policy VALUES "
+            "('crane', 'erd_all', 'x', 3.5, 5, 120, 100)")
         conn.commit()
         conn.close()
 
@@ -129,6 +135,7 @@ class TestExportCandidateScores(unittest.TestCase):
             "SELECT name FROM sqlite_master WHERE type='table'")}
         out_conn.close()
         self.assertNotIn("candidate_erd_by_policy", tables)
+        self.assertNotIn("opener_erd_by_policy", tables)
         self.assertIn("candidate_scores", tables)
 
     def test_since_excludes_rows_not_updated_after_watermark(self):
