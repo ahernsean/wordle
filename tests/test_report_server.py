@@ -566,6 +566,93 @@ class ReportServerTest(unittest.TestCase):
         )
 
 
+class RevalidatedReportCacheTest(ReportServerTest):
+    """When a rebuilt leaderboard is served, and when a cached one is."""
+
+    def setUp(self):
+        super().setUp()
+        self.report = load_fixtures(FIXTURE_DIRECTORY)["leaderboard.json"]
+        self.calls = 0
+
+    def collect_counting(self, _sources, _request):
+        self.calls += 1
+        return self.report
+
+    def get_leaderboard(self, base_url, times=1):
+        for _ in range(times):
+            status, _headers, body = request(base_url, "/api/view/leaderboard")
+            self.assertEqual(status, 200)
+        return body
+
+    def test_an_unchanged_completion_signal_serves_the_cached_report(self):
+        # The signal is what the whole cache turns on: while no opener has
+        # finished, a rebuild cannot produce a different ranking, so asking for
+        # one is pure cost against a client that polls every two seconds.
+        with patch("report_server.collect_report", side_effect=self.collect_counting), \
+             patch("report_server.opener_completion_signal", return_value=(3, 3)):
+            with running_server(self.live_configuration) as base_url:
+                first = self.get_leaderboard(base_url)
+                self.get_leaderboard(base_url, times=4)
+                last = self.get_leaderboard(base_url)
+        self.assertEqual(self.calls, 1)
+        self.assertEqual(first, last)
+
+    def test_a_moved_completion_signal_rebuilds(self):
+        signals = iter([(3, 3), (3, 3), (4, 4), (4, 4)])
+        with patch("report_server.collect_report", side_effect=self.collect_counting), \
+             patch("report_server.opener_completion_signal",
+                   side_effect=lambda _sources: next(signals)):
+            with running_server(self.live_configuration) as base_url:
+                self.get_leaderboard(base_url, times=4)
+        self.assertEqual(self.calls, 2)
+
+    def test_an_unreadable_signal_rebuilds_every_time(self):
+        # None means the queue could not be read, so nothing is known about
+        # whether an opener finished.  Serving a cached report on no
+        # information would be asserting freshness the server cannot support.
+        with patch("report_server.collect_report", side_effect=self.collect_counting), \
+             patch("report_server.opener_completion_signal", return_value=None):
+            with running_server(self.live_configuration) as base_url:
+                self.get_leaderboard(base_url, times=3)
+        self.assertEqual(self.calls, 3)
+
+    def test_a_cached_report_expires_even_though_the_signal_stands_still(self):
+        # A repair or an import changes the cache without completing any opener
+        # work, so the signal cannot see it.  The age bound is what keeps such a
+        # change from going unnoticed indefinitely.
+        # The server's own machinery reads the clock too, so the fake advances
+        # on the cache's reads rather than replacing time everywhere.
+        now = [1000.0]
+
+        def collect_and_age(sources, request):
+            now[0] += report_server.REPORT_CACHE_MAX_AGE_SECONDS + 1
+            return self.collect_counting(sources, request)
+
+        with patch("report_server.collect_report", side_effect=collect_and_age), \
+             patch("report_server.opener_completion_signal", return_value=(3, 3)), \
+             patch.object(report_server.time, "time", lambda: now[0]):
+            with running_server(self.live_configuration) as base_url:
+                self.get_leaderboard(base_url, times=2)
+        self.assertEqual(self.calls, 2)
+
+    def test_a_queue_backed_report_is_never_served_from_the_cache(self):
+        # The queue reports exist to say what the swarm is doing now.  Serving
+        # one a minute old would make a liveness dashboard report a liveness it
+        # no longer has, so they are collected on every request however cheap
+        # caching them would be.
+        self.assertNotIn("queue", report_server.REVALIDATED_REPORT_KINDS)
+        queue_report = load_fixtures(FIXTURE_DIRECTORY)["queue.json"]
+        with patch("report_server.collect_report",
+                   side_effect=lambda _s, _r: (
+                       setattr(self, "calls", self.calls + 1) or queue_report)), \
+             patch("report_server.opener_completion_signal", return_value=(3, 3)):
+            with running_server(self.live_configuration) as base_url:
+                for _ in range(3):
+                    status, _headers, _body = request(base_url, "/api/view/queue")
+                    self.assertEqual(status, 200)
+        self.assertEqual(self.calls, 3)
+
+
 class ReportServerMainTest(unittest.TestCase):
     def test_port_collision_exits_cleanly_instead_of_crashing(self):
         with running_server(fixture_configuration()) as base_url:

@@ -2759,12 +2759,22 @@ def _row_matches_branch_target(row, branch_target, prefix):
     return False
 
 
+#: The worker-status bucket for branches that have no worker dimension at all.
+#: `branch_worker_status` is NULL for a branch that is done or unqueued, and a
+#: None key cannot be ordered against the string keys beside it -- which makes
+#: the whole report unserializable under `sort_keys`, not merely oddly named.
+#: The spelling matches `cache_state`'s "not_applicable" for the same idea.
+NO_WORKER_STATUS_BUCKET = "not_applicable"
+
+
 def _collection_summary(rows):
     by_status = {}
     by_worker_status = {}
     for row in rows:
         status = row["branch_status"]
         worker_status = row["branch_worker_status"]
+        if worker_status is None:
+            worker_status = NO_WORKER_STATUS_BUCKET
         by_status[status] = by_status.get(status, 0) + 1
         by_worker_status[worker_status] = by_worker_status.get(worker_status, 0) + 1
     return {
@@ -3904,6 +3914,44 @@ def _opener_erd_summaries(sources, openers, report, cache,
     except (sqlite3.Error, OSError) as error:
         report["sources"]["cache"]["error"] = str(error)
     return summaries
+
+
+def opener_completion_signal(sources):
+    """A token that changes when an opener's tree finishes, and not otherwise.
+
+    The leaderboard's answer is the set of openers whose whole tree is solved.
+    That set grows when an opener's work completes — about every 27 minutes on
+    the production swarm — against a client that asks every two seconds.  Two
+    indexed counts over `opener_work` say whether it could have grown, for
+    about a tenth of a millisecond.
+
+    **The obvious signal does not work, and the reason is worth keeping.**  A
+    watermark over branch results (`MAX(updated_at)`) is the conservative
+    choice and is useless here: it covers every branch written at any depth,
+    and those land every few seconds — measured at 189 changes in 180 seconds,
+    a median of one per second, against a leaderboard answer that moves once
+    per 1,650.  A signal that fires faster than the poll interval caches
+    nothing.
+
+    This signal is a hint, never an answer: the caller still rescreens every
+    opener against the cache.  It is also not exhaustive — a repair or an
+    import changes the cache without touching the queue — so a caller must
+    pair it with a staleness bound.  Returns None when the queue cannot be
+    read, which callers must treat as "assume changed".
+    """
+    try:
+        connection = sqlite3.connect(
+            f"file:{sources.queue_path}?mode=ro", uri=True)
+    except (sqlite3.Error, OSError):
+        return None
+    try:
+        return tuple(connection.execute(
+            "SELECT COUNT(*), MAX(opener_work_id) FROM opener_work "
+            "WHERE state = 'complete'").fetchone())
+    except sqlite3.Error:
+        return None
+    finally:
+        connection.close()
 
 
 def _score_cache_file_signature(cache_path):

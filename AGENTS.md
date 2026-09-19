@@ -510,6 +510,49 @@ winner is decided once, at finalize, and is recorded per branch in
 `branch_finalize_log.hint_was_winner` — never added to a process counter that
 several workers each contributed placements to.
 
+### An expensive report is rebuilt on its own event, not on the poll
+
+`report_client.html` polls every two seconds. A leaderboard build rescreens the
+whole opener vocabulary, so serving one per poll means the server is never idle
+and requests queue behind each other — which is what
+`report_server.collect_report_once`'s shared-collection lock was papering over.
+
+`REVALIDATED_REPORT_KINDS` names the reports served from a cache that
+revalidates instead of rebuilding. A kind belongs there only if its answer is a
+function of something the signal covers. **The queue-backed reports are
+deliberately excluded**: their subject is what the swarm is doing right now, so
+serving one a minute old would make a liveness dashboard report a liveness it
+no longer has. Caching them would be cheap and wrong.
+
+`report_model.opener_completion_signal` is the signal: two indexed counts over
+`opener_work` where `state = 'complete'`, about 0.14 ms. It moves exactly when
+an opener's tree finishes, which is what grows the leaderboard's answer.
+
+**The obvious signal is a branch-result watermark, and it does not work.**
+`MAX(updated_at)` over the branch tables is the conservative choice — it cannot
+miss a change — and it is useless here, because it covers every branch written
+at any depth. Measured on the production swarm: the watermark changed **189
+times in 180 seconds** (median gap 1.0 s) while openers completed about **once
+every 27 minutes**. A signal that fires faster than the poll interval caches
+nothing. Do not reach for the watermark again without re-measuring that ratio;
+a 90-second sample taken during a quiet stretch shows zero changes and reads as
+a green light.
+
+The signal is a hint and never an answer: the build still rescreens every
+opener against the cache, so a stale signal costs freshness and never
+correctness. It is also not exhaustive — a repair, a reverification or an
+import changes the cache without completing any queue work — so
+`REPORT_CACHE_MAX_AGE_SECONDS` bounds how long such a change can go unnoticed.
+That age is a backstop for the rare case, not the mechanism. A signal that
+cannot be read at all returns `None`, which must be treated as "assume
+changed": serving a cached report on no information asserts a freshness the
+server cannot support.
+
+The encoded body is cached alongside the report, because re-encoding a
+multi-megabyte ranking on every poll is its own cost once the build is gone.
+Measured end to end on the production cache: a repeat leaderboard request went
+from 18.4 s to 0.005 s, serving identical bytes.
+
 ### Completed work has two records, and they can disagree
 
 "Already solved" is answered by the **permanent cache**
