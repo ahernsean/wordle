@@ -15,6 +15,9 @@ from erd_queue import ERDQueue
 import erd_search
 import report_model
 from report_model import (
+    _worker_process_is_running,
+    _normalize_worker,
+    DEFAULT_QUEUE_ROW_LIMIT,
     opener_completion_signal,
     _collection_summary,
     NO_WORKER_STATUS_BUCKET,
@@ -2039,6 +2042,77 @@ class ReportModelTest(unittest.TestCase):
         queue.close()
         sources = self._signal_sources(queue_path)
         self.assertEqual(opener_completion_signal(sources), (1, 1))
+
+    def test_a_stale_heartbeat_does_not_make_a_running_worker_dead(self):
+        # The node counter that drives the heartbeat lives inside _heartbeat,
+        # so a worker spending a long time in one kernel call reports nothing
+        # for the whole of it.  Observed live at 122.4M nodes and 0/s with the
+        # process at 74% CPU and a heartbeat 1,402s old against a 30s window.
+        row = {"worker_id": "worker-0", "pid": 4242, "updated_at": 1_000,
+               "current_branch_key": None, "cur_candidate": None,
+               "best_guess": None, "n_words": None, "claim_idx": None,
+               "claim_started_at": None, "claims_done": 0, "cur_max_depth": None,
+               "cur_nodes": None, "cur_help_depth": 0, "node_rate": None}
+        generated_at = 1_000 + WORKER_LIVENESS_SECONDS + 1_372
+        with patch("report_model._worker_process_is_running", return_value=True):
+            worker = _normalize_worker(row, generated_at, set())
+        self.assertTrue(worker["is_live"])
+        self.assertEqual(worker["heartbeat_age_seconds"],
+                         WORKER_LIVENESS_SECONDS + 1_372)
+
+        with patch("report_model._worker_process_is_running", return_value=False):
+            gone = _normalize_worker(row, generated_at, set())
+        self.assertFalse(gone["is_live"])
+
+    def test_a_fresh_heartbeat_needs_no_process_lookup(self):
+        # The heartbeat is the cheap evidence and it is sufficient on its own,
+        # so the common case must not pay for a /proc read per worker.
+        row = {"worker_id": "worker-1", "pid": 4242, "updated_at": 1_000,
+               "current_branch_key": None, "cur_candidate": None,
+               "best_guess": None, "n_words": None, "claim_idx": None,
+               "claim_started_at": None, "claims_done": 0, "cur_max_depth": None,
+               "cur_nodes": None, "cur_help_depth": 0, "node_rate": None}
+        with patch("report_model._worker_process_is_running") as looked_up:
+            worker = _normalize_worker(row, 1_001, set())
+        self.assertTrue(worker["is_live"])
+        looked_up.assert_not_called()
+
+    def test_a_recycled_pid_does_not_resurrect_a_departed_worker(self):
+        # This process is alive and is not a swarm worker, so a pid that has
+        # been reused must not read as the worker that once held it.
+        self.assertFalse(_worker_process_is_running(os.getpid()))
+        self.assertFalse(_worker_process_is_running(None))
+        # A pid that cannot exist, and one that is not a number at all.
+        self.assertFalse(_worker_process_is_running(2 ** 31 - 1))
+        self.assertFalse(_worker_process_is_running("not-a-pid"))
+
+    def test_the_queue_report_limits_its_rows_when_the_caller_names_no_limit(self):
+        # Without a default the queue returns every branch it has registered.
+        # On the production queue that is 54,201 rows and 68 MB, which the
+        # browser spends minutes fetching before it can draw anything --
+        # the report never fails, it just never arrives.
+        queue = self._open_queue()
+        queue.add_pending_many([
+            (ScoreCache.encode_subset(["crane", f"w{index:04d}x"]), 2, 9, "salet", 0)
+            for index in range(DEFAULT_QUEUE_ROW_LIMIT + 5)
+        ])
+        queue.close()
+        data = collect_report(self.sources, ReportRequest(
+            report_kind="queue"))["data"]
+        self.assertEqual(len(data["rows"]), DEFAULT_QUEUE_ROW_LIMIT)
+        self.assertGreater(data["matched_rows"], DEFAULT_QUEUE_ROW_LIMIT)
+
+    def test_an_explicit_queue_limit_still_wins(self):
+        queue = self._open_queue()
+        queue.add_pending_many([
+            (ScoreCache.encode_subset(["crane", f"w{index:04d}x"]), 2, 9, "salet", 0)
+            for index in range(20)
+        ])
+        queue.close()
+        data = collect_report(self.sources, ReportRequest(
+            report_kind="queue", filters=ReportFilters(limit=7)))["data"]
+        self.assertEqual(len(data["rows"]), 7)
+        self.assertEqual(data["matched_rows"], 20)
 
     def test_a_summary_of_branches_with_no_worker_status_stays_serializable(self):
         # branch_worker_status is NULL for a done or unqueued branch, and a
