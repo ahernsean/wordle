@@ -955,23 +955,144 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(degraded["response_group_count"], 2)
 
     def test_leaderboard_refolds_every_candidate_on_every_build(self):
-        # No candidate's ERD survives a build.  Each row is folded from the
-        # branch results as they stand when the leaderboard is asked for, so a
-        # cache that has not changed gives the same ranking by recomputing it,
-        # never by reading a stored fold back.
+        # A stored fold is a record of the last screen, never an answer.  Each
+        # row is folded from the branch results as they stand when the
+        # leaderboard is asked for, so poisoning the stored value changes
+        # nothing about what the build reports.
+        answers = ["crane", "slate"]
+        sources = self._leaderboard_sources(
+            answers, ["crane", "slate", "raise", "howdy"]
+        )
+        first = collect_report(sources, ReportRequest(report_kind="leaderboard"))
+        cache = ScoreCache(sources.cache_path, answers,
+                           checkpoint_on_close=False)
+        self.assertTrue(cache.opener_erd_map(ERD_ALL))
+        cache.write_opener_erds(
+            [(row["word"], row["erd"] + 99.0, 6, 4)
+             for row in first["data"]["rows"]],
+            ERD_ALL,
+        )
+        cache.close()
+
+        second = collect_report(sources, ReportRequest(report_kind="leaderboard"))
+        self.assertEqual(second["data"]["rows"], first["data"]["rows"])
+        self.assertEqual(second["data"]["counts"], first["data"]["counts"])
+
+    def test_a_screened_candidate_holding_a_loss_and_a_gap_is_infeasible(self):
+        # GIPPY splits these answers into two groups of more than one answer.
+        # Prove one a loss and leave the other unsolved: the fold calls that
+        # infeasible, because a proven loss settles the candidate whatever the
+        # unsolved group later turns out to be.  A screen that stopped at the
+        # first unsettled group could exit before reaching the loss and report
+        # the candidate as merely pending, which is the one wrong answer that
+        # still looks plausible.
+        answers = ["crane", "slate", "shale", "stale", "brine", "swine"]
+        sources = self._leaderboard_sources(answers, ["gippy"])
+        cache = ScoreCache(sources.cache_path, answers,
+                           checkpoint_on_close=False)
+        cache.write_loss(
+            ScoreCache.encode_subset(["brine", "swine"]), ERD_ALL, 5)
+        cache.close()
+
+        data = collect_report(
+            sources, ReportRequest(report_kind="leaderboard"))["data"]
+        self.assertEqual(data["counts"],
+                         {"complete": 0, "pending": 0, "infeasible": 1})
+
+    def test_a_screened_candidate_with_only_a_gap_is_pending(self):
+        # The same fixture without the loss: now nothing settles GIPPY, and
+        # the unsolved group leaves it pending rather than infeasible.  Paired
+        # with the test above so a screen cannot pass both by calling every
+        # unsettled candidate one thing or the other.
+        answers = ["crane", "slate", "shale", "stale", "brine", "swine"]
+        sources = self._leaderboard_sources(answers, ["gippy"])
+        data = collect_report(
+            sources, ReportRequest(report_kind="leaderboard"))["data"]
+        self.assertEqual(data["counts"],
+                         {"complete": 0, "pending": 1, "infeasible": 0})
+
+    def test_a_screen_admits_a_candidate_whose_groups_are_all_lone_survivors(self):
+        # A group of one answer is solved by playing it, so it holds no branch
+        # result and never will.  A screen that asked the cache about every
+        # group would reject every such candidate, and RAISE here has nothing
+        # but lone survivors.
+        answers = ["crane", "slate"]
+        sources = self._leaderboard_sources(answers, ["raise"])
+        data = collect_report(
+            sources, ReportRequest(report_kind="leaderboard"))["data"]
+        self.assertEqual(data["counts"],
+                         {"complete": 1, "pending": 0, "infeasible": 0})
+        self.assertEqual([row["word"] for row in data["rows"]], ["raise"])
+
+    def test_a_rebuild_over_an_unchanged_cache_writes_no_stored_folds(self):
+        # The leaderboard is polled, and the cache it writes to is the one the
+        # swarm is writing branch results into.  A build that rewrote every
+        # stored fold would add WAL traffic proportional to the vocabulary for
+        # a set of values none of which changed, so a fold is written only when
+        # it differs from the row already there.
+        answers = ["crane", "slate"]
+        sources = self._leaderboard_sources(answers, ["crane", "slate", "raise"])
+        collect_report(sources, ReportRequest(report_kind="leaderboard"))
+        with patch.object(
+            ScoreCache, "write_opener_erds", autospec=True,
+        ) as written, patch.object(
+            ScoreCache, "delete_opener_erds", autospec=True,
+        ) as deleted:
+            collect_report(sources, ReportRequest(report_kind="leaderboard"))
+        self.assertEqual(
+            [row for call in written.call_args_list for row in call.args[1]],
+            [])
+        self.assertEqual(
+            [row for call in deleted.call_args_list for row in call.args[1]],
+            [])
+
+    def test_a_stored_fold_is_deleted_once_its_opener_stops_screening(self):
+        # The stored fold asserts that every one of an opener's groups holds a
+        # result.  Deleting one of those results falsifies that, so the next
+        # build must take the stored row with it rather than leave it naming a
+        # tree that is gone.
+        answers = ["crane", "slate"]
+        sources = self._leaderboard_sources(answers, ["crane", "howdy"])
+        collided_key = ScoreCache.encode_subset(answers)
+        cache = ScoreCache(sources.cache_path, answers,
+                           checkpoint_on_close=False)
+        cache.write(collided_key, ERD_ALL, "crane", 1.5,
+                    max_depth=2, solve_budget=None)
+        cache.close()
+        collect_report(sources, ReportRequest(report_kind="leaderboard"))
+        cache = ScoreCache(sources.cache_path, answers,
+                           checkpoint_on_close=False)
+        self.assertIn("howdy", cache.opener_erd_map(ERD_ALL))
+        cache._conn.execute(
+            "DELETE FROM branch_best_by_policy WHERE branch_key = ?",
+            (collided_key,))
+        cache.close()
+
+        data = collect_report(
+            sources, ReportRequest(report_kind="leaderboard"))["data"]
+        self.assertNotIn("howdy", {row["word"] for row in data["rows"]})
+        cache = ScoreCache(sources.cache_path, answers,
+                           checkpoint_on_close=False)
+        self.addCleanup(cache.close)
+        self.assertNotIn("howdy", cache.opener_erd_map(ERD_ALL))
+
+    def test_leaderboard_folds_only_the_candidates_its_screen_admits(self):
+        # Folding builds a state dict per response group, so a vocabulary of
+        # openers still being searched costs far more to fold than to screen.
+        # HOWDY is the one candidate here that a cached branch result has not
+        # settled, so the screen must keep it out of the fold entirely.
         sources = self._leaderboard_sources(
             ["crane", "slate"], ["crane", "slate", "raise", "howdy"]
         )
-        first = collect_report(sources, ReportRequest(report_kind="leaderboard"))
         with patch(
             "report_model._candidate_erd_summary", wraps=_candidate_erd_summary,
         ) as folded:
-            second = collect_report(
+            report = collect_report(
                 sources, ReportRequest(report_kind="leaderboard")
             )
-        self.assertEqual(folded.call_count, 4)   # every candidate, every build
-        self.assertEqual(second["data"]["rows"], first["data"]["rows"])
-        self.assertEqual(second["data"]["counts"], first["data"]["counts"])
+        self.assertEqual(folded.call_count, 3)
+        self.assertEqual(report["data"]["counts"],
+                         {"complete": 3, "pending": 1, "infeasible": 0})
 
     def test_leaderboard_drops_a_candidate_whose_child_result_is_deleted(self):
         # HOWDY shares no letters with either answer, so both collide in one
@@ -1943,7 +2064,7 @@ class ReportModelTest(unittest.TestCase):
             ["crane", "slate"], ["crane", "slate", "raise"]
         )
         with patch.object(
-            ScoreCache, "report_branch_row_maps",
+            ScoreCache, "report_reusable_branch_facts",
             side_effect=sqlite3.OperationalError("cache read failed"),
         ):
             report = collect_report(

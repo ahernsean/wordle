@@ -1255,12 +1255,17 @@ def _candidate_erd_summary(response_groups, group_budget):
 
     The single place every caller (word report, leaderboard, openers view) gets
     a candidate's own ERD, and it is derived on every read from the response
-    groups the caller has already materialized — never memoised.  A stored fold
-    would state that every group behind it is an exact branch result, and
-    nothing revalidates that: the branch a fold reads can be deleted by a
-    repair, a reverification, or a requeue, none of which can name the folds
-    that read it.  Folding from the groups in hand keeps a candidate's reported
-    state a description of the cache as it stands.
+    groups the caller has already materialized.  A stored fold states that
+    every group behind it is an exact branch result, and the branch a fold
+    reads can be deleted by a repair, a reverification, or a requeue, none of
+    which can name the folds that read it.  Folding from the groups in hand
+    keeps a candidate's reported state a description of the cache as it stands.
+
+    `opener_erd_by_policy` stores this value for completed openers alone, and
+    only because that set is small enough to rescreen in full on every build
+    (`_screen_and_fold_openers`).  Nothing reads a stored fold in place of
+    folding; the rows are a record of the last screen, and the screen deletes
+    the ones it no longer settles.
 
     `response_groups` carry each group's branch fact as
     `ScoreCache.report_branch_states` resolved it at `group_budget`, so a child
@@ -1333,6 +1338,101 @@ def _candidate_erd_summary(response_groups, group_budget):
         "infeasible_group_count": infeasible_group_count,
         "response_group_count": len(response_groups),
     }
+
+
+def _screen_and_fold_openers(cache, skeletons, group_budget, policy):
+    """Fold every candidate opener that current branch results can settle.
+
+    Folding a whole vocabulary the way the word report folds one word costs a
+    per-group state dict for each of ~1.4 million response groups, almost all
+    of them belonging to openers still being searched.  Screening first reads
+    the same facts as two set lookups per group and reaches the fold only for
+    the openers a fold can finish, which on a production cache is the small
+    minority.
+
+    The screen visits every group rather than stopping at the first unsettled
+    one, because a candidate holding both an unsettled group and a proven loss
+    is `infeasible` and not `pending` — `_candidate_erd_summary` decides
+    infeasibility ahead of pendency, and a screen that stopped early could
+    exit before reaching the loss that decides it.
+
+    Returns (summaries, counts): one `_candidate_erd_summary` per opener the
+    fold could settle, and the three-way state tally over the whole
+    vocabulary.  An opener absent from `summaries` is pending, which is what
+    the tally counts it as.
+    """
+    erd_by_key, loss_keys = cache.report_reusable_branch_facts(
+        policy, group_budget)
+    summaries = {}
+    counts = {"complete": 0, "pending": 0, "infeasible": 0}
+    for candidate, groups in skeletons:
+        settled = True
+        holds_loss = False
+        for _pattern, answer_count, branch_key in groups:
+            # A group of fewer than two answers needs no stored result: the
+            # fold solves it from the response pattern alone.
+            if answer_count < 2:
+                continue
+            if branch_key in loss_keys:
+                holds_loss = True
+            elif branch_key not in erd_by_key:
+                settled = False
+        if not (settled or holds_loss):
+            counts["pending"] += 1
+            continue
+        summary = _candidate_erd_summary(
+            [
+                {
+                    "pattern": pattern,
+                    "answer_count": answer_count,
+                    "best_erd": erd_by_key.get(branch_key, (None, None))[0],
+                    "max_remaining_depth":
+                        erd_by_key.get(branch_key, (None, None))[1],
+                    "cache_state": (
+                        "exact" if branch_key in erd_by_key
+                        else "loss" if branch_key in loss_keys else "missing"
+                    ),
+                }
+                for pattern, answer_count, branch_key in groups
+            ],
+            group_budget,
+        )
+        counts[summary["state"]] += 1
+        if summary["state"] != "pending":
+            summaries[candidate] = summary
+    return summaries, counts
+
+
+def _store_opener_folds(cache, summaries, policy, stored=None):
+    """Bring stored opener folds into line with the folds just screened.
+
+    Writes every opener the screen settled and deletes the stored rows for
+    openers it no longer settles, so a branch result removed by a repair or a
+    requeue takes the folds that read it with it on the next read.  A row is
+    rewritten only when its value differs from the one stored: the build runs
+    on a poll against the cache the swarm is writing into, and rewriting an
+    unchanged vocabulary would add WAL traffic for no change in the answer.
+    """
+    if cache.read_only:
+        return
+    complete = {
+        opener: summary for opener, summary in summaries.items()
+        if summary["state"] == "complete"
+    }
+    if stored is None:
+        stored = cache.opener_erd_map(policy)
+    cache.write_opener_erds(
+        (
+            (opener, summary["erd"], summary["max_remaining_depth"],
+             summary["response_group_count"])
+            for opener, summary in complete.items()
+            if stored.get(opener, {}).get("erd") != summary["erd"]
+            or stored.get(opener, {}).get("max_remaining_depth")
+            != summary["max_remaining_depth"]
+        ),
+        policy,
+    )
+    cache.delete_opener_erds(set(stored) - set(complete), policy)
 
 
 def _response_group_key(row: dict, group_by: str) -> tuple:
@@ -3174,10 +3274,13 @@ def collect_leaderboard_report(sources: ReportOpeners, request: ReportRequest) -
     (`_candidate_erd_summary`), over branch states read through the cache's own
     reusability gate, so the numbers agree with `view WORD`.  Only openers
     whose whole tree is solved have a finite ERD and appear ranked; the rest
-    are summarized as pending or infeasible.  Every candidate is re-folded from
-    current cache state on every build: `report_branch_row_maps` loads the
-    whole policy's rows once, so the pass is one query plus arithmetic over
-    rows already in memory.
+    are summarized as pending or infeasible.
+
+    Every candidate is rescreened against current cache state on every build,
+    and `_screen_and_fold_openers` reaches the fold only for the openers a
+    fold can settle.  `_store_opener_folds` then records those folds, so the
+    ranking is a description of the cache as it stands rather than a reading
+    of what an earlier build stored.
     """
     generated_at = int(time.time())
     all_answers = load_word_list(sources.answer_list_path)
@@ -3201,34 +3304,22 @@ def collect_leaderboard_report(sources: ReportOpeners, request: ReportRequest) -
             (len(groups) for _, groups in skeletons),
             default=0,
         )
-        exact_by_key, loss_by_key = cache.report_branch_row_maps(ERD_ALL)
-        counts = {"complete": 0, "pending": 0, "infeasible": 0}
-        ranked_rows = []
-        for candidate, groups in skeletons:
-            branch_keys = [branch_key for _, _, branch_key in groups]
-            states = cache.report_branch_states_from_maps(
-                branch_keys, exact_by_key, loss_by_key, group_budget
-            )
-            response_groups = [
-                {
-                    "pattern": pattern,
-                    "answer_count": answer_count,
-                    "best_erd": states[branch_key]["best_erd"],
-                    "max_remaining_depth": states[branch_key]["max_remaining_depth"],
-                    "cache_state": states[branch_key]["cache_state"],
-                }
-                for pattern, answer_count, branch_key in groups
-            ]
-            summary = _candidate_erd_summary(response_groups, group_budget)
-            counts[summary["state"]] += 1
-            if summary["state"] == "complete":
-                ranked_rows.append({
-                    "word": candidate,
-                    "word_is_answer": candidate in answer_set,
-                    "erd": summary["erd"],
-                    "max_remaining_depth": summary["max_remaining_depth"],
-                    "_response_group_skeletons": groups,
-                })
+        summaries, counts = _screen_and_fold_openers(
+            cache, skeletons, group_budget, ERD_ALL
+        )
+        _store_opener_folds(cache, summaries, ERD_ALL)
+        groups_by_candidate = dict(skeletons)
+        ranked_rows = [
+            {
+                "word": candidate,
+                "word_is_answer": candidate in answer_set,
+                "erd": summary["erd"],
+                "max_remaining_depth": summary["max_remaining_depth"],
+                "_response_group_skeletons": groups_by_candidate[candidate],
+            }
+            for candidate, summary in summaries.items()
+            if summary["state"] == "complete"
+        ]
         ranked_rows.sort(
             key=lambda row: (row["erd"], row["max_remaining_depth"], row["word"])
         )
