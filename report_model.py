@@ -21,6 +21,7 @@ from erd_queue import (
     best_first_rank,
     derive_telemetry_path,
     disk_stats,
+    read_only_database_uri,
 )
 from runtime_paths import (
     DEFAULT_ANSWER_LIST_PATH,
@@ -3941,7 +3942,7 @@ def opener_completion_signal(sources):
     """
     try:
         connection = sqlite3.connect(
-            f"file:{sources.queue_path}?mode=ro", uri=True)
+            read_only_database_uri(sources.queue_path), uri=True)
     except (sqlite3.Error, OSError):
         return None
     try:

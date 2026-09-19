@@ -653,6 +653,101 @@ class RevalidatedReportCacheTest(ReportServerTest):
         self.assertEqual(self.calls, 3)
 
 
+    def test_a_waiter_does_not_file_the_builders_body_under_its_own_token(self):
+        # A waiter joins a build that started before its own signal read, so
+        # the body it receives can predate the token it holds.  Filing under
+        # that token would publish a body older than the state the token names,
+        # and every later poll matching it would be served the stale ranking --
+        # which inverts the guarantee that a stale signal costs freshness and
+        # never correctness.
+        started, release = Event(), Event()
+        bodies = iter(["first", "second"])
+
+        def collect_slowly(_sources, _request):
+            started.set()
+            release.wait(2)
+            self.calls += 1
+            return {"data": next(bodies), "sources": {}}
+
+        # The builder reads (1, 1); the waiter that joins mid-build reads (2, 2).
+        signals = iter([(1, 1), (2, 2), (2, 2), (2, 2)])
+        with patch("report_server.collect_report", side_effect=collect_slowly), \
+             patch("report_server.opener_completion_signal",
+                   side_effect=lambda _sources: next(signals)):
+            with running_server(self.live_configuration) as base_url:
+                responses = []
+                builder = Thread(target=lambda: responses.append(
+                    request(base_url, "/api/view/leaderboard")))
+                builder.start()
+                self.assertTrue(started.wait(1))
+                waiter = Thread(target=lambda: responses.append(
+                    request(base_url, "/api/view/leaderboard")))
+                waiter.start()
+                time.sleep(0.05)
+                release.set()
+                builder.join(3)
+                waiter.join(3)
+                # A third request holding (2, 2) must not be handed the body
+                # built while the signal still read (1, 1).
+                _status, _headers, body = request(
+                    base_url, "/api/view/leaderboard")
+        self.assertEqual(json.loads(body)["data"], "second")
+
+    def test_a_build_that_recorded_a_source_error_is_not_cached(self):
+        # collect_leaderboard_report catches its own SQLite errors and returns
+        # an ordinary report with an empty ranking and the error on the source,
+        # so a degraded build is a normal-looking 200.  Caching one pins an
+        # empty leaderboard until it expires, where every poll used to recover
+        # on the next request.
+        degraded = {"data": {"rows": []},
+                    "sources": {"cache": {"ok": False, "error": "disk I/O error"}}}
+        with patch("report_server.collect_report",
+                   side_effect=lambda _s, _r: (
+                       setattr(self, "calls", self.calls + 1) or degraded)), \
+             patch("report_server.opener_completion_signal", return_value=(3, 3)):
+            with running_server(self.live_configuration) as base_url:
+                self.get_leaderboard(base_url, times=3)
+        self.assertEqual(self.calls, 3)
+
+    def test_a_source_that_was_never_consulted_does_not_block_caching(self):
+        # The leaderboard never opens the queue, so its queue source reports
+        # ok=false with no error.  That is "not consulted", not a failure, and
+        # must not be read as one -- it would disable the cache entirely.
+        intact = {"data": {"rows": []},
+                  "sources": {"queue": {"ok": False, "error": None},
+                              "cache": {"ok": True, "error": None}}}
+        with patch("report_server.collect_report",
+                   side_effect=lambda _s, _r: (
+                       setattr(self, "calls", self.calls + 1) or intact)), \
+             patch("report_server.opener_completion_signal", return_value=(3, 3)):
+            with running_server(self.live_configuration) as base_url:
+                self.get_leaderboard(base_url, times=3)
+        self.assertEqual(self.calls, 1)
+
+    def test_a_limit_evicted_by_newer_ones_is_rebuilt_rather_than_retained(self):
+        # The cache key is the request, and a request carries a user-controlled
+        # limit, so each distinct ?limit= value is a separate multi-megabyte
+        # body.  Expiry alone only stops an entry being reused; without a cap
+        # the process grows until it is restarted.  Eviction is observable as a
+        # rebuild: the earliest limit is gone once enough newer ones arrive.
+        cap = report_server.REPORT_CACHE_MAX_ENTRIES
+        with patch("report_server.collect_report", side_effect=self.collect_counting), \
+             patch("report_server.opener_completion_signal", return_value=(3, 3)):
+            with running_server(self.live_configuration) as base_url:
+                for limit in range(1, cap + 1):
+                    request(base_url, f"/api/view/leaderboard?limit={limit}")
+                self.assertEqual(self.calls, cap)
+                # Still held: re-asking for one of them rebuilds nothing.
+                request(base_url, "/api/view/leaderboard?limit=1")
+                self.assertEqual(self.calls, cap)
+                # Push past the cap, which evicts the oldest entries.
+                for limit in range(cap + 1, cap + 4):
+                    request(base_url, f"/api/view/leaderboard?limit={limit}")
+                self.assertEqual(self.calls, cap + 3)
+                request(base_url, "/api/view/leaderboard?limit=2")
+        self.assertEqual(self.calls, cap + 4)
+
+
 class ReportServerMainTest(unittest.TestCase):
     def test_port_collision_exits_cleanly_instead_of_crashing(self):
         with running_server(fixture_configuration()) as base_url:

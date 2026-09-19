@@ -94,6 +94,9 @@ class InFlightReport:
         self.completed = Event()
         self.body = None
         self.error = None
+        # False when the build recorded an error on one of its sources, which
+        # `collect_leaderboard_report` does instead of raising.
+        self.intact = False
 
 
 #: Report kinds served from the revalidating cache.  A kind belongs here only
@@ -111,6 +114,12 @@ REVALIDATED_REPORT_KINDS = frozenset({"leaderboard"})
 #: a backstop for the rare case, not the mechanism: an opener completing is
 #: caught within one poll.
 REPORT_CACHE_MAX_AGE_SECONDS = 120
+
+#: How many distinct revalidated bodies to hold.  The cache key is the request,
+#: and a request carries a user-controlled `limit`, so distinct `?limit=` values
+#: would otherwise each pin a multi-megabyte body for the life of the process.
+#: A handful covers the limits one session actually uses.
+REPORT_CACHE_MAX_ENTRIES = 8
 
 
 @dataclass(frozen=True)
@@ -414,6 +423,49 @@ def make_handler(configuration):
     def encode_report(report):
         return json.dumps(report, sort_keys=True).encode("utf-8")
 
+    def report_is_intact(report):
+        """True when no source the report consulted reported an error.
+
+        `collect_leaderboard_report` catches its own SQLite and OS errors and
+        returns an ordinary report with an empty ranking and the error recorded
+        on the source, so a degraded build is a normal-looking 200.  Caching
+        one would pin an empty leaderboard for as long as the entry lives,
+        where before it was rebuilt on the next poll.  A source that was simply
+        not consulted carries `ok: false` with no error, which is not a
+        failure.
+        """
+        return not any(
+            source.get("error")
+            for source in (report.get("sources") or {}).values()
+            if isinstance(source, dict)
+        )
+
+    def store_cached_body(request, token, started_at, body):
+        """Record a body under the token its build read, aged from its start.
+
+        `started_at` is when the build began, not when it finished: the entry's
+        age is meant to say how stale its *content* is, and the content is as
+        old as the read that produced it.  Timing from completion would let a
+        slow build's entry outlive its own staleness bound.
+
+        Entries are bounded because the request is the key and a request
+        carries a user-controlled `limit`: every distinct `?limit=` value is a
+        separate multi-megabyte body, and expiry alone only stops an entry
+        being reused, never removes it.  Expired entries go first, and the
+        oldest go after that if the cap is still exceeded.
+        """
+        now = time.time()
+        with cached_reports_lock:
+            cached_reports[request] = (token, started_at, body)
+            for stale in [
+                key for key, entry in cached_reports.items()
+                if now - entry[1] > REPORT_CACHE_MAX_AGE_SECONDS
+            ]:
+                del cached_reports[stale]
+            while len(cached_reports) > REPORT_CACHE_MAX_ENTRIES:
+                oldest = min(cached_reports, key=lambda key: cached_reports[key][1])
+                del cached_reports[oldest]
+
     def cached_report_body(request):
         """Serve a revalidated report kind, rebuilding only when it could differ.
 
@@ -429,21 +481,30 @@ def make_handler(configuration):
         gone.
         """
         token = opener_completion_signal(configuration.sources)
-        now = time.time()
+        started_at = time.time()
         if token is not None:
             with cached_reports_lock:
                 entry = cached_reports.get(request)
             if (entry is not None and entry[0] == token
-                    and now - entry[1] <= REPORT_CACHE_MAX_AGE_SECONDS):
+                    and time.time() - entry[1] <= REPORT_CACHE_MAX_AGE_SECONDS):
                 return entry[2]
-        body = collect_report_once(request)
-        if token is not None:
-            with cached_reports_lock:
-                cached_reports[request] = (token, now, body)
-        return body
+        return collect_report_once(request, token, started_at)
 
-    def collect_report_once(request):
-        """Collect `request` once, however many callers are waiting on it."""
+    def collect_report_once(request, token, started_at):
+        """Collect `request` once, however many callers are waiting on it.
+
+        **Only the caller that builds files the result**, under the token it
+        read before starting.  A waiter receives a body built by someone else,
+        from a read of the cache that may predate the waiter's own token — so a
+        waiter filing under its own token would record a body older than the
+        state that token names, and every later poll matching that token would
+        be served it.  That inverts the one guarantee the design rests on: a
+        stale signal must cost freshness, never correctness.
+
+        Filing under the builder's token is conservative in the safe
+        direction.  If the signal moves mid-build, the entry is filed under the
+        older token, the next request misses, and the report is rebuilt.
+        """
         with in_flight_lock:
             in_flight = in_flight_reports.get(request)
             if in_flight is None:
@@ -454,8 +515,9 @@ def make_handler(configuration):
                 is_builder = False
         if is_builder:
             try:
-                in_flight.body = encode_report(
-                    collect_report(configuration.sources, request))
+                report = collect_report(configuration.sources, request)
+                in_flight.body = encode_report(report)
+                in_flight.intact = report_is_intact(report)
             except Exception as error:
                 in_flight.error = error
             finally:
@@ -466,6 +528,8 @@ def make_handler(configuration):
             in_flight.completed.wait()
         if in_flight.error is not None:
             raise in_flight.error
+        if is_builder and token is not None and in_flight.intact:
+            store_cached_body(request, token, started_at, in_flight.body)
         return in_flight.body
 
     class ReportHandler(BaseHTTPRequestHandler):

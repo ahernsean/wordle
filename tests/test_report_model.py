@@ -15,6 +15,7 @@ from erd_queue import ERDQueue
 import erd_search
 import report_model
 from report_model import (
+    opener_completion_signal,
     _collection_summary,
     NO_WORKER_STATUS_BUCKET,
     ReportFilters,
@@ -1857,6 +1858,66 @@ class ReportModelTest(unittest.TestCase):
             candidate_list_path=candidate_path,
             telemetry_path=self.telemetry_path,
         )
+
+    def _signal_sources(self, queue_path):
+        directory = self.temporary_directory.name
+        return ReportOpeners(
+            queue_path,
+            os.path.join(directory, "signal_cache.sqlite3"),
+            os.path.join(directory, "signal_answers.txt"),
+            os.path.join(directory, "signal_candidates.txt"),
+            os.path.join(directory, "signal_telemetry.sqlite3"),
+        )
+
+    def test_opener_completion_signal_counts_only_finished_opener_work(self):
+        directory = self.temporary_directory.name
+        queue_path = os.path.join(directory, "signal_queue.sqlite3")
+        queue = ERDQueue(queue_path)
+        queue._conn.execute(
+            "INSERT INTO opener_work (opener, requested_priority, requested_at,"
+            " state) VALUES ('crane', 10, 1, 'queued')")
+        queue.close()
+        sources = self._signal_sources(queue_path)
+        self.assertEqual(opener_completion_signal(sources), (0, None))
+
+        queue = ERDQueue(queue_path)
+        queue._conn.execute(
+            "INSERT INTO opener_work (opener, requested_priority, requested_at,"
+            " state) VALUES ('slate', 10, 1, 'complete')")
+        queue.close()
+        self.assertEqual(opener_completion_signal(sources), (1, 2))
+
+    def test_opener_completion_signal_is_none_when_the_queue_is_absent(self):
+        # None is "nothing is known", which the caller must read as "assume
+        # changed".  A missing queue must not read as "no opener has finished".
+        sources = self._signal_sources(
+            os.path.join(self.temporary_directory.name, "gone.sqlite3"))
+        self.assertIsNone(opener_completion_signal(sources))
+
+    def test_opener_completion_signal_is_none_when_the_queue_is_unreadable(self):
+        # A file that is not a database reaches the query, not the connect, so
+        # this covers the second failure arm rather than the first.
+        directory = self.temporary_directory.name
+        queue_path = os.path.join(directory, "not_a_database.sqlite3")
+        with open(queue_path, "wb") as handle:
+            handle.write(b"this is not a SQLite file")
+        sources = self._signal_sources(queue_path)
+        self.assertIsNone(opener_completion_signal(sources))
+
+    def test_opener_completion_signal_survives_a_path_with_uri_syntax(self):
+        # A path holding '?' or '#' is a valid filename and a URI delimiter, so
+        # interpolating it truncates the path and opens a different database --
+        # which returns None and silently disables revalidation.
+        directory = os.path.join(self.temporary_directory.name, "odd?dir#name")
+        os.makedirs(directory, exist_ok=True)
+        queue_path = os.path.join(directory, "queue.sqlite3")
+        queue = ERDQueue(queue_path)
+        queue._conn.execute(
+            "INSERT INTO opener_work (opener, requested_priority, requested_at,"
+            " state) VALUES ('crane', 10, 1, 'complete')")
+        queue.close()
+        sources = self._signal_sources(queue_path)
+        self.assertEqual(opener_completion_signal(sources), (1, 1))
 
     def test_a_summary_of_branches_with_no_worker_status_stays_serializable(self):
         # branch_worker_status is NULL for a done or unqueued branch, and a
