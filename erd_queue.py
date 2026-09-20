@@ -3552,17 +3552,40 @@ class ERDQueue:
         return (row["n_bundles"], row["max_bundle_nodes"],
                 row["total_bundle_wall_millis"], row["censored_units"])
 
-    def complete_candidate(self, branch_key, idx):
-        """Mark a candidate claim authoritatively complete (done=1)."""
+    def complete_candidate(self, branch_key, idx, claimed_by=None,
+                           bundle_id=None):
+        """Mark a candidate claim authoritatively complete (done=1).
+
+        Returns True when the row completed was the caller's own claim.
+
+        Scoped to that claim, because branch_key and idx alone do not identify
+        one.  A worker whose claim was reclaimed while it was still evaluating
+        goes on to finish; by then the index may have been reissued, to another
+        worker on this branch or to a different incarnation of it after a
+        finalize and re-creation.  Completing by key and index alone marks that
+        live claim done while contributing nothing to it, and the branch can
+        then finalize without the candidate ever having been evaluated at the
+        budget it now holds -- cacheing an optimum some candidate beats, or a
+        loss that is not one.
+
+        claimed_by and bundle_id are the pair `claim_next_bundle` stamps: the
+        bundle id is unique to one claim call and settles the case where the
+        same worker re-claimed the same index, and claimed_by carries a bare
+        claim that has no bundle.  Passing neither asks for no check.
+        """
         now = int(time.time())
         branch_id = self._intern_branch(branch_key, create=True)
         self._conn.execute("""
             UPDATE candidate_claims SET done = 1, done_at = ?
             WHERE branch_id = ? AND idx = ?
-        """, (now, branch_id, idx))
+              AND (? IS NULL OR claimed_by = ?)
+              AND (? IS NULL OR bundle_id = ?)
+        """, (now, branch_id, idx, claimed_by, claimed_by,
+              bundle_id, bundle_id))
         n = self._conn.execute("SELECT changes()").fetchone()[0]
         self._tally_wal_traffic(
             'candidate_claims/complete', n, n * _CLAIM_ROW_WAL_BYTES)
+        return n > 0
 
     def complete_bundle_two_level_erd_prunes(self, branch_key, bundle_id,
                                              candidate_indices, nodes_spent=0,

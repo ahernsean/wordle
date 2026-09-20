@@ -1701,7 +1701,15 @@ class _BranchWorker:
         else:  # pragma: no cover
             self.n_useless += 1
 
-        self.queue.complete_candidate(branch_key, idx)
+        if not self.queue.complete_candidate(
+                branch_key, idx, claimed_by=self.name, bundle_id=bundle_id):
+            # The claim was reclaimed and reissued while this evaluation ran.
+            # Its result belongs to a branch incarnation that no longer holds
+            # this index, so the current holder must still finish it.
+            logger.warning(
+                '%s lost candidate %s (idx=%d) on a branch it no longer '
+                'holds the claim for; result discarded', self.name,
+                candidate, idx)
         # The outbound claim telemetry is required for branch ETA reporting,
         # regardless of whether this worker uses adaptive decomposition.
         now_complete = time.time()

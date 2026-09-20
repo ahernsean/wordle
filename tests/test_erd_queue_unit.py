@@ -821,6 +821,37 @@ class TestBranchLifecycle(_TmpQueue):
         self.assertEqual(guess, "crane")
         self.assertAlmostEqual(erd, 2.0)
 
+    def test_completing_a_candidate_reissued_to_another_worker_is_refused(self):
+        # The stale worker's whole hazard in one case: its claim was reclaimed,
+        # the index reissued, and it now finishes.  Completing by key and index
+        # alone would mark the new holder's live claim done with no result
+        # behind it, and the branch could finalize a candidate nobody evaluated
+        # at the budget it now holds.
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES)
+        idx = self._claim_one_idx(self.key, worker_id="worker-0")
+        self.q.reclaim_claims_of_worker("worker-0")
+        reissued = self._claim_one_idx(self.key, worker_id="worker-1")
+        self.assertEqual(reissued, idx, "fixture did not reissue the index")
+
+        self.assertFalse(
+            self.q.complete_candidate(self.key, idx, claimed_by="worker-0"))
+
+        self.assertEqual(self.q.branch_done_candidates(self.key), 0,
+                         "a live claim was marked done by a stale worker")
+
+    def test_completing_a_candidate_this_worker_still_holds_succeeds(self):
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES)
+        idx = self._claim_one_idx(self.key, worker_id="worker-0")
+        self.assertTrue(
+            self.q.complete_candidate(self.key, idx, claimed_by="worker-0"))
+        self.assertEqual(self.q.branch_done_candidates(self.key), 1)
+
+    def test_completing_without_an_owner_still_asks_for_no_check(self):
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES)
+        idx = self._claim_one_idx(self.key, worker_id="worker-0")
+        self.assertTrue(self.q.complete_candidate(self.key, idx))
+        self.assertEqual(self.q.branch_done_candidates(self.key), 1)
+
     def test_read_branch_best_returns_none_none_for_missing_key(self):
         self.assertEqual(self.q.read_branch_best(b"notakey"), (None, None, None))
 
