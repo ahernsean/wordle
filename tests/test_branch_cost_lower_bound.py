@@ -14,6 +14,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+import wordle_engine
 from cache_sqlite import ScoreCache
 from erd_queue import encode_subset
 from pattern_matrix import PatternMatrix
@@ -783,3 +784,54 @@ class TestPricingGroupsProvesLiveness(_VocabularyMixin, unittest.TestCase):
             branch_floor_table=self._table())
         self.assertGreater(len(ticks), 1)
         self.assertEqual(bound, unticked)
+
+
+class TestDescendantFramesPriceGroupsWithATick(_VocabularyMixin,
+                                               unittest.TestCase):
+    """The tick must reach every frame, not just the entry one.
+
+    `evaluate_candidate` recurses through `_solve_subset`, which evaluates each
+    descendant candidate in turn.  A descendant priced its response groups with
+    no tick would go silent exactly as the entry frame did, and every result
+    assertion would still pass -- so this asserts on the frames actually
+    reached rather than on the answer.
+    """
+
+    def _frames_that_priced_groups(self, branch_words, candidate, best_erd,
+                                   liveness_tick):
+        """Each (branch_size, got_a_tick) the floor loop was entered with."""
+        frames = []
+        real = wordle_engine._remaining_groups_cost_lower_bounds
+
+        def recording(ordered_groups, group_candidate, branch_size,
+                      branch_floor_table, liveness_tick=None):
+            frames.append((branch_size, liveness_tick is not None))
+            return real(ordered_groups, group_candidate, branch_size,
+                        branch_floor_table, liveness_tick=liveness_tick)
+
+        with mock.patch.object(wordle_engine,
+                               "_remaining_groups_cost_lower_bounds",
+                               recording):
+            evaluate_candidate(
+                branch_words, candidate, self._response_cache(),
+                None, best_erd=best_erd, guesses=self.guess_words,
+                policy=ERD_ALL, budget=5,
+                pattern_matrix=self.pattern_matrix,
+                branch_floor_table=self._table(),
+                liveness_tick=liveness_tick)
+        return frames
+
+    def test_every_frame_that_prices_groups_is_given_the_tick(self):
+        branch_words = self._branch(40, seed=77)
+        frames = self._frames_that_priced_groups(
+            branch_words, self.guess_words[0], float("inf"), lambda: None)
+
+        descendant_sizes = {size for size, _ in frames
+                            if size != len(branch_words)}
+        self.assertTrue(
+            descendant_sizes,
+            "fixture never recursed; it cannot cover descendant frames")
+        unticked = sorted({size for size, ticked in frames if not ticked})
+        self.assertEqual(
+            unticked, [],
+            f"frames priced groups with no liveness tick: sizes {unticked}")

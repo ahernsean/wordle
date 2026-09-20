@@ -1639,7 +1639,8 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
             subbranch_solver, ceiling=sub_ceiling,
             entry_guess=candidate, entry_pattern=pattern_code,
             mid_loop_publisher=mid_loop_publisher, pattern_matrix=pattern_matrix,
-            branch_floor_table=branch_floor_table, hint_cache=hint_cache)
+            branch_floor_table=branch_floor_table, hint_cache=hint_cache,
+            liveness_tick=liveness_tick)
         if sub in _ABORT_STATUSES:
             return (sub, None, None, False)
         sub_status, sub_cost, sub_max_remaining_depth, sub_budget_tainted = sub
@@ -1710,7 +1711,7 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
                   branch_floor_table=None,
                   ceiling=float('inf'), entry_guess=None, entry_pattern=None,
                   mid_loop_publisher=None, pattern_matrix=None,
-                  hint_cache=None):
+                  hint_cache=None, liveness_tick=None):
     """Budget-aware core of min_expected_guesses.
 
     Returns (cost, max_depth, floor_hit, cutoff), or None on deadline/cancel
@@ -1901,6 +1902,7 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
                 branch_indices=branch_indices,
                 branch_floor_table=branch_floor_table,
                 hint_cache=hint_cache,
+                liveness_tick=liveness_tick,
             )
         if status in _ABORT_STATUSES:
             return status
