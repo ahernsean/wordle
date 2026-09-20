@@ -15,6 +15,12 @@ from erd_queue import ERDQueue
 import erd_search
 import report_model
 from report_model import (
+    _worker_process_is_running,
+    _normalize_worker,
+    DEFAULT_QUEUE_ROW_LIMIT,
+    opener_completion_signal,
+    _collection_summary,
+    NO_WORKER_STATUS_BUCKET,
     ReportFilters,
     ReportRequest,
     ReportOpeners,
@@ -1976,6 +1982,155 @@ class ReportModelTest(unittest.TestCase):
             candidate_list_path=candidate_path,
             telemetry_path=self.telemetry_path,
         )
+
+    def _signal_sources(self, queue_path):
+        directory = self.temporary_directory.name
+        return ReportOpeners(
+            queue_path,
+            os.path.join(directory, "signal_cache.sqlite3"),
+            os.path.join(directory, "signal_answers.txt"),
+            os.path.join(directory, "signal_candidates.txt"),
+            os.path.join(directory, "signal_telemetry.sqlite3"),
+        )
+
+    def test_opener_completion_signal_counts_only_finished_opener_work(self):
+        directory = self.temporary_directory.name
+        queue_path = os.path.join(directory, "signal_queue.sqlite3")
+        queue = ERDQueue(queue_path)
+        queue._conn.execute(
+            "INSERT INTO opener_work (opener, requested_priority, requested_at,"
+            " state) VALUES ('crane', 10, 1, 'queued')")
+        queue.close()
+        sources = self._signal_sources(queue_path)
+        self.assertEqual(opener_completion_signal(sources), (0, None))
+
+        queue = ERDQueue(queue_path)
+        queue._conn.execute(
+            "INSERT INTO opener_work (opener, requested_priority, requested_at,"
+            " state) VALUES ('slate', 10, 1, 'complete')")
+        queue.close()
+        self.assertEqual(opener_completion_signal(sources), (1, 2))
+
+    def test_opener_completion_signal_is_none_when_the_queue_is_absent(self):
+        # None is "nothing is known", which the caller must read as "assume
+        # changed".  A missing queue must not read as "no opener has finished".
+        sources = self._signal_sources(
+            os.path.join(self.temporary_directory.name, "gone.sqlite3"))
+        self.assertIsNone(opener_completion_signal(sources))
+
+    def test_opener_completion_signal_is_none_when_the_queue_is_unreadable(self):
+        # A file that is not a database reaches the query, not the connect, so
+        # this covers the second failure arm rather than the first.
+        directory = self.temporary_directory.name
+        queue_path = os.path.join(directory, "not_a_database.sqlite3")
+        with open(queue_path, "wb") as handle:
+            handle.write(b"this is not a SQLite file")
+        sources = self._signal_sources(queue_path)
+        self.assertIsNone(opener_completion_signal(sources))
+
+    def test_opener_completion_signal_survives_a_path_with_uri_syntax(self):
+        # A path holding '?' or '#' is a valid filename and a URI delimiter, so
+        # interpolating it truncates the path and opens a different database --
+        # which returns None and silently disables revalidation.
+        directory = os.path.join(self.temporary_directory.name, "odd?dir#name")
+        os.makedirs(directory, exist_ok=True)
+        queue_path = os.path.join(directory, "queue.sqlite3")
+        queue = ERDQueue(queue_path)
+        queue._conn.execute(
+            "INSERT INTO opener_work (opener, requested_priority, requested_at,"
+            " state) VALUES ('crane', 10, 1, 'complete')")
+        queue.close()
+        sources = self._signal_sources(queue_path)
+        self.assertEqual(opener_completion_signal(sources), (1, 1))
+
+    def test_a_stale_heartbeat_does_not_make_a_running_worker_dead(self):
+        # The node counter that drives the heartbeat lives inside _heartbeat,
+        # so a worker spending a long time in one kernel call reports nothing
+        # for the whole of it.  Observed live at 122.4M nodes and 0/s with the
+        # process at 74% CPU and a heartbeat 1,402s old against a 30s window.
+        row = {"worker_id": "worker-0", "pid": 4242, "updated_at": 1_000,
+               "current_branch_key": None, "cur_candidate": None,
+               "best_guess": None, "n_words": None, "claim_idx": None,
+               "claim_started_at": None, "claims_done": 0, "cur_max_depth": None,
+               "cur_nodes": None, "cur_help_depth": 0, "node_rate": None}
+        generated_at = 1_000 + WORKER_LIVENESS_SECONDS + 1_372
+        with patch("report_model._worker_process_is_running", return_value=True):
+            worker = _normalize_worker(row, generated_at, set())
+        self.assertTrue(worker["is_live"])
+        self.assertEqual(worker["heartbeat_age_seconds"],
+                         WORKER_LIVENESS_SECONDS + 1_372)
+
+        with patch("report_model._worker_process_is_running", return_value=False):
+            gone = _normalize_worker(row, generated_at, set())
+        self.assertFalse(gone["is_live"])
+
+    def test_a_fresh_heartbeat_needs_no_process_lookup(self):
+        # The heartbeat is the cheap evidence and it is sufficient on its own,
+        # so the common case must not pay for a /proc read per worker.
+        row = {"worker_id": "worker-1", "pid": 4242, "updated_at": 1_000,
+               "current_branch_key": None, "cur_candidate": None,
+               "best_guess": None, "n_words": None, "claim_idx": None,
+               "claim_started_at": None, "claims_done": 0, "cur_max_depth": None,
+               "cur_nodes": None, "cur_help_depth": 0, "node_rate": None}
+        with patch("report_model._worker_process_is_running") as looked_up:
+            worker = _normalize_worker(row, 1_001, set())
+        self.assertTrue(worker["is_live"])
+        looked_up.assert_not_called()
+
+    def test_a_recycled_pid_does_not_resurrect_a_departed_worker(self):
+        # This process is alive and is not a swarm worker, so a pid that has
+        # been reused must not read as the worker that once held it.
+        self.assertFalse(_worker_process_is_running(os.getpid()))
+        self.assertFalse(_worker_process_is_running(None))
+        # A pid that cannot exist, and one that is not a number at all.
+        self.assertFalse(_worker_process_is_running(2 ** 31 - 1))
+        self.assertFalse(_worker_process_is_running("not-a-pid"))
+
+    def test_the_queue_report_limits_its_rows_when_the_caller_names_no_limit(self):
+        # Without a default the queue returns every branch it has registered.
+        # On the production queue that is 54,201 rows and 68 MB, which the
+        # browser spends minutes fetching before it can draw anything --
+        # the report never fails, it just never arrives.
+        queue = self._open_queue()
+        queue.add_pending_many([
+            (ScoreCache.encode_subset(["crane", f"w{index:04d}x"]), 2, 9, "salet", 0)
+            for index in range(DEFAULT_QUEUE_ROW_LIMIT + 5)
+        ])
+        queue.close()
+        data = collect_report(self.sources, ReportRequest(
+            report_kind="queue"))["data"]
+        self.assertEqual(len(data["rows"]), DEFAULT_QUEUE_ROW_LIMIT)
+        self.assertGreater(data["matched_rows"], DEFAULT_QUEUE_ROW_LIMIT)
+
+    def test_an_explicit_queue_limit_still_wins(self):
+        queue = self._open_queue()
+        queue.add_pending_many([
+            (ScoreCache.encode_subset(["crane", f"w{index:04d}x"]), 2, 9, "salet", 0)
+            for index in range(20)
+        ])
+        queue.close()
+        data = collect_report(self.sources, ReportRequest(
+            report_kind="queue", filters=ReportFilters(limit=7)))["data"]
+        self.assertEqual(len(data["rows"]), 7)
+        self.assertEqual(data["matched_rows"], 20)
+
+    def test_a_summary_of_branches_with_no_worker_status_stays_serializable(self):
+        # branch_worker_status is NULL for a done or unqueued branch, and a
+        # None key cannot be ordered against the string keys beside it.  The
+        # server encodes with sort_keys, so one such branch made the whole
+        # queue report unserializable rather than merely oddly labelled -- and
+        # a queue holding any finished branch has one.
+        summary = _collection_summary([
+            {"branch_status": "evaluating", "branch_worker_status": "active"},
+            {"branch_status": "done", "branch_worker_status": None},
+            {"branch_status": "queued", "branch_worker_status": "waiting"},
+        ])
+        self.assertEqual(
+            summary["branch_count_by_worker_status"],
+            {"active": 1, NO_WORKER_STATUS_BUCKET: 1, "waiting": 1},
+        )
+        self.assertNotIn(None, summary["branch_count_by_worker_status"])
+        json.dumps(summary, sort_keys=True)
 
     def test_leaderboard_ranks_complete_openers_by_erd(self):
         # With two answers, an opener that separates them into singletons is

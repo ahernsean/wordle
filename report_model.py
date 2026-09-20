@@ -21,6 +21,7 @@ from erd_queue import (
     best_first_rank,
     derive_telemetry_path,
     disk_stats,
+    read_only_database_uri,
 )
 from runtime_paths import (
     DEFAULT_ANSWER_LIST_PATH,
@@ -741,6 +742,38 @@ def _worker_number(worker_id):
     return worker_id.rsplit("-", 1)[-1]
 
 
+#: Read from /proc to tell a live worker from a recycled pid.  The swarm is
+#: Linux-only, and the report runs on the same machine as the workers it
+#: describes, so the process table is available and authoritative.
+_WORKER_COMMAND_MARKER = "erd_search.py"
+
+
+def _worker_process_is_running(pid):
+    """True when `pid` is a live swarm process on this machine.
+
+    A heartbeat says when a worker last *reported*, which is not the same as
+    whether it is running.  The node counter that drives the heartbeat lives
+    inside `_BranchWorker._heartbeat`, so a worker spending a long time inside
+    one kernel call reports nothing for the whole of it: observed live at
+    122.4M nodes and 0/s with the process at 74% CPU and a heartbeat 1,402
+    seconds old, against a 30-second liveness window.  Calling that worker dead
+    asserts something the process table contradicts.
+
+    The command line is checked as well as the pid, because pid numbers are
+    reused and a recycled number would otherwise resurrect a worker that is
+    genuinely gone.  Anything unreadable answers False, which leaves the
+    heartbeat as the only evidence -- the behaviour from before this check
+    existed.
+    """
+    if not pid:
+        return False
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as command_file:
+            return _WORKER_COMMAND_MARKER.encode() in command_file.read()
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def _normalize_worker(row, generated_at, answer_set):
     branch_key_value = _row_value(row, "current_branch_key")
     branch_key = bytes(branch_key_value) if branch_key_value is not None else None
@@ -753,7 +786,13 @@ def _normalize_worker(row, generated_at, answer_set):
         "pid": row["pid"],
         "answer_count": _row_value(row, "n_words"),
         "updated_at": row["updated_at"],
-        "is_live": generated_at - row["updated_at"] <= WORKER_LIVENESS_SECONDS,
+        # A fresh heartbeat proves liveness; a stale one does not disprove it,
+        # so the process table is consulted before a worker is called dead.
+        "is_live": (
+            generated_at - row["updated_at"] <= WORKER_LIVENESS_SECONDS
+            or _worker_process_is_running(row["pid"])
+        ),
+        "heartbeat_age_seconds": max(0, generated_at - row["updated_at"]),
         "branch_reference": branch_reference(branch_key) if branch_key else None,
         "branch_key_hex": branch_key.hex() if branch_key else None,
         "branch_context": _normalized_branch_spine(row, answer_set),
@@ -2859,12 +2898,32 @@ def _row_matches_branch_target(row, branch_target, prefix):
     return False
 
 
+#: The worker-status bucket for branches that have no worker dimension at all.
+#: `branch_worker_status` is NULL for a branch that is done or unqueued, and a
+#: None key cannot be ordered against the string keys beside it -- which makes
+#: the whole report unserializable under `sort_keys`, not merely oddly named.
+#: The spelling matches `cache_state`'s "not_applicable" for the same idea.
+NO_WORKER_STATUS_BUCKET = "not_applicable"
+
+
+#: Rows the queue report returns when the caller names no limit.  Every other
+#: row-bearing report already defaults one; without it the queue returns every
+#: branch it has ever registered -- 54,201 rows and a 68 MB payload on the
+#: production queue, which the browser spends minutes fetching and rendering
+#: before showing anything.  `matched_rows` still reports the full count, so
+#: the view says how much it is not showing, and the row-limit control raises
+#: it.
+DEFAULT_QUEUE_ROW_LIMIT = 100
+
+
 def _collection_summary(rows):
     by_status = {}
     by_worker_status = {}
     for row in rows:
         status = row["branch_status"]
         worker_status = row["branch_worker_status"]
+        if worker_status is None:
+            worker_status = NO_WORKER_STATUS_BUCKET
         by_status[status] = by_status.get(status, 0) + 1
         by_worker_status[worker_status] = by_worker_status.get(worker_status, 0) + 1
     return {
@@ -2899,8 +2958,8 @@ def collect_queue_report(sources: ReportOpeners, request: ReportRequest) -> dict
         rows, _prefix = _scoped_queue_rows(queue, request)
         data["summary"] = _collection_summary(rows)
         data["matched_rows"] = len(rows)
-        limit = request.filters.limit
-        data["rows"] = rows[:limit] if limit is not None else rows
+        limit = request.filters.limit or DEFAULT_QUEUE_ROW_LIMIT
+        data["rows"] = rows[:limit]
         for row in data["rows"]:
             row["branch_reference"] = branch_reference(bytes(row.pop("branch_key")))
             row["spine"] = _normalized_branch_spine(row, answer_set)
@@ -3995,6 +4054,44 @@ def _opener_erd_summaries(sources, openers, report, cache,
     except (sqlite3.Error, OSError) as error:
         report["sources"]["cache"]["error"] = str(error)
     return summaries
+
+
+def opener_completion_signal(sources):
+    """A token that changes when an opener's tree finishes, and not otherwise.
+
+    The leaderboard's answer is the set of openers whose whole tree is solved.
+    That set grows when an opener's work completes — about every 27 minutes on
+    the production swarm — against a client that asks every two seconds.  Two
+    indexed counts over `opener_work` say whether it could have grown, for
+    about a tenth of a millisecond.
+
+    **The obvious signal does not work, and the reason is worth keeping.**  A
+    watermark over branch results (`MAX(updated_at)`) is the conservative
+    choice and is useless here: it covers every branch written at any depth,
+    and those land every few seconds — measured at 189 changes in 180 seconds,
+    a median of one per second, against a leaderboard answer that moves once
+    per 1,650.  A signal that fires faster than the poll interval caches
+    nothing.
+
+    This signal is a hint, never an answer: the caller still rescreens every
+    opener against the cache.  It is also not exhaustive — a repair or an
+    import changes the cache without touching the queue — so a caller must
+    pair it with a staleness bound.  Returns None when the queue cannot be
+    read, which callers must treat as "assume changed".
+    """
+    try:
+        connection = sqlite3.connect(
+            read_only_database_uri(sources.queue_path), uri=True)
+    except (sqlite3.Error, OSError):
+        return None
+    try:
+        return tuple(connection.execute(
+            "SELECT COUNT(*), MAX(opener_work_id) FROM opener_work "
+            "WHERE state = 'complete'").fetchone())
+    except sqlite3.Error:
+        return None
+    finally:
+        connection.close()
 
 
 def _score_cache_file_signature(cache_path):

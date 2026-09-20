@@ -11,6 +11,7 @@ import json
 import os
 import re
 import sys
+import time
 from threading import Event, Lock
 from urllib.parse import parse_qs, urlsplit
 
@@ -24,6 +25,7 @@ from report_model import (
     GROUP_BY_STRATEGIES,
     SCHEMA_VERSION,
     OPENER_GROUP_BY_STRATEGIES,
+    opener_completion_signal,
     OPENER_SORT_FIELDS,
     OPENER_STATES,
     TREE_CURSOR_PATTERN,
@@ -85,13 +87,39 @@ class InvalidRequest(ValueError):
     pass
 
 
-class InFlightLeaderboardReport:
-    """One leaderboard collection shared by concurrent identical requests."""
+class InFlightReport:
+    """One report collection shared by concurrent identical requests."""
 
     def __init__(self):
         self.completed = Event()
-        self.report = None
+        self.body = None
         self.error = None
+        # False when the build recorded an error on one of its sources, which
+        # `collect_leaderboard_report` does instead of raising.
+        self.intact = False
+
+
+#: Report kinds served from the revalidating cache.  A kind belongs here only
+#: if its answer is a function of what `opener_completion_signal` covers — the
+#: set of openers whose tree is finished.  The queue-backed reports are
+#: deliberately absent: their subject is what the swarm is doing right now, so
+#: serving one a few seconds old would make a liveness dashboard report a
+#: liveness it no longer has.
+REVALIDATED_REPORT_KINDS = frozenset({"leaderboard"})
+
+#: How long a cached report may be served while its signal stands still.  The
+#: signal names openers whose queue work finished, so a change reaching the
+#: cache by another route — a repair, a reverification, an import — is
+#: invisible to it; this bounds how long such a change can go unnoticed.  It is
+#: a backstop for the rare case, not the mechanism: an opener completing is
+#: caught within one poll.
+REPORT_CACHE_MAX_AGE_SECONDS = 120
+
+#: How many distinct revalidated bodies to hold.  The cache key is the request,
+#: and a request carries a user-controlled `limit`, so distinct `?limit=` values
+#: would otherwise each pin a multi-megabyte body for the life of the process.
+#: A handful covers the limits one session actually uses.
+REPORT_CACHE_MAX_ENTRIES = 8
 
 
 @dataclass(frozen=True)
@@ -387,32 +415,129 @@ def load_fixtures(directory):
 
 
 def make_handler(configuration):
-    leaderboard_reports = {}
-    leaderboard_reports_lock = Lock()
+    in_flight_reports = {}
+    in_flight_lock = Lock()
+    cached_reports = {}
+    cached_reports_lock = Lock()
 
-    def collect_leaderboard_once(request):
-        with leaderboard_reports_lock:
-            in_flight = leaderboard_reports.get(request)
+    def encode_report(report):
+        return json.dumps(report, sort_keys=True).encode("utf-8")
+
+    def report_is_intact(report):
+        """True when no source the report consulted reported an error.
+
+        `collect_leaderboard_report` catches its own SQLite and OS errors and
+        returns an ordinary report with an empty ranking and the error recorded
+        on the source, so a degraded build is a normal-looking 200.  Caching
+        one would pin an empty leaderboard for as long as the entry lives,
+        where before it was rebuilt on the next poll.  A source that was simply
+        not consulted carries `ok: false` with no error, which is not a
+        failure.
+        """
+        return not any(
+            source.get("error")
+            for source in (report.get("sources") or {}).values()
+            if isinstance(source, dict)
+        )
+
+    def store_cached_body(request, token, started_at, body):
+        """Record a body under the token its build read, aged from its start.
+
+        `started_at` is when the build began, not when it finished: the entry's
+        age is meant to say how stale its *content* is, and the content is as
+        old as the read that produced it.  Timing from completion would let a
+        slow build's entry outlive its own staleness bound.
+
+        Entries are bounded because the request is the key and a request
+        carries a user-controlled `limit`: every distinct `?limit=` value is a
+        separate multi-megabyte body, and expiry alone only stops an entry
+        being reused, never removes it.  Expired entries go first, and the
+        oldest go after that if the cap is still exceeded.
+        """
+        now = time.time()
+        with cached_reports_lock:
+            cached_reports[request] = (token, started_at, body)
+            for stale in [
+                key for key, entry in cached_reports.items()
+                if now - entry[1] > REPORT_CACHE_MAX_AGE_SECONDS
+            ]:
+                del cached_reports[stale]
+            while len(cached_reports) > REPORT_CACHE_MAX_ENTRIES:
+                oldest = min(cached_reports, key=lambda key: cached_reports[key][1])
+                del cached_reports[oldest]
+
+    def cached_report_body(request):
+        """Serve a revalidated report kind, rebuilding only when it could differ.
+
+        Rebuilding the leaderboard means rescreening the whole opener
+        vocabulary; the signal that says whether the answer could have moved is
+        two indexed counts.  Asking the cheap question on every request and the
+        expensive one only when the answer changes is the whole point: an
+        opener completes about every 27 minutes against a client that polls
+        every two seconds.
+
+        The encoded body is cached with the report, because re-encoding a
+        multi-megabyte ranking on every poll is its own cost once the build is
+        gone.
+        """
+        token = opener_completion_signal(configuration.sources)
+        started_at = time.time()
+        if token is not None:
+            with cached_reports_lock:
+                entry = cached_reports.get(request)
+            if (entry is not None and entry[0] == token
+                    and time.time() - entry[1] <= REPORT_CACHE_MAX_AGE_SECONDS):
+                return entry[2]
+        return collect_report_once(request, token, started_at)
+
+    def collect_report_once(request, token, started_at):
+        """Collect `request` once, however many callers are waiting on it.
+
+        **Only the caller that builds files the result**, under the token it
+        read before starting.  A waiter receives a body built by someone else,
+        from a read of the cache that may predate the waiter's own token — so a
+        waiter filing under its own token would record a body older than the
+        state that token names, and every later poll matching that token would
+        be served it.  That inverts the one guarantee the design rests on: a
+        stale signal must cost freshness, never correctness.
+
+        Filing under the builder's token is conservative in the safe
+        direction.  If the signal moves mid-build, the entry is filed under the
+        older token, the next request misses, and the report is rebuilt.
+        """
+        with in_flight_lock:
+            in_flight = in_flight_reports.get(request)
             if in_flight is None:
-                in_flight = InFlightLeaderboardReport()
-                leaderboard_reports[request] = in_flight
+                in_flight = InFlightReport()
+                in_flight_reports[request] = in_flight
                 is_builder = True
             else:
                 is_builder = False
         if is_builder:
             try:
-                in_flight.report = collect_report(configuration.sources, request)
+                report = collect_report(configuration.sources, request)
+                in_flight.body = encode_report(report)
+                in_flight.intact = report_is_intact(report)
+                # Published before the waiters are released and before the
+                # in-flight marker is dropped, so no arriving request can find
+                # neither.  Releasing first leaves a window in which the build
+                # is finished, the marker is gone and the entry is not yet
+                # stored, and a request landing there starts a second build of
+                # a report that is already in hand.
+                if token is not None and in_flight.intact:
+                    store_cached_body(
+                        request, token, started_at, in_flight.body)
             except Exception as error:
                 in_flight.error = error
             finally:
                 in_flight.completed.set()
-                with leaderboard_reports_lock:
-                    leaderboard_reports.pop(request, None)
+                with in_flight_lock:
+                    in_flight_reports.pop(request, None)
         else:
             in_flight.completed.wait()
         if in_flight.error is not None:
             raise in_flight.error
-        return in_flight.report
+        return in_flight.body
 
     class ReportHandler(BaseHTTPRequestHandler):
         def log_message(self, _format, *_args):
@@ -471,13 +596,14 @@ def make_handler(configuration):
                 return
             try:
                 if configuration.fixtures is not None:
-                    report = configuration.fixtures[
+                    body = encode_report(configuration.fixtures[
                         fixture_name_for_request(target.path, request)
-                    ]
-                elif request.report_kind == "leaderboard":
-                    report = collect_leaderboard_once(request)
+                    ])
+                elif request.report_kind in REVALIDATED_REPORT_KINDS:
+                    body = cached_report_body(request)
                 else:
-                    report = collect_report(configuration.sources, request)
+                    body = encode_report(
+                        collect_report(configuration.sources, request))
             except ValueError as error:
                 if hasattr(error, "candidates"):
                     report = collect_ambiguous_branch_reference_report(
@@ -496,7 +622,7 @@ def make_handler(configuration):
                 print("report server: report collection failed", file=sys.stderr)
                 self._error(500, "server_error", "report collection failed")
                 return
-            self._json(200, report)
+            self._write(200, "application/json; charset=utf-8", body)
 
         def _method_not_allowed(self):
             self._error(
