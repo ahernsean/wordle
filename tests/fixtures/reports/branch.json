@@ -1,31 +1,222 @@
 {
-  "schema_version": 3,
-  "report_kind": "branch",
-  "generated_at": 1000,
-  "branch_target": {"kind": "branch", "steps": [{"word": "raise", "pattern": "-----"}], "trailing_word": null, "branch_reference": null, "input_text": "RAISE -----"},
-  "filters": {},
-  "tree": false,
-  "sources": {"queue": {"path": "fixture/queue.sqlite3", "ok": true, "error": null, "epoch": 4, "label": "packed", "git_sha": "abcdef12"}, "telemetry": {"path": "fixture/telemetry.sqlite3", "ok": true, "error": null}, "cache": {"path": "fixture/cache.sqlite3", "ok": true, "error": null}},
-  "data": {
-    "branch": {"branch_reference": "111111111111", "branch_key_hex": "01", "spine": [{"word": "raise", "pattern": "-----", "word_is_answer": false}], "guess_depth": 1, "budget": 5, "answer_count": 8, "branch_status": "done", "branch_worker_status": null},
-    "queue": {"branch_status": "done", "branch_worker_status": null, "pending_status": "in_progress", "active_status": "open", "priority": 5, "candidate_count": 100, "completed_candidate_count": 25, "bulk_completed_candidate_count": 4, "one_level_erd_pruned_candidate_count": 3, "two_level_erd_pruned_candidate_count": 1, "best_guess": "crane", "best_guess_is_answer": true, "best_erd": 2.1, "best_max_remaining_depth": 3, "ceiling": 2.4, "search_node_count": 12000, "created_at": 900, "finalized_at": null},
-    "cache": {"cache_state": "exact", "best_guess": "crane", "best_guess_is_answer": true, "best_erd": 2.1, "max_remaining_depth": 3, "solve_budget": 5, "tainted": false, "updated_at": 990},
-    "workers": [],
-    "republished_candidates": [{"candidate_index": 7, "republish_count": 2}],
-    "completed_candidate_indexes": [3, 4],
-    "claims": [
-      {"candidate_index": 3, "state": "done", "completion_kind": "evaluated", "worker_id": "worker-0", "bundle_id": "bundle-1", "claimed_at": 930, "done_at": 940, "republish_count": 0},
-      {"candidate_index": 4, "state": "done", "completion_kind": "one_level_erd_pruned", "worker_id": null, "bundle_id": null, "claimed_at": 940, "done_at": 940, "republish_count": 0}
-    ],
-    "claim_summary": {"total_claim_count": 12972, "done_count": 12819, "in_flight_count": 5, "evaluated_count": 11200, "one_level_erd_pruned_count": 1500, "two_level_erd_pruned_count": 119, "provenance_unknown_count": 0, "worker_contributions": [{"worker_id": "worker-0", "done_count": 6484}, {"worker_id": "worker-2", "done_count": 6335}]},
-    "provenance_unknown": false,
-    "bundle_summary": {"bundle_count": 3, "node_count": 9000, "wall_millis": 800, "censored_unit_count": 1, "maximum_bundle_node_count": 5000},
-    "recent_finalizations": [
-      {"finalization_id": 3, "spine": "SLATE g---- CRIMP -----", "outcome": "exact", "ceiling": null, "budget": 5, "answer_count": 8, "search_node_count": 12000, "created_at": 800, "finalized_at": 900, "wall_millis": 1000, "bundle_count": 3, "maximum_bundle_node_count": 5000, "censored_unit_count": 1, "epoch": 4, "evaluated_candidate_count": 20, "bulk_completed_candidate_count": 4, "one_level_erd_pruned_candidate_count": 3, "two_level_erd_pruned_candidate_count": 1, "recorded_at": 901},
-      {"finalization_id": 2, "spine": "SLATE g---- DUCHY -----", "outcome": "cut", "ceiling": 2.2, "budget": 5, "answer_count": 8, "search_node_count": 9000, "created_at": 700, "finalized_at": 790, "wall_millis": 800, "bundle_count": 2, "maximum_bundle_node_count": 4500, "censored_unit_count": 0, "epoch": 4, "evaluated_candidate_count": 15, "bulk_completed_candidate_count": 2, "one_level_erd_pruned_candidate_count": 2, "two_level_erd_pruned_candidate_count": 0, "recorded_at": 791},
-      {"finalization_id": 1, "spine": "SLATE g---- WRUNG -----", "outcome": "loss", "ceiling": null, "budget": 4, "answer_count": 8, "search_node_count": 6000, "created_at": 600, "finalized_at": 680, "wall_millis": 700, "bundle_count": 2, "maximum_bundle_node_count": 3500, "censored_unit_count": 0, "epoch": 3, "evaluated_candidate_count": 12, "bulk_completed_candidate_count": 1, "one_level_erd_pruned_candidate_count": 1, "two_level_erd_pruned_candidate_count": 0, "recorded_at": 681}
-    ],
-    "finalization_total_count": 3,
-    "cut_reuse_misses": [{"cut_reuse_miss_id": 1, "answer_count": 8, "budget": 5, "wanted_ceiling": null, "available_bound": 2.2, "available_budget": 4, "epoch": 4, "recorded_at": 950}]
+ "branch_target": {
+  "branch_reference": null,
+  "input_text": "RAISE -----",
+  "kind": "branch",
+  "steps": [
+   {
+    "pattern": "-----",
+    "word": "raise"
+   }
+  ],
+  "trailing_word": null
+ },
+ "data": {
+  "branch": {
+   "answer_count": 8,
+   "branch_key_hex": "01",
+   "branch_reference": "111111111111",
+   "branch_status": "done",
+   "branch_worker_status": null,
+   "budget": 5,
+   "guess_depth": 1,
+   "spine": [
+    {
+     "pattern": "-----",
+     "word": "raise",
+     "word_is_answer": false
+    }
+   ]
+  },
+  "bundle_summary": {
+   "bundle_count": 3,
+   "censored_unit_count": 1,
+   "maximum_bundle_node_count": 5000,
+   "node_count": 9000,
+   "wall_millis": 800
+  },
+  "cache": {
+   "best_erd": 2.1,
+   "best_guess": "crane",
+   "best_guess_is_answer": true,
+   "cache_state": "exact",
+   "max_remaining_depth": 3,
+   "solve_budget": 5,
+   "tainted": false,
+   "updated_at": 990
+  },
+  "claim_summary": {
+   "done_count": 12819,
+   "evaluated_count": 11200,
+   "in_flight_count": 5,
+   "one_level_erd_pruned_count": 1500,
+   "provenance_unknown_count": 0,
+   "total_claim_count": 12972,
+   "two_level_erd_pruned_count": 119,
+   "worker_contributions": [
+    {
+     "done_count": 6484,
+     "worker_id": "worker-0"
+    },
+    {
+     "done_count": 6335,
+     "worker_id": "worker-2"
+    }
+   ]
+  },
+  "claims": [
+   {
+    "bundle_id": "bundle-1",
+    "candidate_index": 3,
+    "claimed_at": 930,
+    "completion_kind": "evaluated",
+    "done_at": 940,
+    "republish_count": 0,
+    "state": "done",
+    "worker_id": "worker-0"
+   },
+   {
+    "bundle_id": null,
+    "candidate_index": 4,
+    "claimed_at": 940,
+    "completion_kind": "one_level_erd_pruned",
+    "done_at": 940,
+    "republish_count": 0,
+    "state": "done",
+    "worker_id": null
+   }
+  ],
+  "completed_candidate_bitmap": "GA==",
+  "cut_reuse_misses": [
+   {
+    "answer_count": 8,
+    "available_bound": 2.2,
+    "available_budget": 4,
+    "budget": 5,
+    "cut_reuse_miss_id": 1,
+    "epoch": 4,
+    "recorded_at": 950,
+    "wanted_ceiling": null
+   }
+  ],
+  "finalization_total_count": 3,
+  "provenance_unknown": false,
+  "queue": {
+   "active_status": "open",
+   "best_erd": 2.1,
+   "best_guess": "crane",
+   "best_guess_is_answer": true,
+   "best_max_remaining_depth": 3,
+   "branch_status": "done",
+   "branch_worker_status": null,
+   "bulk_completed_candidate_count": 4,
+   "candidate_count": 100,
+   "ceiling": 2.4,
+   "completed_candidate_count": 25,
+   "created_at": 900,
+   "finalized_at": null,
+   "one_level_erd_pruned_candidate_count": 3,
+   "pending_status": "in_progress",
+   "priority": 5,
+   "search_node_count": 12000,
+   "two_level_erd_pruned_candidate_count": 1
+  },
+  "recent_finalizations": [
+   {
+    "answer_count": 8,
+    "budget": 5,
+    "bulk_completed_candidate_count": 4,
+    "bundle_count": 3,
+    "ceiling": null,
+    "censored_unit_count": 1,
+    "created_at": 800,
+    "epoch": 4,
+    "evaluated_candidate_count": 20,
+    "finalization_id": 3,
+    "finalized_at": 900,
+    "maximum_bundle_node_count": 5000,
+    "one_level_erd_pruned_candidate_count": 3,
+    "outcome": "exact",
+    "recorded_at": 901,
+    "search_node_count": 12000,
+    "spine": "SLATE g---- CRIMP -----",
+    "two_level_erd_pruned_candidate_count": 1,
+    "wall_millis": 1000
+   },
+   {
+    "answer_count": 8,
+    "budget": 5,
+    "bulk_completed_candidate_count": 2,
+    "bundle_count": 2,
+    "ceiling": 2.2,
+    "censored_unit_count": 0,
+    "created_at": 700,
+    "epoch": 4,
+    "evaluated_candidate_count": 15,
+    "finalization_id": 2,
+    "finalized_at": 790,
+    "maximum_bundle_node_count": 4500,
+    "one_level_erd_pruned_candidate_count": 2,
+    "outcome": "cut",
+    "recorded_at": 791,
+    "search_node_count": 9000,
+    "spine": "SLATE g---- DUCHY -----",
+    "two_level_erd_pruned_candidate_count": 0,
+    "wall_millis": 800
+   },
+   {
+    "answer_count": 8,
+    "budget": 4,
+    "bulk_completed_candidate_count": 1,
+    "bundle_count": 2,
+    "ceiling": null,
+    "censored_unit_count": 0,
+    "created_at": 600,
+    "epoch": 3,
+    "evaluated_candidate_count": 12,
+    "finalization_id": 1,
+    "finalized_at": 680,
+    "maximum_bundle_node_count": 3500,
+    "one_level_erd_pruned_candidate_count": 1,
+    "outcome": "loss",
+    "recorded_at": 681,
+    "search_node_count": 6000,
+    "spine": "SLATE g---- WRUNG -----",
+    "two_level_erd_pruned_candidate_count": 0,
+    "wall_millis": 700
+   }
+  ],
+  "republished_candidates": [
+   {
+    "candidate_index": 7,
+    "republish_count": 2
+   }
+  ],
+  "workers": []
+ },
+ "filters": {},
+ "generated_at": 1000,
+ "report_kind": "branch",
+ "schema_version": 4,
+ "sources": {
+  "cache": {
+   "error": null,
+   "ok": true,
+   "path": "fixture/cache.sqlite3"
+  },
+  "queue": {
+   "epoch": 4,
+   "error": null,
+   "git_sha": "abcdef12",
+   "label": "packed",
+   "ok": true,
+   "path": "fixture/queue.sqlite3"
+  },
+  "telemetry": {
+   "error": null,
+   "ok": true,
+   "path": "fixture/telemetry.sqlite3"
   }
+ },
+ "tree": false
 }

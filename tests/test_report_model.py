@@ -15,6 +15,8 @@ from erd_queue import ERDQueue
 import erd_search
 import report_model
 from report_model import (
+    encode_candidate_bitmap,
+    decode_candidate_bitmap,
     _worker_process_is_running,
     _normalize_worker,
     DEFAULT_QUEUE_ROW_LIMIT,
@@ -2086,6 +2088,54 @@ class ReportModelTest(unittest.TestCase):
         self.assertFalse(_worker_process_is_running(2 ** 31 - 1))
         self.assertFalse(_worker_process_is_running("not-a-pid"))
 
+    def test_a_candidate_bitmap_round_trips_every_position(self):
+        # The renderers count completions per cell at their own resolutions --
+        # the browser draws up to 50 cells, the terminal 10 to 40 -- so the
+        # wire format has to keep every position, not a histogram either of
+        # them would then resample.
+        for indexes, total in (
+            ([], 10),
+            ([0], 1),
+            ([0, 7, 8, 9], 16),
+            (list(range(0, 40)), 100),
+            (list(range(0, 14_855, 3)), 14_855),
+            ([14_854], 14_855),
+        ):
+            with self.subTest(total=total, count=len(indexes)):
+                bitmap = encode_candidate_bitmap(indexes, total)
+                self.assertEqual(
+                    decode_candidate_bitmap(bitmap, total), list(indexes))
+
+    def test_a_candidate_bitmap_is_one_size_whatever_the_sweep_looks_like(self):
+        # This is the whole reason it is a bitset and not run-length pairs.
+        # Six workers claim scattered ranges, so runs are short, and run-length
+        # encoding measured 64.7% of the raw list on the worst live branch.
+        # A bitset has no fragmented case to degrade into.
+        total = 14_855
+        contiguous = encode_candidate_bitmap(range(0, 7_000), total)
+        scattered = encode_candidate_bitmap(range(0, 14_000, 2), total)
+        self.assertEqual(len(contiguous), len(scattered))
+        # And it is far smaller than the positions it replaces.
+        as_positions = len(json.dumps(list(range(0, 14_000, 2))))
+        self.assertLess(len(scattered) * 10, as_positions)
+
+    def test_a_candidate_bitmap_ignores_positions_outside_the_vocabulary(self):
+        # A claim index past the candidate count would otherwise write outside
+        # the bitset and raise, taking the whole report with it.
+        bitmap = encode_candidate_bitmap([0, 5, 99, -1, None], 8)
+        self.assertEqual(decode_candidate_bitmap(bitmap, 8), [0, 5])
+
+    def test_a_candidate_bitmap_is_absent_when_there_is_nothing_to_draw(self):
+        self.assertIsNone(encode_candidate_bitmap([1, 2], 0))
+        self.assertIsNone(encode_candidate_bitmap([1, 2], None))
+        self.assertEqual(decode_candidate_bitmap(None, 10), [])
+        self.assertEqual(decode_candidate_bitmap("", 10), [])
+
+    def test_a_corrupt_candidate_bitmap_draws_nothing_rather_than_raising(self):
+        # The strip is decoration on a progress card; a malformed value must
+        # not take the report down with it.
+        self.assertEqual(decode_candidate_bitmap("not base64!!", 10), [])
+
     def test_the_queue_report_limits_its_rows_when_the_caller_names_no_limit(self):
         # Without a default the queue returns every branch it has registered.
         # On the production queue that is 54,201 rows and 68 MB, which the
@@ -2524,7 +2574,10 @@ class ReportModelTest(unittest.TestCase):
 
         self.assertEqual(report_queue_rows.call_count, 1)
         self.assertEqual(
-            report["data"]["branches"][0]["completed_candidate_indexes"], [1, 3]
+            decode_candidate_bitmap(
+                report["data"]["branches"][0]["completed_candidate_bitmap"],
+                report["data"]["branches"][0]["candidate_count"]),
+            [1, 3]
         )
 
     def test_active_report_rows_ignore_inactive_claim_history(self):

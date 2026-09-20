@@ -13,6 +13,7 @@ import termios
 import time
 
 from report_model import (
+    decode_candidate_bitmap,
     ROOT_PROGRESS_DISPLAY_STATES,
     ROOT_PROGRESS_GROUP_STATES,
     ReportRequest,
@@ -1253,7 +1254,8 @@ def _render_branch_sections(report, previous_report, color, width, display_order
         ]
         sweep = candidate_sweep_bar(
             candidate_count,
-            data.get("completed_candidate_indexes") or (),
+            decode_candidate_bitmap(
+                data.get("completed_candidate_bitmap"), candidate_count),
             worker_positions,
             width=max(10, min(40, width - 4)),
         )

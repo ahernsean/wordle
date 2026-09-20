@@ -33,6 +33,18 @@ FIXTURE_DIRECTORY = os.path.join(ROOT, "tests", "fixtures", "reports")
 # The client's DEFAULT_POLL; a re-render lands on every one of these.
 CLIENT_POLL_MILLIS = 2000
 CLIENT_PATH = os.path.join(ROOT, "report_client.html")
+# The sweep strip arrives as a base64 bitset, one bit per candidate, sized by
+# the whole candidate list rather than by how far the sweep has reached.  A
+# test therefore states both numbers: how many candidates the branch holds and
+# how many of them are swept.
+SWEEP_BITMAP_JS = (
+    "const sweepBitmap=(sweptCount,candidateCount)=>{"
+    "const bytes=new Uint8Array(Math.ceil(candidateCount/8));"
+    "for(let index=0;index<sweptCount;index++)bytes[index>>3]|=1<<(index&7);"
+    "let binary='';"
+    "for(const byte of bytes)binary+=String.fromCharCode(byte);"
+    "return btoa(binary);};"
+)
 # Both browser suites run by default, and a browser that will not start is a
 # failure rather than a skip.  This client is used overwhelmingly from WebKit
 # (Safari and iOS Chrome), so a run that quietly covered only Chromium would
@@ -3994,10 +4006,11 @@ class ReportClientBrowserTest(unittest.TestCase):
         """Render a strip whose first half is complete, and report how each
         worker's marker was drawn against the cell geometry."""
         return self.page.evaluate("""async ([workersJs,candidateCount]) => {
+          """ + SWEEP_BITMAP_JS + """
           const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
           branch.data.queue.candidate_count=candidateCount;
-          branch.data.completed_candidate_indexes=
-            Array.from({length:candidateCount/2},(_,i)=>i);
+          branch.data.completed_candidate_bitmap=
+            sweepBitmap(candidateCount/2,candidateCount);
           branch.data.workers=JSON.parse(workersJs).map(worker=>({
             state:'working',is_live:true,updated_at:branch.generated_at,
             current_candidate:'crane',branch_reference:'eb81eb81eb81',...worker}));
@@ -4380,8 +4393,10 @@ class ReportClientBrowserTest(unittest.TestCase):
         """Render a branch report with one live worker; the marker persists
         in the DOM afterward for a subsequent theme check with no rerender."""
         self.page.evaluate("""async () => {
+          """ + SWEEP_BITMAP_JS + """
           const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
-          branch.data.completed_candidate_indexes=[...Array(50).keys()];
+          branch.data.completed_candidate_bitmap=
+            sweepBitmap(50,branch.data.queue.candidate_count);
           branch.data.workers=[{worker_id:'worker-3',worker_number:'3',updated_at:999,is_live:true,branch_key_hex:'01',branch_reference:'111111111111',candidate_index:75,current_candidate:'crane',current_candidate_is_answer:true}];
           applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
         }""")
@@ -4798,12 +4813,14 @@ class ReportClientBrowserTest(unittest.TestCase):
             self.page.goto(self.base_url)
             self.page.wait_for_selector(".card")
             measured = self.page.evaluate("""async () => {
+              """ + SWEEP_BITMAP_JS + """
               const report = await (await fetch('/api/view')).json();
               report.data.branches = [{...report.data.branches[0],
                 answer_count: 502, candidate_count: 14855,
                 completed_candidate_count: 6363, best_guess: 'clart',
                 best_guess_is_answer: false, best_erd: 1572 / 502,
-                worker_count: 1, completed_candidate_indexes: [],
+                worker_count: 1,
+                completed_candidate_bitmap: sweepBitmap(0, 14855),
                 spine: [{word: 'raise', pattern: '-----'}]}];
               applyReport(report, null, {...__reportClient.getState()});
               const card = document.querySelector('.card');
@@ -4944,8 +4961,10 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def test_branch_report_renders_candidate_sweep_with_worker_marker(self):
         result = self.page.evaluate("""async () => {
+          """ + SWEEP_BITMAP_JS + """
           const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
-          branch.data.completed_candidate_indexes=[...Array(50).keys()];
+          branch.data.completed_candidate_bitmap=
+            sweepBitmap(50,branch.data.queue.candidate_count);
           branch.data.workers=[{worker_id:'worker-3',worker_number:'3',updated_at:999,is_live:true,branch_key_hex:'01',branch_reference:'111111111111',candidate_index:75,current_candidate:'crane',current_candidate_is_answer:true}];
           applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
           const cells=[...document.querySelectorAll('.sweep-cell')];
@@ -4959,8 +4978,10 @@ class ReportClientBrowserTest(unittest.TestCase):
 
     def test_completed_sweep_cells_are_marked_for_desaturated_color(self):
         result = self.page.evaluate("""async () => {
+          """ + SWEEP_BITMAP_JS + """
           const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
-          branch.data.completed_candidate_indexes=[...Array(branch.data.queue.candidate_count).keys()];
+          branch.data.completed_candidate_bitmap=sweepBitmap(
+            branch.data.queue.candidate_count,branch.data.queue.candidate_count);
           applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
           const cells=[...document.querySelectorAll('.sweep-cell')];
           const rootStyle=getComputedStyle(document.documentElement);

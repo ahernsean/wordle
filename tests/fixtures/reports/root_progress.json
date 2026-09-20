@@ -1162,7 +1162,7 @@
  },
  "generated_at": 1786547682,
  "report_kind": "root_progress",
- "schema_version": 3,
+ "schema_version": 4,
  "sources": {
   "cache": {
    "error": null,
