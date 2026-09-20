@@ -4515,24 +4515,13 @@ class ERDQueue:
             conditions.append("(" + " OR ".join(scope_conditions) + ")")
             parameters.extend(scope_parameters)
         where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
-        summary_rows = self._conn.execute(
+        summary_query = (
             base_query
             + " SELECT branch_status, branch_worker_status, COUNT(*) AS branch_count"
             + " FROM normalized"
             + where_clause
-            + " GROUP BY branch_status, branch_worker_status",
-            parameters,
-        ).fetchall()
-        by_status = {}
-        by_worker_status = {}
-        for row in summary_rows:
-            by_status[row["branch_status"]] = (
-                by_status.get(row["branch_status"], 0) + row["branch_count"]
-            )
-            by_worker_status[row["branch_worker_status"]] = (
-                by_worker_status.get(row["branch_worker_status"], 0) + row["branch_count"]
-            )
-        matched_rows = sum(by_status.values())
+            + " GROUP BY branch_status, branch_worker_status"
+        )
         sort_name = sort or self._report_filter_value(filters, "sort") or "default"
         order_by = {
             "age": "COALESCE(created_at, claimed_at, 0), branch_key",
@@ -4556,7 +4545,33 @@ class ERDQueue:
         if effective_limit is not None:
             row_query += " LIMIT ?"
             row_parameters.append(effective_limit)
-        joined_rows = self._conn.execute(row_query, row_parameters).fetchall()
+        # The count and the page must describe the same instant.  A limited
+        # page cannot be counted by measuring itself, so the totals come from
+        # their own aggregate -- and a swarm moves branches between statuses
+        # continuously, so two statements taken separately can report a match
+        # the page does not contain, or buckets that disagree with the rows
+        # beneath them.  A deferred transaction takes its read snapshot at the
+        # first statement and holds it across both.  In WAL mode it blocks no
+        # writer.
+        opened_snapshot = not self._conn.in_transaction
+        if opened_snapshot:
+            self._conn.execute("BEGIN DEFERRED")
+        try:
+            summary_rows = self._conn.execute(summary_query, parameters).fetchall()
+            joined_rows = self._conn.execute(row_query, row_parameters).fetchall()
+        finally:
+            if opened_snapshot:
+                self._conn.execute("COMMIT")
+        by_status = {}
+        by_worker_status = {}
+        for row in summary_rows:
+            by_status[row["branch_status"]] = (
+                by_status.get(row["branch_status"], 0) + row["branch_count"]
+            )
+            by_worker_status[row["branch_worker_status"]] = (
+                by_worker_status.get(row["branch_worker_status"], 0) + row["branch_count"]
+            )
+        matched_rows = sum(by_status.values())
         returned_rows = []
         for row in joined_rows:
             opener_pattern = row["opener_pattern"]

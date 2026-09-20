@@ -573,6 +573,52 @@ class QueueVisibilityTests(unittest.TestCase):
         self.q._conn.execute("DELETE FROM run_meta WHERE key = 'epoch'")
         self.assertIsNone(self.q.epoch_metadata())
 
+    def test_queue_totals_and_rows_come_from_one_snapshot(self):
+        # A limited page cannot be counted by measuring itself, so the totals
+        # come from their own aggregate -- a second statement.  A swarm moves
+        # branches between statuses continuously, so without one read snapshot
+        # a status-filtered report can count matches the page no longer holds.
+        keys = [ScoreCache.encode_subset(WORDS[:size]) for size in (2, 3, 4, 5)]
+        self.q.add_pending_many([
+            (key, len(WORDS), 7, "crane", 1) for key in keys
+        ])
+        rival = ERDQueue(os.path.join(self._tmp.name, "q.sqlite3"))
+        self.addCleanup(rival.close)
+
+        class _FinishBetweenStatements:
+            """Stand in for a worker that finishes every matched branch in the
+            window between the aggregate and the page."""
+
+            def __init__(self, connection):
+                self._connection = connection
+                self._fired = False
+
+            def execute(self, statement, *arguments):
+                if not self._fired and " ORDER BY " in statement:
+                    self._fired = True
+                    for key in keys:
+                        rival.mark_done(key)
+                return self._connection.execute(statement, *arguments)
+
+            def __getattr__(self, name):
+                return getattr(self._connection, name)
+
+        real_connection = self.q._conn
+        self.q._conn = _FinishBetweenStatements(real_connection)
+        try:
+            result = self.q.report_queue_rows({"branch_statuses": ("queued",)})
+        finally:
+            self.q._conn = real_connection
+
+        self.assertEqual(result["matched_rows"], len(keys))
+        self.assertEqual(len(result["rows"]), len(keys))
+        self.assertEqual(
+            result["summary"]["branch_count_by_status"], {"queued": len(keys)}
+        )
+        # The write itself landed; the report simply predates it.
+        after = self.q.report_queue_rows({"branch_statuses": ("queued",)})
+        self.assertEqual(after["matched_rows"], 0)
+
     def test_finalization_hotspot_metadata_uses_the_scoped_population(self):
         now = int(time.time())
         for index, spine in enumerate((
