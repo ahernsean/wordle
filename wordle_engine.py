@@ -1318,10 +1318,21 @@ def _candidate_response_groups(branch_words, candidate, cache,
 
 
 def _remaining_groups_cost_lower_bounds(ordered_groups, candidate,
-                                        branch_size, branch_floor_table):
-    """Suffix sums used by both the two-level entry gate and sub-ceilings."""
+                                        branch_size, branch_floor_table,
+                                        liveness_tick=None):
+    """Suffix sums used by both the two-level entry gate and sub-ceilings.
+
+    liveness_tick fires once per response group.  Pricing one group can cost a
+    scan of the whole guess vocabulary, and a candidate that prunes here never
+    recurses — so without a tick in this loop the caller's single entry tick is
+    the only liveness signal for the candidate's entire evaluation, which is
+    measured in minutes on a large branch.  One call per group is nothing
+    against the scan it brackets, and observation only.
+    """
     remaining_groups_cost_lower_bound = [0.0] * (len(ordered_groups) + 1)
     for index in range(len(ordered_groups) - 1, -1, -1):
+        if liveness_tick is not None:
+            liveness_tick()
         sub_branch = ordered_groups[index][1]
         remaining_groups_cost_lower_bound[index] = (
             remaining_groups_cost_lower_bound[index + 1]
@@ -1333,7 +1344,8 @@ def _remaining_groups_cost_lower_bounds(ordered_groups, candidate,
 
 def candidate_two_level_cost_lower_bound(
         branch_words, candidate, cache, guesses=None,
-        pattern_matrix=None, branch_indices=None, branch_floor_table=None):
+        pattern_matrix=None, branch_indices=None, branch_floor_table=None,
+        liveness_tick=None):
     """Admissible two-level ERD lower bound for one candidate.
 
     This is evaluate_candidate's entry proof without recursion.  It performs
@@ -1364,7 +1376,8 @@ def candidate_two_level_cost_lower_bound(
         groups.values(), has_self, branch_size)
     ordered_groups = sorted(groups.items(), key=_by_group_size, reverse=True)
     remaining_groups_cost_lower_bound = _remaining_groups_cost_lower_bounds(
-        ordered_groups, candidate, branch_size, branch_floor_table)
+        ordered_groups, candidate, branch_size, branch_floor_table,
+        liveness_tick=liveness_tick)
     two_level_cost_lower_bound = (
         1.0 + remaining_groups_cost_lower_bound[0]
     )
@@ -1464,7 +1477,8 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
                    subbranch_solver=None, bound_provider=None,
                    mid_loop_publisher=None, metric_observer=None,
                    pattern_matrix=None, branch_indices=None,
-                   branch_floor_table=None, hint_cache=None):
+                   branch_floor_table=None, hint_cache=None,
+                   liveness_tick=None):
     """Evaluate one `candidate`'s exact ERD for solving `branch_words`.
 
     This is the body of the top-level candidate loop, extracted so a parallel
@@ -1575,7 +1589,8 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
     # *after* position i (each sub-branch of size k costs >= lb(k)).  The self
     # singleton contributes 0.
     remaining_groups_cost_lower_bound = _remaining_groups_cost_lower_bounds(
-        ordered, candidate, n, branch_floor_table)
+        ordered, candidate, n, branch_floor_table,
+        liveness_tick=liveness_tick)
 
     def _sub_lb(sub_branch):
         return sub_branch_cost_lower_bound(
