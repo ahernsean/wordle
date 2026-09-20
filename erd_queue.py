@@ -3650,12 +3650,26 @@ class ERDQueue:
                 updated_branch_count * _CLAIM_ROW_WAL_BYTES)
         return completed_candidate_count
 
-    def update_branch_best(self, branch_key, best_guess, best_erd, max_depth=None):
+    def update_branch_best(self, branch_key, best_guess, best_erd,
+                           max_depth=None, budget=None):
         """Lower the branch's running best (monotone — never raises it).
 
         max_depth is the winning candidate's worst-case line length; it is
         stored atomically with the best it belongs to, so best_max_depth always
         describes the current best_guess.
+
+        budget is the budget the caller evaluated at, and the update applies
+        only to a branch still open at that budget.  A branch can finalize and
+        be re-created at another budget under the same branch_key — the same
+        answer set reached by a second spine of a different length — while a
+        worker holding a claim on the old branch is still evaluating.  Its cost
+        belongs to the budget it was computed at, and a cost from a larger
+        budget is below what a smaller one can achieve, so the monotone test
+        below would accept it and drive the new branch's best under its own
+        optimum.  Ownership and priority both survive the re-creation and so
+        catch nothing.  A stored budget of NULL predates the column and is
+        admitted, matching how callers derive a budget from the spine for
+        those; a caller passing no budget asks for no check.
 
         The same statement stamps first_best_at/nodes_at_first_best on the
         update that creates the branch's first incumbent, and leaves them alone
@@ -3675,8 +3689,9 @@ class ERDQueue:
                 nodes_at_first_best = COALESCE(nodes_at_first_best, nodes_spent)
             WHERE branch_id = ?
               AND (best_erd IS NULL OR ? < best_erd)
+              AND (? IS NULL OR budget IS NULL OR budget = ?)
         """, (best_erd, best_guess, max_depth, now, now, branch_id,
-              best_erd))
+              best_erd, budget, budget))
 
     def read_branch_best(self, branch_key):
         """Return (best_guess, best_erd, ceiling) or (None, None, None).

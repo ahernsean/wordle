@@ -549,7 +549,8 @@ class _MidLoopPublisher:
         # ceiling, if any, rides on the branch's ceiling column instead).
         if best_guess is not None:
             self._worker.queue.update_branch_best(
-                branch_key, best_guess, best_erd, best_max_remaining_depth)
+                branch_key, best_guess, best_erd, best_max_remaining_depth,
+                budget=budget)
 
         result = self._worker.cooperative_solve(
             branch_words, budget,
@@ -1258,6 +1259,22 @@ class _BranchWorker:
         # Count every invocation (one per node) BEFORE the throttle, so the
         # node counter is exact even though we only write every HB_SECONDS.
         self._nodes += 1
+        self._liveness_tick(branch_key, n_words, claim_idx, claim_started_at,
+                            best_guess, best_erd, force=force,
+                            bound_erd=bound_erd)
+
+    def _liveness_tick(self, branch_key, n_words, claim_idx, claim_started_at,
+                       best_guess, best_erd, force=False,
+                       bound_erd=None):
+        """Prove the worker is alive without counting a node.
+
+        `_nodes` means candidate evaluations — the cost model, add_nodes_spent
+        and the accuracy rows all read it as one — so a signal that fires per
+        response group, or anywhere else below a candidate, must come through
+        here instead of `_heartbeat`.  A worker that has not reached this
+        within HB_TIMEOUT_SECONDS has its in-flight claims reclaimed and
+        handed to another worker.
+        """
         now = time.time()
         if not force and now - self._last_hb < HB_SECONDS:
             return
@@ -1602,6 +1619,9 @@ class _BranchWorker:
             hint_cache=self.hint_cache,
             heartbeat=lambda: self._heartbeat(
                 branch_key, n_words, idx, claim_started,
+                local_candidate, local_best, bound_erd=_eff_bound()),
+            liveness_tick=lambda: self._liveness_tick(
+                branch_key, n_words, idx, claim_started,
                 local_candidate, local_best, bound_erd=_eff_bound()))
         cand_elapsed = time.time() - cand_t0
         self._eval_seconds += cand_elapsed
@@ -1665,7 +1685,8 @@ class _BranchWorker:
             if local_best is None or cost < local_best:
                 local_best, local_candidate, local_md = cost, candidate, cand_md
                 self.queue.update_branch_best(branch_key, local_candidate,
-                                              local_best, local_md)
+                                              local_best, local_md,
+                                              budget=budget)
                 shared_best = local_best
         elif status == OVER_ERD_LIMIT:
             self.n_cutoff += 1
@@ -1794,7 +1815,10 @@ class _BranchWorker:
                 words, candidate, self.rcache, guesses=self.all_words,
                 pattern_matrix=self.pattern_matrix,
                 branch_indices=branch_indices,
-                branch_floor_table=self.branch_floor_table)
+                branch_floor_table=self.branch_floor_table,
+                liveness_tick=lambda: self._liveness_tick(
+                    branch_key, n_words, candidate_index, claim_started_at,
+                    best_guess, best_erd, bound_erd=bound_erd))
             if candidate_cost_lower_bound >= bound_erd:
                 pruned_candidate_indices.append(candidate_index)
 

@@ -778,6 +778,49 @@ class TestBranchLifecycle(_TmpQueue):
         self.assertEqual(guess, "crane")
         self.assertAlmostEqual(erd, 2.0)
 
+    def test_update_branch_best_at_a_stale_budget_cannot_lower_a_recreated_branch(self):
+        # A branch finalizes, is deleted, and is re-created at a smaller budget
+        # -- the same answer set reached by a longer spine.  A worker whose
+        # claim on the old incarnation was reclaimed is still evaluating, and
+        # folds in a cost computed at the larger budget.  It is below anything
+        # the smaller budget can achieve, so the monotone test alone accepts
+        # it and the branch finalizes under its own optimum.
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
+        self.q.delete_branch(self.key)
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=3)
+        self.q.update_branch_best(self.key, "crane", 3.0, max_depth=3, budget=3)
+
+        self.q.update_branch_best(self.key, "slate", 1.5, max_depth=5, budget=5)
+
+        guess, erd, _ceiling = self.q.read_branch_best(self.key)
+        self.assertEqual(guess, "crane")
+        self.assertAlmostEqual(erd, 3.0)
+
+    def test_update_branch_best_at_the_branch_budget_still_lowers(self):
+        # The guard rejects a stale budget, never a legitimate improvement.
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=3)
+        self.q.update_branch_best(self.key, "crane", 3.0, max_depth=3, budget=3)
+        self.q.update_branch_best(self.key, "slate", 2.0, max_depth=3, budget=3)
+        guess, erd, _ceiling = self.q.read_branch_best(self.key)
+        self.assertEqual(guess, "slate")
+        self.assertAlmostEqual(erd, 2.0)
+
+    def test_update_branch_best_admits_a_branch_whose_budget_predates_the_column(self):
+        # A NULL stored budget carries no assertion to contradict, so it is
+        # admitted -- the same rule the claim transaction applies.
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES)
+        self.q.update_branch_best(self.key, "crane", 2.0, max_depth=3, budget=5)
+        guess, erd, _ceiling = self.q.read_branch_best(self.key)
+        self.assertEqual(guess, "crane")
+        self.assertAlmostEqual(erd, 2.0)
+
+    def test_update_branch_best_without_a_budget_asks_for_no_check(self):
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=3)
+        self.q.update_branch_best(self.key, "crane", 2.0, max_depth=3)
+        guess, erd, _ceiling = self.q.read_branch_best(self.key)
+        self.assertEqual(guess, "crane")
+        self.assertAlmostEqual(erd, 2.0)
+
     def test_read_branch_best_returns_none_none_for_missing_key(self):
         self.assertEqual(self.q.read_branch_best(b"notakey"), (None, None, None))
 
