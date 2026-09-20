@@ -21,7 +21,7 @@ from report_model import (
     _normalize_worker,
     DEFAULT_QUEUE_ROW_LIMIT,
     opener_completion_signal,
-    _collection_summary,
+    _bucketed_collection_summary,
     NO_WORKER_STATUS_BUCKET,
     ReportFilters,
     ReportRequest,
@@ -577,11 +577,19 @@ class ReportModelTest(unittest.TestCase):
     def test_queue_and_current_hotspot_reports_normalize_rows(self):
         branch_key = ScoreCache.encode_subset(["salet"])
         queue = Mock(epoch=12)
-        queue.report_queue_rows.return_value = {"rows": [{
-            "branch_key": branch_key, "branch_status": "evaluating",
-            "branch_worker_status": "active", "spine": "RAISE -----",
-            "best_guess": "salet",
-        }]}
+        queue.report_queue_rows.return_value = {
+            "summary": {
+                "branch_count": 1,
+                "branch_count_by_status": {"evaluating": 1},
+                "branch_count_by_worker_status": {"active": 1},
+            },
+            "matched_rows": 1,
+            "rows": [{
+                "branch_key": branch_key, "branch_status": "evaluating",
+                "branch_worker_status": "active", "spine": "RAISE -----",
+                "best_guess": "salet",
+            }],
+        }
         with patch("report_model._open_report_queue", return_value=queue):
             queue_report = report_model.collect_queue_report(
                 self.sources, ReportRequest(report_kind="queue"))
@@ -590,11 +598,19 @@ class ReportModelTest(unittest.TestCase):
         self.assertTrue(row["best_guess_is_answer"])
 
         queue = Mock(epoch=12)
-        queue.report_queue_rows.return_value = {"rows": [{
-            "branch_key": branch_key, "branch_key_hex": branch_key.hex(),
-            "branch_status": "evaluating", "branch_worker_status": "active",
-            "spine": "RAISE -----", "best_guess": "salet",
-        }]}
+        queue.report_queue_rows.return_value = {
+            "summary": {
+                "branch_count": 1,
+                "branch_count_by_status": {"evaluating": 1},
+                "branch_count_by_worker_status": {"active": 1},
+            },
+            "matched_rows": 1,
+            "rows": [{
+                "branch_key": branch_key, "branch_key_hex": branch_key.hex(),
+                "branch_status": "evaluating", "branch_worker_status": "active",
+                "spine": "RAISE -----", "best_guess": "salet",
+            }],
+        }
         with patch("report_model._open_report_queue", return_value=queue):
             hotspots = report_model.collect_hotspot_report(
                 self.sources, ReportRequest(report_kind="hotspots", hotspot_field="nodes"))
@@ -2165,22 +2181,91 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(data["matched_rows"], 20)
 
     def test_a_summary_of_branches_with_no_worker_status_stays_serializable(self):
-        # branch_worker_status is NULL for a done or unqueued branch, and a
-        # None key cannot be ordered against the string keys beside it.  The
-        # server encodes with sort_keys, so one such branch made the whole
-        # queue report unserializable rather than merely oddly labelled -- and
-        # a queue holding any finished branch has one.
-        summary = _collection_summary([
-            {"branch_status": "evaluating", "branch_worker_status": "active"},
-            {"branch_status": "done", "branch_worker_status": None},
-            {"branch_status": "queued", "branch_worker_status": "waiting"},
-        ])
+        # The queue counts by branch_worker_status in SQL, where a done or
+        # unqueued branch counts under NULL.  A None key cannot be ordered
+        # against the string keys beside it, and the server encodes with
+        # sort_keys, so one such branch made the whole queue report
+        # unserializable rather than merely oddly labelled.
+        summary = _bucketed_collection_summary({
+            "branch_count": 3,
+            "branch_count_by_status": {
+                "evaluating": 1, "done": 1, "queued": 1,
+            },
+            "branch_count_by_worker_status": {
+                "active": 1, None: 1, "waiting": 1,
+            },
+        })
         self.assertEqual(
             summary["branch_count_by_worker_status"],
             {"active": 1, NO_WORKER_STATUS_BUCKET: 1, "waiting": 1},
         )
         self.assertNotIn(None, summary["branch_count_by_worker_status"])
+        self.assertEqual(summary["branch_count"], 3)
         json.dumps(summary, sort_keys=True)
+
+    def test_a_queue_holding_a_finished_branch_encodes_with_sorted_keys(self):
+        # The end-to-end shape of the bug above: the NULL bucket arrives from
+        # SQL, so a report built over a real finished branch is where it bites.
+        queue = self._open_queue()
+        finished = ScoreCache.encode_subset(["crane", "slate"])
+        queue.add_pending_many([(finished, 2, 9, "salet", 0)])
+        queue.mark_done(finished)
+        queue.close()
+        report = collect_report(self.sources, ReportRequest(report_kind="queue"))
+        buckets = report["data"]["summary"]["branch_count_by_worker_status"]
+        self.assertIn(NO_WORKER_STATUS_BUCKET, buckets)
+        json.dumps(report, sort_keys=True)
+
+    def test_queue_totals_are_counted_without_materializing_the_rows(self):
+        # A limit that only slices in Python cuts the payload and leaves the
+        # server building every row it then discards.  Measured on the
+        # production queue that is 54,204 rows and 2,736 ms against 487 ms.
+        queue = self._open_queue()
+        queue.add_pending_many([
+            (ScoreCache.encode_subset(["crane", f"w{index:04d}x"]), 2, 9, "salet", 0)
+            for index in range(30)
+        ])
+        queue.close()
+        limits = []
+        original = ERDQueue.report_queue_rows
+
+        def record(self, filters=None, sort=None, limit=None, generated_at=None):
+            limits.append(limit)
+            return original(self, filters, sort, limit, generated_at)
+
+        with patch.object(ERDQueue, "report_queue_rows", record):
+            data = collect_report(self.sources, ReportRequest(
+                report_kind="queue", filters=ReportFilters(limit=4)))["data"]
+        self.assertEqual(limits, [4])
+        self.assertEqual(len(data["rows"]), 4)
+        self.assertEqual(data["matched_rows"], 30)
+        self.assertEqual(data["summary"]["branch_count"], 30)
+
+    def test_hotspot_totals_count_matches_rather_than_returned_rows(self):
+        # The hotspot report asks SQL to sort the whole queue and keeps ten
+        # rows.  sampled_row_count reports how many the sort ranked, so it must
+        # come from the match count and not from the page that was returned.
+        queue = self._open_queue()
+        queue.add_pending_many([
+            (ScoreCache.encode_subset(["crane", f"w{index:04d}x"]), 2, 9, "salet", 0)
+            for index in range(15)
+        ])
+        queue.close()
+        limits = []
+        original = ERDQueue.report_queue_rows
+
+        def record(self, filters=None, sort=None, limit=None, generated_at=None):
+            limits.append(limit)
+            return original(self, filters, sort, limit, generated_at)
+
+        with patch.object(ERDQueue, "report_queue_rows", record):
+            data = collect_report(self.sources, ReportRequest(
+                report_kind="hotspots", hotspot_field="size",
+                filters=ReportFilters(limit=3)))["data"]
+        self.assertEqual(limits, [3])
+        self.assertEqual(len(data["rows"]), 3)
+        self.assertEqual(data["sampled_row_count"], 15)
+        self.assertTrue(data["sample_truncated"])
 
     def test_leaderboard_ranks_complete_openers_by_erd(self):
         # With two answers, an opener that separates them into singletons is
