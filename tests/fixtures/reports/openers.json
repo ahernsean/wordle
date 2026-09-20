@@ -1,226 +1,226 @@
 {
-  "schema_version": 3,
-  "report_kind": "openers",
-  "generated_at": 1000,
-  "branch_target": {
-    "kind": "root",
-    "steps": [],
-    "trailing_word": null,
-    "branch_reference": null,
-    "input_text": ""
-  },
-  "filters": {},
-  "tree": false,
-  "sources": {
-    "queue": {
-      "path": "fixture/queue.sqlite3",
-      "ok": true,
-      "error": null,
-      "epoch": 4,
-      "label": "packed",
-      "git_sha": "abcdef12"
+ "branch_target": {
+  "branch_reference": null,
+  "input_text": "",
+  "kind": "root",
+  "steps": [],
+  "trailing_word": null
+ },
+ "data": {
+  "branch_row_offset": 0,
+  "matched_branch_count": 1376,
+  "matched_open_branch_count": 1211,
+  "matched_opener_count": 3,
+  "matched_rows": 0,
+  "opener_offset": 0,
+  "rows": [],
+  "shared_branch_count": 0,
+  "summary": [
+   {
+    "branch_count": 1240,
+    "completed_at": null,
+    "direct_branch_count": 12,
+    "direct_done_branch_count": 3,
+    "done_branch_count": 37,
+    "elapsed_millis": 120000,
+    "erd_summary": {
+     "erd": null,
+     "infeasible_group_count": 0,
+     "max_remaining_depth": null,
+     "resolved_group_count": 96,
+     "response_group_count": 148,
+     "state": "pending"
     },
-    "telemetry": {
-      "path": "fixture/telemetry.sqlite3",
-      "ok": true,
-      "error": null
+    "open_branch_count": 1203,
+    "opener": "salet",
+    "opener_is_answer": false,
+    "request_count": 2,
+    "requested_at": 400,
+    "requested_priority": 5,
+    "started_at": null,
+    "state": "queued",
+    "worker_count": 3,
+    "worker_millis": 240000
+   },
+   {
+    "branch_count": 96,
+    "completed_at": null,
+    "direct_branch_count": 4,
+    "direct_done_branch_count": 4,
+    "done_branch_count": 88,
+    "elapsed_millis": 180000,
+    "erd_summary": {
+     "erd": 3.4207,
+     "infeasible_group_count": 0,
+     "max_remaining_depth": 5,
+     "resolved_group_count": 132,
+     "response_group_count": 132,
+     "state": "complete"
     },
-    "cache": {
-      "path": "fixture/cache.sqlite3",
-      "ok": true,
-      "error": null
-    }
+    "open_branch_count": 8,
+    "opener": "raise",
+    "opener_is_answer": true,
+    "request_count": 1,
+    "requested_at": 200,
+    "requested_priority": 3,
+    "started_at": null,
+    "state": "queued",
+    "worker_count": 1,
+    "worker_millis": 360000
+   },
+   {
+    "branch_count": 40,
+    "completed_at": 490,
+    "direct_branch_count": 2,
+    "direct_done_branch_count": 2,
+    "done_branch_count": 40,
+    "elapsed_millis": 480000,
+    "erd_summary": {
+     "erd": 3.3891,
+     "infeasible_group_count": 0,
+     "max_remaining_depth": 4,
+     "resolved_group_count": 141,
+     "response_group_count": 141,
+     "state": "complete"
+    },
+    "open_branch_count": 0,
+    "opener": "crane",
+    "opener_is_answer": true,
+    "request_count": 1,
+    "requested_at": 100,
+    "requested_priority": 1,
+    "started_at": null,
+    "state": "complete",
+    "worker_count": 0,
+    "worker_millis": 600000
+   }
+  ],
+  "summary_groups": [
+   {
+    "label": "queued",
+    "rollup": {
+     "branch_count": 1336,
+     "done_branch_count": 125,
+     "open_branch_count": 1211,
+     "opener_count": 2,
+     "worker_count": 4
+    },
+    "rows": [
+     {
+      "branch_count": 1240,
+      "completed_at": null,
+      "direct_branch_count": 12,
+      "direct_done_branch_count": 3,
+      "done_branch_count": 37,
+      "elapsed_millis": 120000,
+      "erd_summary": {
+       "erd": null,
+       "infeasible_group_count": 0,
+       "max_remaining_depth": null,
+       "resolved_group_count": 96,
+       "response_group_count": 148,
+       "state": "pending"
+      },
+      "open_branch_count": 1203,
+      "opener": "salet",
+      "opener_is_answer": false,
+      "request_count": 2,
+      "requested_at": 400,
+      "requested_priority": 5,
+      "state": "queued",
+      "worker_count": 3,
+      "worker_millis": 240000
+     },
+     {
+      "branch_count": 96,
+      "completed_at": null,
+      "direct_branch_count": 4,
+      "direct_done_branch_count": 4,
+      "done_branch_count": 88,
+      "elapsed_millis": 180000,
+      "erd_summary": {
+       "erd": 3.4207,
+       "infeasible_group_count": 0,
+       "max_remaining_depth": 5,
+       "resolved_group_count": 132,
+       "response_group_count": 132,
+       "state": "complete"
+      },
+      "open_branch_count": 8,
+      "opener": "raise",
+      "opener_is_answer": true,
+      "request_count": 1,
+      "requested_at": 200,
+      "requested_priority": 3,
+      "state": "queued",
+      "worker_count": 1,
+      "worker_millis": 360000
+     }
+    ]
+   },
+   {
+    "label": "complete",
+    "rollup": {
+     "branch_count": 40,
+     "done_branch_count": 40,
+     "open_branch_count": 0,
+     "opener_count": 1,
+     "worker_count": 0
+    },
+    "rows": [
+     {
+      "branch_count": 40,
+      "completed_at": 490,
+      "direct_branch_count": 2,
+      "direct_done_branch_count": 2,
+      "done_branch_count": 40,
+      "elapsed_millis": 480000,
+      "erd_summary": {
+       "erd": 3.3891,
+       "infeasible_group_count": 0,
+       "max_remaining_depth": 4,
+       "resolved_group_count": 141,
+       "response_group_count": 141,
+       "state": "complete"
+      },
+      "open_branch_count": 0,
+      "opener": "crane",
+      "opener_is_answer": true,
+      "request_count": 1,
+      "requested_at": 100,
+      "requested_priority": 1,
+      "state": "complete",
+      "worker_count": 0,
+      "worker_millis": 600000
+     }
+    ]
+   }
+  ],
+  "total_opener_count": 3
+ },
+ "filters": {},
+ "generated_at": 1000,
+ "report_kind": "openers",
+ "schema_version": 4,
+ "sources": {
+  "cache": {
+   "error": null,
+   "ok": true,
+   "path": "fixture/cache.sqlite3"
   },
-  "data": {
-    "summary": [
-      {
-        "opener": "salet",
-        "opener_is_answer": false,
-        "requested_priority": 5,
-        "requested_at": 400,
-        "started_at": null,
-        "completed_at": null,
-        "request_count": 2,
-        "state": "queued",
-        "branch_count": 1240,
-        "open_branch_count": 1203,
-        "done_branch_count": 37,
-        "worker_count": 3,
-        "direct_branch_count": 12,
-        "direct_done_branch_count": 3,
-        "elapsed_millis": 120000,
-        "worker_millis": 240000,
-        "erd_summary": {
-          "state": "pending",
-          "erd": null,
-          "max_remaining_depth": null,
-          "response_group_count": 148,
-          "resolved_group_count": 96,
-          "infeasible_group_count": 0
-        }
-      },
-      {
-        "opener": "raise",
-        "opener_is_answer": true,
-        "requested_priority": 3,
-        "requested_at": 200,
-        "started_at": null,
-        "completed_at": null,
-        "request_count": 1,
-        "state": "queued",
-        "branch_count": 96,
-        "open_branch_count": 8,
-        "done_branch_count": 88,
-        "worker_count": 1,
-        "direct_branch_count": 4,
-        "direct_done_branch_count": 4,
-        "elapsed_millis": 180000,
-        "worker_millis": 360000,
-        "erd_summary": {
-          "state": "complete",
-          "erd": 3.4207,
-          "max_remaining_depth": 5,
-          "response_group_count": 132,
-          "resolved_group_count": 132,
-          "infeasible_group_count": 0
-        }
-      },
-      {
-        "opener": "crane",
-        "opener_is_answer": true,
-        "requested_priority": 1,
-        "requested_at": 100,
-        "started_at": null,
-        "request_count": 1,
-        "state": "complete",
-        "completed_at": 490,
-        "branch_count": 40,
-        "open_branch_count": 0,
-        "done_branch_count": 40,
-        "worker_count": 0,
-        "direct_branch_count": 2,
-        "direct_done_branch_count": 2,
-        "elapsed_millis": 480000,
-        "worker_millis": 600000,
-        "erd_summary": {
-          "state": "complete",
-          "erd": 3.3891,
-          "max_remaining_depth": 4,
-          "response_group_count": 141,
-          "resolved_group_count": 141,
-          "infeasible_group_count": 0
-        }
-      }
-    ],
-    "summary_groups": [
-      {
-        "label": "queued",
-        "rows": [
-          {
-            "opener": "salet",
-            "opener_is_answer": false,
-            "requested_priority": 5,
-            "requested_at": 400,
-            "completed_at": null,
-            "request_count": 2,
-            "state": "queued",
-            "branch_count": 1240,
-            "open_branch_count": 1203,
-            "done_branch_count": 37,
-            "worker_count": 3,
-            "direct_branch_count": 12,
-            "direct_done_branch_count": 3,
-            "elapsed_millis": 120000,
-            "worker_millis": 240000,
-            "erd_summary": {
-              "state": "pending",
-              "erd": null,
-              "max_remaining_depth": null,
-              "response_group_count": 148,
-              "resolved_group_count": 96,
-              "infeasible_group_count": 0
-            }
-          },
-          {
-            "opener": "raise",
-            "opener_is_answer": true,
-            "requested_priority": 3,
-            "requested_at": 200,
-            "completed_at": null,
-            "request_count": 1,
-            "state": "queued",
-            "branch_count": 96,
-            "open_branch_count": 8,
-            "done_branch_count": 88,
-            "worker_count": 1,
-            "direct_branch_count": 4,
-            "direct_done_branch_count": 4,
-            "elapsed_millis": 180000,
-            "worker_millis": 360000,
-            "erd_summary": {
-              "state": "complete",
-              "erd": 3.4207,
-              "max_remaining_depth": 5,
-              "response_group_count": 132,
-              "resolved_group_count": 132,
-              "infeasible_group_count": 0
-            }
-          }
-        ],
-        "rollup": {
-          "opener_count": 2,
-          "branch_count": 1336,
-          "open_branch_count": 1211,
-          "done_branch_count": 125,
-          "worker_count": 4
-        }
-      },
-      {
-        "label": "complete",
-        "rows": [
-          {
-            "opener": "crane",
-            "opener_is_answer": true,
-            "requested_priority": 1,
-            "requested_at": 100,
-            "request_count": 1,
-            "state": "complete",
-            "completed_at": 490,
-            "branch_count": 40,
-            "open_branch_count": 0,
-            "done_branch_count": 40,
-            "worker_count": 0,
-            "direct_branch_count": 2,
-            "direct_done_branch_count": 2,
-            "elapsed_millis": 480000,
-            "worker_millis": 600000,
-            "erd_summary": {
-              "state": "complete",
-              "erd": 3.3891,
-              "max_remaining_depth": 4,
-              "response_group_count": 141,
-              "resolved_group_count": 141,
-              "infeasible_group_count": 0
-            }
-          }
-        ],
-        "rollup": {
-          "opener_count": 1,
-          "branch_count": 40,
-          "open_branch_count": 0,
-          "done_branch_count": 40,
-          "worker_count": 0
-        }
-      }
-    ],
-    "total_opener_count": 3,
-    "matched_opener_count": 3,
-    "matched_branch_count": 1376,
-    "matched_open_branch_count": 1211,
-    "opener_offset": 0,
-    "matched_rows": 0,
-    "shared_branch_count": 0,
-    "branch_row_offset": 0,
-    "rows": []
+  "queue": {
+   "epoch": 4,
+   "error": null,
+   "git_sha": "abcdef12",
+   "label": "packed",
+   "ok": true,
+   "path": "fixture/queue.sqlite3"
+  },
+  "telemetry": {
+   "error": null,
+   "ok": true,
+   "path": "fixture/telemetry.sqlite3"
   }
+ },
+ "tree": false
 }

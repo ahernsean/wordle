@@ -1,40 +1,101 @@
 {
-  "schema_version": 3,
-  "report_kind": "leaderboard",
-  "generated_at": 1000,
-  "branch_target": null,
-  "filters": {},
-  "tree": false,
-  "sources": {"queue": {"path": "fixture/queue.sqlite3", "ok": false, "error": null, "epoch": null, "label": null, "git_sha": null}, "telemetry": {"path": "fixture/telemetry.sqlite3", "ok": false, "error": null}, "cache": {"path": "fixture/cache.sqlite3", "ok": true, "error": null}},
-  "data": {
-    "candidate_count": 14855,
-    "response_pattern_count": 243,
-    "counts": {"complete": 2, "pending": 14852, "infeasible": 1},
-    "total_rows": 2,
-    "matched_rows": 2,
-    "rows": [
-      {
-        "word": "salet", "word_is_answer": false, "erd": 3.5643502648,
-        "max_remaining_depth": 6, "rank": 1, "answer_count": 100,
-        "response_groups": [
-          {"pattern": "-----", "answer_count": 31},
-          {"pattern": "---g-", "answer_count": 24},
-          {"pattern": "---y-", "answer_count": 21},
-          {"pattern": "-y---", "answer_count": 14},
-          {"pattern": "--y--", "answer_count": 10}
-        ]
-      },
-      {
-        "word": "crane", "word_is_answer": true, "erd": 3.7124567,
-        "max_remaining_depth": 5, "rank": 2, "answer_count": 100,
-        "response_groups": [
-          {"pattern": "-----", "answer_count": 40},
-          {"pattern": "----y", "answer_count": 25},
-          {"pattern": "---y-", "answer_count": 20},
-          {"pattern": "--y--", "answer_count": 10},
-          {"pattern": "-y---", "answer_count": 5}
-        ]
-      }
-    ]
+ "branch_target": null,
+ "data": {
+  "candidate_count": 14855,
+  "counts": {
+   "complete": 2,
+   "infeasible": 1,
+   "pending": 14852
+  },
+  "matched_rows": 2,
+  "response_pattern_count": 243,
+  "rows": [
+   {
+    "answer_count": 100,
+    "erd": 3.5643502648,
+    "max_remaining_depth": 6,
+    "rank": 1,
+    "response_groups": [
+     {
+      "answer_count": 31,
+      "pattern": "-----"
+     },
+     {
+      "answer_count": 24,
+      "pattern": "---g-"
+     },
+     {
+      "answer_count": 21,
+      "pattern": "---y-"
+     },
+     {
+      "answer_count": 14,
+      "pattern": "-y---"
+     },
+     {
+      "answer_count": 10,
+      "pattern": "--y--"
+     }
+    ],
+    "word": "salet",
+    "word_is_answer": false
+   },
+   {
+    "answer_count": 100,
+    "erd": 3.7124567,
+    "max_remaining_depth": 5,
+    "rank": 2,
+    "response_groups": [
+     {
+      "answer_count": 40,
+      "pattern": "-----"
+     },
+     {
+      "answer_count": 25,
+      "pattern": "----y"
+     },
+     {
+      "answer_count": 20,
+      "pattern": "---y-"
+     },
+     {
+      "answer_count": 10,
+      "pattern": "--y--"
+     },
+     {
+      "answer_count": 5,
+      "pattern": "-y---"
+     }
+    ],
+    "word": "crane",
+    "word_is_answer": true
+   }
+  ],
+  "total_rows": 2
+ },
+ "filters": {},
+ "generated_at": 1000,
+ "report_kind": "leaderboard",
+ "schema_version": 4,
+ "sources": {
+  "cache": {
+   "error": null,
+   "ok": true,
+   "path": "fixture/cache.sqlite3"
+  },
+  "queue": {
+   "epoch": null,
+   "error": null,
+   "git_sha": null,
+   "label": null,
+   "ok": false,
+   "path": "fixture/queue.sqlite3"
+  },
+  "telemetry": {
+   "error": null,
+   "ok": false,
+   "path": "fixture/telemetry.sqlite3"
   }
+ },
+ "tree": false
 }

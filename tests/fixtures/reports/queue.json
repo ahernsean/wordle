@@ -1,12 +1,165 @@
 {
-  "schema_version": 3, "report_kind": "queue", "generated_at": 1000,
-  "branch_target": {"kind": "root", "steps": [], "trailing_word": null, "branch_reference": null, "input_text": ""},
-  "filters": {}, "tree": false,
-  "sources": {"queue": {"path": "fixture/queue.sqlite3", "ok": true, "error": null, "epoch": 4, "label": "packed", "git_sha": "abcdef12"}, "telemetry": {"path": "fixture/telemetry.sqlite3", "ok": true, "error": null}, "cache": {"path": "fixture/cache.sqlite3", "ok": true, "error": null}},
-  "data": {"summary": {"branch_count": 4, "branch_count_by_status": {"queued": 1, "evaluating": 1, "finalizing": 1, "done": 1}, "branch_count_by_worker_status": {"waiting": 1, "active": 2, "null": 1}}, "matched_rows": 4, "rows": [
-    {"branch_key_hex": "01", "branch_reference": "111111111111", "branch_status": "queued", "branch_worker_status": null, "raw_status": "pending", "is_cooperative": false, "answer_count": 20, "priority": 3, "budget": null, "candidate_count": null, "completed_candidate_count": 0, "bulk_completed_candidate_count": 0, "one_level_erd_pruned_candidate_count": 0, "two_level_erd_pruned_candidate_count": 0, "worker_count": 0, "search_node_count": 0, "ceiling": null, "best_guess": null, "best_erd": null, "best_max_remaining_depth": null, "opener": "raise", "opener_pattern": "-----", "spine": null, "created_at": null, "updated_at": 900, "is_context": false},
-    {"branch_key_hex": "02", "branch_reference": "222222222222", "branch_status": "evaluating", "branch_worker_status": "active", "raw_status": "open", "is_cooperative": true, "answer_count": 8, "priority": 1000000, "budget": 4, "candidate_count": 50, "completed_candidate_count": 20, "bulk_completed_candidate_count": 0, "one_level_erd_pruned_candidate_count": 0, "two_level_erd_pruned_candidate_count": 0, "worker_count": 2, "search_node_count": 8000, "ceiling": null, "best_guess": "crane", "best_erd": 1.8, "best_max_remaining_depth": 2, "opener": "alibi", "opener_pattern": "y----", "spine": "RAISE ----- ALIBI y----", "created_at": 920, "updated_at": 920, "is_context": false},
-    {"branch_key_hex": "03", "branch_reference": "333333333333", "branch_status": "finalizing", "branch_worker_status": "active", "raw_status": "finalized", "is_cooperative": true, "answer_count": 4, "priority": 1000000, "budget": 3, "candidate_count": 20, "completed_candidate_count": 20, "bulk_completed_candidate_count": 0, "one_level_erd_pruned_candidate_count": 0, "two_level_erd_pruned_candidate_count": 0, "worker_count": 1, "search_node_count": 5000, "ceiling": null, "best_guess": "cigar", "best_erd": 1.5, "best_max_remaining_depth": 2, "opener": "crane", "opener_pattern": "yy---", "spine": "RAISE ----- ALIBI y---- CRANE yy---", "created_at": 930, "updated_at": 980, "is_context": false},
-    {"branch_key_hex": "04", "branch_reference": "444444444444", "branch_status": "done", "branch_worker_status": null, "raw_status": "done", "is_cooperative": false, "answer_count": 3, "priority": 0, "budget": null, "candidate_count": null, "completed_candidate_count": 0, "bulk_completed_candidate_count": 0, "one_level_erd_pruned_candidate_count": 0, "two_level_erd_pruned_candidate_count": 0, "worker_count": 0, "search_node_count": 0, "ceiling": null, "best_guess": null, "best_erd": null, "best_max_remaining_depth": null, "opener": "slate", "opener_pattern": "-y---", "spine": null, "created_at": null, "updated_at": 970, "is_context": false}
-  ]}
+ "branch_target": {
+  "branch_reference": null,
+  "input_text": "",
+  "kind": "root",
+  "steps": [],
+  "trailing_word": null
+ },
+ "data": {
+  "matched_rows": 4,
+  "rows": [
+   {
+    "answer_count": 20,
+    "best_erd": null,
+    "best_guess": null,
+    "best_max_remaining_depth": null,
+    "branch_key_hex": "01",
+    "branch_reference": "111111111111",
+    "branch_status": "queued",
+    "branch_worker_status": null,
+    "budget": null,
+    "bulk_completed_candidate_count": 0,
+    "candidate_count": null,
+    "ceiling": null,
+    "completed_candidate_count": 0,
+    "created_at": null,
+    "is_context": false,
+    "is_cooperative": false,
+    "one_level_erd_pruned_candidate_count": 0,
+    "opener": "raise",
+    "opener_pattern": "-----",
+    "priority": 3,
+    "raw_status": "pending",
+    "search_node_count": 0,
+    "spine": null,
+    "two_level_erd_pruned_candidate_count": 0,
+    "updated_at": 900,
+    "worker_count": 0
+   },
+   {
+    "answer_count": 8,
+    "best_erd": 1.8,
+    "best_guess": "crane",
+    "best_max_remaining_depth": 2,
+    "branch_key_hex": "02",
+    "branch_reference": "222222222222",
+    "branch_status": "evaluating",
+    "branch_worker_status": "active",
+    "budget": 4,
+    "bulk_completed_candidate_count": 0,
+    "candidate_count": 50,
+    "ceiling": null,
+    "completed_candidate_count": 20,
+    "created_at": 920,
+    "is_context": false,
+    "is_cooperative": true,
+    "one_level_erd_pruned_candidate_count": 0,
+    "opener": "alibi",
+    "opener_pattern": "y----",
+    "priority": 1000000,
+    "raw_status": "open",
+    "search_node_count": 8000,
+    "spine": "RAISE ----- ALIBI y----",
+    "two_level_erd_pruned_candidate_count": 0,
+    "updated_at": 920,
+    "worker_count": 2
+   },
+   {
+    "answer_count": 4,
+    "best_erd": 1.5,
+    "best_guess": "cigar",
+    "best_max_remaining_depth": 2,
+    "branch_key_hex": "03",
+    "branch_reference": "333333333333",
+    "branch_status": "finalizing",
+    "branch_worker_status": "active",
+    "budget": 3,
+    "bulk_completed_candidate_count": 0,
+    "candidate_count": 20,
+    "ceiling": null,
+    "completed_candidate_count": 20,
+    "created_at": 930,
+    "is_context": false,
+    "is_cooperative": true,
+    "one_level_erd_pruned_candidate_count": 0,
+    "opener": "crane",
+    "opener_pattern": "yy---",
+    "priority": 1000000,
+    "raw_status": "finalized",
+    "search_node_count": 5000,
+    "spine": "RAISE ----- ALIBI y---- CRANE yy---",
+    "two_level_erd_pruned_candidate_count": 0,
+    "updated_at": 980,
+    "worker_count": 1
+   },
+   {
+    "answer_count": 3,
+    "best_erd": null,
+    "best_guess": null,
+    "best_max_remaining_depth": null,
+    "branch_key_hex": "04",
+    "branch_reference": "444444444444",
+    "branch_status": "done",
+    "branch_worker_status": null,
+    "budget": null,
+    "bulk_completed_candidate_count": 0,
+    "candidate_count": null,
+    "ceiling": null,
+    "completed_candidate_count": 0,
+    "created_at": null,
+    "is_context": false,
+    "is_cooperative": false,
+    "one_level_erd_pruned_candidate_count": 0,
+    "opener": "slate",
+    "opener_pattern": "-y---",
+    "priority": 0,
+    "raw_status": "done",
+    "search_node_count": 0,
+    "spine": null,
+    "two_level_erd_pruned_candidate_count": 0,
+    "updated_at": 970,
+    "worker_count": 0
+   }
+  ],
+  "summary": {
+   "branch_count": 4,
+   "branch_count_by_status": {
+    "done": 1,
+    "evaluating": 1,
+    "finalizing": 1,
+    "queued": 1
+   },
+   "branch_count_by_worker_status": {
+    "active": 2,
+    "null": 1,
+    "waiting": 1
+   }
+  }
+ },
+ "filters": {},
+ "generated_at": 1000,
+ "report_kind": "queue",
+ "schema_version": 4,
+ "sources": {
+  "cache": {
+   "error": null,
+   "ok": true,
+   "path": "fixture/cache.sqlite3"
+  },
+  "queue": {
+   "epoch": 4,
+   "error": null,
+   "git_sha": "abcdef12",
+   "label": "packed",
+   "ok": true,
+   "path": "fixture/queue.sqlite3"
+  },
+  "telemetry": {
+   "error": null,
+   "ok": true,
+   "path": "fixture/telemetry.sqlite3"
+  }
+ },
+ "tree": false
 }

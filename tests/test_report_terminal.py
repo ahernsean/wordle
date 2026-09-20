@@ -19,6 +19,7 @@ from erd_queue import ERDQueue, encode_subset
 import report_model
 import report_terminal
 from report_model import (
+    encode_candidate_bitmap,
     WORK_DISTRIBUTION_BAND_EDGE_SECONDS,
     ReportFilters,
     parse_report_branch_target,
@@ -1038,7 +1039,8 @@ class CandidateSweepBarTest(unittest.TestCase):
                     "current_max_guess_depth": 2, "nodes_per_second": 10.0,
                 }],
                 "republished_candidates": [],
-                "completed_candidate_indexes": list(range(0, 40)),
+                "completed_candidate_bitmap": encode_candidate_bitmap(
+                    range(0, 40), 100),
                 "claims": None,
                 "provenance_unknown": False,
             },
@@ -1065,7 +1067,7 @@ class CandidateSweepBarTest(unittest.TestCase):
         self.assertLess(moved_line.index("2"), sweep_line.index("2"))
 
         unswept = deepcopy(report)
-        unswept["data"]["completed_candidate_indexes"] = []
+        unswept["data"]["completed_candidate_bitmap"] = None
         unswept["data"]["workers"] = []
         unswept_output = render_report(unswept, width=80)
         self.assertFalse(any(
