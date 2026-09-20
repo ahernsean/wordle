@@ -518,6 +518,15 @@ def make_handler(configuration):
                 report = collect_report(configuration.sources, request)
                 in_flight.body = encode_report(report)
                 in_flight.intact = report_is_intact(report)
+                # Published before the waiters are released and before the
+                # in-flight marker is dropped, so no arriving request can find
+                # neither.  Releasing first leaves a window in which the build
+                # is finished, the marker is gone and the entry is not yet
+                # stored, and a request landing there starts a second build of
+                # a report that is already in hand.
+                if token is not None and in_flight.intact:
+                    store_cached_body(
+                        request, token, started_at, in_flight.body)
             except Exception as error:
                 in_flight.error = error
             finally:
@@ -528,8 +537,6 @@ def make_handler(configuration):
             in_flight.completed.wait()
         if in_flight.error is not None:
             raise in_flight.error
-        if is_builder and token is not None and in_flight.intact:
-            store_cached_body(request, token, started_at, in_flight.body)
         return in_flight.body
 
     class ReportHandler(BaseHTTPRequestHandler):

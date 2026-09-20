@@ -6,6 +6,7 @@ from http.server import ThreadingHTTPServer
 from threading import Event, Lock, Thread
 import io
 import json
+import threading
 import os
 import tempfile
 import time
@@ -692,6 +693,64 @@ class RevalidatedReportCacheTest(ReportServerTest):
                 _status, _headers, body = request(
                     base_url, "/api/view/leaderboard")
         self.assertEqual(json.loads(body)["data"], "second")
+
+    def test_a_waiter_is_released_only_once_the_body_is_published(self):
+        # Releasing waiters before publishing leaves a window in which the
+        # build is finished, the in-flight marker is gone, and the entry is not
+        # yet stored.  A request landing there finds neither and rebuilds a
+        # report already in hand.
+        #
+        # That window is a dict write, and reaching it takes an HTTP round
+        # trip, so it is not reachable by timing alone -- this test widens it
+        # by slowing the release of the lock the marker is dropped under, which
+        # is the last thing the old ordering did before publishing.  Under the
+        # correct ordering the entry is already stored by then, so widening
+        # changes nothing.
+        started, release = Event(), Event()
+        widen = [False]
+
+        class SlowReleaseLock:
+            def __init__(self):
+                self._lock = threading.Lock()
+
+            def __enter__(self):
+                return self._lock.__enter__()
+
+            def __exit__(self, *details):
+                result = self._lock.__exit__(*details)
+                if widen[0]:
+                    time.sleep(0.4)
+                return result
+
+        def collect_slowly(_sources, _request):
+            self.calls += 1
+            started.set()
+            release.wait(2)
+            return self.report
+
+        followup = []
+        with patch("report_server.Lock", SlowReleaseLock), \
+             patch("report_server.collect_report", side_effect=collect_slowly), \
+             patch("report_server.opener_completion_signal", return_value=(5, 5)):
+            with running_server(self.live_configuration) as base_url:
+                builder = Thread(target=lambda: request(
+                    base_url, "/api/view/leaderboard"))
+                builder.start()
+                self.assertTrue(started.wait(1))
+
+                def wait_then_ask():
+                    request(base_url, "/api/view/leaderboard")
+                    followup.append(request(base_url, "/api/view/leaderboard"))
+
+                waiter = Thread(target=wait_then_ask)
+                waiter.start()
+                time.sleep(0.05)
+                widen[0] = True
+                release.set()
+                builder.join(5)
+                waiter.join(5)
+        self.assertEqual([status for status, _h, _b in followup], [200])
+        self.assertEqual(self.calls, 1)
 
     def test_a_build_that_recorded_a_source_error_is_not_cached(self):
         # collect_leaderboard_report catches its own SQLite errors and returns
