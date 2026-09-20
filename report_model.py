@@ -2969,24 +2969,38 @@ NO_WORKER_STATUS_BUCKET = "not_applicable"
 DEFAULT_QUEUE_ROW_LIMIT = 100
 
 
-def _collection_summary(rows):
-    by_status = {}
+def _bucketed_collection_summary(summary):
+    """Rebucket a queue summary's NULL worker status under a JSON-safe key.
+
+    The queue counts by `branch_worker_status` in SQL, where a branch with no
+    worker dimension at all counts under NULL.  A None key cannot be ordered
+    against the string keys beside it, so the server's `sort_keys` encoding
+    fails on the whole report rather than merely labelling one bucket oddly --
+    and a queue holding any finished branch has such a branch.
+    """
     by_worker_status = {}
-    for row in rows:
-        status = row["branch_status"]
-        worker_status = row["branch_worker_status"]
+    for worker_status, count in summary["branch_count_by_worker_status"].items():
         if worker_status is None:
             worker_status = NO_WORKER_STATUS_BUCKET
-        by_status[status] = by_status.get(status, 0) + 1
-        by_worker_status[worker_status] = by_worker_status.get(worker_status, 0) + 1
+        by_worker_status[worker_status] = (
+            by_worker_status.get(worker_status, 0) + count
+        )
     return {
-        "branch_count": len(rows),
-        "branch_count_by_status": by_status,
+        "branch_count": summary["branch_count"],
+        "branch_count_by_status": dict(summary["branch_count_by_status"]),
         "branch_count_by_worker_status": by_worker_status,
     }
 
 
-def _scoped_queue_rows(queue, request, apply_filters=True):
+def _scoped_queue_result(queue, request, apply_filters=True, limit=None):
+    """Return the queue's own result for this request's scope, and the prefix.
+
+    The result carries a summary and a `matched_rows` count computed by SQL
+    aggregates over every matched branch, so a caller that wants totals does
+    not have to materialize the rows to count them.  `limit` therefore bounds
+    only what is returned, never what is counted -- which is what lets a
+    row-bearing report ask for a page without the server building the rest.
+    """
     filters = request.filters if apply_filters else ReportFilters()
     unbounded_filters = replace(filters, limit=None)
     scope, prefix = _branch_target_queue_scope(request.branch_target, queue)
@@ -2994,7 +3008,15 @@ def _scoped_queue_rows(queue, request, apply_filters=True):
     query_filters.update(scope)
     if request.tree_parent:
         query_filters["spine_prefix"] = request.tree_parent
-    result = queue.report_queue_rows(query_filters)
+    result = queue.report_queue_rows(query_filters, limit=limit)
+    return result, prefix
+
+
+def _scoped_queue_rows(queue, request, apply_filters=True):
+    """Return every matched queue row.  Callers that need the rows themselves
+    -- a tree's topology, a worker report's branch-key set -- rather than a
+    page of them."""
+    result, prefix = _scoped_queue_result(queue, request, apply_filters)
     return result["rows"], prefix
 
 
@@ -3008,11 +3030,11 @@ def collect_queue_report(sources: ReportOpeners, request: ReportRequest) -> dict
     queue = None
     try:
         queue = _open_report_queue(sources)
-        rows, _prefix = _scoped_queue_rows(queue, request)
-        data["summary"] = _collection_summary(rows)
-        data["matched_rows"] = len(rows)
         limit = request.filters.limit or DEFAULT_QUEUE_ROW_LIMIT
-        data["rows"] = rows[:limit]
+        result, _prefix = _scoped_queue_result(queue, request, limit=limit)
+        data["summary"] = _bucketed_collection_summary(result["summary"])
+        data["matched_rows"] = result["matched_rows"]
+        data["rows"] = result["rows"]
         for row in data["rows"]:
             row["branch_reference"] = branch_reference(bytes(row.pop("branch_key")))
             row["spine"] = _normalized_branch_spine(row, answer_set)
@@ -3600,15 +3622,18 @@ def collect_hotspot_report(sources: ReportOpeners, request: ReportRequest) -> di
                 request.filters, sort=field, limit=None
             )
             hotspot_request = replace(request, filters=hotspot_filters)
-            rows, _prefix = _scoped_queue_rows(queue, hotspot_request)
+            scoped, _prefix = _scoped_queue_result(
+                queue, hotspot_request, limit=limit
+            )
+            matched_rows = scoped["matched_rows"]
             result = {
                 "population": "current_queue_branches",
                 "epoch": epoch,
                 "since": generated_at - since_seconds,
                 "sample_size": None,
-                "sampled_row_count": len(rows),
-                "sample_truncated": len(rows) > limit,
-                "rows": rows[:limit],
+                "sampled_row_count": matched_rows,
+                "sample_truncated": matched_rows > limit,
+                "rows": scoped["rows"],
             }
         else:
             scope, prefix = _branch_target_queue_scope(request.branch_target, queue)
