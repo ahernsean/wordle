@@ -852,6 +852,35 @@ class TestBranchLifecycle(_TmpQueue):
         self.assertTrue(self.q.complete_candidate(self.key, idx))
         self.assertEqual(self.q.branch_done_candidates(self.key), 1)
 
+    def test_claim_is_current_is_true_for_the_worker_that_holds_it(self):
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
+        idx = self._claim_one_idx(self.key, worker_id="worker-0")
+        self.assertTrue(self.q.claim_is_current(
+            self.key, idx, claimed_by="worker-0", budget=5))
+
+    def test_claim_is_current_is_false_once_the_claim_is_reissued(self):
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
+        idx = self._claim_one_idx(self.key, worker_id="worker-0")
+        self.q.reclaim_claims_of_worker("worker-0")
+        self._claim_one_idx(self.key, worker_id="worker-1")
+        self.assertFalse(self.q.claim_is_current(
+            self.key, idx, claimed_by="worker-0", budget=5))
+
+    def test_claim_is_current_is_false_at_a_budget_the_branch_no_longer_holds(self):
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
+        idx = self._claim_one_idx(self.key, worker_id="worker-0")
+        self.q.delete_branch(self.key)
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=3)
+        self.assertFalse(self.q.claim_is_current(
+            self.key, idx, claimed_by="worker-0", budget=5))
+
+    def test_claim_is_current_is_false_for_a_branch_that_finalized(self):
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
+        idx = self._claim_one_idx(self.key, worker_id="worker-0")
+        self.q.delete_branch(self.key)
+        self.assertFalse(self.q.claim_is_current(
+            self.key, idx, claimed_by="worker-0", budget=5))
+
     def test_read_branch_best_returns_none_none_for_missing_key(self):
         self.assertEqual(self.q.read_branch_best(b"notakey"), (None, None, None))
 

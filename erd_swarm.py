@@ -1625,13 +1625,28 @@ class _BranchWorker:
                 local_candidate, local_best, bound_erd=_eff_bound()))
         cand_elapsed = time.time() - cand_t0
         self._eval_seconds += cand_elapsed
+        # Every write below carries branch state, and all of them describe the
+        # incarnation this candidate was evaluated against.  A claim reclaimed
+        # mid-evaluation may have been reissued, and the branch itself may have
+        # been finalized and re-created at another budget, so the set is
+        # admitted or refused together -- one of them landing without the rest
+        # leaves the branch describing a mixture of two incarnations.
+        claim_is_mine = self.queue.claim_is_current(
+            branch_key, idx, claimed_by=self.name, bundle_id=bundle_id,
+            budget=budget)
+        if not claim_is_mine:
+            logger.warning(
+                '%s lost candidate %s (idx=%d) mid-evaluation; its result '
+                'describes a branch incarnation this worker no longer holds '
+                'and is discarded', self.name, candidate, idx)
         if cand_elapsed > 10:  # pragma: no cover
             logger.warning('%s slow candidate %s (idx=%d): %.1fs  '
                            'status=%s  max_depth=%d', self.name, candidate,
                            idx, cand_elapsed, status, self._cand_max_depth)
 
         nodes_delta = self._nodes - nodes_before
-        if self._adaptive and (nodes_delta > 0 or status == OVER_DEPTH_BUDGET):
+        if (claim_is_mine and self._adaptive
+                and (nodes_delta > 0 or status == OVER_DEPTH_BUDGET)):
             # These counters cover candidates proven infeasible at this level,
             # not candidates whose taint arrived from a deeper branch.  They
             # are therefore a lower bound on local infeasibility.  Every such
@@ -1678,11 +1693,11 @@ class _BranchWorker:
         # A candidate excluded by the depth cap (anywhere in its subtree)
         # taints the branch: its ERD is only valid at this budget.  Marked
         # for any candidate, winner or not — see the taint rule.
-        if budget_tainted:
+        if claim_is_mine and budget_tainted:
             self.queue.mark_branch_tainted(branch_key)
         if status == SOLVED:
             self.n_ok += 1
-            if local_best is None or cost < local_best:
+            if claim_is_mine and (local_best is None or cost < local_best):
                 local_best, local_candidate, local_md = cost, candidate, cand_md
                 self.queue.update_branch_best(branch_key, local_candidate,
                                               local_best, local_md,
@@ -1690,7 +1705,7 @@ class _BranchWorker:
                 shared_best = local_best
         elif status == OVER_ERD_LIMIT:
             self.n_cutoff += 1
-            if branch_ceiling is not None:
+            if claim_is_mine and branch_ceiling is not None:
                 # Priced out on a ceilinged branch.  Only consulted at finalize
                 # when best_guess is NULL — where no real best ever existed, so
                 # every price-out was against the ceiling and the branch is a
@@ -1701,15 +1716,12 @@ class _BranchWorker:
         else:  # pragma: no cover
             self.n_useless += 1
 
-        if not self.queue.complete_candidate(
-                branch_key, idx, claimed_by=self.name, bundle_id=bundle_id):
-            # The claim was reclaimed and reissued while this evaluation ran.
-            # Its result belongs to a branch incarnation that no longer holds
-            # this index, so the current holder must still finish it.
-            logger.warning(
-                '%s lost candidate %s (idx=%d) on a branch it no longer '
-                'holds the claim for; result discarded', self.name,
-                candidate, idx)
+        # Still scoped to this worker's own claim, and still checked: the
+        # guard above closes the window the evaluation ran in, this one closes
+        # the window since.
+        if claim_is_mine:
+            self.queue.complete_candidate(
+                branch_key, idx, claimed_by=self.name, bundle_id=bundle_id)
         # The outbound claim telemetry is required for branch ETA reporting,
         # regardless of whether this worker uses adaptive decomposition.
         now_complete = time.time()

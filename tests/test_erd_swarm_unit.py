@@ -6280,3 +6280,66 @@ class TestDependencyWaitAttribution(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["blocked_millis"], 0)
         self._assert_blocks(rows[0])
+
+
+class TestAStaleResultTouchesNoBranchState(unittest.TestCase):
+    """A result whose claim is gone must land nowhere, not partly.
+
+    Guarding the writes one at a time cannot be made safe.  The branch's cut
+    flag is the sharpest case: a stale OVER_ERD_LIMIT sets `cut_occurred` on a
+    replacement that has no ceiling, and `maybe_finalize` then reaches
+    `add_cut_result` with a NULL bound against a NOT NULL column -- an
+    exception mid-finalize, after `try_finalize_branch` has already been won,
+    which strands the branch.
+    """
+
+    BRANCH_WRITES = ("mark_branch_tainted", "update_branch_best",
+                     "mark_branch_cut", "add_nodes_spent",
+                     "complete_candidate")
+
+    def _worker(self, claim_is_current):
+        w = _bare_worker()
+        w._adaptive = True
+        w.queue.claim_is_current.return_value = claim_is_current
+        # The branch this candidate was evaluated against carried a ceiling:
+        # that is what makes a price-out set cut_occurred, and the stale
+        # version of it is what reaches add_cut_result with a NULL bound.
+        w.queue.read_branch_best.return_value = (None, None, 4.5)
+        return w
+
+    def _evaluate(self, worker):
+        """Evaluate one candidate whose result touches every branch write.
+
+        The engine's return has to reach all of them or the assertions below
+        pass against a fixture that never fired any: OVER_ERD_LIMIT with a
+        ceiling in scope reaches mark_branch_cut, budget_tainted reaches
+        mark_branch_tainted, and a node advance reaches add_nodes_spent.
+        """
+        branch_key = ScoreCache.encode_subset(BRANCH)
+
+        def _evaluated(*args, **kwargs):
+            worker._nodes += 5          # so nodes_delta > 0
+            return (erd_swarm.OVER_ERD_LIMIT, 4.0, 2, True)   # tainted
+
+        with mock.patch.object(erd_swarm, "evaluate_candidate", _evaluated):
+            worker.evaluate_claim(branch_key, BRANCH, len(BRANCH), idx=0,
+                                  budget=5)
+        return branch_key
+
+    def test_every_branch_write_fires_when_the_claim_is_held(self):
+        # Proves the fixture reaches each write, so the refusal test below is
+        # asserting on something that would otherwise have happened.
+        w = self._worker(claim_is_current=True)
+        self._evaluate(w)
+        for name in ("mark_branch_tainted", "mark_branch_cut",
+                     "add_nodes_spent", "complete_candidate"):
+            with self.subTest(write=name):
+                self.assertTrue(getattr(w.queue, name).called,
+                                f"fixture never reached {name}")
+
+    def test_no_branch_state_is_written_when_the_claim_is_gone(self):
+        w = self._worker(claim_is_current=False)
+        self._evaluate(w)
+        for name in self.BRANCH_WRITES:
+            with self.subTest(write=name):
+                getattr(w.queue, name).assert_not_called()

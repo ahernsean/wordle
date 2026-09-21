@@ -3552,6 +3552,42 @@ class ERDQueue:
         return (row["n_bundles"], row["max_bundle_nodes"],
                 row["total_bundle_wall_millis"], row["censored_units"])
 
+    def claim_is_current(self, branch_key, idx, claimed_by=None,
+                         bundle_id=None, budget=None):
+        """Does this caller still hold an unfinished claim on this branch?
+
+        One question for the whole set of writes an evaluation produces.  A
+        result carries branch state in several places -- the taint flag, the
+        running best, the cut flag, the nodes spent, and the completion itself
+        -- and every one of them is only meaningful for the branch incarnation
+        the candidate was evaluated against.  Guarding them one at a time
+        cannot be made safe: refusing one while accepting the others leaves the
+        branch describing a mixture of two incarnations, which is how a stale
+        OVER_ERD_LIMIT sets cut_occurred on a replacement that has no ceiling,
+        and finalize then reaches add_cut_result with a NULL bound.
+
+        Answered in one indexed read: the claim must still exist unfinished and
+        belong to this caller, and the branch must still be open at the budget
+        the caller evaluated at.  A NULL stored budget predates the column and
+        is admitted, as everywhere else.
+        """
+        branch_id = self._intern_branch(branch_key)
+        if branch_id is None:
+            return False
+        row = self._conn.execute("""
+            SELECT 1
+            FROM candidate_claims c
+            JOIN active_branches a ON a.branch_id = c.branch_id
+            WHERE c.branch_id = ? AND c.idx = ? AND c.done = 0
+              AND (? IS NULL OR c.claimed_by = ?)
+              AND (? IS NULL OR c.bundle_id = ?)
+              AND a.status = 'open'
+              AND (? IS NULL OR a.budget IS NULL OR a.budget = ?)
+            LIMIT 1
+        """, (branch_id, idx, claimed_by, claimed_by, bundle_id, bundle_id,
+              budget, budget)).fetchone()
+        return row is not None
+
     def complete_candidate(self, branch_key, idx, claimed_by=None,
                            bundle_id=None):
         """Mark a candidate claim authoritatively complete (done=1).
