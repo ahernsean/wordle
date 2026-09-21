@@ -3588,6 +3588,64 @@ class ERDQueue:
               budget, budget)).fetchone()
         return row is not None
 
+    def apply_candidate_result(self, branch_key, idx, *, claimed_by=None,
+                               bundle_id=None, budget=None, nodes_spent=0,
+                               infeasible=False, tainted=False, best=None,
+                               cut=False):
+        """Apply every write one candidate evaluation produces, or none.
+
+        Returns True when the result was applied.
+
+        The writes are the branch's nodes spent, its taint flag, its running
+        best, its cut flag, and the candidate's completion.  All five describe
+        the branch incarnation the candidate was evaluated against, and a
+        reclaimed claim can be reissued -- or the branch finalized, deleted and
+        re-created at another budget -- while the evaluation runs.
+
+        Checking first and writing after cannot close that: the check and each
+        write are separate statements, so the branch can change between them
+        and leave a mixture of two incarnations behind.  That is how a stale
+        OVER_ERD_LIMIT sets cut_occurred on a replacement with no ceiling, and
+        finalize then reaches add_cut_result with a NULL bound against a NOT
+        NULL column.  So the validation and the writes share one transaction,
+        and the claim is re-read inside it.
+
+        `best` is (best_guess, best_erd, max_depth) or None.  Each write keeps
+        its own guard as well: they cost nothing here and they still hold for
+        the callers that use them directly.
+        """
+        opened_transaction = not self._conn.in_transaction
+        if opened_transaction:
+            self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            if not self.claim_is_current(branch_key, idx,
+                                         claimed_by=claimed_by,
+                                         bundle_id=bundle_id, budget=budget):
+                applied = False
+            else:
+                if nodes_spent or infeasible:
+                    self.add_nodes_spent(branch_key, nodes_spent,
+                                         infeasible=infeasible)
+                if tainted:
+                    self.mark_branch_tainted(branch_key)
+                if best is not None:
+                    best_guess, best_erd, max_remaining_depth = best
+                    self.update_branch_best(branch_key, best_guess, best_erd,
+                                            max_remaining_depth, budget=budget)
+                if cut:
+                    self.mark_branch_cut(branch_key)
+                self.complete_candidate(branch_key, idx,
+                                        claimed_by=claimed_by,
+                                        bundle_id=bundle_id)
+                applied = True
+        except Exception:
+            if opened_transaction:
+                self._conn.execute("ROLLBACK")
+            raise
+        if opened_transaction:
+            self._conn.execute("COMMIT")
+        return applied
+
     def complete_candidate(self, branch_key, idx, claimed_by=None,
                            bundle_id=None):
         """Mark a candidate claim authoritatively complete (done=1).

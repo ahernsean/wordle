@@ -3236,9 +3236,10 @@ class TestInfeasibleCandidateCounters(unittest.TestCase):
             self.assertTrue(worker.evaluate_claim(
                 b"branch", BRANCH, len(BRANCH), 0, budget=4))
 
-        worker.queue.add_nodes_spent.assert_called_once_with(
-            b"branch", 7, infeasible=True)
-        worker.queue.mark_branch_tainted.assert_called_once_with(b"branch")
+        kwargs = worker.queue.apply_candidate_result.call_args.kwargs
+        self.assertEqual(kwargs["nodes_spent"], 7)
+        self.assertTrue(kwargs["infeasible"])
+        self.assertTrue(kwargs["tainted"])
 
 
 class TestTwoLevelERDPruneBundles(unittest.TestCase):
@@ -6281,97 +6282,63 @@ class TestDependencyWaitAttribution(unittest.TestCase):
         self.assertEqual(rows[0]["blocked_millis"], 0)
         self._assert_blocks(rows[0])
 
+class TestAStaleResultIsNotAppliedPiecemeal(unittest.TestCase):
+    """The worker hands its whole result to one call, and survives a refusal.
 
-class TestAStaleResultTouchesNoBranchState(unittest.TestCase):
-    """A result whose claim is gone must land nowhere, not partly.
-
-    Guarding the writes one at a time cannot be made safe.  The branch's cut
-    flag is the sharpest case: a stale OVER_ERD_LIMIT sets `cut_occurred` on a
-    replacement that has no ceiling, and `maybe_finalize` then reaches
-    `add_cut_result` with a NULL bound against a NOT NULL column -- an
-    exception mid-finalize, after `try_finalize_branch` has already been won,
-    which strands the branch.
+    Whether those writes land atomically is the queue's property, tested
+    against a real database in test_erd_queue_unit.  What belongs here is that
+    the worker states the whole result in one place, issues no branch write
+    outside it, and does the right thing when it is refused.
     """
 
-    BRANCH_WRITES = ("mark_branch_tainted", "update_branch_best",
-                     "mark_branch_cut", "add_nodes_spent",
-                     "complete_candidate")
-
-    def _worker(self, claim_is_current):
+    def _worker(self, applied):
         w = _bare_worker()
         w._adaptive = True
-        w.queue.claim_is_current.return_value = claim_is_current
-        # The branch this candidate was evaluated against carried a ceiling:
-        # that is what makes a price-out set cut_occurred, and the stale
-        # version of it is what reaches add_cut_result with a NULL bound.
+        w.queue.apply_candidate_result.return_value = applied
+        # A ceiling in scope is what makes a price-out a cut.
         w.queue.read_branch_best.return_value = (None, None, 4.5)
         return w
 
     def _evaluate(self, worker):
-        """Evaluate one candidate whose result touches every branch write.
-
-        The engine's return has to reach all of them or the assertions below
-        pass against a fixture that never fired any: OVER_ERD_LIMIT with a
-        ceiling in scope reaches mark_branch_cut, budget_tainted reaches
-        mark_branch_tainted, and a node advance reaches add_nodes_spent.
-        """
         branch_key = ScoreCache.encode_subset(BRANCH)
 
         def _evaluated(*args, **kwargs):
-            worker._nodes += 5          # so nodes_delta > 0
-            return (erd_swarm.OVER_ERD_LIMIT, 4.0, 2, True)   # tainted
+            worker._nodes += 5
+            return (erd_swarm.OVER_ERD_LIMIT, 4.0, 2, True)
 
         with mock.patch.object(erd_swarm, "evaluate_candidate", _evaluated):
-            worker.evaluate_claim(branch_key, BRANCH, len(BRANCH), idx=0,
-                                  budget=5)
-        return branch_key
+            return worker.evaluate_claim(branch_key, BRANCH, len(BRANCH),
+                                         idx=0, budget=5)
 
-    def test_every_branch_write_fires_when_the_claim_is_held(self):
-        # Proves the fixture reaches each write, so the refusal test below is
-        # asserting on something that would otherwise have happened.
-        w = self._worker(claim_is_current=True)
+    def test_the_whole_result_is_handed_over_in_one_call(self):
+        w = self._worker(applied=True)
+        self._evaluate(w)
+        w.queue.apply_candidate_result.assert_called_once()
+        kwargs = w.queue.apply_candidate_result.call_args.kwargs
+        self.assertEqual(kwargs["claimed_by"], w.name)
+        self.assertEqual(kwargs["budget"], 5)
+        self.assertTrue(kwargs["tainted"], "the taint was not carried")
+        self.assertTrue(kwargs["cut"], "the cut was not carried")
+        self.assertEqual(kwargs["nodes_spent"], 5)
+
+    def test_no_branch_write_is_issued_outside_that_call(self):
+        # Every one of these used to be its own statement on this path.
+        w = self._worker(applied=True)
         self._evaluate(w)
         for name in ("mark_branch_tainted", "mark_branch_cut",
-                     "add_nodes_spent", "complete_candidate"):
-            with self.subTest(write=name):
-                self.assertTrue(getattr(w.queue, name).called,
-                                f"fixture never reached {name}")
-
-    def test_no_branch_state_is_written_when_the_claim_is_gone(self):
-        w = self._worker(claim_is_current=False)
-        self._evaluate(w)
-        for name in self.BRANCH_WRITES:
+                     "add_nodes_spent", "update_branch_best",
+                     "complete_candidate"):
             with self.subTest(write=name):
                 getattr(w.queue, name).assert_not_called()
 
-    def test_the_bundle_is_released_rather_than_run_to_the_end(self):
-        """A lost claim ends the bundle, it does not skip one candidate.
+    def test_a_refused_result_does_not_abandon_the_rest_of_the_bundle(self):
+        """A lost claim is not a cancellation.
 
-        reclaim_stale_claims frees a worker's unfinished claims together and a
-        bundle is claimed in one instant, so the siblings are gone too.
-        Carrying on would re-evaluate candidates another worker now owns --
-        measured at a 98 s median apiece, about eight minutes for a bundle.
+        claim_next_bundle's one-level sweep replaces a single claim row, so the
+        siblings may still be this worker's to finish -- and a worker that is
+        alive and heartbeating never has them reclaimed for it, so abandoning
+        them leaves the branch unable to finalize at all.
         """
-        w = self._worker(claim_is_current=False)
-        branch_key = ScoreCache.encode_subset(BRANCH)
-
-        def _evaluated(*args, **kwargs):
-            return (erd_swarm.OVER_ERD_LIMIT, 4.0, 2, True)
-
-        with mock.patch.object(erd_swarm, "evaluate_candidate", _evaluated):
-            kept_going = w.evaluate_claim(branch_key, BRANCH, len(BRANCH),
-                                          idx=0, budget=5)
-        self.assertFalse(kept_going,
-                         "the worker kept evaluating a bundle it had lost")
-
-    def test_a_held_claim_keeps_the_bundle_going(self):
-        w = self._worker(claim_is_current=True)
-        branch_key = ScoreCache.encode_subset(BRANCH)
-
-        def _evaluated(*args, **kwargs):
-            return (erd_swarm.OVER_ERD_LIMIT, 4.0, 2, True)
-
-        with mock.patch.object(erd_swarm, "evaluate_candidate", _evaluated):
-            kept_going = w.evaluate_claim(branch_key, BRANCH, len(BRANCH),
-                                          idx=0, budget=5)
-        self.assertTrue(kept_going)
+        w = self._worker(applied=False)
+        self.assertTrue(self._evaluate(w),
+                        "a refused result abandoned the bundle")

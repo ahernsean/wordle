@@ -874,10 +874,21 @@ class TestBranchLifecycle(_TmpQueue):
             self.key, idx, claimed_by="worker-0", budget=5))
 
     def test_claim_is_current_is_false_at_a_budget_the_branch_no_longer_holds(self):
+        # The budget clause has to be what decides this.  delete_branch also
+        # deletes the claim rows, so re-creating the branch and asking straight
+        # away answers False because the JOIN finds no claim at all -- true
+        # with the budget clause deleted as well.  A live claim under the new
+        # incarnation is what isolates it.
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
-        idx = self._claim_one_idx(self.key, worker_id="worker-0")
+        self._claim_one_idx(self.key, worker_id="worker-0")
         self.q.delete_branch(self.key)
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=3)
+        idx = self._claim_one_idx(self.key, worker_id="worker-0")
+
+        self.assertTrue(
+            self.q.claim_is_current(self.key, idx, claimed_by="worker-0",
+                                    budget=3),
+            "fixture has no live claim; the budget clause decides nothing")
         self.assertFalse(self.q.claim_is_current(
             self.key, idx, claimed_by="worker-0", budget=5))
 
@@ -887,6 +898,56 @@ class TestBranchLifecycle(_TmpQueue):
         self.q.delete_branch(self.key)
         self.assertFalse(self.q.claim_is_current(
             self.key, idx, claimed_by="worker-0", budget=5))
+
+    def test_apply_candidate_result_writes_everything_or_nothing(self):
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
+        idx = self._claim_one_idx(self.key, worker_id="worker-0")
+
+        applied = self.q.apply_candidate_result(
+            self.key, idx, claimed_by="worker-0", budget=5,
+            nodes_spent=9, infeasible=False, tainted=True,
+            best=("crane", 2.5, 3), cut=False)
+
+        self.assertTrue(applied)
+        self.assertEqual(self.q.branch_done_candidates(self.key), 1)
+        guess, erd, _ceiling = self.q.read_branch_best(self.key)
+        self.assertEqual(guess, "crane")
+        self.assertAlmostEqual(erd, 2.5)
+        row = self.q.get_branch(self.key)
+        self.assertEqual(row["nodes_spent"], 9)
+        self.assertTrue(row["tainted"])
+
+    def test_apply_candidate_result_writes_nothing_once_the_claim_is_gone(self):
+        # The whole point: a refusal must leave no trace of any of the five,
+        # not just of the completion.
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
+        idx = self._claim_one_idx(self.key, worker_id="worker-0")
+        self.q.reclaim_claims_of_worker("worker-0")
+        self._claim_one_idx(self.key, worker_id="worker-1")
+
+        applied = self.q.apply_candidate_result(
+            self.key, idx, claimed_by="worker-0", budget=5,
+            nodes_spent=9, infeasible=True, tainted=True,
+            best=("crane", 0.5, 3), cut=True)
+
+        self.assertFalse(applied)
+        self.assertEqual(self.q.branch_done_candidates(self.key), 0,
+                         "a live claim was completed by a stale worker")
+        self.assertEqual(self.q.read_branch_best(self.key)[0], None,
+                         "a stale best was published")
+        row = self.q.get_branch(self.key)
+        self.assertEqual(row["nodes_spent"], 0, "stale nodes were charged")
+        self.assertFalse(row["tainted"], "a stale taint was set")
+        self.assertFalse(row["cut_occurred"], "a stale cut was set")
+
+    def test_apply_candidate_result_leaves_no_transaction_open(self):
+        # It opens BEGIN IMMEDIATE; a leaked transaction would block every
+        # other writer for as long as this worker lives.
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
+        idx = self._claim_one_idx(self.key, worker_id="worker-0")
+        self.q.apply_candidate_result(
+            self.key, idx, claimed_by="worker-0", budget=5, nodes_spent=1)
+        self.assertFalse(self.q._conn.in_transaction)
 
     def test_read_branch_best_returns_none_none_for_missing_key(self):
         self.assertEqual(self.q.read_branch_best(b"notakey"), (None, None, None))

@@ -702,10 +702,13 @@ class TestPricingGroupsProvesLiveness(_VocabularyMixin, unittest.TestCase):
 
     `evaluate_candidate` ticks once on entry and then relies on recursion to
     reach the next tick.  A candidate that prunes on its bound never recurses,
-    so that single tick covers its entire evaluation -- and pricing one group
-    costs a scan of the whole guess pool, which on a production branch runs for
-    minutes.  A worker silent that long has its in-flight claims reclaimed and
-    handed to another worker.
+    so that single tick covers its entire evaluation.
+
+    That gap is closed because it is cheap to close, not because the time is
+    spent here: `_remaining_groups_cost_lower_bounds` measures 1.4 ms to 44 ms
+    per group and 0.52 s to 0.91 s for a candidate priced over the whole answer
+    list, which is two orders of magnitude inside HB_TIMEOUT_SECONDS.  This
+    loop is not where a worker falls silent.
 
     The tick is observation only: it can never change a bound, so these assert
     on the signal alone and on the bound being unchanged by its presence.
@@ -727,7 +730,8 @@ class TestPricingGroupsProvesLiveness(_VocabularyMixin, unittest.TestCase):
         vectorized one-level check and the group loop never runs at all -- the
         cheap prune, which needs no tick.  The expensive prune is the band
         above it, where every group must be priced before the candidate can be
-        rejected, and that is the shape that runs for minutes in production.
+        rejected -- so it is the band where a tick in that loop is the only
+        signal a candidate emits after its entry tick.
         """
         cache = self._response_cache()
         groups = cache.group_words(
