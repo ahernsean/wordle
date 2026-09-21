@@ -852,6 +852,13 @@ class TestBranchLifecycle(_TmpQueue):
         self.assertTrue(self.q.complete_candidate(self.key, idx))
         self.assertEqual(self.q.branch_done_candidates(self.key), 1)
 
+    def test_claim_is_current_is_false_for_a_branch_never_registered(self):
+        # No branch_id means no claim can exist against it, so the answer is
+        # no -- and asking must not intern the key, which would register a
+        # branch as a side effect of a read.
+        self.assertFalse(self.q.claim_is_current(
+            b"notakey", 0, claimed_by="worker-0"))
+
     def test_claim_is_current_is_true_for_the_worker_that_holds_it(self):
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
         idx = self._claim_one_idx(self.key, worker_id="worker-0")

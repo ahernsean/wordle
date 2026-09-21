@@ -6343,3 +6343,35 @@ class TestAStaleResultTouchesNoBranchState(unittest.TestCase):
         for name in self.BRANCH_WRITES:
             with self.subTest(write=name):
                 getattr(w.queue, name).assert_not_called()
+
+    def test_the_bundle_is_released_rather_than_run_to_the_end(self):
+        """A lost claim ends the bundle, it does not skip one candidate.
+
+        reclaim_stale_claims frees a worker's unfinished claims together and a
+        bundle is claimed in one instant, so the siblings are gone too.
+        Carrying on would re-evaluate candidates another worker now owns --
+        measured at a 98 s median apiece, about eight minutes for a bundle.
+        """
+        w = self._worker(claim_is_current=False)
+        branch_key = ScoreCache.encode_subset(BRANCH)
+
+        def _evaluated(*args, **kwargs):
+            return (erd_swarm.OVER_ERD_LIMIT, 4.0, 2, True)
+
+        with mock.patch.object(erd_swarm, "evaluate_candidate", _evaluated):
+            kept_going = w.evaluate_claim(branch_key, BRANCH, len(BRANCH),
+                                          idx=0, budget=5)
+        self.assertFalse(kept_going,
+                         "the worker kept evaluating a bundle it had lost")
+
+    def test_a_held_claim_keeps_the_bundle_going(self):
+        w = self._worker(claim_is_current=True)
+        branch_key = ScoreCache.encode_subset(BRANCH)
+
+        def _evaluated(*args, **kwargs):
+            return (erd_swarm.OVER_ERD_LIMIT, 4.0, 2, True)
+
+        with mock.patch.object(erd_swarm, "evaluate_candidate", _evaluated):
+            kept_going = w.evaluate_claim(branch_key, BRANCH, len(BRANCH),
+                                          idx=0, budget=5)
+        self.assertTrue(kept_going)
