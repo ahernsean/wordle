@@ -14,6 +14,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+import wordle_engine
 from cache_sqlite import ScoreCache
 from erd_queue import encode_subset
 from pattern_matrix import PatternMatrix
@@ -21,7 +22,7 @@ from runtime_paths import DEFAULT_ANSWER_LIST_PATH, DEFAULT_CANDIDATE_LIST_PATH
 from wordle_engine import (
     ERD_ALL, BranchFloorTable, ResponseCache, all_singletons_floor,
     candidate_two_level_cost_lower_bound, evaluate_candidate,
-    _candidate_cost_lower_bound, min_expected_guesses,
+    _ALL_GREEN_PATTERN, _candidate_cost_lower_bound, min_expected_guesses,
     sub_branch_cost_lower_bound,
 )
 
@@ -694,3 +695,147 @@ class TestGatesAreObservedOnce(_VocabularyMixin, unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPricingGroupsProvesLiveness(_VocabularyMixin, unittest.TestCase):
+    """Pricing a candidate's response groups must signal liveness as it goes.
+
+    `evaluate_candidate` ticks once on entry and then relies on recursion to
+    reach the next tick.  A candidate that prunes on its bound never recurses,
+    so that single tick covers its entire evaluation.
+
+    That gap is closed because it is cheap to close, not because the time is
+    spent here: `_remaining_groups_cost_lower_bounds` measures 1.4 ms to 44 ms
+    per group and 0.52 s to 0.91 s for a candidate priced over the whole answer
+    list, which is two orders of magnitude inside HB_TIMEOUT_SECONDS.  This
+    loop is not where a worker falls silent.
+
+    The tick is observation only: it can never change a bound, so these assert
+    on the signal alone and on the bound being unchanged by its presence.
+    """
+
+    def _ticks_for_evaluate(self, branch_words, candidate, best_erd,
+                            liveness_tick):
+        return evaluate_candidate(
+            branch_words, candidate, self._response_cache(), None,
+            best_erd=best_erd, guesses=self.guess_words, policy=ERD_ALL,
+            budget=5, pattern_matrix=self.pattern_matrix,
+            branch_floor_table=self._table(),
+            liveness_tick=liveness_tick)
+
+    def _two_level_pruning_bound(self, branch_words, candidate):
+        """A bound that only the group-pricing gate can prove.
+
+        Below the closed-form bound the candidate is priced out by the
+        vectorized one-level check and the group loop never runs at all -- the
+        cheap prune, which needs no tick.  The expensive prune is the band
+        above it, where every group must be priced before the candidate can be
+        rejected -- so it is the band where a tick in that loop is the only
+        signal a candidate emits after its entry tick.
+        """
+        cache = self._response_cache()
+        groups = cache.group_words(
+            candidate, branch_words, pattern_matrix=self.pattern_matrix,
+            branch_indices=self.pattern_matrix.answer_indices(branch_words))
+        closed_form = _candidate_cost_lower_bound(
+            groups.values(), _ALL_GREEN_PATTERN in groups, len(branch_words))
+        two_level = candidate_two_level_cost_lower_bound(
+            branch_words, candidate, cache, guesses=self.guess_words,
+            pattern_matrix=self.pattern_matrix,
+            branch_floor_table=self._table())
+        self.assertGreater(two_level, closed_form,
+                           "fixture has no band only group pricing can decide")
+        return len(groups), (closed_form + two_level) / 2
+
+    def test_a_candidate_that_prunes_without_recursing_ticks_per_group(self):
+        branch_words = self._branch(40, seed=77)
+        candidate = self.guess_words[0]
+        group_count, bound = self._two_level_pruning_bound(
+            branch_words, candidate)
+        ticks = []
+        status, _cost, max_remaining_depth, _floor = self._ticks_for_evaluate(
+            branch_words, candidate, bound, lambda: ticks.append(1))
+        self.assertIsNone(max_remaining_depth,
+                          "fixture recursed; it must prune on the bound")
+        self.assertEqual(
+            len(ticks), group_count,
+            "a non-recursing candidate produced no signal beyond entry")
+
+    def test_the_tick_cannot_change_the_answer(self):
+        branch_words = self._branch(40, seed=77)
+        candidate = self.guess_words[0]
+        _group_count, bound = self._two_level_pruning_bound(
+            branch_words, candidate)
+        without = self._ticks_for_evaluate(branch_words, candidate, bound, None)
+        with_tick = self._ticks_for_evaluate(
+            branch_words, candidate, bound, lambda: None)
+        self.assertEqual(without, with_tick)
+
+    def test_the_two_level_bound_ticks_per_group_too(self):
+        # The swarm prices a whole bundle through this entry before evaluating
+        # any of it, and that pass has no recursion to fall back on at all.
+        branch_words = self._branch(40, seed=78)
+        candidate = self.guess_words[0]
+        ticks = []
+        bound = candidate_two_level_cost_lower_bound(
+            branch_words, candidate, self._response_cache(),
+            guesses=self.guess_words, pattern_matrix=self.pattern_matrix,
+            branch_floor_table=self._table(),
+            liveness_tick=lambda: ticks.append(1))
+        unticked = candidate_two_level_cost_lower_bound(
+            branch_words, candidate, self._response_cache(),
+            guesses=self.guess_words, pattern_matrix=self.pattern_matrix,
+            branch_floor_table=self._table())
+        self.assertGreater(len(ticks), 1)
+        self.assertEqual(bound, unticked)
+
+
+class TestDescendantFramesPriceGroupsWithATick(_VocabularyMixin,
+                                               unittest.TestCase):
+    """The tick must reach every frame, not just the entry one.
+
+    `evaluate_candidate` recurses through `_solve_subset`, which evaluates each
+    descendant candidate in turn.  A descendant priced its response groups with
+    no tick would go silent exactly as the entry frame did, and every result
+    assertion would still pass -- so this asserts on the frames actually
+    reached rather than on the answer.
+    """
+
+    def _frames_that_priced_groups(self, branch_words, candidate, best_erd,
+                                   liveness_tick):
+        """Each (branch_size, got_a_tick) the floor loop was entered with."""
+        frames = []
+        real = wordle_engine._remaining_groups_cost_lower_bounds
+
+        def recording(ordered_groups, group_candidate, branch_size,
+                      branch_floor_table, liveness_tick=None):
+            frames.append((branch_size, liveness_tick is not None))
+            return real(ordered_groups, group_candidate, branch_size,
+                        branch_floor_table, liveness_tick=liveness_tick)
+
+        with mock.patch.object(wordle_engine,
+                               "_remaining_groups_cost_lower_bounds",
+                               recording):
+            evaluate_candidate(
+                branch_words, candidate, self._response_cache(),
+                None, best_erd=best_erd, guesses=self.guess_words,
+                policy=ERD_ALL, budget=5,
+                pattern_matrix=self.pattern_matrix,
+                branch_floor_table=self._table(),
+                liveness_tick=liveness_tick)
+        return frames
+
+    def test_every_frame_that_prices_groups_is_given_the_tick(self):
+        branch_words = self._branch(40, seed=77)
+        frames = self._frames_that_priced_groups(
+            branch_words, self.guess_words[0], float("inf"), lambda: None)
+
+        descendant_sizes = {size for size, _ in frames
+                            if size != len(branch_words)}
+        self.assertTrue(
+            descendant_sizes,
+            "fixture never recursed; it cannot cover descendant frames")
+        unticked = sorted({size for size, ticked in frames if not ticked})
+        self.assertEqual(
+            unticked, [],
+            f"frames priced groups with no liveness tick: sizes {unticked}")

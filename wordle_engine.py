@@ -1318,10 +1318,30 @@ def _candidate_response_groups(branch_words, candidate, cache,
 
 
 def _remaining_groups_cost_lower_bounds(ordered_groups, candidate,
-                                        branch_size, branch_floor_table):
-    """Suffix sums used by both the two-level entry gate and sub-ceilings."""
+                                        branch_size, branch_floor_table,
+                                        liveness_tick=None):
+    """Suffix sums used by both the two-level entry gate and sub-ceilings.
+
+    liveness_tick fires once per response group, and is observation only: it
+    can never change a bound.
+
+    Measured at production vocabulary, this loop is cheap.  One group's floor
+    is a single pass over (guess vocabulary x group): 1.4 ms on a two-word
+    group, 44 ms on the largest group that can exist -- the whole answer list.
+    A candidate's groups partition its branch, so the loop is not 243
+    full-branch scans; priced over the entire answer list it runs in 0.52 s to
+    0.91 s.
+
+    So this is not a place a worker can fall silent for HB_TIMEOUT_SECONDS.
+    The tick is here because it costs one call per group and closes a gap
+    wherever uninterrupted work happens, not because the time is spent here.
+    Do not cite this loop as the cause of a stale-claim reclamation without
+    measuring again.
+    """
     remaining_groups_cost_lower_bound = [0.0] * (len(ordered_groups) + 1)
     for index in range(len(ordered_groups) - 1, -1, -1):
+        if liveness_tick is not None:
+            liveness_tick()
         sub_branch = ordered_groups[index][1]
         remaining_groups_cost_lower_bound[index] = (
             remaining_groups_cost_lower_bound[index + 1]
@@ -1333,7 +1353,8 @@ def _remaining_groups_cost_lower_bounds(ordered_groups, candidate,
 
 def candidate_two_level_cost_lower_bound(
         branch_words, candidate, cache, guesses=None,
-        pattern_matrix=None, branch_indices=None, branch_floor_table=None):
+        pattern_matrix=None, branch_indices=None, branch_floor_table=None,
+        liveness_tick=None):
     """Admissible two-level ERD lower bound for one candidate.
 
     This is evaluate_candidate's entry proof without recursion.  It performs
@@ -1364,7 +1385,8 @@ def candidate_two_level_cost_lower_bound(
         groups.values(), has_self, branch_size)
     ordered_groups = sorted(groups.items(), key=_by_group_size, reverse=True)
     remaining_groups_cost_lower_bound = _remaining_groups_cost_lower_bounds(
-        ordered_groups, candidate, branch_size, branch_floor_table)
+        ordered_groups, candidate, branch_size, branch_floor_table,
+        liveness_tick=liveness_tick)
     two_level_cost_lower_bound = (
         1.0 + remaining_groups_cost_lower_bound[0]
     )
@@ -1464,7 +1486,8 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
                    subbranch_solver=None, bound_provider=None,
                    mid_loop_publisher=None, metric_observer=None,
                    pattern_matrix=None, branch_indices=None,
-                   branch_floor_table=None, hint_cache=None):
+                   branch_floor_table=None, hint_cache=None,
+                   liveness_tick=None):
     """Evaluate one `candidate`'s exact ERD for solving `branch_words`.
 
     This is the body of the top-level candidate loop, extracted so a parallel
@@ -1575,7 +1598,8 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
     # *after* position i (each sub-branch of size k costs >= lb(k)).  The self
     # singleton contributes 0.
     remaining_groups_cost_lower_bound = _remaining_groups_cost_lower_bounds(
-        ordered, candidate, n, branch_floor_table)
+        ordered, candidate, n, branch_floor_table,
+        liveness_tick=liveness_tick)
 
     def _sub_lb(sub_branch):
         return sub_branch_cost_lower_bound(
@@ -1624,7 +1648,8 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
             subbranch_solver, ceiling=sub_ceiling,
             entry_guess=candidate, entry_pattern=pattern_code,
             mid_loop_publisher=mid_loop_publisher, pattern_matrix=pattern_matrix,
-            branch_floor_table=branch_floor_table, hint_cache=hint_cache)
+            branch_floor_table=branch_floor_table, hint_cache=hint_cache,
+            liveness_tick=liveness_tick)
         if sub in _ABORT_STATUSES:
             return (sub, None, None, False)
         sub_status, sub_cost, sub_max_remaining_depth, sub_budget_tainted = sub
@@ -1695,7 +1720,7 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
                   branch_floor_table=None,
                   ceiling=float('inf'), entry_guess=None, entry_pattern=None,
                   mid_loop_publisher=None, pattern_matrix=None,
-                  hint_cache=None):
+                  hint_cache=None, liveness_tick=None):
     """Budget-aware core of min_expected_guesses.
 
     Returns (cost, max_depth, floor_hit, cutoff), or None on deadline/cancel
@@ -1886,6 +1911,7 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
                 branch_indices=branch_indices,
                 branch_floor_table=branch_floor_table,
                 hint_cache=hint_cache,
+                liveness_tick=liveness_tick,
             )
         if status in _ABORT_STATUSES:
             return status

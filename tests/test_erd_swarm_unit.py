@@ -171,6 +171,40 @@ class TestHeartbeatThrottling(unittest.TestCase):
         self.assertEqual(w._nodes, 2)          # counter still incremented
         self.assertEqual(w.queue.heartbeat.call_count, 1)  # still only one DB write
 
+    def test_liveness_tick_writes_a_heartbeat_without_counting_a_node(self):
+        """A signal that fires below one candidate must not move `_nodes`.
+
+        `_nodes` means candidate evaluations, and the cost model,
+        add_nodes_spent and the accuracy rows all read it as one.  Routing a
+        per-response-group tick through `_heartbeat` would prove liveness and
+        inflate every one of them, which is the tempting simplification this
+        pins against.
+        """
+        w = _bare_worker()
+        branch_key = ScoreCache.encode_subset(BRANCH)
+
+        w._liveness_tick(branch_key, len(BRANCH), 0, 0, None, None, force=True)
+        self.assertEqual(w._nodes, 0, "a liveness tick counted a node")
+        self.assertEqual(w.queue.heartbeat.call_count, 1,
+                         "a liveness tick did not prove liveness")
+
+    def test_liveness_tick_is_throttled_on_the_same_clock_as_a_heartbeat(self):
+        # Pricing a branch's groups fires this per group, so an unthrottled
+        # tick would write a heartbeat row per group.
+        w = _bare_worker()
+        branch_key = ScoreCache.encode_subset(BRANCH)
+        w._liveness_tick(branch_key, len(BRANCH), 0, 0, None, None, force=True)
+        for _ in range(50):
+            w._liveness_tick(branch_key, len(BRANCH), 0, 0, None, None)
+        self.assertEqual(w.queue.heartbeat.call_count, 1)
+        self.assertEqual(w._nodes, 0)
+
+    def test_heartbeat_still_counts_its_node(self):
+        w = _bare_worker()
+        branch_key = ScoreCache.encode_subset(BRANCH)
+        w._heartbeat(branch_key, len(BRANCH), 0, 0, None, None, force=True)
+        self.assertEqual(w._nodes, 1)
+
     def test_hb_max_spine_reset_after_each_db_write(self):
         """_hb_max_spine is cleared after each DB write so the 2-second window
         starts fresh — the next heartbeat builds a new spine from scratch."""
@@ -3202,9 +3236,10 @@ class TestInfeasibleCandidateCounters(unittest.TestCase):
             self.assertTrue(worker.evaluate_claim(
                 b"branch", BRANCH, len(BRANCH), 0, budget=4))
 
-        worker.queue.add_nodes_spent.assert_called_once_with(
-            b"branch", 7, infeasible=True)
-        worker.queue.mark_branch_tainted.assert_called_once_with(b"branch")
+        kwargs = worker.queue.apply_candidate_result.call_args.kwargs
+        self.assertEqual(kwargs["nodes_spent"], 7)
+        self.assertTrue(kwargs["infeasible"])
+        self.assertTrue(kwargs["tainted"])
 
 
 class TestTwoLevelERDPruneBundles(unittest.TestCase):
@@ -4086,9 +4121,11 @@ class TestMidLoopPublisherBranchEdgeCases(unittest.TestCase):
         self.assertIsNotNone(result)
         # The seed carries the winner's worst-case line, not just its cost: a
         # branch seeded with an unknown depth finalizes into a cache row no
-        # budget can ever reuse, so it reads as unsolved forever.
+        # budget can ever reuse, so it reads as unsolved forever.  It carries
+        # the budget it was achieved at too, so a branch re-created at another
+        # budget under the same key does not take this seed as its own.
         w.queue.update_branch_best.assert_called_once_with(
-            ScoreCache.encode_subset(BRANCH[:6]), "crane", 1.5, 3)
+            ScoreCache.encode_subset(BRANCH[:6]), "crane", 1.5, 3, budget=5)
 
     def test_check_skips_update_branch_best_when_no_best_guess(self):
         result, w, _ = self._pub_overrun(best_guess=None)
@@ -4599,7 +4636,7 @@ class TestMidLoopPublisherCeiling(unittest.TestCase):
         pub.check(token, CANDIDATES, 1, "crane", 1.8, 4, 5)
         self.assertIsNone(w.queue.create_branch.call_args.kwargs["ceiling"])
         w.queue.update_branch_best.assert_called_once_with(
-            ScoreCache.encode_subset(BRANCH[:6]), "crane", 1.8, 4)
+            ScoreCache.encode_subset(BRANCH[:6]), "crane", 1.8, 4, budget=5)
         w.queue.mark_claims_done.assert_called_once()
         w.cooperative_solve.assert_called_once_with(
             BRANCH[:6], 5, ceiling=float('inf'))
@@ -6244,3 +6281,64 @@ class TestDependencyWaitAttribution(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["blocked_millis"], 0)
         self._assert_blocks(rows[0])
+
+class TestAStaleResultIsNotAppliedPiecemeal(unittest.TestCase):
+    """The worker hands its whole result to one call, and survives a refusal.
+
+    Whether those writes land atomically is the queue's property, tested
+    against a real database in test_erd_queue_unit.  What belongs here is that
+    the worker states the whole result in one place, issues no branch write
+    outside it, and does the right thing when it is refused.
+    """
+
+    def _worker(self, applied):
+        w = _bare_worker()
+        w._adaptive = True
+        w.queue.apply_candidate_result.return_value = applied
+        # A ceiling in scope is what makes a price-out a cut.
+        w.queue.read_branch_best.return_value = (None, None, 4.5)
+        return w
+
+    def _evaluate(self, worker):
+        branch_key = ScoreCache.encode_subset(BRANCH)
+
+        def _evaluated(*args, **kwargs):
+            worker._nodes += 5
+            return (erd_swarm.OVER_ERD_LIMIT, 4.0, 2, True)
+
+        with mock.patch.object(erd_swarm, "evaluate_candidate", _evaluated):
+            return worker.evaluate_claim(branch_key, BRANCH, len(BRANCH),
+                                         idx=0, budget=5)
+
+    def test_the_whole_result_is_handed_over_in_one_call(self):
+        w = self._worker(applied=True)
+        self._evaluate(w)
+        w.queue.apply_candidate_result.assert_called_once()
+        kwargs = w.queue.apply_candidate_result.call_args.kwargs
+        self.assertEqual(kwargs["claimed_by"], w.name)
+        self.assertEqual(kwargs["budget"], 5)
+        self.assertTrue(kwargs["tainted"], "the taint was not carried")
+        self.assertTrue(kwargs["cut"], "the cut was not carried")
+        self.assertEqual(kwargs["nodes_spent"], 5)
+
+    def test_no_branch_write_is_issued_outside_that_call(self):
+        # Every one of these used to be its own statement on this path.
+        w = self._worker(applied=True)
+        self._evaluate(w)
+        for name in ("mark_branch_tainted", "mark_branch_cut",
+                     "add_nodes_spent", "update_branch_best",
+                     "complete_candidate"):
+            with self.subTest(write=name):
+                getattr(w.queue, name).assert_not_called()
+
+    def test_a_refused_result_does_not_abandon_the_rest_of_the_bundle(self):
+        """A lost claim is not a cancellation.
+
+        claim_next_bundle's one-level sweep replaces a single claim row, so the
+        siblings may still be this worker's to finish -- and a worker that is
+        alive and heartbeating never has them reclaimed for it, so abandoning
+        them leaves the branch unable to finalize at all.
+        """
+        w = self._worker(applied=False)
+        self.assertTrue(self._evaluate(w),
+                        "a refused result abandoned the bundle")

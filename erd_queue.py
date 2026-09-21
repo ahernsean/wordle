@@ -3552,17 +3552,134 @@ class ERDQueue:
         return (row["n_bundles"], row["max_bundle_nodes"],
                 row["total_bundle_wall_millis"], row["censored_units"])
 
-    def complete_candidate(self, branch_key, idx):
-        """Mark a candidate claim authoritatively complete (done=1)."""
+    def claim_is_current(self, branch_key, idx, claimed_by=None,
+                         bundle_id=None, budget=None):
+        """Does this caller still hold an unfinished claim on this branch?
+
+        One question for the whole set of writes an evaluation produces.  A
+        result carries branch state in several places -- the taint flag, the
+        running best, the cut flag, the nodes spent, and the completion itself
+        -- and every one of them is only meaningful for the branch incarnation
+        the candidate was evaluated against.  Guarding them one at a time
+        cannot be made safe: refusing one while accepting the others leaves the
+        branch describing a mixture of two incarnations, which is how a stale
+        OVER_ERD_LIMIT sets cut_occurred on a replacement that has no ceiling,
+        and finalize then reaches add_cut_result with a NULL bound.
+
+        Answered in one indexed read: the claim must still exist unfinished and
+        belong to this caller, and the branch must still be open at the budget
+        the caller evaluated at.  A NULL stored budget predates the column and
+        is admitted, as everywhere else.
+        """
+        branch_id = self._intern_branch(branch_key)
+        if branch_id is None:
+            return False
+        row = self._conn.execute("""
+            SELECT 1
+            FROM candidate_claims c
+            JOIN active_branches a ON a.branch_id = c.branch_id
+            WHERE c.branch_id = ? AND c.idx = ? AND c.done = 0
+              AND (? IS NULL OR c.claimed_by = ?)
+              AND (? IS NULL OR c.bundle_id = ?)
+              AND a.status = 'open'
+              AND (? IS NULL OR a.budget IS NULL OR a.budget = ?)
+            LIMIT 1
+        """, (branch_id, idx, claimed_by, claimed_by, bundle_id, bundle_id,
+              budget, budget)).fetchone()
+        return row is not None
+
+    def apply_candidate_result(self, branch_key, idx, *, claimed_by=None,
+                               bundle_id=None, budget=None, nodes_spent=0,
+                               infeasible=False, tainted=False, best=None,
+                               cut=False):
+        """Apply every write one candidate evaluation produces, or none.
+
+        Returns True when the result was applied.
+
+        The writes are the branch's nodes spent, its taint flag, its running
+        best, its cut flag, and the candidate's completion.  All five describe
+        the branch incarnation the candidate was evaluated against, and a
+        reclaimed claim can be reissued -- or the branch finalized, deleted and
+        re-created at another budget -- while the evaluation runs.
+
+        Checking first and writing after cannot close that: the check and each
+        write are separate statements, so the branch can change between them
+        and leave a mixture of two incarnations behind.  That is how a stale
+        OVER_ERD_LIMIT sets cut_occurred on a replacement with no ceiling, and
+        finalize then reaches add_cut_result with a NULL bound against a NOT
+        NULL column.  So the validation and the writes share one transaction,
+        and the claim is re-read inside it.
+
+        `best` is (best_guess, best_erd, max_depth) or None.  Each write keeps
+        its own guard as well: they cost nothing here and they still hold for
+        the callers that use them directly.
+        """
+        opened_transaction = not self._conn.in_transaction
+        if opened_transaction:
+            self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            if not self.claim_is_current(branch_key, idx,
+                                         claimed_by=claimed_by,
+                                         bundle_id=bundle_id, budget=budget):
+                applied = False
+            else:
+                if nodes_spent or infeasible:
+                    self.add_nodes_spent(branch_key, nodes_spent,
+                                         infeasible=infeasible)
+                if tainted:
+                    self.mark_branch_tainted(branch_key)
+                if best is not None:
+                    best_guess, best_erd, max_remaining_depth = best
+                    self.update_branch_best(branch_key, best_guess, best_erd,
+                                            max_remaining_depth, budget=budget)
+                if cut:
+                    self.mark_branch_cut(branch_key)
+                self.complete_candidate(branch_key, idx,
+                                        claimed_by=claimed_by,
+                                        bundle_id=bundle_id)
+                applied = True
+        except Exception:
+            if opened_transaction:
+                self._conn.execute("ROLLBACK")
+            raise
+        if opened_transaction:
+            self._conn.execute("COMMIT")
+        return applied
+
+    def complete_candidate(self, branch_key, idx, claimed_by=None,
+                           bundle_id=None):
+        """Mark a candidate claim authoritatively complete (done=1).
+
+        Returns True when the row completed was the caller's own claim.
+
+        Scoped to that claim, because branch_key and idx alone do not identify
+        one.  A worker whose claim was reclaimed while it was still evaluating
+        goes on to finish; by then the index may have been reissued, to another
+        worker on this branch or to a different incarnation of it after a
+        finalize and re-creation.  Completing by key and index alone marks that
+        live claim done while contributing nothing to it, and the branch can
+        then finalize without the candidate ever having been evaluated at the
+        budget it now holds -- cacheing an optimum some candidate beats, or a
+        loss that is not one.
+
+        claimed_by and bundle_id are the pair `claim_next_bundle` stamps: the
+        bundle id is unique to one claim call and settles the case where the
+        same worker re-claimed the same index, and claimed_by carries a bare
+        claim that has no bundle.  Passing neither asks for no check.
+        """
         now = int(time.time())
         branch_id = self._intern_branch(branch_key, create=True)
         self._conn.execute("""
             UPDATE candidate_claims SET done = 1, done_at = ?
             WHERE branch_id = ? AND idx = ?
-        """, (now, branch_id, idx))
+              AND (? IS NULL OR claimed_by = ?)
+              AND (? IS NULL OR bundle_id = ?)
+        """, (now, branch_id, idx, claimed_by, claimed_by,
+              bundle_id, bundle_id))
         n = self._conn.execute("SELECT changes()").fetchone()[0]
         self._tally_wal_traffic(
             'candidate_claims/complete', n, n * _CLAIM_ROW_WAL_BYTES)
+        return n > 0
 
     def complete_bundle_two_level_erd_prunes(self, branch_key, bundle_id,
                                              candidate_indices, nodes_spent=0,
@@ -3650,12 +3767,26 @@ class ERDQueue:
                 updated_branch_count * _CLAIM_ROW_WAL_BYTES)
         return completed_candidate_count
 
-    def update_branch_best(self, branch_key, best_guess, best_erd, max_depth=None):
+    def update_branch_best(self, branch_key, best_guess, best_erd,
+                           max_depth=None, budget=None):
         """Lower the branch's running best (monotone — never raises it).
 
         max_depth is the winning candidate's worst-case line length; it is
         stored atomically with the best it belongs to, so best_max_depth always
         describes the current best_guess.
+
+        budget is the budget the caller evaluated at, and the update applies
+        only to a branch still open at that budget.  A branch can finalize and
+        be re-created at another budget under the same branch_key — the same
+        answer set reached by a second spine of a different length — while a
+        worker holding a claim on the old branch is still evaluating.  Its cost
+        belongs to the budget it was computed at, and a cost from a larger
+        budget is below what a smaller one can achieve, so the monotone test
+        below would accept it and drive the new branch's best under its own
+        optimum.  Ownership and priority both survive the re-creation and so
+        catch nothing.  A stored budget of NULL predates the column and is
+        admitted, matching how callers derive a budget from the spine for
+        those; a caller passing no budget asks for no check.
 
         The same statement stamps first_best_at/nodes_at_first_best on the
         update that creates the branch's first incumbent, and leaves them alone
@@ -3675,8 +3806,9 @@ class ERDQueue:
                 nodes_at_first_best = COALESCE(nodes_at_first_best, nodes_spent)
             WHERE branch_id = ?
               AND (best_erd IS NULL OR ? < best_erd)
+              AND (? IS NULL OR budget IS NULL OR budget = ?)
         """, (best_erd, best_guess, max_depth, now, now, branch_id,
-              best_erd))
+              best_erd, budget, budget))
 
     def read_branch_best(self, branch_key):
         """Return (best_guess, best_erd, ceiling) or (None, None, None).

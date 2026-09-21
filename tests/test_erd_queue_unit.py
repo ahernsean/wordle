@@ -778,6 +778,177 @@ class TestBranchLifecycle(_TmpQueue):
         self.assertEqual(guess, "crane")
         self.assertAlmostEqual(erd, 2.0)
 
+    def test_update_branch_best_at_a_stale_budget_cannot_lower_a_recreated_branch(self):
+        # A branch finalizes, is deleted, and is re-created at a smaller budget
+        # -- the same answer set reached by a longer spine.  A worker whose
+        # claim on the old incarnation was reclaimed is still evaluating, and
+        # folds in a cost computed at the larger budget.  It is below anything
+        # the smaller budget can achieve, so the monotone test alone accepts
+        # it and the branch finalizes under its own optimum.
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
+        self.q.delete_branch(self.key)
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=3)
+        self.q.update_branch_best(self.key, "crane", 3.0, max_depth=3, budget=3)
+
+        self.q.update_branch_best(self.key, "slate", 1.5, max_depth=5, budget=5)
+
+        guess, erd, _ceiling = self.q.read_branch_best(self.key)
+        self.assertEqual(guess, "crane")
+        self.assertAlmostEqual(erd, 3.0)
+
+    def test_update_branch_best_at_the_branch_budget_still_lowers(self):
+        # The guard rejects a stale budget, never a legitimate improvement.
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=3)
+        self.q.update_branch_best(self.key, "crane", 3.0, max_depth=3, budget=3)
+        self.q.update_branch_best(self.key, "slate", 2.0, max_depth=3, budget=3)
+        guess, erd, _ceiling = self.q.read_branch_best(self.key)
+        self.assertEqual(guess, "slate")
+        self.assertAlmostEqual(erd, 2.0)
+
+    def test_update_branch_best_admits_a_branch_whose_budget_predates_the_column(self):
+        # A NULL stored budget carries no assertion to contradict, so it is
+        # admitted -- the same rule the claim transaction applies.
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES)
+        self.q.update_branch_best(self.key, "crane", 2.0, max_depth=3, budget=5)
+        guess, erd, _ceiling = self.q.read_branch_best(self.key)
+        self.assertEqual(guess, "crane")
+        self.assertAlmostEqual(erd, 2.0)
+
+    def test_update_branch_best_without_a_budget_asks_for_no_check(self):
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=3)
+        self.q.update_branch_best(self.key, "crane", 2.0, max_depth=3)
+        guess, erd, _ceiling = self.q.read_branch_best(self.key)
+        self.assertEqual(guess, "crane")
+        self.assertAlmostEqual(erd, 2.0)
+
+    def test_completing_a_candidate_reissued_to_another_worker_is_refused(self):
+        # The stale worker's whole hazard in one case: its claim was reclaimed,
+        # the index reissued, and it now finishes.  Completing by key and index
+        # alone would mark the new holder's live claim done with no result
+        # behind it, and the branch could finalize a candidate nobody evaluated
+        # at the budget it now holds.
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES)
+        idx = self._claim_one_idx(self.key, worker_id="worker-0")
+        self.q.reclaim_claims_of_worker("worker-0")
+        reissued = self._claim_one_idx(self.key, worker_id="worker-1")
+        self.assertEqual(reissued, idx, "fixture did not reissue the index")
+
+        self.assertFalse(
+            self.q.complete_candidate(self.key, idx, claimed_by="worker-0"))
+
+        self.assertEqual(self.q.branch_done_candidates(self.key), 0,
+                         "a live claim was marked done by a stale worker")
+
+    def test_completing_a_candidate_this_worker_still_holds_succeeds(self):
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES)
+        idx = self._claim_one_idx(self.key, worker_id="worker-0")
+        self.assertTrue(
+            self.q.complete_candidate(self.key, idx, claimed_by="worker-0"))
+        self.assertEqual(self.q.branch_done_candidates(self.key), 1)
+
+    def test_completing_without_an_owner_still_asks_for_no_check(self):
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES)
+        idx = self._claim_one_idx(self.key, worker_id="worker-0")
+        self.assertTrue(self.q.complete_candidate(self.key, idx))
+        self.assertEqual(self.q.branch_done_candidates(self.key), 1)
+
+    def test_claim_is_current_is_false_for_a_branch_never_registered(self):
+        # No branch_id means no claim can exist against it, so the answer is
+        # no -- and asking must not intern the key, which would register a
+        # branch as a side effect of a read.
+        self.assertFalse(self.q.claim_is_current(
+            b"notakey", 0, claimed_by="worker-0"))
+
+    def test_claim_is_current_is_true_for_the_worker_that_holds_it(self):
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
+        idx = self._claim_one_idx(self.key, worker_id="worker-0")
+        self.assertTrue(self.q.claim_is_current(
+            self.key, idx, claimed_by="worker-0", budget=5))
+
+    def test_claim_is_current_is_false_once_the_claim_is_reissued(self):
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
+        idx = self._claim_one_idx(self.key, worker_id="worker-0")
+        self.q.reclaim_claims_of_worker("worker-0")
+        self._claim_one_idx(self.key, worker_id="worker-1")
+        self.assertFalse(self.q.claim_is_current(
+            self.key, idx, claimed_by="worker-0", budget=5))
+
+    def test_claim_is_current_is_false_at_a_budget_the_branch_no_longer_holds(self):
+        # The budget clause has to be what decides this.  delete_branch also
+        # deletes the claim rows, so re-creating the branch and asking straight
+        # away answers False because the JOIN finds no claim at all -- true
+        # with the budget clause deleted as well.  A live claim under the new
+        # incarnation is what isolates it.
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
+        self._claim_one_idx(self.key, worker_id="worker-0")
+        self.q.delete_branch(self.key)
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=3)
+        idx = self._claim_one_idx(self.key, worker_id="worker-0")
+
+        self.assertTrue(
+            self.q.claim_is_current(self.key, idx, claimed_by="worker-0",
+                                    budget=3),
+            "fixture has no live claim; the budget clause decides nothing")
+        self.assertFalse(self.q.claim_is_current(
+            self.key, idx, claimed_by="worker-0", budget=5))
+
+    def test_claim_is_current_is_false_for_a_branch_that_finalized(self):
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
+        idx = self._claim_one_idx(self.key, worker_id="worker-0")
+        self.q.delete_branch(self.key)
+        self.assertFalse(self.q.claim_is_current(
+            self.key, idx, claimed_by="worker-0", budget=5))
+
+    def test_apply_candidate_result_writes_everything_or_nothing(self):
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
+        idx = self._claim_one_idx(self.key, worker_id="worker-0")
+
+        applied = self.q.apply_candidate_result(
+            self.key, idx, claimed_by="worker-0", budget=5,
+            nodes_spent=9, infeasible=False, tainted=True,
+            best=("crane", 2.5, 3), cut=False)
+
+        self.assertTrue(applied)
+        self.assertEqual(self.q.branch_done_candidates(self.key), 1)
+        guess, erd, _ceiling = self.q.read_branch_best(self.key)
+        self.assertEqual(guess, "crane")
+        self.assertAlmostEqual(erd, 2.5)
+        row = self.q.get_branch(self.key)
+        self.assertEqual(row["nodes_spent"], 9)
+        self.assertTrue(row["tainted"])
+
+    def test_apply_candidate_result_writes_nothing_once_the_claim_is_gone(self):
+        # The whole point: a refusal must leave no trace of any of the five,
+        # not just of the completion.
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
+        idx = self._claim_one_idx(self.key, worker_id="worker-0")
+        self.q.reclaim_claims_of_worker("worker-0")
+        self._claim_one_idx(self.key, worker_id="worker-1")
+
+        applied = self.q.apply_candidate_result(
+            self.key, idx, claimed_by="worker-0", budget=5,
+            nodes_spent=9, infeasible=True, tainted=True,
+            best=("crane", 0.5, 3), cut=True)
+
+        self.assertFalse(applied)
+        self.assertEqual(self.q.branch_done_candidates(self.key), 0,
+                         "a live claim was completed by a stale worker")
+        self.assertEqual(self.q.read_branch_best(self.key)[0], None,
+                         "a stale best was published")
+        row = self.q.get_branch(self.key)
+        self.assertEqual(row["nodes_spent"], 0, "stale nodes were charged")
+        self.assertFalse(row["tainted"], "a stale taint was set")
+        self.assertFalse(row["cut_occurred"], "a stale cut was set")
+
+    def test_apply_candidate_result_leaves_no_transaction_open(self):
+        # It opens BEGIN IMMEDIATE; a leaked transaction would block every
+        # other writer for as long as this worker lives.
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
+        idx = self._claim_one_idx(self.key, worker_id="worker-0")
+        self.q.apply_candidate_result(
+            self.key, idx, claimed_by="worker-0", budget=5, nodes_spent=1)
+        self.assertFalse(self.q._conn.in_transaction)
+
     def test_read_branch_best_returns_none_none_for_missing_key(self):
         self.assertEqual(self.q.read_branch_best(b"notakey"), (None, None, None))
 

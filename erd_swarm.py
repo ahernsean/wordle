@@ -549,7 +549,8 @@ class _MidLoopPublisher:
         # ceiling, if any, rides on the branch's ceiling column instead).
         if best_guess is not None:
             self._worker.queue.update_branch_best(
-                branch_key, best_guess, best_erd, best_max_remaining_depth)
+                branch_key, best_guess, best_erd, best_max_remaining_depth,
+                budget=budget)
 
         result = self._worker.cooperative_solve(
             branch_words, budget,
@@ -1258,6 +1259,22 @@ class _BranchWorker:
         # Count every invocation (one per node) BEFORE the throttle, so the
         # node counter is exact even though we only write every HB_SECONDS.
         self._nodes += 1
+        self._liveness_tick(branch_key, n_words, claim_idx, claim_started_at,
+                            best_guess, best_erd, force=force,
+                            bound_erd=bound_erd)
+
+    def _liveness_tick(self, branch_key, n_words, claim_idx, claim_started_at,
+                       best_guess, best_erd, force=False,
+                       bound_erd=None):
+        """Prove the worker is alive without counting a node.
+
+        `_nodes` means candidate evaluations — the cost model, add_nodes_spent
+        and the accuracy rows all read it as one — so a signal that fires per
+        response group, or anywhere else below a candidate, must come through
+        here instead of `_heartbeat`.  A worker that has not reached this
+        within HB_TIMEOUT_SECONDS has its in-flight claims reclaimed and
+        handed to another worker.
+        """
         now = time.time()
         if not force and now - self._last_hb < HB_SECONDS:
             return
@@ -1602,6 +1619,9 @@ class _BranchWorker:
             hint_cache=self.hint_cache,
             heartbeat=lambda: self._heartbeat(
                 branch_key, n_words, idx, claim_started,
+                local_candidate, local_best, bound_erd=_eff_bound()),
+            liveness_tick=lambda: self._liveness_tick(
+                branch_key, n_words, idx, claim_started,
                 local_candidate, local_best, bound_erd=_eff_bound()))
         cand_elapsed = time.time() - cand_t0
         self._eval_seconds += cand_elapsed
@@ -1611,15 +1631,11 @@ class _BranchWorker:
                            idx, cand_elapsed, status, self._cand_max_depth)
 
         nodes_delta = self._nodes - nodes_before
-        if self._adaptive and (nodes_delta > 0 or status == OVER_DEPTH_BUDGET):
-            # These counters cover candidates proven infeasible at this level,
-            # not candidates whose taint arrived from a deeper branch.  They
-            # are therefore a lower bound on local infeasibility.  Every such
-            # proof also carries budget_tainted, so infeasible_candidates > 0
-            # implies that the branch is marked tainted below.
-            self.queue.add_nodes_spent(
-                branch_key, nodes_delta,
-                infeasible=status == OVER_DEPTH_BUDGET)
+        # Counted with the rest of the result rather than on its own.  An
+        # aborted candidate keeps its claim open for another worker to redo, so
+        # charging its nodes here as well would count the same candidate twice.
+        record_nodes = (self._adaptive
+                        and (nodes_delta > 0 or status == OVER_DEPTH_BUDGET))
 
         candidate_outcome = {
             SOLVED: 'exact',
@@ -1655,32 +1671,48 @@ class _BranchWorker:
             _record_candidate_accuracy()
             return False
 
-        # A candidate excluded by the depth cap (anywhere in its subtree)
-        # taints the branch: its ERD is only valid at this budget.  Marked
-        # for any candidate, winner or not — see the taint rule.
-        if budget_tainted:
-            self.queue.mark_branch_tainted(branch_key)
+        # What this evaluation has to say about the branch, decided before any
+        # of it is written.  A candidate excluded by the depth cap (anywhere in
+        # its subtree) taints the branch: its ERD is only valid at this budget,
+        # and that holds for any candidate, winner or not — see the taint rule.
+        improved_best = None
+        mark_cut = False
         if status == SOLVED:
             self.n_ok += 1
             if local_best is None or cost < local_best:
                 local_best, local_candidate, local_md = cost, candidate, cand_md
-                self.queue.update_branch_best(branch_key, local_candidate,
-                                              local_best, local_md)
+                improved_best = (local_candidate, local_best, local_md)
                 shared_best = local_best
         elif status == OVER_ERD_LIMIT:
             self.n_cutoff += 1
-            if branch_ceiling is not None:
-                # Priced out on a ceilinged branch.  Only consulted at finalize
-                # when best_guess is NULL — where no real best ever existed, so
-                # every price-out was against the ceiling and the branch is a
-                # cut, not a proven loss.
-                self.queue.mark_branch_cut(branch_key)
+            # Priced out on a ceilinged branch.  Only consulted at finalize
+            # when best_guess is NULL — where no real best ever existed, so
+            # every price-out was against the ceiling and the branch is a cut,
+            # not a proven loss.
+            mark_cut = branch_ceiling is not None
         elif status == OVER_DEPTH_BUDGET:
             self.n_pruned += 1
         else:  # pragma: no cover
             self.n_useless += 1
 
-        self.queue.complete_candidate(branch_key, idx)
+        # One transaction: the claim is re-read inside it, so either every one
+        # of these lands on the incarnation this candidate was evaluated
+        # against or none of them lands at all.
+        if not self.queue.apply_candidate_result(
+                branch_key, idx, claimed_by=self.name, bundle_id=bundle_id,
+                budget=budget,
+                nodes_spent=nodes_delta if record_nodes else 0,
+                infeasible=record_nodes and status == OVER_DEPTH_BUDGET,
+                tainted=budget_tainted, best=improved_best, cut=mark_cut):
+            # The claim was reissued, or the branch was re-created, while this
+            # candidate ran.  The bundle is not abandoned with it: a one-level
+            # prune sweep replaces a single claim row, so the siblings may
+            # still be this worker's to finish, and a worker that is alive and
+            # heartbeating never has them reclaimed for it.
+            logger.warning(
+                '%s lost candidate %s (idx=%d) mid-evaluation; its result '
+                'describes a branch incarnation this worker no longer holds '
+                'and was discarded', self.name, candidate, idx)
         # The outbound claim telemetry is required for branch ETA reporting,
         # regardless of whether this worker uses adaptive decomposition.
         now_complete = time.time()
@@ -1794,7 +1826,10 @@ class _BranchWorker:
                 words, candidate, self.rcache, guesses=self.all_words,
                 pattern_matrix=self.pattern_matrix,
                 branch_indices=branch_indices,
-                branch_floor_table=self.branch_floor_table)
+                branch_floor_table=self.branch_floor_table,
+                liveness_tick=lambda: self._liveness_tick(
+                    branch_key, n_words, candidate_index, claim_started_at,
+                    best_guess, best_erd, bound_erd=bound_erd))
             if candidate_cost_lower_bound >= bound_erd:
                 pruned_candidate_indices.append(candidate_index)
 
