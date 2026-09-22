@@ -436,7 +436,8 @@
     const treelessKinds=new Set(["cache","hotspots","work_distribution","leaderboard","openers"]);
     const populationNames={current_queue_branches:"current queue branches",recent_branch_finalizations:"recent branch finalizations",recent_cut_reuse_misses:"recent cut-reuse misses",recent_claim_coordination_buckets:"recent claim coordination buckets",recent_claims_by_branch:"recent claims by branch"};
     const collapsedNodes=new Set(), initializedNodes=new Set(), collapsedWordGroups=new Set(), initializedWordGroups=new Set(), collapsedResponseGroups=new Set(), stickyOrders=new Map(), packedOrders=new Map(), gridColumnCounts=new Map(), treePageHistory=new Map(), treeGroupPages=new Map(),
-      expandedOpeners=new Set(), openerBreakdowns=new Map();
+      expandedOpeners=new Set(), openerBreakdowns=new Map(),
+      reportEntityTags=new Map();
     const COMPLETED_BRANCH_HOLD_MILLIS=5000;
     const recentOverviewCompletionRows=new Map();
     let completionExpiryTimer=null;
@@ -2366,25 +2367,21 @@
       const columns=data.columns;
       if(!columns)return data.rows||[];
       const width=columns.word_width||5,words=columns.words||"",count=Math.floor(words.length/width),
-        numerators=columns.erd_numerator||[],decimals=columns.erd_decimal||[],
+        numerators=columns.erd_numerator||[],
         denominator=columns.erd_denominator||data.answer_count||null,
         depths=columns.max_remaining_depth||[],answerBits=decodeCandidateBitmap(columns.word_is_answer_bitmap);
       const rows=[];
       for(let index=0;index<count;index++){
-        const numerator=numerators[index],
-          // An exact ERD is numerator/answer_count on the branch's own
-          // lattice; erdValue renders both halves the way every other surface
-          // does.  A row the lattice could not express carries its decimal
-          // instead and is shown as a decimal alone.
-          erd=numerator===null||numerator===undefined
-            ?(decimals[index]??null)
-            :numerator/denominator;
+        // An opener's ERD is total guesses over the answer list, so the
+        // numerator is a count of guesses and the value is on the branch's
+        // lattice by construction.  erdValue renders both halves the way every
+        // other surface does.
+        const numerator=numerators[index],erd=numerator/denominator;
         rows.push({
           word:words.slice(index*width,(index+1)*width),
           rank:index+1,
           erd,
-          erdText:numerator===null||numerator===undefined
-            ?fixed(erd):erdValue(erd,denominator),
+          erdText:erdValue(erd,denominator),
           max_remaining_depth:depths[index],
           word_is_answer:!!(answerBits[index>>3]&(1<<(index&7))),
         });
@@ -2655,8 +2652,20 @@
       // Same-context polls keep the current data on screen and never show it.
       if(context!==lastContext)setReportStatus(pendingReportStatus(state));
       try{
-        const response=await fetch(buildAPIURL(state),{headers:{Accept:"application/json"},signal:controller.signal});
+        // The leaderboard's answer moves when an opener completes, roughly
+        // every 27 minutes, against a poll every two seconds.  Sending back the
+        // tag the server gave us lets it answer 304 with no body, so the
+        // ordinary poll costs no payload, no parse and no comparison.
+        // cache:"no-store" keeps the browser from satisfying the revalidation
+        // itself and handing back a synthesised 200, which would hide the 304
+        // from this code and reinstate the parse.
+        const requestHeaders={Accept:"application/json"},cachedTag=reportEntityTags.get(context);
+        if(cachedTag)requestHeaders["If-None-Match"]=cachedTag;
+        const response=await fetch(buildAPIURL(state),{headers:requestHeaders,cache:"no-store",signal:controller.signal});
         if(generation!==requestGeneration)return;
+        if(response.status===304){lastSuccess=Date.now();failureCount=0;connection(true,"connected");return;}
+        const entityTag=response.headers.get("ETag");
+        if(entityTag)reportEntityTags.set(context,entityTag);else reportEntityTags.delete(context);
         if(!response.ok){let message="HTTP "+response.status;try{const body=await response.json();message=body.error?.message||message;}catch(_error){}if(response.status===400){connection(false,"invalid request",false);byId("report").replaceChildren(element("p","error",message));return;}throw new Error(message);}
         const report=await response.json();if(generation!==requestGeneration)return;
         const sameView=context===lastContext,previous=sameView?lastReport:null;

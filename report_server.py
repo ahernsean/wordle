@@ -492,8 +492,8 @@ def make_handler(configuration):
                 entry = cached_reports.get(request)
             if (entry is not None and entry[0] == token
                     and time.time() - entry[1] <= REPORT_CACHE_MAX_AGE_SECONDS):
-                return entry[2]
-        return collect_report_once(request, token, started_at)
+                return entry[2], token
+        return collect_report_once(request, token, started_at), token
 
     def collect_report_once(request, token, started_at):
         """Collect `request` once, however many callers are waiting on it.
@@ -565,6 +565,17 @@ def make_handler(configuration):
             self.end_headers()
             self.wfile.write(body)
 
+        def _not_modified(self, entity_tag):
+            """304 with no body: the client already holds this exact report.
+
+            Content-Length is deliberately absent -- a 304 carries no body, and
+            sending a length for one confuses caches about what to expect.
+            """
+            self.send_response(304)
+            self.send_header("ETag", entity_tag)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+
         def _json(self, status, value, extra_headers=None):
             body = json.dumps(value, sort_keys=True).encode("utf-8")
             self._write(
@@ -599,13 +610,26 @@ def make_handler(configuration):
             except InvalidRequest as error:
                 self._error(400, "invalid_request", str(error))
                 return
+            extra_headers = None
             try:
                 if configuration.fixtures is not None:
                     body = encode_report(configuration.fixtures[
                         fixture_name_for_request(target.path, request)
                     ])
                 elif request.report_kind in REVALIDATED_REPORT_KINDS:
-                    body = cached_report_body(request)
+                    body, token = cached_report_body(request)
+                    # The signal already says whether the answer could have
+                    # moved, so a client that has seen this one needs nothing
+                    # sent at all.  A leaderboard's answer changes when an
+                    # opener completes -- about every 27 minutes -- against a
+                    # client polling every two seconds, so this is the ordinary
+                    # case rather than an optimisation for a rare one.
+                    if token is not None:
+                        entity_tag = f'"{token}"'
+                        if self.headers.get("If-None-Match") == entity_tag:
+                            self._not_modified(entity_tag)
+                            return
+                        extra_headers = {"ETag": entity_tag}
                 else:
                     body = encode_report(
                         collect_report(configuration.sources, request))
@@ -627,7 +651,8 @@ def make_handler(configuration):
                 print("report server: report collection failed", file=sys.stderr)
                 self._error(500, "server_error", "report collection failed")
                 return
-            self._write(200, "application/json; charset=utf-8", body)
+            self._write(200, "application/json; charset=utf-8", body,
+                        extra_headers)
 
         def _method_not_allowed(self):
             self._error(

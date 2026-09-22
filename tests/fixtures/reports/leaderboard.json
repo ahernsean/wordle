@@ -4,14 +4,10 @@
     "answer_count": 100,
     "candidate_count": 14855,
     "columns": {
-      "erd_decimal": [
-        null,
-        3.7124567
-      ],
       "erd_denominator": 100,
       "erd_numerator": [
         356,
-        null
+        371
       ],
       "max_remaining_depth": [
         6,

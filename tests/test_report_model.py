@@ -2314,6 +2314,27 @@ class ReportModelTest(unittest.TestCase):
         self.assertNotIn("detail", data)
         self.assertNotIn("response_groups", json.dumps(data))
 
+    def test_an_off_lattice_erd_is_refused_rather_than_shown(self):
+        """An exact ERD cannot be off its branch's lattice.
+
+        It is total guesses over the answer count, so the numerator counts
+        guesses and is an integer by construction.  A value that is not says
+        the fold produced something an ERD cannot be, and every other value in
+        the ranking is suspect with it -- so this is a defect to surface, not a
+        display case to fall back from.
+        """
+        with self.assertRaises(ValueError) as raised:
+            report_model._leaderboard_columns(
+                [(3.5 + 1e-3, 6, "crane")], 2, {"crane"})
+        self.assertIn("crane", str(raised.exception))
+        self.assertIn("whole guesses", str(raised.exception))
+
+    def test_a_ranking_carries_no_decimal_beside_its_numerators(self):
+        columns = report_model._leaderboard_columns(
+            [(1.5, 3, "crane"), (2.0, 4, "slate")], 2, {"crane"})
+        self.assertEqual(columns["erd_numerator"], [3, 4])
+        self.assertNotIn("erd_decimal", columns)
+
     def test_leaderboard_carries_one_opener_s_groups_when_it_is_named(self):
         sources = self._leaderboard_sources(
             ["crane", "slate"], ["crane", "slate", "raise", "howdy"]

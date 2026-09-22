@@ -60,7 +60,6 @@ LEADERBOARD_COLUMNS_JS = (
     "return {word_width:5,words,erd_denominator:denominator,"
     "erd_numerator:Array.from({length:rowCount},(_,index)=>"
     "Math.round(3.5*denominator)+index),"
-    "erd_decimal:Array.from({length:rowCount},()=>null),"
     "max_remaining_depth:Array.from({length:rowCount},()=>6),"
     "word_is_answer_bitmap:btoa(binary)};};"
 )
@@ -1863,11 +1862,10 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.wait_for_selector("text=Opener leaderboard")
         text = self.page.locator("#report").inner_text()
         self.assertIn("SALET", text)
-        # SALET sits on the lattice, so the card states the exact fraction
-        # beside the decimal; CRANE does not and gets the decimal alone.
+        # Every exact ERD is a whole number of guesses over the answer
+        # count, so every card states its fraction.
         self.assertIn("3.560 356/100", text)
-        self.assertIn("3.712", text)
-        self.assertNotIn("3.7124567", text)
+        self.assertIn("3.710 371/100", text)
         self.assertIn("Worst-case solve: 6 guesses", text)
         self.assertNotIn("max remaining depth", text)
         self.assertNotIn("expected guesses remaining", text)
@@ -1946,10 +1944,7 @@ class ReportClientBrowserTest(unittest.TestCase):
           window.fetch = (url, options) => realFetch(url, options).then(async response => {
             if (!String(url).includes('/leaderboard')) return response;
             const report = await response.json();
-            // 9.876 x 100 is not an integer, so this rides the off-lattice
-            // path: no exact numerator, decimal alone on the card.
-            report.data.columns.erd_numerator[0] = null;
-            report.data.columns.erd_decimal[0] = 9.876;
+            report.data.columns.erd_numerator[0] = 987;
             return new Response(JSON.stringify(report), {
               status: 200,
               headers: {'Content-Type': 'application/json'},
@@ -1957,7 +1952,68 @@ class ReportClientBrowserTest(unittest.TestCase):
           });
         }""")
         self.page.evaluate("async () => { await window.__reportClient.fetchReport(); }")
-        self.assertIn("9.876", self.page.locator("#report").inner_text())
+        self.assertIn("9.870 987/100", self.page.locator("#report").inner_text())
+
+    def test_a_leaderboard_poll_sends_back_the_tag_it_was_given(self):
+        """A conditional poll is what makes an unchanged ranking free.
+
+        The server answers 304 when the opener-completion signal has not
+        moved, which it does not for about 27 minutes at a time, so the
+        request has to carry the tag or every poll pays for a body the client
+        already holds.
+        """
+        self.page.locator("[data-kind=leaderboard]").click()
+        self.page.wait_for_selector("text=Opener leaderboard")
+        sent = self.page.evaluate("""async () => {
+          const realFetch = window.fetch.bind(window);
+          const seen = [];
+          window.fetch = (url, options) => {
+            if (String(url).includes('/leaderboard') && !String(url).includes('branch_target')) {
+              seen.push((options && options.headers || {})['If-None-Match'] || null);
+              return Promise.resolve(new Response(JSON.stringify({}), {
+                status: 304, headers: {'ETag': '"signal-1"'},
+              }));
+            }
+            return realFetch(url, options);
+          };
+          // First poll teaches the client the tag, second must send it back.
+          window.fetch = ((inner) => (url, options) => {
+            if (String(url).includes('/leaderboard') && !String(url).includes('branch_target')) {
+              seen.push((options && options.headers || {})['If-None-Match'] || null);
+              return realFetch(url, options).then(response => response.json()).then(body =>
+                new Response(JSON.stringify(body), {
+                  status: 200,
+                  headers: {'Content-Type': 'application/json', 'ETag': '"signal-1"'},
+                }));
+            }
+            return inner(url, options);
+          })(window.fetch);
+          await window.__reportClient.fetchReport();
+          await window.__reportClient.fetchReport();
+          return seen;
+        }""")
+        self.assertIsNone(sent[0], "the first poll had no tag to send")
+        self.assertEqual(sent[1], '"signal-1"',
+                         "the second poll did not carry the tag back")
+
+    def test_a_304_leaderboard_poll_leaves_the_rendered_cards_alone(self):
+        # Nothing arrives to render, and the client must treat that as the
+        # ranking standing still rather than as a failure.
+        self.page.locator("[data-kind=leaderboard]").click()
+        self.page.wait_for_selector(".grid.leaderboard > .leaderboard-card")
+        before = self.page.locator("#report").inner_text()
+        self.page.evaluate("""() => {
+          const realFetch = window.fetch.bind(window);
+          window.fetch = (url, options) =>
+            String(url).includes('/leaderboard') && !String(url).includes('branch_target')
+              ? Promise.resolve(new Response(null, {status: 304, headers: {'ETag': '"x"'}}))
+              : realFetch(url, options);
+        }""")
+        self.page.evaluate("async () => { await window.__reportClient.fetchReport(); }")
+        self.assertEqual(self.page.locator("#report").inner_text(), before)
+        self.assertEqual(
+            self.page.locator(".grid.leaderboard > .leaderboard-card").count(), 2)
+        self.assertNotIn("error", self.page.locator("#connection").inner_text().lower())
 
     def test_unchanged_leaderboard_poll_keeps_the_reading_position(self):
         self.page.set_viewport_size({"width": 834, "height": 1112})

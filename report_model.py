@@ -1360,9 +1360,14 @@ def erd_lattice_numerator(value, answer_count):
     """The exact numerator of `value` over `answer_count`, or None.
 
     None when the value is not finite, the count is unusable, or the value does
-    not sit on the lattice.  An off-lattice value is never snapped: the caller
-    keeps the decimal and says nothing exact about it, which is the whole point
-    of reporting the numerator separately rather than rounding for display.
+    not sit on the lattice.  An off-lattice value is never snapped.
+
+    What None *means* is the caller's to decide, because it differs by the
+    quantity asked about.  An exact ERD is a mean of integer line lengths and
+    is on its branch's lattice by construction, so None there is a defect.  A
+    derived ceiling carries an epsilon of padding and can legitimately sit
+    between lattice points, so None there is ordinary and the decimal stands
+    alone.
     """
     if value is None or answer_count is None or answer_count <= 0:
         return None
@@ -3439,15 +3444,13 @@ def leaderboard_rows(data):
     width = columns.get("word_width", WORD_WIDTH)
     words = columns.get("words", "")
     numerators = columns.get("erd_numerator") or []
-    decimals = columns.get("erd_decimal") or []
     denominator = columns.get("erd_denominator") or data.get("answer_count")
     depths = columns.get("max_remaining_depth") or []
     answer_bits = base64.b64decode(columns.get("word_is_answer_bitmap") or "")
     rows = []
     for index in range(len(words) // width):
         numerator = numerators[index] if index < len(numerators) else None
-        erd = (decimals[index] if numerator is None
-               else numerator / denominator)
+        erd = None if numerator is None else numerator / denominator
         rows.append({
             "word": words[index * width:(index + 1) * width],
             "rank": index + 1,
@@ -3476,24 +3479,33 @@ def _leaderboard_columns(ranked, answer_count, answer_set):
     row i.  `word_is_answer` is a base64 bitset, one bit per row in rank order,
     the same shape the sweep strip uses.
 
-    `erd_numerator` carries the ERD exactly: an opener's ERD is the mean line
-    length over the answer list, so it is numerator/answer_count for an integer
-    numerator, and the integer is both exact and five characters against the
-    float's seventeen.  A row whose value does not sit on the lattice gets a
-    null numerator and keeps only its decimal -- see erd_lattice_numerator.
+    `erd_numerator` carries the ERD exactly, and there is no decimal beside it.
+    An opener's ERD is the mean line length over the answer list -- total
+    guesses divided by the answer count -- so the numerator is a count of
+    guesses and the value is on the lattice by construction, not by luck.  The
+    integer is also five characters against the float's seventeen, so the exact
+    form is the smaller one.
+
+    A value that does not land on the lattice is therefore not a display case
+    to fall back from; it means the fold produced something an ERD cannot be,
+    and every other value in the ranking is suspect with it.  This raises
+    rather than quietly showing a decimal.
     """
     words = []
     erd_numerators = []
-    erd_decimals = []
     max_remaining_depths = []
     answer_bits = bytearray((len(ranked) + 7) // 8)
     for index, (erd, max_remaining_depth, word) in enumerate(ranked):
         words.append(word)
         numerator = erd_lattice_numerator(erd, answer_count)
+        if numerator is None:
+            raise ValueError(
+                f"opener {word!r} has ERD {erd!r}, which is not "
+                f"{answer_count} answers' worth of whole guesses; an exact ERD "
+                f"is a mean of integer line lengths and cannot be off this "
+                f"lattice"
+            )
         erd_numerators.append(numerator)
-        # Carried only where the lattice could not express the value, so the
-        # common case costs nothing and an off-lattice row is still readable.
-        erd_decimals.append(None if numerator is not None else erd)
         max_remaining_depths.append(max_remaining_depth)
         if word in answer_set:
             answer_bits[index >> 3] |= 1 << (index & 7)
@@ -3502,7 +3514,6 @@ def _leaderboard_columns(ranked, answer_count, answer_set):
         "words": "".join(words),
         "erd_denominator": answer_count,
         "erd_numerator": erd_numerators,
-        "erd_decimal": erd_decimals,
         "max_remaining_depth": max_remaining_depths,
         "word_is_answer_bitmap": base64.b64encode(bytes(answer_bits)).decode(),
     }

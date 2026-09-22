@@ -56,9 +56,10 @@ def running_server(configuration):
         thread.join(timeout=2)
 
 
-def request(base_url, path, method="GET"):
+def request(base_url, path, method="GET", headers=None):
     try:
-        with urlopen(Request(base_url + path, method=method), timeout=3) as response:
+        with urlopen(Request(base_url + path, method=method,
+                             headers=headers or {}), timeout=3) as response:
             body = response.read()
             return response.status, response.headers, body
     except HTTPError as error:
@@ -1029,3 +1030,61 @@ class RootProgressRequestTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConditionalLeaderboardRequestTest(ReportServerTest):
+    """A poll that would receive the same ranking receives nothing instead.
+
+    The leaderboard's answer moves when an opener completes -- about every 27
+    minutes -- and the client polls every two seconds, so an unchanged answer
+    is the ordinary case.  The signal that decides whether to rebuild is the
+    same one that decides whether to send, so it is spent as an ETag.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.report = load_fixtures(FIXTURE_DIRECTORY)["leaderboard.json"]
+        self.tokens = ["opener-signal-1"]
+
+    def test_a_ranking_carries_the_signal_it_was_revalidated_against(self):
+        with patch("report_server.collect_report", return_value=self.report), \
+             patch("report_server.opener_completion_signal",
+                   side_effect=lambda *_: self.tokens[0]):
+            with running_server(self.live_configuration) as base_url:
+                status, headers, body = request(base_url, "/api/view/leaderboard")
+        self.assertEqual(status, 200)
+        self.assertTrue(headers.get("ETag"), "no ETag to revalidate against")
+        self.assertTrue(body)
+
+    def test_an_unchanged_ranking_answers_304_with_no_body(self):
+        with patch("report_server.collect_report", return_value=self.report), \
+             patch("report_server.opener_completion_signal",
+                   side_effect=lambda *_: self.tokens[0]):
+            with running_server(self.live_configuration) as base_url:
+                _status, headers, first = request(
+                    base_url, "/api/view/leaderboard")
+                tag = headers["ETag"]
+                status, _headers, body = request(
+                    base_url, "/api/view/leaderboard",
+                    headers={"If-None-Match": tag})
+        self.assertEqual(status, 304)
+        self.assertEqual(body, b"", "a 304 must carry no body")
+        self.assertTrue(first, "the first response should have carried one")
+
+    def test_a_completed_opener_moves_the_signal_and_the_body_returns(self):
+        with patch("report_server.collect_report", return_value=self.report), \
+             patch("report_server.opener_completion_signal",
+                   side_effect=lambda *_: self.tokens[0]):
+            with running_server(self.live_configuration) as base_url:
+                _status, headers, _body = request(
+                    base_url, "/api/view/leaderboard")
+                stale_tag = headers["ETag"]
+                # An opener finished: the signal moves, and the tag the client
+                # holds no longer matches.
+                self.tokens[0] = "opener-signal-2"
+                status, new_headers, body = request(
+                    base_url, "/api/view/leaderboard",
+                    headers={"If-None-Match": stale_tag})
+        self.assertEqual(status, 200)
+        self.assertTrue(body)
+        self.assertNotEqual(new_headers["ETag"], stale_tag)
