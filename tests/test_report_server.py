@@ -1088,3 +1088,32 @@ class ConditionalLeaderboardRequestTest(ReportServerTest):
         self.assertEqual(status, 200)
         self.assertTrue(body)
         self.assertNotEqual(new_headers["ETag"], stale_tag)
+
+
+class RevalidatedReportsDeclareThemselvesTest(ReportServerTest):
+    """A report the poll does not refresh has to say when its data is from.
+
+    Every other view is rebuilt on each two-second poll, so the cadence is the
+    freshness.  The leaderboard is not: its data is as old as the last opener
+    to finish, up to REPORT_CACHE_MAX_AGE_SECONDS.  Without a mark on the
+    report the client cannot tell the two apart, and a reader would take the
+    poll interval for the age of what is on screen.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.report = load_fixtures(FIXTURE_DIRECTORY)["leaderboard.json"]
+
+    def test_a_revalidated_report_is_marked_for_the_client(self):
+        with patch("report_server.collect_report", return_value=dict(self.report)), \
+             patch("report_server.opener_completion_signal", return_value=(1, 1)):
+            with running_server(self.live_configuration) as base_url:
+                _status, _headers, body = request(base_url, "/api/view/leaderboard")
+        self.assertTrue(json.loads(body)["revalidated"])
+
+    def test_a_live_report_is_not_marked(self):
+        # The queue report's subject is what the swarm is doing right now, so
+        # it is rebuilt every poll and carries no age to declare.
+        with running_server(self.live_configuration) as base_url:
+            _status, _headers, body = request(base_url, "/api/view/queue")
+        self.assertNotIn("revalidated", json.loads(body))

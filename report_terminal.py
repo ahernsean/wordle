@@ -1836,7 +1836,7 @@ def _render_leaderboard_sections(report, width):
         ),
     ]
     rows = ["Rank  Opener   ERD    Worst-case guesses"]
-    for row in data["rows"]:
+    for row in leaderboard_rows(data):
         word = row["word"].upper() + ("*" if row["word_is_answer"] else "")
         rows.append(_fit(
             f"{row['rank']:>4}  {word:<7}  {row['erd']:.3f}  "

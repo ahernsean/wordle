@@ -1012,6 +1012,11 @@
       meta.append(element("h1","",report.report_kind+" report"));
       if(report.report_kind!=="branch"||report.tree)meta.append(branchTargetLabel(report,state));
       meta.append(element("span","dim","sorted by "+activeSortLabel(state)));
+      // A report served from revalidation is not refreshed by the poll: its
+      // data is as old as the last time its signal moved.  Saying so is the
+      // difference between a reader trusting a two-second cadence the screen
+      // does not actually have and knowing what they are looking at.
+      if(report.revalidated)meta.append(element("span","dim","data as of "+absoluteTime(report.generated_at)));
       if(report.tree){meta.append(element("span","dim","snapshot "+absoluteTime(report.generated_at)));const refreshButton=element("button","","Refresh tree");refreshButton.addEventListener("click",refreshTreeSnapshot);meta.append(refreshButton);}
       const banner=sourceErrorBanner(report);
       if(!banner)return meta;

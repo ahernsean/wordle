@@ -521,6 +521,13 @@ def make_handler(configuration):
         if is_builder:
             try:
                 report = collect_report(configuration.sources, request)
+                # This kind is not rebuilt on the poll, so its data is as old
+                # as the last time the signal moved -- up to
+                # REPORT_CACHE_MAX_AGE_SECONDS, and in practice as old as the
+                # last opener to finish.  The client says so on screen rather
+                # than letting a two-second poll imply a freshness the report
+                # does not have.
+                report["revalidated"] = True
                 in_flight.body = encode_report(report)
                 in_flight.intact = report_is_intact(report)
                 # Published before the waiters are released and before the
