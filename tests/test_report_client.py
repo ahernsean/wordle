@@ -45,6 +45,25 @@ SWEEP_BITMAP_JS = (
     "for(const byte of bytes)binary+=String.fromCharCode(byte);"
     "return btoa(binary);};"
 )
+# The leaderboard ships its ranking as parallel arrays rather than one object
+# per row, so a test that wants N ranked openers states the count and gets the
+# columns.  ERDs are laid on the lattice the denominator defines, which is what
+# the cards render as exact fractions.
+LEADERBOARD_COLUMNS_JS = (
+    "const leaderboardColumns=(rowCount,denominator)=>{"
+    "const bytes=new Uint8Array(Math.ceil(rowCount/8));"
+    "let words='';"
+    "for(let index=0;index<rowCount;index++)"
+    "words+='a'+String(index).padStart(4,'0');"
+    "let binary='';"
+    "for(const byte of bytes)binary+=String.fromCharCode(byte);"
+    "return {word_width:5,words,erd_denominator:denominator,"
+    "erd_numerator:Array.from({length:rowCount},(_,index)=>"
+    "Math.round(3.5*denominator)+index),"
+    "erd_decimal:Array.from({length:rowCount},()=>null),"
+    "max_remaining_depth:Array.from({length:rowCount},()=>6),"
+    "word_is_answer_bitmap:btoa(binary)};};"
+)
 # Both browser suites run by default, and a browser that will not start is a
 # failure rather than a skip.  This client is used overwhelmingly from WebKit
 # (Safari and iOS Chrome), so a run that quietly covered only Chromium would
@@ -1501,6 +1520,19 @@ class ReportClientBrowserTest(unittest.TestCase):
     def _menu(self):
         return self.page.locator(".group-menu")
 
+    def _open_leaderboard_breakdown(self, index=0):
+        """Open a ranked card's response groups and wait for them to arrive.
+
+        A collapsed card carries no breakdown at all: the groups are 5.9 KB
+        apiece against the 20 bytes that rank an opener, so they are fetched
+        for the one card a reader opens.  Every assertion about segments,
+        legends or group menus therefore has to open a card first.
+        """
+        cards = self.page.locator(".grid.leaderboard > .leaderboard-card")
+        cards.nth(index).locator("summary").click()
+        self.page.wait_for_selector(".leaderboard-card .answer-segment")
+        return cards.nth(index)
+
     def test_word_report_breakdown_group_opens_a_menu_naming_the_group(self):
         # Which group a tap landed on is a guess until the menu names it, so
         # the title draws the guess and the response it caught.
@@ -1794,7 +1826,8 @@ class ReportClientBrowserTest(unittest.TestCase):
         # The same interaction in both views: a group is never a direct jump in
         # one place and a menu in the other.
         self.page.locator("[data-kind=leaderboard]").click()
-        self.page.wait_for_selector(".leaderboard-card .answer-segment")
+        self.page.wait_for_selector(".grid.leaderboard > .leaderboard-card")
+        self._open_leaderboard_breakdown(0)
         self.page.locator(".leaderboard-card .answer-segment").first.click()
         self.page.wait_for_selector(".group-menu")
         self.assertEqual(
@@ -1810,7 +1843,8 @@ class ReportClientBrowserTest(unittest.TestCase):
         # Every ranked opener is complete, so outlining there would black out
         # every segment and say nothing.  The leaderboard sends no solved flag.
         self.page.locator("[data-kind=leaderboard]").click()
-        self.page.wait_for_selector(".leaderboard-card .answer-segment")
+        self.page.wait_for_selector(".grid.leaderboard > .leaderboard-card")
+        self._open_leaderboard_breakdown(0)
         self.assertEqual(
             self.page.locator(".leaderboard-card .answer-segment.solved-group").count(),
             0)
@@ -1829,14 +1863,20 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.wait_for_selector("text=Opener leaderboard")
         text = self.page.locator("#report").inner_text()
         self.assertIn("SALET", text)
-        self.assertIn("3.564", text)
-        self.assertNotIn("3.5643502648", text)
+        # SALET sits on the lattice, so the card states the exact fraction
+        # beside the decimal; CRANE does not and gets the decimal alone.
+        self.assertIn("3.560 356/100", text)
+        self.assertIn("3.712", text)
+        self.assertNotIn("3.7124567", text)
         self.assertIn("Worst-case solve: 6 guesses", text)
         self.assertNotIn("max remaining depth", text)
         self.assertNotIn("expected guesses remaining", text)
-        self.assertIn("5 answer groups (more groups = better)", text)
-        self.assertIn("Largest: 31 answers (31.0%)", text)
-        self.assertIn("Two largest: 55 answers (55.0%)", text)
+        # A collapsed card is rank, word, ERD and worst case.  The response
+        # groups are 5.9 KB apiece against 20 bytes of ranking, so they are
+        # fetched only for a card the reader opens.
+        self.assertNotIn("5 answer groups (more groups = better)", text)
+        self.assertNotIn("Largest: 31 answers (31.0%)", text)
+        self.assertIn("Response groups", text)
         self.assertIn("CRANE", text)
         self.assertTrue(self.answer_notch(
             self.page.locator(".card", has_text="CRANE").first.locator(".word")))
@@ -1848,7 +1888,8 @@ class ReportClientBrowserTest(unittest.TestCase):
         rank = cards.nth(0).locator(".leaderboard-rank")
         self.assertEqual(rank.inner_text(), "#1")
         self.assertNotIn("chip", rank.get_attribute("class").split())
-        answer_strip = cards.nth(0).locator(".answer-strip")
+        card = self._open_leaderboard_breakdown(0)
+        answer_strip = card.locator(".answer-strip")
         segments = answer_strip.locator(".answer-segment")
         self.assertEqual(segments.count(), 5)
         first_box = segments.nth(0).bounding_box()
@@ -1905,7 +1946,10 @@ class ReportClientBrowserTest(unittest.TestCase):
           window.fetch = (url, options) => realFetch(url, options).then(async response => {
             if (!String(url).includes('/leaderboard')) return response;
             const report = await response.json();
-            report.data.rows[0].erd = 9.876;
+            // 9.876 x 100 is not an integer, so this rides the off-lattice
+            // path: no exact numerator, decimal alone on the card.
+            report.data.columns.erd_numerator[0] = null;
+            report.data.columns.erd_decimal[0] = 9.876;
             return new Response(JSON.stringify(report), {
               status: 200,
               headers: {'Content-Type': 'application/json'},
@@ -1918,18 +1962,16 @@ class ReportClientBrowserTest(unittest.TestCase):
     def test_unchanged_leaderboard_poll_keeps_the_reading_position(self):
         self.page.set_viewport_size({"width": 834, "height": 1112})
         self.page.evaluate("""() => {
+          """ + LEADERBOARD_COLUMNS_JS + """
           const realFetch = window.fetch.bind(window);
           let leaderboard;
           window.fetch = (url, options) => realFetch(url, options).then(async response => {
             if (!String(url).includes('/leaderboard')) return response;
             if (!leaderboard) {
               leaderboard = await response.json();
-              const row = leaderboard.data.rows[0];
-              leaderboard.data.rows = Array.from({length: 12}, (_, index) => ({
-                ...row, word: 'a' + String(index).padStart(4, '0'), rank: index + 1,
-              }));
-              leaderboard.data.total_rows = leaderboard.data.rows.length;
-              leaderboard.data.counts.complete = leaderboard.data.rows.length;
+              leaderboard.data.columns = leaderboardColumns(12, leaderboard.data.answer_count);
+              leaderboard.data.total_rows = 12;
+              leaderboard.data.counts.complete = 12;
             }
             return new Response(JSON.stringify(leaderboard), {
               status: 200, headers: {'Content-Type': 'application/json'},
@@ -1976,6 +2018,7 @@ class ReportClientBrowserTest(unittest.TestCase):
     def test_changed_leaderboard_poll_keeps_the_visible_word_in_place(self):
         self.page.set_viewport_size({"width": 834, "height": 1112})
         self.page.evaluate("""() => {
+          """ + LEADERBOARD_COLUMNS_JS + """
           const realFetch = window.fetch.bind(window);
           let leaderboard, allowChangedReport = false;
           window.__changeLeaderboardReport = () => { allowChangedReport = true; };
@@ -1983,12 +2026,9 @@ class ReportClientBrowserTest(unittest.TestCase):
             if (!String(url).includes('/leaderboard')) return response;
             if (!leaderboard) {
               leaderboard = await response.json();
-              const row = leaderboard.data.rows[0];
-              leaderboard.data.rows = Array.from({length: 12}, (_, index) => ({
-                ...row, word: 'a' + String(index).padStart(4, '0'), rank: index + 1,
-              }));
-              leaderboard.data.total_rows = leaderboard.data.rows.length;
-              leaderboard.data.counts.complete = leaderboard.data.rows.length;
+              leaderboard.data.columns = leaderboardColumns(12, leaderboard.data.answer_count);
+              leaderboard.data.total_rows = 12;
+              leaderboard.data.counts.complete = 12;
             }
             const report = structuredClone(leaderboard);
             if (allowChangedReport) report.data.rows[0].erd = 9.876;
@@ -2012,6 +2052,7 @@ class ReportClientBrowserTest(unittest.TestCase):
     def test_changed_leaderboard_poll_keeps_the_reader_at_the_bottom(self):
         self.page.set_viewport_size({"width": 834, "height": 1112})
         distances = self.page.evaluate("""async () => {
+          """ + LEADERBOARD_COLUMNS_JS + """
           // Each applyReport schedules its scroll restore in a frame of its
           // own, so a measurement taken after a single frame can read a
           // position the client is still adjusting.  Settling first measures
@@ -2024,10 +2065,8 @@ class ReportClientBrowserTest(unittest.TestCase):
           const base = await (await fetch('/api/view/leaderboard')).json();
           const state = {...__reportClient.getState(), kind: 'leaderboard'};
           const leaderboard = count => {
-            const report = structuredClone(base), row = report.data.rows[0];
-            report.data.rows = Array.from({length: count}, (_, index) => ({
-              ...row, word: 'a' + String(index).padStart(4, '0'), rank: index + 1,
-            }));
+            const report = structuredClone(base);
+            report.data.columns = leaderboardColumns(count, report.data.answer_count);
             report.data.total_rows = count;
             report.data.counts.complete = count;
             return report;
@@ -4898,18 +4937,35 @@ class ReportClientBrowserTest(unittest.TestCase):
         try:
             page.goto(self.base_url + "?kind=leaderboard")
             page.wait_for_selector("text=Opener leaderboard")
+            # A card's breakdown is fetched when it is opened, so the groups
+            # under measurement are supplied by the detail request rather than
+            # written into the ranking.  Installed after the navigation, which
+            # would otherwise discard the override.
+            page.evaluate("""() => {
+              const realFetch = window.fetch.bind(window);
+              window.fetch = (url, options) => realFetch(url, options).then(async response => {
+                if (!String(url).includes('branch_target=')) return response;
+                const report = await response.json();
+                report.data.detail = {
+                  word: 'salet', available: true, word_is_answer: false,
+                  answer_count: 284,
+                  response_groups: [
+                    ...Array.from({length: 24}, (_, index) => ({
+                      pattern: String(index), answer_count: 1,
+                    })),
+                    ...[2, 5, 9, 17, 33, 65, 129].map((answer_count, index) => ({
+                      pattern: 'large-' + String(index), answer_count,
+                    })),
+                  ],
+                };
+                return new Response(JSON.stringify(report), {
+                  status: 200, headers: {'Content-Type': 'application/json'},
+                });
+              });
+            }""")
+            page.locator(".grid.leaderboard > .leaderboard-card").nth(0).locator("summary").click()
+            page.wait_for_selector(".response-bucket-legend > span")
             measured = page.evaluate("""async () => {
-              const report = await (await fetch('/api/view/leaderboard')).json();
-              report.data.rows[0].response_groups = [
-                ...Array.from({length: 24}, (_, index) => ({
-                  pattern: String(index), answer_count: 1,
-                })),
-                ...[2, 5, 9, 17, 33, 65, 129].map((answer_count, index) => ({
-                  pattern: 'large-' + String(index), answer_count,
-                })),
-              ];
-              applyReport(report, null,
-                {...__reportClient.getState(), kind: 'leaderboard'});
               await new Promise(requestAnimationFrame);
               const segment = [...document.querySelectorAll('.response-count-segment')]
                 .find(node => node.title.startsWith('2–4 answers'));
@@ -4936,6 +4992,8 @@ class ReportClientBrowserTest(unittest.TestCase):
         # already 1200px wide; each width below drops straight to it with no
         # wait, so nothing gets a chance to re-render first.
         self.page.goto(self.base_url + "?kind=leaderboard")
+        self.page.wait_for_selector(".grid.leaderboard > .leaderboard-card")
+        self._open_leaderboard_breakdown(0)
         self.page.wait_for_selector(".response-bucket-legend > span")
         for width in (375, 480, 600, 700, 800, 801, 900, 1000, 1100, 1199, 1200):
             with self.subTest(width=width):

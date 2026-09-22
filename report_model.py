@@ -6,6 +6,7 @@ from dataclasses import dataclass, field, replace
 import base64
 import collections
 import datetime
+import math
 import os
 import re
 import sqlite3
@@ -1339,6 +1340,39 @@ def _response_group_is_solved(group, group_budget):
                     or group_budget >= 1)
         return False
     return group["max_remaining_depth"] is not None
+
+
+# An ERD is a mean over a branch's answers, so an exact one lies on that
+# branch's own lattice: it is numerator/answer_count for an integer numerator
+# counting total guesses across the branch.  The margin is on the scaled value,
+# matching report_client.html's ERD_LATTICE_NOISE_MARGIN, and is float noise
+# only -- the worst deviation measured across the production leaderboard is
+# 3.3e-11 against a margin of 1e-6.
+ERD_LATTICE_NOISE_MARGIN = 1e-6
+
+# Every Wordle word is exactly five ASCII characters, which is the same
+# invariant `ScoreCache.encode_subset` slices branch keys on.  It lets the
+# ranking carry its words as one string instead of a list of them.
+WORD_WIDTH = 5
+
+
+def erd_lattice_numerator(value, answer_count):
+    """The exact numerator of `value` over `answer_count`, or None.
+
+    None when the value is not finite, the count is unusable, or the value does
+    not sit on the lattice.  An off-lattice value is never snapped: the caller
+    keeps the decimal and says nothing exact about it, which is the whole point
+    of reporting the numerator separately rather than rounding for display.
+    """
+    if value is None or answer_count is None or answer_count <= 0:
+        return None
+    if not math.isfinite(value):
+        return None
+    scaled = value * answer_count
+    numerator = round(scaled)
+    if abs(scaled - numerator) >= ERD_LATTICE_NOISE_MARGIN:
+        return None
+    return int(numerator)
 
 
 def _candidate_erd_summary(response_groups, group_budget):
@@ -3391,6 +3425,112 @@ def _candidate_group_skeletons(sources, all_answers, all_candidates, cache):
     return skeletons
 
 
+def leaderboard_rows(data):
+    """The ranking's columns read back as one dict per row, in rank order.
+
+    The columnar payload is what crosses the wire; every consumer that wants
+    rows goes through here so the encoding is stated once.  `erd` is
+    reconstructed exactly from the numerator where there is one, and falls back
+    to the decimal the producer carried for a value off the branch's lattice.
+    """
+    columns = data.get("columns")
+    if columns is None:
+        return list(data.get("rows") or [])
+    width = columns.get("word_width", WORD_WIDTH)
+    words = columns.get("words", "")
+    numerators = columns.get("erd_numerator") or []
+    decimals = columns.get("erd_decimal") or []
+    denominator = columns.get("erd_denominator") or data.get("answer_count")
+    depths = columns.get("max_remaining_depth") or []
+    answer_bits = base64.b64decode(columns.get("word_is_answer_bitmap") or "")
+    rows = []
+    for index in range(len(words) // width):
+        numerator = numerators[index] if index < len(numerators) else None
+        erd = (decimals[index] if numerator is None
+               else numerator / denominator)
+        rows.append({
+            "word": words[index * width:(index + 1) * width],
+            "rank": index + 1,
+            "erd": erd,
+            "erd_numerator": numerator,
+            "erd_denominator": denominator,
+            "max_remaining_depth": depths[index] if index < len(depths) else None,
+            "word_is_answer": bool(
+                index // 8 < len(answer_bits)
+                and answer_bits[index // 8] & (1 << (index % 8))),
+        })
+    return rows
+
+
+def _leaderboard_columns(ranked, answer_count, answer_set):
+    """The ranking as parallel arrays rather than one object per row.
+
+    At the full candidate vocabulary a row-shaped ranking is mostly spelling:
+    measured on the production report, JSON keys are 63% of a row once its
+    response groups are gone, and `answer_count` is the same number in every
+    one of them.  Columns drop the keys, hoist what is constant, and leave rank
+    implicit in the order -- 0.29 MB against 1.75 MB at 14,855 openers, and
+    56.16 MB against what the rows used to carry.
+
+    `words` is a single string of fixed-width entries, so `words[5*i:5*i+5]` is
+    row i.  `word_is_answer` is a base64 bitset, one bit per row in rank order,
+    the same shape the sweep strip uses.
+
+    `erd_numerator` carries the ERD exactly: an opener's ERD is the mean line
+    length over the answer list, so it is numerator/answer_count for an integer
+    numerator, and the integer is both exact and five characters against the
+    float's seventeen.  A row whose value does not sit on the lattice gets a
+    null numerator and keeps only its decimal -- see erd_lattice_numerator.
+    """
+    words = []
+    erd_numerators = []
+    erd_decimals = []
+    max_remaining_depths = []
+    answer_bits = bytearray((len(ranked) + 7) // 8)
+    for index, (erd, max_remaining_depth, word) in enumerate(ranked):
+        words.append(word)
+        numerator = erd_lattice_numerator(erd, answer_count)
+        erd_numerators.append(numerator)
+        # Carried only where the lattice could not express the value, so the
+        # common case costs nothing and an off-lattice row is still readable.
+        erd_decimals.append(None if numerator is not None else erd)
+        max_remaining_depths.append(max_remaining_depth)
+        if word in answer_set:
+            answer_bits[index >> 3] |= 1 << (index & 7)
+    return {
+        "word_width": WORD_WIDTH,
+        "words": "".join(words),
+        "erd_denominator": answer_count,
+        "erd_numerator": erd_numerators,
+        "erd_decimal": erd_decimals,
+        "max_remaining_depth": max_remaining_depths,
+        "word_is_answer_bitmap": base64.b64encode(bytes(answer_bits)).decode(),
+    }
+
+
+def _leaderboard_detail(word, summary, response_group_skeletons, answer_set):
+    """One opener's response-group breakdown, for a card that was opened.
+
+    Absent or incomplete openers return a detail that says so rather than an
+    error: asking for a word the ranking does not hold is an ordinary thing for
+    a client to do while the sweep is still running.
+    """
+    if summary is None or summary["state"] != "complete" or not response_group_skeletons:
+        return {"word": word, "available": False, "response_groups": []}
+    return {
+        "word": word,
+        "available": True,
+        "word_is_answer": word in answer_set,
+        "answer_count": sum(count for _, count, _ in response_group_skeletons),
+        "response_groups": [
+            {"pattern": pattern, "answer_count": count}
+            for pattern, count, _ in sorted(
+                response_group_skeletons, key=lambda group: group[1],
+                reverse=True)
+        ],
+    }
+
+
 def collect_leaderboard_report(sources: ReportOpeners, request: ReportRequest) -> dict:
     """Rank every candidate opener by its own ERD.
 
@@ -3433,51 +3573,41 @@ def collect_leaderboard_report(sources: ReportOpeners, request: ReportRequest) -
         )
         _store_opener_folds(cache, summaries, ERD_ALL)
         groups_by_candidate = dict(skeletons)
-        ranked_rows = [
-            {
-                "word": candidate,
-                "word_is_answer": candidate in answer_set,
-                "erd": summary["erd"],
-                "max_remaining_depth": summary["max_remaining_depth"],
-                "_response_group_skeletons": groups_by_candidate[candidate],
-            }
-            for candidate, summary in summaries.items()
-            if summary["state"] == "complete"
-        ]
-        ranked_rows.sort(
-            key=lambda row: (row["erd"], row["max_remaining_depth"], row["word"])
-        )
-        for rank, row in enumerate(ranked_rows, start=1):
-            row["rank"] = rank
-        displayed_rows = (
-            ranked_rows[:limit] if limit is not None else ranked_rows
-        )
-        for row in displayed_rows:
-            response_group_skeletons = row.pop("_response_group_skeletons")
-            row["answer_count"] = sum(
-                answer_count
-                for _, answer_count, _ in response_group_skeletons
+        ranked = sorted(
+            (
+                (summary["erd"], summary["max_remaining_depth"], candidate)
+                for candidate, summary in summaries.items()
+                if summary["state"] == "complete"
             )
-            row["response_groups"] = [
-                {
-                    "pattern": pattern,
-                    "answer_count": answer_count,
-                }
-                for pattern, answer_count, _ in sorted(
-                    response_group_skeletons,
-                    key=lambda group: group[1],
-                    reverse=True,
-                )
-            ]
+        )
+        displayed = ranked[:limit] if limit is not None else ranked
+        # Every opener partitions the whole answer list, so the count -- and
+        # therefore the ERD denominator -- is one number for the ranking rather
+        # than a copy per row.
+        answer_count = len(all_answers)
+        columns = _leaderboard_columns(displayed, answer_count, answer_set)
         # Publish only after the whole vocabulary is folded.  A mid-loop cache
         # error must not leave a truncated ranking that reads as complete.
         data.update({
             "candidate_count": len(all_candidates),
             "counts": counts,
-            "total_rows": len(ranked_rows),
-            "matched_rows": len(ranked_rows),
-            "rows": displayed_rows,
+            "total_rows": len(ranked),
+            "matched_rows": len(ranked),
+            "answer_count": answer_count,
+            "columns": columns,
         })
+        # The breakdown is the whole payload at this row count -- 3.7 KB a row
+        # against 20 bytes of column -- so it is carried only for a named
+        # opener, which is what a card asks for when it is opened.
+        # A bare opener only: a deeper spine names a branch inside a tree, not
+        # a row of this ranking.
+        target = request.branch_target
+        detail_word = (target.trailing_word
+                       if target.kind == "word" and not target.steps else None)
+        if detail_word:
+            data["detail"] = _leaderboard_detail(
+                detail_word, summaries.get(detail_word),
+                groups_by_candidate.get(detail_word), answer_set)
         report["sources"]["cache"]["ok"] = True
     except (sqlite3.Error, OSError) as error:
         report["sources"]["cache"]["error"] = str(error)

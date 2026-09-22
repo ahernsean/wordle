@@ -435,7 +435,8 @@
     const explicitKinds=new Set(["queue","workers","cache","hotspots","work_distribution","leaderboard","openers"]);
     const treelessKinds=new Set(["cache","hotspots","work_distribution","leaderboard","openers"]);
     const populationNames={current_queue_branches:"current queue branches",recent_branch_finalizations:"recent branch finalizations",recent_cut_reuse_misses:"recent cut-reuse misses",recent_claim_coordination_buckets:"recent claim coordination buckets",recent_claims_by_branch:"recent claims by branch"};
-    const collapsedNodes=new Set(), initializedNodes=new Set(), collapsedWordGroups=new Set(), initializedWordGroups=new Set(), collapsedResponseGroups=new Set(), stickyOrders=new Map(), packedOrders=new Map(), gridColumnCounts=new Map(), treePageHistory=new Map(), treeGroupPages=new Map();
+    const collapsedNodes=new Set(), initializedNodes=new Set(), collapsedWordGroups=new Set(), initializedWordGroups=new Set(), collapsedResponseGroups=new Set(), stickyOrders=new Map(), packedOrders=new Map(), gridColumnCounts=new Map(), treePageHistory=new Map(), treeGroupPages=new Map(),
+      expandedOpeners=new Set(), openerBreakdowns=new Map();
     const COMPLETED_BRANCH_HOLD_MILLIS=5000;
     const recentOverviewCompletionRows=new Map();
     let completionExpiryTimer=null;
@@ -2300,13 +2301,95 @@
       const data=report.data,fragment=document.createDocumentFragment(),counts=data.counts||{},metrics=element("div","metrics");
       metrics.append(metric("complete",counts.complete),metric("pending",counts.pending),metric("infeasible",counts.infeasible),metric("candidates",data.candidate_count));
       fragment.append(element("h2","","Opener leaderboard"),metrics);
-      const rows=data.rows||[];
+      const rows=leaderboardRows(data);
       fragment.append(element("p","dim","Ranked by ERD · showing "+numText(rows.length)+" of "+numText(data.total_rows??rows.length)+" complete"));
       if(!rows.length){fragment.append(element("p","empty","No opener has a complete tree yet"));return fragment;}
-      const maximumResponseGroupCount=data.maximum_response_group_count||data.response_pattern_count||243;fragment.append(responseVisualKey());
-      const grid=element("div","grid leaderboard"),previousRows=previousBy(previous,"rows","word");
-      for(const row of rows){const card=element("article","card leaderboard-card");card.dataset.identity=row.word;const title=element("div","card-title"),entry=element("span","word-erd");entry.append(wordTiles(row.word,null,row.word_is_answer,"word-md"),"/"+fixed(row.erd,3));title.append(element("span","leaderboard-rank","#"+row.rank),entry);card.append(title,renderResponseGroupBreakdown(row,{maximumResponseGroupCount,selection:{branchTargetPrefix:String(row.word||"").toUpperCase(),open:branchTarget=>setState({...state,kind:"auto",branch_target:branchTarget,tree:false,finalization_cursor:""})}}),element("div","leaderboard-worst-case dim","Worst-case solve: "+row.max_remaining_depth+" guesses"));grid.append(card);}
+      const grid=element("div","grid leaderboard");
+      const maximumResponseGroupCount=data.maximum_response_group_count||data.response_pattern_count||243;
+      for(const row of rows){
+        const card=element("article","card leaderboard-card");card.dataset.identity=row.word;
+        const title=element("div","card-title"),entry=element("span","word-erd");
+        entry.append(wordTiles(row.word,null,row.word_is_answer,"word-md"),"/",element("span","erd-value",row.erdText));
+        title.append(element("span","leaderboard-rank","#"+numText(row.rank)),entry);
+        card.append(title,element("div","leaderboard-worst-case dim","Worst-case solve: "+row.max_remaining_depth+" guesses"),
+          renderLeaderboardBreakdown(row,state,maximumResponseGroupCount));
+        grid.append(card);
+      }
       fragment.append(grid);return fragment;
+    }
+    // A card's response groups are 5.9 KB against the 20 bytes of column that
+    // rank it, so they are fetched for the one opener a reader opened rather
+    // than shipped for all of them.  The open set and the fetched breakdowns
+    // live outside the DOM because the report re-renders on every poll.
+    function leaderboardDetailURL(state,word){
+      const url=new URL(buildAPIURL({...state,kind:"leaderboard"}),location.origin);
+      url.searchParams.set("branch_target",String(word).toUpperCase());
+      return url.pathname+url.search;
+    }
+    function renderLeaderboardBreakdown(row,state,maximumResponseGroupCount){
+      const details=element("details","leaderboard-breakdown"),
+        summary=element("summary","clickable","Response groups"),
+        host=element("div","leaderboard-breakdown-body");
+      details.open=expandedOpeners.has(row.word);
+      details.append(summary,host);
+      const draw=()=>{
+        const detail=openerBreakdowns.get(row.word);
+        if(!detail){host.replaceChildren(element("p","dim","Loading response groups…"));return;}
+        if(!detail.available){host.replaceChildren(element("p","empty","No complete tree for this opener yet"));return;}
+        host.replaceChildren(renderResponseGroupBreakdown(detail,{maximumResponseGroupCount,
+          selection:{branchTargetPrefix:String(row.word||"").toUpperCase(),
+            open:branchTarget=>setState({...state,kind:"auto",branch_target:branchTarget,tree:false,finalization_cursor:""})}}));
+      };
+      const load=async()=>{
+        if(openerBreakdowns.has(row.word)){draw();return;}
+        host.replaceChildren(element("p","dim","Loading response groups…"));
+        try{
+          const response=await fetch(leaderboardDetailURL(state,row.word),{headers:{Accept:"application/json"}});
+          if(!response.ok)throw new Error("Breakdown request failed ("+response.status+")");
+          const report=await response.json();
+          openerBreakdowns.set(row.word,report.data.detail||{available:false,response_groups:[]});
+          draw();
+        }catch(error){host.replaceChildren(element("p","error",error.message));}
+      };
+      details.addEventListener("toggle",()=>{
+        if(details.open){expandedOpeners.add(row.word);load();}
+        else expandedOpeners.delete(row.word);
+      });
+      if(details.open)load();
+      return details;
+    }
+    // The ranking arrives as parallel arrays: at the full candidate vocabulary
+    // a row-shaped payload is mostly repeated JSON keys and a constant answer
+    // count, and the columns are 0.29 MB against 56 MB of rows.  Rank is the
+    // position, so it is not carried at all.
+    function leaderboardRows(data){
+      const columns=data.columns;
+      if(!columns)return data.rows||[];
+      const width=columns.word_width||5,words=columns.words||"",count=Math.floor(words.length/width),
+        numerators=columns.erd_numerator||[],decimals=columns.erd_decimal||[],
+        denominator=columns.erd_denominator||data.answer_count||null,
+        depths=columns.max_remaining_depth||[],answerBits=decodeCandidateBitmap(columns.word_is_answer_bitmap);
+      const rows=[];
+      for(let index=0;index<count;index++){
+        const numerator=numerators[index],
+          // An exact ERD is numerator/answer_count on the branch's own
+          // lattice; erdValue renders both halves the way every other surface
+          // does.  A row the lattice could not express carries its decimal
+          // instead and is shown as a decimal alone.
+          erd=numerator===null||numerator===undefined
+            ?(decimals[index]??null)
+            :numerator/denominator;
+        rows.push({
+          word:words.slice(index*width,(index+1)*width),
+          rank:index+1,
+          erd,
+          erdText:numerator===null||numerator===undefined
+            ?fixed(erd):erdValue(erd,denominator),
+          max_remaining_depth:depths[index],
+          word_is_answer:!!(answerBits[index>>3]&(1<<(index&7))),
+        });
+      }
+      return rows;
     }
     function renderCache(report,previous){const data=report.data,fragment=document.createDocumentFragment(),metrics=element("div","metrics");for(const [key,value] of Object.entries(data.summary||{}))metrics.append(metric(label(key),value));fragment.append(metrics);for(const [name,distribution] of Object.entries(data.distributions||{}))fragment.append(section(label(name),labeledFacts(Object.entries(distribution))));const rows=gridElement("cache"),previousRows=new Map(cacheRows((previous||{}).data||{}).map(row=>[String(row.branch_key_hex),row]));for(const row of cacheRows(data)){const card=section("@"+shortReference(valueOrDash(row.branch_reference)),labeledFacts(displayEntries(row,report.generated_at)),(row.cache_state||"")+" "+changeClass(row,previousRows.get(String(row.branch_key_hex))));card.dataset.identity=row.branch_key_hex;rows.append(card);}fragment.append(rows);return fragment;}
     // Bands over the whole sampled claim population.  renderHotspots ranks the
@@ -2518,7 +2601,8 @@
       else scrollTo(readingPosition.left,readingPosition.top);
     }
     function leaderboardRowsChanged(report,previousReport){
-      return JSON.stringify(semanticProjection({rows:report.data.rows,total_rows:report.data.total_rows}))!==JSON.stringify(semanticProjection({rows:previousReport.data.rows,total_rows:previousReport.data.total_rows}));
+      const shape=data=>({columns:data.columns,rows:data.rows,total_rows:data.total_rows});
+      return JSON.stringify(semanticProjection(shape(report.data)))!==JSON.stringify(semanticProjection(shape(previousReport.data)));
     }
     function refreshLeaderboardMetrics(report){
       const counts=report.data.counts||{},values=[counts.complete,counts.pending,counts.infeasible,report.data.candidate_count];

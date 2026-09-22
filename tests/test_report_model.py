@@ -15,6 +15,7 @@ from erd_queue import ERDQueue
 import erd_search
 import report_model
 from report_model import (
+    leaderboard_rows,
     encode_candidate_bitmap,
     decode_candidate_bitmap,
     _worker_process_is_running,
@@ -991,13 +992,14 @@ class ReportModelTest(unittest.TestCase):
         self.assertTrue(cache.opener_erd_map(ERD_ALL))
         cache.write_opener_erds(
             [(row["word"], row["erd"] + 99.0, 6, 4)
-             for row in first["data"]["rows"]],
+             for row in leaderboard_rows(first["data"])],
             ERD_ALL,
         )
         cache.close()
 
         second = collect_report(sources, ReportRequest(report_kind="leaderboard"))
-        self.assertEqual(second["data"]["rows"], first["data"]["rows"])
+        self.assertEqual(leaderboard_rows(second["data"]),
+                         leaderboard_rows(first["data"]))
         self.assertEqual(second["data"]["counts"], first["data"]["counts"])
 
     def test_a_screened_candidate_holding_a_loss_and_a_gap_is_infeasible(self):
@@ -1044,7 +1046,8 @@ class ReportModelTest(unittest.TestCase):
             sources, ReportRequest(report_kind="leaderboard"))["data"]
         self.assertEqual(data["counts"],
                          {"complete": 1, "pending": 0, "infeasible": 0})
-        self.assertEqual([row["word"] for row in data["rows"]], ["raise"])
+        self.assertEqual([row["word"] for row in leaderboard_rows(data)],
+                         ["raise"])
 
     def test_a_rebuild_over_an_unchanged_cache_writes_no_stored_folds(self):
         # The leaderboard is polled, and the cache it writes to is the one the
@@ -1092,7 +1095,8 @@ class ReportModelTest(unittest.TestCase):
 
         data = collect_report(
             sources, ReportRequest(report_kind="leaderboard"))["data"]
-        self.assertNotIn("howdy", {row["word"] for row in data["rows"]})
+        self.assertNotIn("howdy",
+                         {row["word"] for row in leaderboard_rows(data)})
         cache = ScoreCache(sources.cache_path, answers,
                            checkpoint_on_close=False)
         self.addCleanup(cache.close)
@@ -1128,7 +1132,8 @@ class ReportModelTest(unittest.TestCase):
         pending = collect_report(
             sources, ReportRequest(report_kind="leaderboard"))["data"]
         self.assertEqual(pending["counts"]["complete"], 3)
-        self.assertNotIn("howdy", {row["word"] for row in pending["rows"]})
+        self.assertNotIn("howdy",
+                         {row["word"] for row in leaderboard_rows(pending)})
 
         cache = ScoreCache(sources.cache_path, answers,
                            checkpoint_on_close=False)
@@ -1138,7 +1143,8 @@ class ReportModelTest(unittest.TestCase):
         complete = collect_report(
             sources, ReportRequest(report_kind="leaderboard"))["data"]
         self.assertEqual(complete["counts"]["complete"], 4)
-        self.assertIn("howdy", {row["word"] for row in complete["rows"]})
+        self.assertIn("howdy",
+                      {row["word"] for row in leaderboard_rows(complete)})
 
         # Nothing names HOWDY when this row goes, and nothing needs to: the
         # next build folds HOWDY from the group that no longer resolves.
@@ -1151,8 +1157,9 @@ class ReportModelTest(unittest.TestCase):
             sources, ReportRequest(report_kind="leaderboard"))["data"]
         self.assertEqual(second["counts"]["complete"], 3)
         self.assertEqual(second["counts"]["pending"], 1)
-        self.assertNotIn("howdy", {row["word"] for row in second["rows"]})
-        self.assertEqual(second["rows"], pending["rows"])
+        self.assertNotIn("howdy",
+                         {row["word"] for row in leaderboard_rows(second)})
+        self.assertEqual(leaderboard_rows(second), leaderboard_rows(pending))
 
     def test_collect_word_report_populates_candidate_erd_summary(self):
         request = ReportRequest(
@@ -2283,19 +2290,59 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(
             data["counts"], {"complete": 3, "pending": 1, "infeasible": 0}
         )
-        self.assertEqual([row["word"] for row in data["rows"]],
+        rows = leaderboard_rows(data)
+        self.assertEqual([row["word"] for row in rows],
                          ["crane", "slate", "raise"])
-        self.assertEqual([row["rank"] for row in data["rows"]], [1, 2, 3])
-        self.assertAlmostEqual(data["rows"][0]["erd"], 1.5)
-        self.assertAlmostEqual(data["rows"][2]["erd"], 2.0)
-        self.assertTrue(data["rows"][0]["word_is_answer"])
-        self.assertFalse(data["rows"][2]["word_is_answer"])
-        self.assertEqual(data["rows"][0]["answer_count"], 2)
-        self.assertEqual(
-            [group["answer_count"] for group in data["rows"][0]["response_groups"]],
-            [1, 1],
-        )
+        self.assertEqual([row["rank"] for row in rows], [1, 2, 3])
+        self.assertAlmostEqual(rows[0]["erd"], 1.5)
+        self.assertAlmostEqual(rows[2]["erd"], 2.0)
+        self.assertTrue(rows[0]["word_is_answer"])
+        self.assertFalse(rows[2]["word_is_answer"])
         self.assertEqual(data["response_pattern_count"], 243)
+
+        # The ERD is carried exactly, on the branch's own lattice: three
+        # guesses over two answers is 3/2, not a float that happens to print
+        # as 1.5.
+        self.assertEqual(rows[0]["erd_numerator"], 3)
+        self.assertEqual(rows[0]["erd_denominator"], 2)
+        self.assertEqual(data["answer_count"], 2)
+
+        # The ranking carries no response groups at all -- they are the whole
+        # payload at vocabulary scale and arrive only for an opener that is
+        # named.
+        self.assertNotIn("rows", data)
+        self.assertNotIn("detail", data)
+        self.assertNotIn("response_groups", json.dumps(data))
+
+    def test_leaderboard_carries_one_opener_s_groups_when_it_is_named(self):
+        sources = self._leaderboard_sources(
+            ["crane", "slate"], ["crane", "slate", "raise", "howdy"]
+        )
+        data = collect_report(sources, ReportRequest(
+            report_kind="leaderboard",
+            branch_target=parse_report_branch_target("crane")))["data"]
+        detail = data["detail"]
+        self.assertTrue(detail["available"])
+        self.assertEqual(detail["word"], "crane")
+        self.assertEqual(detail["answer_count"], 2)
+        self.assertEqual([group["answer_count"]
+                          for group in detail["response_groups"]], [1, 1])
+        # Naming an opener does not cost the ranking its columns.
+        self.assertEqual([row["word"] for row in leaderboard_rows(data)],
+                         ["crane", "slate", "raise"])
+
+    def test_leaderboard_detail_for_an_unfinished_opener_says_so(self):
+        # howdy collides both answers into one unsolved group, so it is
+        # pending -- an ordinary thing to ask about while a sweep runs, and
+        # not an error.
+        sources = self._leaderboard_sources(
+            ["crane", "slate"], ["crane", "slate", "raise", "howdy"]
+        )
+        data = collect_report(sources, ReportRequest(
+            report_kind="leaderboard",
+            branch_target=parse_report_branch_target("howdy")))["data"]
+        self.assertFalse(data["detail"]["available"])
+        self.assertEqual(data["detail"]["response_groups"], [])
 
     def test_leaderboard_report_counts_partition_the_candidate_list(self):
         report = collect_report(
@@ -2307,11 +2354,12 @@ class ReportModelTest(unittest.TestCase):
             counts["complete"] + counts["pending"] + counts["infeasible"],
             data["candidate_count"],
         )
-        self.assertEqual(len(data["rows"]), counts["complete"])
-        erds = [row["erd"] for row in data["rows"]]
+        self.assertEqual(len(leaderboard_rows(data)), counts["complete"])
+        erds = [row["erd"] for row in leaderboard_rows(data)]
         self.assertEqual(erds, sorted(erds))
-        self.assertEqual([row["rank"] for row in data["rows"]],
-                         list(range(1, len(data["rows"]) + 1)))
+        rows = leaderboard_rows(data)
+        self.assertEqual([row["rank"] for row in rows],
+                         list(range(1, len(rows) + 1)))
 
     def test_leaderboard_builds_matrix_beside_the_cache_not_the_cwd(self):
         # load_or_build derives the matrix directory from the cache *path*;

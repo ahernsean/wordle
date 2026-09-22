@@ -26,6 +26,34 @@
       "infeasible": 1,
       "pending": 14852
     },
+    "detail": {
+      "answer_count": 100,
+      "available": true,
+      "response_groups": [
+        {
+          "answer_count": 31,
+          "pattern": "-----"
+        },
+        {
+          "answer_count": 24,
+          "pattern": "---g-"
+        },
+        {
+          "answer_count": 21,
+          "pattern": "---y-"
+        },
+        {
+          "answer_count": 14,
+          "pattern": "-y---"
+        },
+        {
+          "answer_count": 10,
+          "pattern": "--y--"
+        }
+      ],
+      "word": "salet",
+      "word_is_answer": false
+    },
     "matched_rows": 2,
     "response_pattern_count": 243,
     "total_rows": 2

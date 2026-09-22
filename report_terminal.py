@@ -21,6 +21,7 @@ from report_model import (
     WORKER_STALE_SECONDS,
     collect_ambiguous_branch_reference_report,
     collect_report,
+    leaderboard_rows,
     parse_report_branch_target,
 )
 from wordle_engine import erd_display_numerator
@@ -1538,7 +1539,7 @@ def _render_cache_collection_sections(report, width, display_order):
             ) or "none"
             lines.append(_fit(f"  {label}: {formatted_values}", width))
     elif "rows" in data:
-        for row in data["rows"]:
+        for row in leaderboard_rows(data):
             hotkey = _hotkey_label(display_order, row.get("branch_key_hex"))
             hotkey_prefix = f"{hotkey} " if hotkey else ""
             lines.append(_fit(
@@ -1830,7 +1831,7 @@ def _render_leaderboard_sections(report, width):
             f"  complete {counts['complete']}  "
             f"pending {counts['pending']}  "
             f"infeasible {counts['infeasible']}  "
-            f"(showing {len(data['rows'])} of {data['total_rows']})",
+            f"(showing {len(leaderboard_rows(data))} of {data['total_rows']})",
             width,
         ),
     ]

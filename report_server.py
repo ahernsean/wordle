@@ -54,6 +54,7 @@ FIXTURE_FILENAMES = (
     "hotspots.json",
     "work_distribution.json",
     "leaderboard.json",
+    "leaderboard-word.json",
     "root_progress.json",
     "root_progress-inherited.json",
     "openers.json",
@@ -397,6 +398,10 @@ def fixture_name_for_request(path, request):
     # named, so the two shapes need two fixtures.
     if kind == "openers" and request.branch_target.kind == "word":
         return "openers-word.json"
+    # The leaderboard carries one opener's response groups only once that
+    # opener is named, for the same reason and with the same split.
+    if kind == "leaderboard" and request.branch_target.kind == "word":
+        return "leaderboard-word.json"
     return f"{kind}{progressive_stage_suffix(request)}.json"
 
 
