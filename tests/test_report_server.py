@@ -5,6 +5,7 @@ import errno
 from http.server import ThreadingHTTPServer
 from threading import Event, Lock, Thread
 import io
+import copy
 import json
 import threading
 import os
@@ -56,9 +57,10 @@ def running_server(configuration):
         thread.join(timeout=2)
 
 
-def request(base_url, path, method="GET"):
+def request(base_url, path, method="GET", headers=None):
     try:
-        with urlopen(Request(base_url + path, method=method), timeout=3) as response:
+        with urlopen(Request(base_url + path, method=method,
+                             headers=headers or {}), timeout=3) as response:
             body = response.read()
             return response.status, response.headers, body
     except HTTPError as error:
@@ -1029,3 +1031,209 @@ class RootProgressRequestTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConditionalLeaderboardRequestTest(ReportServerTest):
+    """A poll that would receive the same ranking receives nothing instead.
+
+    The leaderboard's answer moves when an opener completes -- about every 27
+    minutes -- and the client polls every two seconds, so an unchanged answer
+    is the ordinary case.  The signal that decides whether to rebuild is the
+    same one that decides whether to send, so it is spent as an ETag.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.report = load_fixtures(FIXTURE_DIRECTORY)["leaderboard.json"]
+        self.tokens = ["opener-signal-1"]
+
+    def test_a_ranking_carries_the_signal_it_was_revalidated_against(self):
+        with patch("report_server.collect_report", return_value=self.report), \
+             patch("report_server.opener_completion_signal",
+                   side_effect=lambda *_: self.tokens[0]):
+            with running_server(self.live_configuration) as base_url:
+                status, headers, body = request(base_url, "/api/view/leaderboard")
+        self.assertEqual(status, 200)
+        self.assertTrue(headers.get("ETag"), "no ETag to revalidate against")
+        self.assertTrue(body)
+
+    def test_an_unchanged_ranking_answers_304_with_no_body(self):
+        with patch("report_server.collect_report", return_value=self.report), \
+             patch("report_server.opener_completion_signal",
+                   side_effect=lambda *_: self.tokens[0]):
+            with running_server(self.live_configuration) as base_url:
+                _status, headers, first = request(
+                    base_url, "/api/view/leaderboard")
+                tag = headers["ETag"]
+                status, _headers, body = request(
+                    base_url, "/api/view/leaderboard",
+                    headers={"If-None-Match": tag})
+        self.assertEqual(status, 304)
+        self.assertEqual(body, b"", "a 304 must carry no body")
+        self.assertTrue(first, "the first response should have carried one")
+
+    def _ranking(self, first_word):
+        report = copy.deepcopy(self.report)
+        columns = report["data"]["columns"]
+        columns["words"] = first_word + columns["words"][5:]
+        return report
+
+    def test_a_changed_ranking_returns_a_body_and_a_new_tag(self):
+        rankings = [self._ranking("salet")]
+        with patch("report_server.collect_report",
+                   side_effect=lambda *_: rankings[0]), \
+             patch("report_server.opener_completion_signal",
+                   side_effect=lambda *_: self.tokens[0]):
+            with running_server(self.live_configuration) as base_url:
+                _status, headers, _body = request(
+                    base_url, "/api/view/leaderboard")
+                stale_tag = headers["ETag"]
+                # An opener finished and took the top of the ranking with it.
+                self.tokens[0] = "opener-signal-2"
+                rankings[0] = self._ranking("tarse")
+                status, new_headers, body = request(
+                    base_url, "/api/view/leaderboard",
+                    headers={"If-None-Match": stale_tag})
+        self.assertEqual(status, 200)
+        self.assertIn(b"tarse", body)
+        self.assertNotEqual(new_headers["ETag"], stale_tag)
+
+    def test_a_rebuild_that_changes_nothing_still_revalidates(self):
+        # An opener can finish without moving the ranking the client holds --
+        # it lands below the rows being shown.  The body is identical, so the
+        # client's copy is current and there is nothing to send.
+        with patch("report_server.collect_report",
+                   side_effect=lambda *_: copy.deepcopy(self.report)), \
+             patch("report_server.opener_completion_signal",
+                   side_effect=lambda *_: self.tokens[0]):
+            with running_server(self.live_configuration) as base_url:
+                _status, headers, _body = request(
+                    base_url, "/api/view/leaderboard")
+                tag = headers["ETag"]
+                self.tokens[0] = "opener-signal-2"
+                status, _new_headers, body = request(
+                    base_url, "/api/view/leaderboard",
+                    headers={"If-None-Match": tag})
+        self.assertEqual(status, 304)
+        self.assertEqual(body, b"")
+
+    def test_a_rebuild_the_signal_cannot_see_still_reaches_the_client(self):
+        """The backstop rebuild must be visible, or it accomplishes nothing.
+
+        `opener_completion_signal` is deliberately not exhaustive: a repair, a
+        reverification or an import changes the cache while completing no queue
+        work.  REPORT_CACHE_MAX_AGE_SECONDS exists to catch exactly that, by
+        rebuilding once the entry ages out even though the signal has not
+        moved.
+
+        A validator taken from the signal would still match across that
+        rebuild, so the client would be told nothing had changed while the
+        server held a ranking it had already replaced -- and with the queue
+        stopped, no opener ever completes and the client never learns.
+        """
+        rankings = [self._ranking("salet")]
+        with patch("report_server.collect_report",
+                   side_effect=lambda *_: rankings[0]), \
+             patch("report_server.opener_completion_signal",
+                   side_effect=lambda *_: self.tokens[0]), \
+             patch.object(report_server, "REPORT_CACHE_MAX_AGE_SECONDS", 0):
+            with running_server(self.live_configuration) as base_url:
+                _status, headers, _body = request(
+                    base_url, "/api/view/leaderboard")
+                stale_tag = headers["ETag"]
+                # A repair rewrote a branch result.  No opener completed, so
+                # the signal stands exactly where it was.
+                rankings[0] = self._ranking("crane")
+                status, new_headers, body = request(
+                    base_url, "/api/view/leaderboard",
+                    headers={"If-None-Match": stale_tag})
+        self.assertEqual(
+            status, 200,
+            "a rebuild the signal cannot see was withheld from the client")
+        self.assertIn(b"crane", body)
+        self.assertNotEqual(new_headers["ETag"], stale_tag)
+
+
+class RevalidatedReportsDeclareThemselvesTest(ReportServerTest):
+    """A report the poll does not refresh has to say when its data is from.
+
+    Every other view is rebuilt on each two-second poll, so the cadence is the
+    freshness.  The leaderboard is not: its data is as old as the last opener
+    to finish, up to REPORT_CACHE_MAX_AGE_SECONDS.  Without a mark on the
+    report the client cannot tell the two apart, and a reader would take the
+    poll interval for the age of what is on screen.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.report = load_fixtures(FIXTURE_DIRECTORY)["leaderboard.json"]
+
+    def test_a_revalidated_report_is_marked_for_the_client(self):
+        with patch("report_server.collect_report", return_value=dict(self.report)), \
+             patch("report_server.opener_completion_signal", return_value=(1, 1)):
+            with running_server(self.live_configuration) as base_url:
+                _status, _headers, body = request(base_url, "/api/view/leaderboard")
+        self.assertTrue(json.loads(body)["revalidated"])
+
+    def test_a_live_report_is_not_marked(self):
+        # The queue report's subject is what the swarm is doing right now, so
+        # it is rebuilt every poll and carries no age to declare.
+        with running_server(self.live_configuration) as base_url:
+            _status, _headers, body = request(base_url, "/api/view/queue")
+        self.assertNotIn("revalidated", json.loads(body))
+
+
+class CardExpansionsLeaveTheRankingCacheAloneTest(ReportServerTest):
+    """Opening cards must not evict the ranking the reader is polling.
+
+    The revalidated cache holds REPORT_CACHE_MAX_ENTRIES entries against a
+    vocabulary of 14,855 words, and its key is the whole request -- so a
+    detail request is a distinct entry.  A reader who opened a handful of cards
+    would push the ranking out, and the next poll would rebuild it.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.report = load_fixtures(FIXTURE_DIRECTORY)["leaderboard.json"]
+
+    def test_opened_cards_do_not_push_the_ranking_out_of_the_cache(self):
+        # More detail requests than the cache holds entries, so if they were
+        # stored at all the ranking could not have survived them.
+        built = []
+
+        def counting(_sources, request):
+            built.append(request.branch_target.trailing_word or "ranking")
+            return self.report
+
+        with patch("report_server.collect_report", side_effect=counting), \
+             patch("report_server.opener_completion_signal", return_value=(1, 1)):
+            with running_server(self.live_configuration) as base_url:
+                request(base_url, "/api/view/leaderboard")
+                self.assertEqual(built, ["ranking"])
+                words = ("salet", "crane", "raise", "tarse", "caret",
+                         "carle", "slate", "trace", "leant", "stale")
+                self.assertGreater(len(words),
+                                   report_server.REPORT_CACHE_MAX_ENTRIES)
+                for word in words:
+                    status, _headers, _body = request(
+                        base_url, f"/api/view/leaderboard?branch_target={word}")
+                    self.assertEqual(status, 200)
+                status, headers, _body = request(
+                    base_url, "/api/view/leaderboard")
+
+        self.assertEqual(status, 200)
+        self.assertTrue(headers.get("ETag"))
+        self.assertEqual(
+            built.count("ranking"), 1,
+            "the ranking was rebuilt after cards were opened, so the "
+            "expansions had displaced it")
+
+    def test_a_detail_request_carries_no_entity_tag(self):
+        # It is built fresh every time and costs milliseconds, so there is
+        # nothing for a client to revalidate against.
+        with patch("report_server.collect_report", return_value=self.report), \
+             patch("report_server.opener_completion_signal", return_value=(1, 1)):
+            with running_server(self.live_configuration) as base_url:
+                _status, headers, _body = request(
+                    base_url, "/api/view/leaderboard?branch_target=salet")
+        self.assertIsNone(headers.get("ETag"))

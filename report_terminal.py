@@ -21,6 +21,7 @@ from report_model import (
     WORKER_STALE_SECONDS,
     collect_ambiguous_branch_reference_report,
     collect_report,
+    leaderboard_rows,
     parse_report_branch_target,
 )
 from wordle_engine import erd_display_numerator
@@ -1538,7 +1539,7 @@ def _render_cache_collection_sections(report, width, display_order):
             ) or "none"
             lines.append(_fit(f"  {label}: {formatted_values}", width))
     elif "rows" in data:
-        for row in data["rows"]:
+        for row in leaderboard_rows(data):
             hotkey = _hotkey_label(display_order, row.get("branch_key_hex"))
             hotkey_prefix = f"{hotkey} " if hotkey else ""
             lines.append(_fit(
@@ -1816,8 +1817,39 @@ def _render_opener_sections(report, width, display_order):
     return [("header", header), ("opener_rows", lines)]
 
 
+def _render_leaderboard_detail_sections(report, width, detail):
+    """One opener's response groups, for `view --leaderboard WORD`.
+
+    Naming an opener asks about that opener, so the report carries its
+    breakdown and no ranking at all -- ranking the vocabulary to describe one
+    word costs more than the ranking does.  There are no counts to summarise
+    here because nothing was counted.
+    """
+    word = str(detail.get("word") or "").upper()
+    header = _semantic_header(report, f"Opener {word}  response groups", width)
+    if not detail.get("available"):
+        return [("header", header),
+                ("summary", [_fit(f"{word} has no complete tree yet", width)])]
+    answer_count = detail.get("answer_count") or 0
+    groups = detail.get("response_groups") or []
+    summary = [_fit(
+        f"{len(groups):,} response groups over {answer_count:,} answers", width)]
+    rows = ["Response   Answers   Share"]
+    for group in groups:
+        share = (group["answer_count"] / answer_count) if answer_count else 0
+        rows.append(_fit(
+            f"{group['pattern']:<9}  {group['answer_count']:>7,}  "
+            f"{share * 100:>5.1f}%",
+            width,
+        ))
+    return [("header", header), ("summary", summary), ("leaderboard", rows)]
+
+
 def _render_leaderboard_sections(report, width):
     data = report["data"]
+    detail = data.get("detail")
+    if detail is not None:
+        return _render_leaderboard_detail_sections(report, width, detail)
     counts = data["counts"]
     header = _semantic_header(
         report,
@@ -1830,12 +1862,12 @@ def _render_leaderboard_sections(report, width):
             f"  complete {counts['complete']}  "
             f"pending {counts['pending']}  "
             f"infeasible {counts['infeasible']}  "
-            f"(showing {len(data['rows'])} of {data['total_rows']})",
+            f"(showing {len(leaderboard_rows(data))} of {data['total_rows']})",
             width,
         ),
     ]
     rows = ["Rank  Opener   ERD    Worst-case guesses"]
-    for row in data["rows"]:
+    for row in leaderboard_rows(data):
         word = row["word"].upper() + ("*" if row["word_is_answer"] else "")
         rows.append(_fit(
             f"{row['rank']:>4}  {word:<7}  {row['erd']:.3f}  "

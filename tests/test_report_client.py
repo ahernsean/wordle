@@ -45,6 +45,24 @@ SWEEP_BITMAP_JS = (
     "for(const byte of bytes)binary+=String.fromCharCode(byte);"
     "return btoa(binary);};"
 )
+# The leaderboard ships its ranking as parallel arrays rather than one object
+# per row, so a test that wants N ranked openers states the count and gets the
+# columns.  ERDs are laid on the lattice the denominator defines, which is what
+# the cards render as exact fractions.
+LEADERBOARD_COLUMNS_JS = (
+    "const leaderboardColumns=(rowCount,denominator)=>{"
+    "const bytes=new Uint8Array(Math.ceil(rowCount/8));"
+    "let words='';"
+    "for(let index=0;index<rowCount;index++)"
+    "words+='a'+String(index).padStart(4,'0');"
+    "let binary='';"
+    "for(const byte of bytes)binary+=String.fromCharCode(byte);"
+    "return {word_width:5,words,erd_denominator:denominator,"
+    "erd_numerator:Array.from({length:rowCount},(_,index)=>"
+    "Math.round(3.5*denominator)+index),"
+    "max_remaining_depth:Array.from({length:rowCount},()=>6),"
+    "word_is_answer_bitmap:btoa(binary)};};"
+)
 # Both browser suites run by default, and a browser that will not start is a
 # failure rather than a skip.  This client is used overwhelmingly from WebKit
 # (Safari and iOS Chrome), so a run that quietly covered only Chromium would
@@ -1501,6 +1519,19 @@ class ReportClientBrowserTest(unittest.TestCase):
     def _menu(self):
         return self.page.locator(".group-menu")
 
+    def _open_leaderboard_breakdown(self, index=0):
+        """Open a ranked card's response groups and wait for them to arrive.
+
+        A collapsed card carries no breakdown at all: the groups are 5.9 KB
+        apiece against the 20 bytes that rank an opener, so they are fetched
+        for the one card a reader opens.  Every assertion about segments,
+        legends or group menus therefore has to open a card first.
+        """
+        cards = self.page.locator(".grid.leaderboard > .leaderboard-card")
+        cards.nth(index).locator("summary").click()
+        self.page.wait_for_selector(".leaderboard-card .answer-segment")
+        return cards.nth(index)
+
     def test_word_report_breakdown_group_opens_a_menu_naming_the_group(self):
         # Which group a tap landed on is a guess until the menu names it, so
         # the title draws the guess and the response it caught.
@@ -1794,7 +1825,8 @@ class ReportClientBrowserTest(unittest.TestCase):
         # The same interaction in both views: a group is never a direct jump in
         # one place and a menu in the other.
         self.page.locator("[data-kind=leaderboard]").click()
-        self.page.wait_for_selector(".leaderboard-card .answer-segment")
+        self.page.wait_for_selector(".grid.leaderboard > .leaderboard-card")
+        self._open_leaderboard_breakdown(0)
         self.page.locator(".leaderboard-card .answer-segment").first.click()
         self.page.wait_for_selector(".group-menu")
         self.assertEqual(
@@ -1810,7 +1842,8 @@ class ReportClientBrowserTest(unittest.TestCase):
         # Every ranked opener is complete, so outlining there would black out
         # every segment and say nothing.  The leaderboard sends no solved flag.
         self.page.locator("[data-kind=leaderboard]").click()
-        self.page.wait_for_selector(".leaderboard-card .answer-segment")
+        self.page.wait_for_selector(".grid.leaderboard > .leaderboard-card")
+        self._open_leaderboard_breakdown(0)
         self.assertEqual(
             self.page.locator(".leaderboard-card .answer-segment.solved-group").count(),
             0)
@@ -1829,14 +1862,19 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.wait_for_selector("text=Opener leaderboard")
         text = self.page.locator("#report").inner_text()
         self.assertIn("SALET", text)
-        self.assertIn("3.564", text)
-        self.assertNotIn("3.5643502648", text)
+        # Every exact ERD is a whole number of guesses over the answer
+        # count, so every card states its fraction.
+        self.assertIn("3.560 356/100", text)
+        self.assertIn("3.710 371/100", text)
         self.assertIn("Worst-case solve: 6 guesses", text)
         self.assertNotIn("max remaining depth", text)
         self.assertNotIn("expected guesses remaining", text)
-        self.assertIn("5 answer groups (more groups = better)", text)
-        self.assertIn("Largest: 31 answers (31.0%)", text)
-        self.assertIn("Two largest: 55 answers (55.0%)", text)
+        # A collapsed card is rank, word, ERD and worst case.  The response
+        # groups are 5.9 KB apiece against 20 bytes of ranking, so they are
+        # fetched only for a card the reader opens.
+        self.assertNotIn("5 answer groups (more groups = better)", text)
+        self.assertNotIn("Largest: 31 answers (31.0%)", text)
+        self.assertIn("Response groups", text)
         self.assertIn("CRANE", text)
         self.assertTrue(self.answer_notch(
             self.page.locator(".card", has_text="CRANE").first.locator(".word")))
@@ -1848,7 +1886,8 @@ class ReportClientBrowserTest(unittest.TestCase):
         rank = cards.nth(0).locator(".leaderboard-rank")
         self.assertEqual(rank.inner_text(), "#1")
         self.assertNotIn("chip", rank.get_attribute("class").split())
-        answer_strip = cards.nth(0).locator(".answer-strip")
+        card = self._open_leaderboard_breakdown(0)
+        answer_strip = card.locator(".answer-strip")
         segments = answer_strip.locator(".answer-segment")
         self.assertEqual(segments.count(), 5)
         first_box = segments.nth(0).bounding_box()
@@ -1905,7 +1944,7 @@ class ReportClientBrowserTest(unittest.TestCase):
           window.fetch = (url, options) => realFetch(url, options).then(async response => {
             if (!String(url).includes('/leaderboard')) return response;
             const report = await response.json();
-            report.data.rows[0].erd = 9.876;
+            report.data.columns.erd_numerator[0] = 987;
             return new Response(JSON.stringify(report), {
               status: 200,
               headers: {'Content-Type': 'application/json'},
@@ -1913,23 +1952,168 @@ class ReportClientBrowserTest(unittest.TestCase):
           });
         }""")
         self.page.evaluate("async () => { await window.__reportClient.fetchReport(); }")
-        self.assertIn("9.876", self.page.locator("#report").inner_text())
+        self.assertIn("9.870 987/100", self.page.locator("#report").inner_text())
+
+    def test_an_unfinished_breakdown_is_asked_for_again(self):
+        """"Not finished yet" describes this instant, not the opener.
+
+        An opener still being swept, or one a repair has just invalidated,
+        answers unavailable.  Keeping that answer would hand it to every later
+        expansion, so a card opened early would read as unfinished for the life
+        of the page even after its tree completed.
+        """
+        self.page.locator("[data-kind=leaderboard]").click()
+        self.page.wait_for_selector(".grid.leaderboard > .leaderboard-card")
+        self.page.evaluate("""() => {
+          const realFetch = window.fetch.bind(window);
+          window.__detailFetches = 0;
+          window.__detailAvailable = false;
+          window.fetch = (url, options) => {
+            if (!String(url).includes('branch_target=')) return realFetch(url, options);
+            window.__detailFetches += 1;
+            return realFetch(url, options).then(response => response.json()).then(body => {
+              body.data.detail = window.__detailAvailable
+                ? {word: 'salet', available: true, word_is_answer: false,
+                   answer_count: 2,
+                   response_groups: [{pattern: '-----', answer_count: 1},
+                                     {pattern: 'ggggg', answer_count: 1}]}
+                : {word: 'salet', available: false, response_groups: []};
+              return new Response(JSON.stringify(body), {
+                status: 200, headers: {'Content-Type': 'application/json'},
+              });
+            });
+          };
+        }""")
+        summary = self.page.locator(
+            ".grid.leaderboard > .leaderboard-card").nth(0).locator("summary")
+        summary.click()
+        self.page.wait_for_selector("text=No complete tree for this opener yet")
+        summary.click()  # collapse
+
+        # The sweep finished it; opening again must ask rather than answer
+        # from what it kept.
+        self.page.evaluate("() => { window.__detailAvailable = true; }")
+        summary.click()
+        self.page.wait_for_selector(".leaderboard-card .answer-segment")
+        self.assertEqual(self.page.evaluate("() => window.__detailFetches"), 2)
+
+    def test_a_leaderboard_poll_sends_back_the_tag_it_was_given(self):
+        """A conditional poll is what makes an unchanged ranking free.
+
+        The server answers 304 when the opener-completion signal has not
+        moved, which it does not for about 27 minutes at a time, so the
+        request has to carry the tag or every poll pays for a body the client
+        already holds.
+        """
+        self.page.locator("[data-kind=leaderboard]").click()
+        self.page.wait_for_selector("text=Opener leaderboard")
+        sent = self.page.evaluate("""async () => {
+          const realFetch = window.fetch.bind(window);
+          const seen = [];
+          window.fetch = (url, options) => {
+            if (String(url).includes('/leaderboard') && !String(url).includes('branch_target')) {
+              seen.push((options && options.headers || {})['If-None-Match'] || null);
+              return Promise.resolve(new Response(JSON.stringify({}), {
+                status: 304, headers: {'ETag': '"signal-1"'},
+              }));
+            }
+            return realFetch(url, options);
+          };
+          // First poll teaches the client the tag, second must send it back.
+          window.fetch = ((inner) => (url, options) => {
+            if (String(url).includes('/leaderboard') && !String(url).includes('branch_target')) {
+              seen.push((options && options.headers || {})['If-None-Match'] || null);
+              return realFetch(url, options).then(response => response.json()).then(body =>
+                new Response(JSON.stringify(body), {
+                  status: 200,
+                  headers: {'Content-Type': 'application/json', 'ETag': '"signal-1"'},
+                }));
+            }
+            return inner(url, options);
+          })(window.fetch);
+          await window.__reportClient.fetchReport();
+          await window.__reportClient.fetchReport();
+          return seen;
+        }""")
+        self.assertIsNone(sent[0], "the first poll had no tag to send")
+        self.assertEqual(sent[1], '"signal-1"',
+                         "the second poll did not carry the tag back")
+
+    def test_returning_to_the_leaderboard_never_revalidates(self):
+        """A 304 sends no body, so it can only ever mean "keep what is up".
+
+        The client holds one rendered report and deliberately leaves the
+        previous view on screen while the next is fetched.  Revalidating the
+        view being *entered* would answer 304 for it and leave the other view's
+        report sitting under its tab -- for up to REPORT_CACHE_MAX_AGE_SECONDS,
+        or until the bytes happened to change.
+        """
+        self.page.locator("[data-kind=leaderboard]").click()
+        self.page.wait_for_selector("text=Opener leaderboard")
+        sent = self.page.evaluate("""() => {
+          const realFetch = window.fetch.bind(window);
+          const seen = [];
+          window.fetch = (url, options) => {
+            if (String(url).includes('/leaderboard') && !String(url).includes('branch_target')) {
+              seen.push((options && options.headers || {})['If-None-Match'] || null);
+              return realFetch(url, options).then(response => response.json()).then(body =>
+                new Response(JSON.stringify(body), {
+                  status: 200,
+                  headers: {'Content-Type': 'application/json', 'ETag': '"signal-1"'},
+                }));
+            }
+            return realFetch(url, options);
+          };
+          window.__seen = seen;
+          return seen;
+        }""")
+        # Learn a tag on the view we are already on.
+        self.page.evaluate("async () => { await window.__reportClient.fetchReport(); }")
+        self.page.locator("[data-kind=queue]").click()
+        self.page.wait_for_selector("text=queue report")
+        self.page.locator("[data-kind=leaderboard]").click()
+        self.page.wait_for_selector("text=Opener leaderboard")
+
+        sent = self.page.evaluate("() => window.__seen")
+        self.assertIsNone(
+            sent[-1],
+            "returning to the leaderboard revalidated it, so a 304 could have "
+            "left the other view on screen")
+        self.assertIn("Opener leaderboard",
+                      self.page.locator("#report").inner_text())
+
+    def test_a_304_leaderboard_poll_leaves_the_rendered_cards_alone(self):
+        # Nothing arrives to render, and the client must treat that as the
+        # ranking standing still rather than as a failure.
+        self.page.locator("[data-kind=leaderboard]").click()
+        self.page.wait_for_selector(".grid.leaderboard > .leaderboard-card")
+        before = self.page.locator("#report").inner_text()
+        self.page.evaluate("""() => {
+          const realFetch = window.fetch.bind(window);
+          window.fetch = (url, options) =>
+            String(url).includes('/leaderboard') && !String(url).includes('branch_target')
+              ? Promise.resolve(new Response(null, {status: 304, headers: {'ETag': '"x"'}}))
+              : realFetch(url, options);
+        }""")
+        self.page.evaluate("async () => { await window.__reportClient.fetchReport(); }")
+        self.assertEqual(self.page.locator("#report").inner_text(), before)
+        self.assertEqual(
+            self.page.locator(".grid.leaderboard > .leaderboard-card").count(), 2)
+        self.assertNotIn("error", self.page.locator("#connection").inner_text().lower())
 
     def test_unchanged_leaderboard_poll_keeps_the_reading_position(self):
         self.page.set_viewport_size({"width": 834, "height": 1112})
         self.page.evaluate("""() => {
+          """ + LEADERBOARD_COLUMNS_JS + """
           const realFetch = window.fetch.bind(window);
           let leaderboard;
           window.fetch = (url, options) => realFetch(url, options).then(async response => {
             if (!String(url).includes('/leaderboard')) return response;
             if (!leaderboard) {
               leaderboard = await response.json();
-              const row = leaderboard.data.rows[0];
-              leaderboard.data.rows = Array.from({length: 12}, (_, index) => ({
-                ...row, word: 'a' + String(index).padStart(4, '0'), rank: index + 1,
-              }));
-              leaderboard.data.total_rows = leaderboard.data.rows.length;
-              leaderboard.data.counts.complete = leaderboard.data.rows.length;
+              leaderboard.data.columns = leaderboardColumns(12, leaderboard.data.answer_count);
+              leaderboard.data.total_rows = 12;
+              leaderboard.data.counts.complete = 12;
             }
             return new Response(JSON.stringify(leaderboard), {
               status: 200, headers: {'Content-Type': 'application/json'},
@@ -1976,6 +2160,7 @@ class ReportClientBrowserTest(unittest.TestCase):
     def test_changed_leaderboard_poll_keeps_the_visible_word_in_place(self):
         self.page.set_viewport_size({"width": 834, "height": 1112})
         self.page.evaluate("""() => {
+          """ + LEADERBOARD_COLUMNS_JS + """
           const realFetch = window.fetch.bind(window);
           let leaderboard, allowChangedReport = false;
           window.__changeLeaderboardReport = () => { allowChangedReport = true; };
@@ -1983,15 +2168,12 @@ class ReportClientBrowserTest(unittest.TestCase):
             if (!String(url).includes('/leaderboard')) return response;
             if (!leaderboard) {
               leaderboard = await response.json();
-              const row = leaderboard.data.rows[0];
-              leaderboard.data.rows = Array.from({length: 12}, (_, index) => ({
-                ...row, word: 'a' + String(index).padStart(4, '0'), rank: index + 1,
-              }));
-              leaderboard.data.total_rows = leaderboard.data.rows.length;
-              leaderboard.data.counts.complete = leaderboard.data.rows.length;
+              leaderboard.data.columns = leaderboardColumns(12, leaderboard.data.answer_count);
+              leaderboard.data.total_rows = 12;
+              leaderboard.data.counts.complete = 12;
             }
             const report = structuredClone(leaderboard);
-            if (allowChangedReport) report.data.rows[0].erd = 9.876;
+            if (allowChangedReport) report.data.columns.erd_numerator[0] = 987;
             return new Response(JSON.stringify(report), {
               status: 200, headers: {'Content-Type': 'application/json'},
             });
@@ -2005,6 +2187,13 @@ class ReportClientBrowserTest(unittest.TestCase):
         card.scroll_into_view_if_needed()
         before = card.evaluate("(node) => { window.scrollBy(0, 40); return node.getBoundingClientRect().top; }")
         self.page.evaluate("async () => { window.__changeLeaderboardReport(); await window.__reportClient.fetchReport(); await new Promise(requestAnimationFrame); }")
+        # The poll has to have changed something, or holding the reader's
+        # position is not being tested -- a mutation the renderer never sees
+        # leaves the page identical and every assertion below passes for the
+        # wrong reason.
+        self.assertIn("9.870 987/100",
+                      self.page.locator("#report").inner_text(),
+                      "the changed poll never reached the page")
         self.assertAlmostEqual(
             card.evaluate("(node) => node.getBoundingClientRect().top"), before, delta=1
         )
@@ -2012,6 +2201,7 @@ class ReportClientBrowserTest(unittest.TestCase):
     def test_changed_leaderboard_poll_keeps_the_reader_at_the_bottom(self):
         self.page.set_viewport_size({"width": 834, "height": 1112})
         distances = self.page.evaluate("""async () => {
+          """ + LEADERBOARD_COLUMNS_JS + """
           // Each applyReport schedules its scroll restore in a frame of its
           // own, so a measurement taken after a single frame can read a
           // position the client is still adjusting.  Settling first measures
@@ -2024,10 +2214,8 @@ class ReportClientBrowserTest(unittest.TestCase):
           const base = await (await fetch('/api/view/leaderboard')).json();
           const state = {...__reportClient.getState(), kind: 'leaderboard'};
           const leaderboard = count => {
-            const report = structuredClone(base), row = report.data.rows[0];
-            report.data.rows = Array.from({length: count}, (_, index) => ({
-              ...row, word: 'a' + String(index).padStart(4, '0'), rank: index + 1,
-            }));
+            const report = structuredClone(base);
+            report.data.columns = leaderboardColumns(count, report.data.answer_count);
             report.data.total_rows = count;
             report.data.counts.complete = count;
             return report;
@@ -2061,11 +2249,12 @@ class ReportClientBrowserTest(unittest.TestCase):
           window.fetch = (url, options) => realFetch(url, options).then(async response => {
             if (!String(url).includes('/leaderboard')) return response;
             const report = await response.json();
-            report.data.rows[0].erd = 9.876;
+            report.data.columns.erd_numerator[0] = window.__numerator;
             return new Response(JSON.stringify(report), {
               status: 200, headers: {'Content-Type': 'application/json'},
             });
           });
+          window.__numerator = 987;
           const range = document.createRange();
           range.selectNodeContents(document.querySelector('.leaderboard-card .word'));
           const selection = getSelection();
@@ -2074,6 +2263,18 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.evaluate("async () => { await window.__reportClient.fetchReport(); }")
         self.assertEqual(card.get_attribute("data-test-marker"), "still-here")
         self.assertFalse(self.page.evaluate("() => getSelection().isCollapsed"))
+
+        # The selection is what held the render back, not an inert poll.  The
+        # next value has to differ from the one the suppressed poll already
+        # banked as the comparison baseline, or the client reads the ranking as
+        # unchanged and the screen would stay put for that reason instead.
+        self.page.evaluate(
+            "async () => { getSelection().removeAllRanges();"
+            " window.__numerator = 988;"
+            " await window.__reportClient.fetchReport(); }")
+        self.assertIn("9.880 988/100",
+                      self.page.locator("#report").inner_text(),
+                      "the mutation never reached the renderer")
 
     def test_slow_view_switch_shows_a_computing_notice(self):
         # Delay only the leaderboard fetch on the client so the slow-request
@@ -4898,18 +5099,35 @@ class ReportClientBrowserTest(unittest.TestCase):
         try:
             page.goto(self.base_url + "?kind=leaderboard")
             page.wait_for_selector("text=Opener leaderboard")
+            # A card's breakdown is fetched when it is opened, so the groups
+            # under measurement are supplied by the detail request rather than
+            # written into the ranking.  Installed after the navigation, which
+            # would otherwise discard the override.
+            page.evaluate("""() => {
+              const realFetch = window.fetch.bind(window);
+              window.fetch = (url, options) => realFetch(url, options).then(async response => {
+                if (!String(url).includes('branch_target=')) return response;
+                const report = await response.json();
+                report.data.detail = {
+                  word: 'salet', available: true, word_is_answer: false,
+                  answer_count: 284,
+                  response_groups: [
+                    ...Array.from({length: 24}, (_, index) => ({
+                      pattern: String(index), answer_count: 1,
+                    })),
+                    ...[2, 5, 9, 17, 33, 65, 129].map((answer_count, index) => ({
+                      pattern: 'large-' + String(index), answer_count,
+                    })),
+                  ],
+                };
+                return new Response(JSON.stringify(report), {
+                  status: 200, headers: {'Content-Type': 'application/json'},
+                });
+              });
+            }""")
+            page.locator(".grid.leaderboard > .leaderboard-card").nth(0).locator("summary").click()
+            page.wait_for_selector(".response-bucket-legend > span")
             measured = page.evaluate("""async () => {
-              const report = await (await fetch('/api/view/leaderboard')).json();
-              report.data.rows[0].response_groups = [
-                ...Array.from({length: 24}, (_, index) => ({
-                  pattern: String(index), answer_count: 1,
-                })),
-                ...[2, 5, 9, 17, 33, 65, 129].map((answer_count, index) => ({
-                  pattern: 'large-' + String(index), answer_count,
-                })),
-              ];
-              applyReport(report, null,
-                {...__reportClient.getState(), kind: 'leaderboard'});
               await new Promise(requestAnimationFrame);
               const segment = [...document.querySelectorAll('.response-count-segment')]
                 .find(node => node.title.startsWith('2–4 answers'));
@@ -4936,6 +5154,8 @@ class ReportClientBrowserTest(unittest.TestCase):
         # already 1200px wide; each width below drops straight to it with no
         # wait, so nothing gets a chance to re-render first.
         self.page.goto(self.base_url + "?kind=leaderboard")
+        self.page.wait_for_selector(".grid.leaderboard > .leaderboard-card")
+        self._open_leaderboard_breakdown(0)
         self.page.wait_for_selector(".response-bucket-legend > span")
         for width in (375, 480, 600, 700, 800, 801, 900, 1000, 1100, 1199, 1200):
             with self.subTest(width=width):
