@@ -13,7 +13,10 @@ name: Claude Code Review
 #      types: [opened, synchronize, reopened]
 #
 # Start one by hand from the Actions tab, or:
-#   gh workflow run claude-code-review.yml --ref <branch>
+#   gh workflow run claude-code-review.yml --ref <branch> -f pull_request=<number>
+#
+# The input is required, so a dispatch without it is refused before any review
+# starts.
 on:
   workflow_dispatch:
     inputs:
