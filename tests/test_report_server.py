@@ -1181,3 +1181,59 @@ class RevalidatedReportsDeclareThemselvesTest(ReportServerTest):
         with running_server(self.live_configuration) as base_url:
             _status, _headers, body = request(base_url, "/api/view/queue")
         self.assertNotIn("revalidated", json.loads(body))
+
+
+class CardExpansionsLeaveTheRankingCacheAloneTest(ReportServerTest):
+    """Opening cards must not evict the ranking the reader is polling.
+
+    The revalidated cache holds REPORT_CACHE_MAX_ENTRIES entries against a
+    vocabulary of 14,855 words, and its key is the whole request -- so a
+    detail request is a distinct entry.  A reader who opened a handful of cards
+    would push the ranking out, and the next poll would rebuild it.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.report = load_fixtures(FIXTURE_DIRECTORY)["leaderboard.json"]
+
+    def test_opened_cards_do_not_push_the_ranking_out_of_the_cache(self):
+        # More detail requests than the cache holds entries, so if they were
+        # stored at all the ranking could not have survived them.
+        built = []
+
+        def counting(_sources, request):
+            built.append(request.branch_target.trailing_word or "ranking")
+            return self.report
+
+        with patch("report_server.collect_report", side_effect=counting), \
+             patch("report_server.opener_completion_signal", return_value=(1, 1)):
+            with running_server(self.live_configuration) as base_url:
+                request(base_url, "/api/view/leaderboard")
+                self.assertEqual(built, ["ranking"])
+                words = ("salet", "crane", "raise", "tarse", "caret",
+                         "carle", "slate", "trace", "leant", "stale")
+                self.assertGreater(len(words),
+                                   report_server.REPORT_CACHE_MAX_ENTRIES)
+                for word in words:
+                    status, _headers, _body = request(
+                        base_url, f"/api/view/leaderboard?branch_target={word}")
+                    self.assertEqual(status, 200)
+                status, headers, _body = request(
+                    base_url, "/api/view/leaderboard")
+
+        self.assertEqual(status, 200)
+        self.assertTrue(headers.get("ETag"))
+        self.assertEqual(
+            built.count("ranking"), 1,
+            "the ranking was rebuilt after cards were opened, so the "
+            "expansions had displaced it")
+
+    def test_a_detail_request_carries_no_entity_tag(self):
+        # It is built fresh every time and costs milliseconds, so there is
+        # nothing for a client to revalidate against.
+        with patch("report_server.collect_report", return_value=self.report), \
+             patch("report_server.opener_completion_signal", return_value=(1, 1)):
+            with running_server(self.live_configuration) as base_url:
+                _status, headers, _body = request(
+                    base_url, "/api/view/leaderboard?branch_target=salet")
+        self.assertIsNone(headers.get("ETag"))

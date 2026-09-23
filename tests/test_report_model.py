@@ -2348,9 +2348,50 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(detail["answer_count"], 2)
         self.assertEqual([group["answer_count"]
                           for group in detail["response_groups"]], [1, 1])
-        # Naming an opener does not cost the ranking its columns.
-        self.assertEqual([row["word"] for row in leaderboard_rows(data)],
-                         ["crane", "slate", "raise"])
+        # The ranking does not come back with it: the client asking for a
+        # card's groups is the client that already has the ranking.
+        self.assertNotIn("columns", data)
+
+    def test_a_named_opener_costs_no_ranking(self):
+        """Opening a card must not screen the vocabulary to answer about one.
+
+        The ranking is what the card came from; rebuilding it to describe a
+        single row costs more than the ranking did, sends the client columns it
+        already holds, and displaces the ranking's own cache entry.
+        """
+        sources = self._leaderboard_sources(
+            ["crane", "slate"], ["crane", "slate", "raise", "howdy"]
+        )
+        screened = []
+        real_screen = report_model._screen_and_fold_openers
+
+        def recording(cache, skeletons, group_budget, policy):
+            screened.append(len(skeletons))
+            return real_screen(cache, skeletons, group_budget, policy)
+
+        with patch.object(report_model, "_screen_and_fold_openers", recording):
+            data = collect_report(sources, ReportRequest(
+                report_kind="leaderboard",
+                branch_target=parse_report_branch_target("crane")))["data"]
+
+        self.assertTrue(data["detail"]["available"])
+        self.assertEqual(
+            screened, [],
+            "a card expansion screened the vocabulary")
+        self.assertNotIn("columns", data,
+                         "a card expansion carried the ranking back")
+
+    def test_a_detail_for_a_word_outside_the_vocabulary_says_so(self):
+        # Asking about a word the candidate list does not hold is an ordinary
+        # client request, not an error.
+        sources = self._leaderboard_sources(
+            ["crane", "slate"], ["crane", "slate", "raise", "howdy"]
+        )
+        data = collect_report(sources, ReportRequest(
+            report_kind="leaderboard",
+            branch_target=parse_report_branch_target("zzzzz")))["data"]
+        self.assertFalse(data["detail"]["available"])
+        self.assertEqual(data["detail"]["response_groups"], [])
 
     def test_leaderboard_detail_for_an_unfinished_opener_says_so(self):
         # howdy collides both answers into one unsolved group, so it is

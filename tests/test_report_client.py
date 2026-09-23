@@ -1954,6 +1954,49 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.evaluate("async () => { await window.__reportClient.fetchReport(); }")
         self.assertIn("9.870 987/100", self.page.locator("#report").inner_text())
 
+    def test_an_unfinished_breakdown_is_asked_for_again(self):
+        """"Not finished yet" describes this instant, not the opener.
+
+        An opener still being swept, or one a repair has just invalidated,
+        answers unavailable.  Keeping that answer would hand it to every later
+        expansion, so a card opened early would read as unfinished for the life
+        of the page even after its tree completed.
+        """
+        self.page.locator("[data-kind=leaderboard]").click()
+        self.page.wait_for_selector(".grid.leaderboard > .leaderboard-card")
+        self.page.evaluate("""() => {
+          const realFetch = window.fetch.bind(window);
+          window.__detailFetches = 0;
+          window.__detailAvailable = false;
+          window.fetch = (url, options) => {
+            if (!String(url).includes('branch_target=')) return realFetch(url, options);
+            window.__detailFetches += 1;
+            return realFetch(url, options).then(response => response.json()).then(body => {
+              body.data.detail = window.__detailAvailable
+                ? {word: 'salet', available: true, word_is_answer: false,
+                   answer_count: 2,
+                   response_groups: [{pattern: '-----', answer_count: 1},
+                                     {pattern: 'ggggg', answer_count: 1}]}
+                : {word: 'salet', available: false, response_groups: []};
+              return new Response(JSON.stringify(body), {
+                status: 200, headers: {'Content-Type': 'application/json'},
+              });
+            });
+          };
+        }""")
+        summary = self.page.locator(
+            ".grid.leaderboard > .leaderboard-card").nth(0).locator("summary")
+        summary.click()
+        self.page.wait_for_selector("text=No complete tree for this opener yet")
+        summary.click()  # collapse
+
+        # The sweep finished it; opening again must ask rather than answer
+        # from what it kept.
+        self.page.evaluate("() => { window.__detailAvailable = true; }")
+        summary.click()
+        self.page.wait_for_selector(".leaderboard-card .answer-segment")
+        self.assertEqual(self.page.evaluate("() => window.__detailFetches"), 2)
+
     def test_a_leaderboard_poll_sends_back_the_tag_it_was_given(self):
         """A conditional poll is what makes an unchanged ranking free.
 

@@ -2338,8 +2338,8 @@
         host=element("div","leaderboard-breakdown-body");
       details.open=expandedOpeners.has(row.word);
       details.append(summary,host);
-      const draw=()=>{
-        const detail=openerBreakdowns.get(row.word);
+      const draw=(fetched=null)=>{
+        const detail=fetched||openerBreakdowns.get(row.word);
         if(!detail){host.replaceChildren(element("p","dim","Loading response groups…"));return;}
         if(!detail.available){host.replaceChildren(element("p","empty","No complete tree for this opener yet"));return;}
         host.replaceChildren(renderResponseGroupBreakdown(detail,{maximumResponseGroupCount,
@@ -2352,9 +2352,14 @@
         try{
           const response=await fetch(leaderboardDetailURL(state,row.word),{headers:{Accept:"application/json"}});
           if(!response.ok)throw new Error("Breakdown request failed ("+response.status+")");
-          const report=await response.json();
-          openerBreakdowns.set(row.word,report.data.detail||{available:false,response_groups:[]});
-          draw();
+          const detail=(await response.json()).data.detail||{available:false,response_groups:[]};
+          // Only a breakdown that exists is worth keeping.  "Not finished yet"
+          // is a statement about this instant -- the opener is still being
+          // swept, or a repair has just invalidated it -- and caching it would
+          // answer every later expansion with it, so a card opened once early
+          // would read as unfinished for the life of the page.
+          if(detail.available)openerBreakdowns.set(row.word,detail);
+          draw(detail);
         }catch(error){host.replaceChildren(element("p","error",error.message));}
       };
       details.addEventListener("toggle",()=>{
@@ -2670,6 +2675,10 @@
         if(generation!==requestGeneration)return;
         if(response.status===304){lastSuccess=Date.now();failureCount=0;connection(true,"connected");return;}
         const entityTag=response.headers.get("ETag");
+        // A new ranking is a new set of facts about every opener in it, so the
+        // breakdowns fetched against the previous one are no longer known to
+        // hold.  Dropping them costs one fetch per card still open.
+        if(entityTag&&reportEntityTags.get(context)!==entityTag)openerBreakdowns.clear();
         if(entityTag)reportEntityTags.set(context,entityTag);else reportEntityTags.delete(context);
         if(!response.ok){let message="HTTP "+response.status;try{const body=await response.json();message=body.error?.message||message;}catch(_error){}if(response.status===400){connection(false,"invalid request",false);byId("report").replaceChildren(element("p","error",message));return;}throw new Error(message);}
         const report=await response.json();if(generation!==requestGeneration)return;

@@ -3519,6 +3519,54 @@ def _leaderboard_columns(ranked, answer_count, answer_set):
     }
 
 
+def _one_opener_detail(sources, cache, all_answers, all_candidates, word,
+                       group_budget, answer_set):
+    """One opener's response groups, computed without ranking anything.
+
+    A card is opened one at a time, so the work is one candidate's partition
+    against the answer list and a fold over its own groups -- milliseconds,
+    against the seconds a vocabulary screen costs.  Asking for the ranking here
+    would also displace the ranking's own cache entry, so a reader who opened a
+    few cards would make the next poll rebuild the thing they were reading.
+
+    A word the vocabulary does not hold, or one whose tree is unfinished,
+    returns an unavailable detail rather than an error: asking about an opener
+    the sweep has not reached is an ordinary thing for a client to do.
+    """
+    if word not in set(all_candidates):
+        return {"word": word, "available": False, "response_groups": []}
+    matrix = PatternMatrix.load_or_build(
+        sources.cache_path, all_candidates, all_answers, cache)
+    pattern_text = {code: fmt_pattern(code) for code in range(3 ** 5)}
+    groups = [
+        (pattern_text[pattern], len(words), ScoreCache.encode_subset(words))
+        for pattern, words in matrix.group_words(
+            word, list(all_answers), matrix.answer_indices(all_answers)
+        ).items()
+        if words
+    ]
+    # Bounded to this opener's own groups.  _screen_and_fold_openers loads
+    # every reusable branch fact in the cache -- 652,989 rows, about 1.9s --
+    # because it screens the whole vocabulary; a single card needs the states
+    # of its own 158, which is one indexed read.
+    states = cache.report_branch_states(
+        [key for _pattern, _count, key in groups], ERD_ALL, group_budget)
+    summary = _candidate_erd_summary(
+        [
+            {
+                "pattern": pattern,
+                "answer_count": count,
+                "best_erd": states[key]["best_erd"],
+                "max_remaining_depth": states[key]["max_remaining_depth"],
+                "cache_state": states[key]["cache_state"],
+            }
+            for pattern, count, key in groups
+        ],
+        group_budget,
+    )
+    return _leaderboard_detail(word, summary, groups, answer_set)
+
+
 def _leaderboard_detail(word, summary, response_group_skeletons, answer_set):
     """One opener's response-group breakdown, for a card that was opened.
 
@@ -3567,11 +3615,26 @@ def collect_leaderboard_report(sources: ReportOpeners, request: ReportRequest) -
     )
     group_budget = GAME_GUESSES - 1
     limit = request.filters.limit
+    # A bare opener only: a deeper spine names a branch inside a tree, not a
+    # row of this ranking.
+    target = request.branch_target
+    detail_word = (target.trailing_word
+                   if target.kind == "word" and not target.steps else None)
     cache = None
     try:
         cache = ScoreCache(
             sources.cache_path, all_answers, checkpoint_on_close=False
         )
+        if detail_word:
+            # One opener's groups, and nothing else.  Screening the whole
+            # vocabulary to answer a question about a single card would cost
+            # more than the ranking that card came from, and would send the
+            # columns back to a client already holding them.
+            data["detail"] = _one_opener_detail(
+                sources, cache, all_answers, all_candidates, detail_word,
+                group_budget, answer_set)
+            report["sources"]["cache"]["ok"] = True
+            return report
         skeletons = _candidate_group_skeletons(
             sources, all_answers, all_candidates, cache
         )
@@ -3607,18 +3670,6 @@ def collect_leaderboard_report(sources: ReportOpeners, request: ReportRequest) -
             "answer_count": answer_count,
             "columns": columns,
         })
-        # The breakdown is the whole payload at this row count -- 3.7 KB a row
-        # against 20 bytes of column -- so it is carried only for a named
-        # opener, which is what a card asks for when it is opened.
-        # A bare opener only: a deeper spine names a branch inside a tree, not
-        # a row of this ranking.
-        target = request.branch_target
-        detail_word = (target.trailing_word
-                       if target.kind == "word" and not target.steps else None)
-        if detail_word:
-            data["detail"] = _leaderboard_detail(
-                detail_word, summaries.get(detail_word),
-                groups_by_candidate.get(detail_word), answer_set)
         report["sources"]["cache"]["ok"] = True
     except (sqlite3.Error, OSError) as error:
         report["sources"]["cache"]["error"] = str(error)

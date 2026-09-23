@@ -446,6 +446,18 @@ def make_handler(configuration):
             if isinstance(source, dict)
         )
 
+    def names_one_opener(request):
+        """Is this a request for one opener's detail rather than the ranking?
+
+        Such a request builds in milliseconds and is keyed by the word, so it
+        belongs outside the revalidated cache on both counts: there is nothing
+        to save, and the cache holds eight entries against a whole vocabulary
+        of words.  Letting a few opened cards in would evict the ranking the
+        reader is polling, and the next poll would rebuild it.
+        """
+        target = request.branch_target
+        return target.kind == "word" and not target.steps
+
     def body_validator(body):
         """An entity tag naming these exact bytes.
 
@@ -651,7 +663,8 @@ def make_handler(configuration):
                     body = encode_report(configuration.fixtures[
                         fixture_name_for_request(target.path, request)
                     ])
-                elif request.report_kind in REVALIDATED_REPORT_KINDS:
+                elif (request.report_kind in REVALIDATED_REPORT_KINDS
+                      and not names_one_opener(request)):
                     body, entity_tag = cached_report_body(request)
                     # A client holding these exact bytes needs nothing sent at
                     # all.  A leaderboard's answer changes when an opener
