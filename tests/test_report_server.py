@@ -5,6 +5,7 @@ import errno
 from http.server import ThreadingHTTPServer
 from threading import Event, Lock, Thread
 import io
+import copy
 import json
 import threading
 import os
@@ -1071,22 +1072,85 @@ class ConditionalLeaderboardRequestTest(ReportServerTest):
         self.assertEqual(body, b"", "a 304 must carry no body")
         self.assertTrue(first, "the first response should have carried one")
 
-    def test_a_completed_opener_moves_the_signal_and_the_body_returns(self):
-        with patch("report_server.collect_report", return_value=self.report), \
+    def _ranking(self, first_word):
+        report = copy.deepcopy(self.report)
+        columns = report["data"]["columns"]
+        columns["words"] = first_word + columns["words"][5:]
+        return report
+
+    def test_a_changed_ranking_returns_a_body_and_a_new_tag(self):
+        rankings = [self._ranking("salet")]
+        with patch("report_server.collect_report",
+                   side_effect=lambda *_: rankings[0]), \
              patch("report_server.opener_completion_signal",
                    side_effect=lambda *_: self.tokens[0]):
             with running_server(self.live_configuration) as base_url:
                 _status, headers, _body = request(
                     base_url, "/api/view/leaderboard")
                 stale_tag = headers["ETag"]
-                # An opener finished: the signal moves, and the tag the client
-                # holds no longer matches.
+                # An opener finished and took the top of the ranking with it.
                 self.tokens[0] = "opener-signal-2"
+                rankings[0] = self._ranking("tarse")
                 status, new_headers, body = request(
                     base_url, "/api/view/leaderboard",
                     headers={"If-None-Match": stale_tag})
         self.assertEqual(status, 200)
-        self.assertTrue(body)
+        self.assertIn(b"tarse", body)
+        self.assertNotEqual(new_headers["ETag"], stale_tag)
+
+    def test_a_rebuild_that_changes_nothing_still_revalidates(self):
+        # An opener can finish without moving the ranking the client holds --
+        # it lands below the rows being shown.  The body is identical, so the
+        # client's copy is current and there is nothing to send.
+        with patch("report_server.collect_report",
+                   side_effect=lambda *_: copy.deepcopy(self.report)), \
+             patch("report_server.opener_completion_signal",
+                   side_effect=lambda *_: self.tokens[0]):
+            with running_server(self.live_configuration) as base_url:
+                _status, headers, _body = request(
+                    base_url, "/api/view/leaderboard")
+                tag = headers["ETag"]
+                self.tokens[0] = "opener-signal-2"
+                status, _new_headers, body = request(
+                    base_url, "/api/view/leaderboard",
+                    headers={"If-None-Match": tag})
+        self.assertEqual(status, 304)
+        self.assertEqual(body, b"")
+
+    def test_a_rebuild_the_signal_cannot_see_still_reaches_the_client(self):
+        """The backstop rebuild must be visible, or it accomplishes nothing.
+
+        `opener_completion_signal` is deliberately not exhaustive: a repair, a
+        reverification or an import changes the cache while completing no queue
+        work.  REPORT_CACHE_MAX_AGE_SECONDS exists to catch exactly that, by
+        rebuilding once the entry ages out even though the signal has not
+        moved.
+
+        A validator taken from the signal would still match across that
+        rebuild, so the client would be told nothing had changed while the
+        server held a ranking it had already replaced -- and with the queue
+        stopped, no opener ever completes and the client never learns.
+        """
+        rankings = [self._ranking("salet")]
+        with patch("report_server.collect_report",
+                   side_effect=lambda *_: rankings[0]), \
+             patch("report_server.opener_completion_signal",
+                   side_effect=lambda *_: self.tokens[0]), \
+             patch.object(report_server, "REPORT_CACHE_MAX_AGE_SECONDS", 0):
+            with running_server(self.live_configuration) as base_url:
+                _status, headers, _body = request(
+                    base_url, "/api/view/leaderboard")
+                stale_tag = headers["ETag"]
+                # A repair rewrote a branch result.  No opener completed, so
+                # the signal stands exactly where it was.
+                rankings[0] = self._ranking("crane")
+                status, new_headers, body = request(
+                    base_url, "/api/view/leaderboard",
+                    headers={"If-None-Match": stale_tag})
+        self.assertEqual(
+            status, 200,
+            "a rebuild the signal cannot see was withheld from the client")
+        self.assertIn(b"crane", body)
         self.assertNotEqual(new_headers["ETag"], stale_tag)
 
 

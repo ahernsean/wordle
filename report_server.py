@@ -7,6 +7,7 @@ import argparse
 from dataclasses import dataclass
 import errno
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import hashlib
 import json
 import os
 import re
@@ -445,6 +446,21 @@ def make_handler(configuration):
             if isinstance(source, dict)
         )
 
+    def body_validator(body):
+        """An entity tag naming these exact bytes.
+
+        Hashing the representation is what makes the tag answer the question a
+        conditional request asks -- "is what I hold still current?" -- rather
+        than the different question the cache asks itself, which is whether a
+        rebuild is worth doing.  A rebuild that produces identical bytes then
+        still revalidates for free, and one that produces different bytes
+        cannot be mistaken for it.
+
+        Paid once per build, never per poll: the tag is stored beside the body
+        it names.
+        """
+        return f'"{hashlib.blake2b(body, digest_size=16).hexdigest()}"'
+
     def store_cached_body(request, token, started_at, body):
         """Record a body under the token its build read, aged from its start.
 
@@ -461,7 +477,8 @@ def make_handler(configuration):
         """
         now = time.time()
         with cached_reports_lock:
-            cached_reports[request] = (token, started_at, body)
+            cached_reports[request] = (
+                token, started_at, body, body_validator(body))
             for stale in [
                 key for key, entry in cached_reports.items()
                 if now - entry[1] > REPORT_CACHE_MAX_AGE_SECONDS
@@ -484,6 +501,16 @@ def make_handler(configuration):
         The encoded body is cached with the report, because re-encoding a
         multi-megabyte ranking on every poll is its own cost once the build is
         gone.
+
+        Returns the body and a validator naming that body, not the signal the
+        rebuild decision was made on.  The two are not the same question: the
+        signal says whether the answer *could* have moved, and it is
+        deliberately not exhaustive -- a repair, a reverification or an import
+        changes the cache while completing no queue work, which is what
+        REPORT_CACHE_MAX_AGE_SECONDS exists to catch.  A validator taken from
+        the signal would go on matching across exactly those rebuilds, so a
+        client would be told nothing had changed while holding a ranking the
+        server had already replaced -- and with the queue stopped, forever.
         """
         token = opener_completion_signal(configuration.sources)
         started_at = time.time()
@@ -492,8 +519,9 @@ def make_handler(configuration):
                 entry = cached_reports.get(request)
             if (entry is not None and entry[0] == token
                     and time.time() - entry[1] <= REPORT_CACHE_MAX_AGE_SECONDS):
-                return entry[2], token
-        return collect_report_once(request, token, started_at), token
+                return entry[2], entry[3]
+        body = collect_report_once(request, token, started_at)
+        return body, body_validator(body)
 
     def collect_report_once(request, token, started_at):
         """Collect `request` once, however many callers are waiting on it.
@@ -624,19 +652,16 @@ def make_handler(configuration):
                         fixture_name_for_request(target.path, request)
                     ])
                 elif request.report_kind in REVALIDATED_REPORT_KINDS:
-                    body, token = cached_report_body(request)
-                    # The signal already says whether the answer could have
-                    # moved, so a client that has seen this one needs nothing
-                    # sent at all.  A leaderboard's answer changes when an
-                    # opener completes -- about every 27 minutes -- against a
-                    # client polling every two seconds, so this is the ordinary
-                    # case rather than an optimisation for a rare one.
-                    if token is not None:
-                        entity_tag = f'"{token}"'
-                        if self.headers.get("If-None-Match") == entity_tag:
-                            self._not_modified(entity_tag)
-                            return
-                        extra_headers = {"ETag": entity_tag}
+                    body, entity_tag = cached_report_body(request)
+                    # A client holding these exact bytes needs nothing sent at
+                    # all.  A leaderboard's answer changes when an opener
+                    # completes -- about every 27 minutes -- against a client
+                    # polling every two seconds, so this is the ordinary case
+                    # rather than an optimisation for a rare one.
+                    if self.headers.get("If-None-Match") == entity_tag:
+                        self._not_modified(entity_tag)
+                        return
+                    extra_headers = {"ETag": entity_tag}
                 else:
                     body = encode_report(
                         collect_report(configuration.sources, request))
