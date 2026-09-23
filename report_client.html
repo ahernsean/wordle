@@ -2669,7 +2669,15 @@
         // cache:"no-store" keeps the browser from satisfying the revalidation
         // itself and handing back a synthesised 200, which would hide the 304
         // from this code and reinstate the parse.
-        const requestHeaders={Accept:"application/json"},cachedTag=reportEntityTags.get(context);
+        // Only revalidate the view already on screen.  A 304 sends no body, so
+        // there is nothing to render from -- and the client keeps one rendered
+        // report at a time, deliberately leaving the previous view up while the
+        // next is fetched.  Revalidating after navigating away would answer 304
+        // for the view being entered and leave the other one on screen under
+        // its tab.  The steady-state poll is exactly the same-context case, so
+        // this costs it nothing.
+        const requestHeaders={Accept:"application/json"},
+          cachedTag=context===lastContext?reportEntityTags.get(context):null;
         if(cachedTag)requestHeaders["If-None-Match"]=cachedTag;
         const response=await fetch(buildAPIURL(state),{headers:requestHeaders,cache:"no-store",signal:controller.signal});
         if(generation!==requestGeneration)return;

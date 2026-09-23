@@ -2039,6 +2039,49 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertEqual(sent[1], '"signal-1"',
                          "the second poll did not carry the tag back")
 
+    def test_returning_to_the_leaderboard_never_revalidates(self):
+        """A 304 sends no body, so it can only ever mean "keep what is up".
+
+        The client holds one rendered report and deliberately leaves the
+        previous view on screen while the next is fetched.  Revalidating the
+        view being *entered* would answer 304 for it and leave the other view's
+        report sitting under its tab -- for up to REPORT_CACHE_MAX_AGE_SECONDS,
+        or until the bytes happened to change.
+        """
+        self.page.locator("[data-kind=leaderboard]").click()
+        self.page.wait_for_selector("text=Opener leaderboard")
+        sent = self.page.evaluate("""() => {
+          const realFetch = window.fetch.bind(window);
+          const seen = [];
+          window.fetch = (url, options) => {
+            if (String(url).includes('/leaderboard') && !String(url).includes('branch_target')) {
+              seen.push((options && options.headers || {})['If-None-Match'] || null);
+              return realFetch(url, options).then(response => response.json()).then(body =>
+                new Response(JSON.stringify(body), {
+                  status: 200,
+                  headers: {'Content-Type': 'application/json', 'ETag': '"signal-1"'},
+                }));
+            }
+            return realFetch(url, options);
+          };
+          window.__seen = seen;
+          return seen;
+        }""")
+        # Learn a tag on the view we are already on.
+        self.page.evaluate("async () => { await window.__reportClient.fetchReport(); }")
+        self.page.locator("[data-kind=queue]").click()
+        self.page.wait_for_selector("text=queue report")
+        self.page.locator("[data-kind=leaderboard]").click()
+        self.page.wait_for_selector("text=Opener leaderboard")
+
+        sent = self.page.evaluate("() => window.__seen")
+        self.assertIsNone(
+            sent[-1],
+            "returning to the leaderboard revalidated it, so a 304 could have "
+            "left the other view on screen")
+        self.assertIn("Opener leaderboard",
+                      self.page.locator("#report").inner_text())
+
     def test_a_304_leaderboard_poll_leaves_the_rendered_cards_alone(self):
         # Nothing arrives to render, and the client must treat that as the
         # ranking standing still rather than as a failure.
@@ -2130,7 +2173,7 @@ class ReportClientBrowserTest(unittest.TestCase):
               leaderboard.data.counts.complete = 12;
             }
             const report = structuredClone(leaderboard);
-            if (allowChangedReport) report.data.rows[0].erd = 9.876;
+            if (allowChangedReport) report.data.columns.erd_numerator[0] = 987;
             return new Response(JSON.stringify(report), {
               status: 200, headers: {'Content-Type': 'application/json'},
             });
@@ -2144,6 +2187,13 @@ class ReportClientBrowserTest(unittest.TestCase):
         card.scroll_into_view_if_needed()
         before = card.evaluate("(node) => { window.scrollBy(0, 40); return node.getBoundingClientRect().top; }")
         self.page.evaluate("async () => { window.__changeLeaderboardReport(); await window.__reportClient.fetchReport(); await new Promise(requestAnimationFrame); }")
+        # The poll has to have changed something, or holding the reader's
+        # position is not being tested -- a mutation the renderer never sees
+        # leaves the page identical and every assertion below passes for the
+        # wrong reason.
+        self.assertIn("9.870 987/100",
+                      self.page.locator("#report").inner_text(),
+                      "the changed poll never reached the page")
         self.assertAlmostEqual(
             card.evaluate("(node) => node.getBoundingClientRect().top"), before, delta=1
         )
@@ -2199,11 +2249,12 @@ class ReportClientBrowserTest(unittest.TestCase):
           window.fetch = (url, options) => realFetch(url, options).then(async response => {
             if (!String(url).includes('/leaderboard')) return response;
             const report = await response.json();
-            report.data.rows[0].erd = 9.876;
+            report.data.columns.erd_numerator[0] = window.__numerator;
             return new Response(JSON.stringify(report), {
               status: 200, headers: {'Content-Type': 'application/json'},
             });
           });
+          window.__numerator = 987;
           const range = document.createRange();
           range.selectNodeContents(document.querySelector('.leaderboard-card .word'));
           const selection = getSelection();
@@ -2212,6 +2263,18 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.evaluate("async () => { await window.__reportClient.fetchReport(); }")
         self.assertEqual(card.get_attribute("data-test-marker"), "still-here")
         self.assertFalse(self.page.evaluate("() => getSelection().isCollapsed"))
+
+        # The selection is what held the render back, not an inert poll.  The
+        # next value has to differ from the one the suppressed poll already
+        # banked as the comparison baseline, or the client reads the ranking as
+        # unchanged and the screen would stay put for that reason instead.
+        self.page.evaluate(
+            "async () => { getSelection().removeAllRanges();"
+            " window.__numerator = 988;"
+            " await window.__reportClient.fetchReport(); }")
+        self.assertIn("9.880 988/100",
+                      self.page.locator("#report").inner_text(),
+                      "the mutation never reached the renderer")
 
     def test_slow_view_switch_shows_a_computing_notice(self):
         # Delay only the leaderboard fetch on the client so the slow-request

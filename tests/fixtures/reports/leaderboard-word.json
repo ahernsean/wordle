@@ -1,31 +1,6 @@
 {
   "branch_target": null,
   "data": {
-    "answer_count": 100,
-    "candidate_count": 14855,
-    "columns": {
-      "erd_decimal": [
-        null,
-        3.7124567
-      ],
-      "erd_denominator": 100,
-      "erd_numerator": [
-        356,
-        null
-      ],
-      "max_remaining_depth": [
-        6,
-        5
-      ],
-      "word_is_answer_bitmap": "Ag==",
-      "word_width": 5,
-      "words": "saletcrane"
-    },
-    "counts": {
-      "complete": 2,
-      "infeasible": 1,
-      "pending": 14852
-    },
     "detail": {
       "answer_count": 100,
       "available": true,
@@ -54,9 +29,7 @@
       "word": "salet",
       "word_is_answer": false
     },
-    "matched_rows": 2,
-    "response_pattern_count": 243,
-    "total_rows": 2
+    "response_pattern_count": 243
   },
   "filters": {},
   "generated_at": 1000,

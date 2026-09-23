@@ -1817,8 +1817,39 @@ def _render_opener_sections(report, width, display_order):
     return [("header", header), ("opener_rows", lines)]
 
 
+def _render_leaderboard_detail_sections(report, width, detail):
+    """One opener's response groups, for `view --leaderboard WORD`.
+
+    Naming an opener asks about that opener, so the report carries its
+    breakdown and no ranking at all -- ranking the vocabulary to describe one
+    word costs more than the ranking does.  There are no counts to summarise
+    here because nothing was counted.
+    """
+    word = str(detail.get("word") or "").upper()
+    header = _semantic_header(report, f"Opener {word}  response groups", width)
+    if not detail.get("available"):
+        return [("header", header),
+                ("summary", [_fit(f"{word} has no complete tree yet", width)])]
+    answer_count = detail.get("answer_count") or 0
+    groups = detail.get("response_groups") or []
+    summary = [_fit(
+        f"{len(groups):,} response groups over {answer_count:,} answers", width)]
+    rows = ["Response   Answers   Share"]
+    for group in groups:
+        share = (group["answer_count"] / answer_count) if answer_count else 0
+        rows.append(_fit(
+            f"{group['pattern']:<9}  {group['answer_count']:>7,}  "
+            f"{share * 100:>5.1f}%",
+            width,
+        ))
+    return [("header", header), ("summary", summary), ("leaderboard", rows)]
+
+
 def _render_leaderboard_sections(report, width):
     data = report["data"]
+    detail = data.get("detail")
+    if detail is not None:
+        return _render_leaderboard_detail_sections(report, width, detail)
     counts = data["counts"]
     header = _semantic_header(
         report,
