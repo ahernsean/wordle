@@ -2082,6 +2082,68 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.assertIn("Opener leaderboard",
                       self.page.locator("#report").inner_text())
 
+    def _defer_a_ranking_behind_an_open_card(self):
+        """Suppress one changed ranking behind a focused card, and return.
+
+        Opening a card leaves focus on its summary, and a poll that replaced
+        the report would delete that summary out from under the reader.  The
+        client therefore declines to draw -- while still banking the report and
+        its entity tag, because those describe what the server holds.
+        """
+        self.page.locator("[data-kind=leaderboard]").click()
+        self.page.wait_for_selector(".grid.leaderboard > .leaderboard-card")
+        self._open_leaderboard_breakdown()
+        self.page.evaluate(
+            "() => document.querySelector('.leaderboard-breakdown summary').focus()")
+        self.assertEqual(
+            self.page.evaluate("() => document.activeElement.tagName"), "SUMMARY")
+        self.page.evaluate("""() => {
+          const realFetch = window.fetch.bind(window);
+          window.__polls = 0;
+          window.fetch = (url, options) => {
+            if (!String(url).includes('/leaderboard')
+                || String(url).includes('branch_target')) return realFetch(url, options);
+            window.__polls += 1;
+            if (window.__polls > 1 && window.__still304)
+              return Promise.resolve(new Response(null, {status: 304, headers: {'ETag': '"x"'}}));
+            return realFetch(url, options).then(async response => {
+              const report = await response.json();
+              report.data.columns.erd_numerator[0] = 987;
+              return new Response(JSON.stringify(report), {
+                status: 200,
+                headers: {'Content-Type': 'application/json', 'ETag': '"moved"'},
+              });
+            });
+          };
+        }""")
+        self.page.evaluate("async () => { await window.__reportClient.fetchReport(); }")
+        self.assertNotIn("987/100", self.page.locator("#report").inner_text())
+
+    def test_a_ranking_deferred_behind_an_open_card_is_drawn_after_a_304(self):
+        """The poll that reports no change is what pays the owed render.
+
+        A ranking that moved while a card held focus is banked undrawn, so the
+        next poll is answered 304 and carries nothing to render from.  Without
+        somewhere to record the debt the reader keeps the superseded ranking
+        until some later opener completes -- forever, with the swarm stopped.
+        """
+        self._defer_a_ranking_behind_an_open_card()
+        self.page.evaluate("() => { window.__still304 = true; document.activeElement.blur(); }")
+        self.page.evaluate("async () => { await window.__reportClient.fetchReport(); }")
+        self.assertIn("9.870 987/100", self.page.locator("#report").inner_text())
+
+    def test_a_ranking_deferred_behind_an_open_card_is_drawn_on_an_unchanged_poll(self):
+        """A repeat of the banked body compares equal and renders nothing new.
+
+        `leaderboardRowsChanged` measures the arriving report against the
+        banked one, which is the undrawn ranking -- so the comparison that
+        normally means "the screen is current" means the opposite here.
+        """
+        self._defer_a_ranking_behind_an_open_card()
+        self.page.evaluate("() => document.activeElement.blur()")
+        self.page.evaluate("async () => { await window.__reportClient.fetchReport(); }")
+        self.assertIn("9.870 987/100", self.page.locator("#report").inner_text())
+
     def test_a_304_leaderboard_poll_leaves_the_rendered_cards_alone(self):
         # Nothing arrives to render, and the client must treat that as the
         # ranking standing still rather than as a failure.

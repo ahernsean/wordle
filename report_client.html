@@ -442,6 +442,12 @@
     const recentOverviewCompletionRows=new Map();
     let completionExpiryTimer=null;
     let currentState, lastReport=null, lastContext=null, displayedState=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,shownBranchTarget=null,rootProgressOpen=true,rootProgressSort="tree_nodes",leaderboardReportWidth=null;
+    // A report an interaction kept from being drawn is still banked, because
+    // `lastReport` and the stored entity tag describe what the server holds.
+    // Nothing downstream would then notice the screen is a report behind, so
+    // the debt is carried here and settled by the first poll that finds the
+    // interaction over.
+    let renderOwed=false;
     // The root-progress scan takes seconds, so a result is held per target and
     // reused across the poll cycle's re-renders; refreshing is explicit.
     const rootProgressCache=new Map(), rootProgressGeneration=new Map(), rootProgressPending=new Set(), rootProgressScroll=new Map(), rootProgressFailure=new Map();
@@ -2615,6 +2621,16 @@
       const counts=report.data.counts||{},values=[counts.complete,counts.pending,counts.infeasible,report.data.candidate_count];
       byId("report").querySelectorAll("h2 + .metrics .metric strong").forEach((node,index)=>{node.textContent=valueOrDash(values[index]);});
     }
+    // Settle an owed render.  The report is redrawn as its own predecessor
+    // because it is already the banked one: nothing is arriving, the screen is
+    // simply catching up to what the client already holds.  A poll that answers
+    // 304 is the ordinary way here -- the ranking stopped moving the moment the
+    // reader opened a card, so the next change to the page is this redraw.
+    function drawOwedReport(state){
+      if(!renderOwed||!lastReport||contextKey(state)!==lastContext)return;
+      if(reportHasFocusedControl()||reportHasActiveSelection())return;
+      applyReport(lastReport,lastReport,state);displayedState=state;renderOwed=false;
+    }
     function applyReport(report,previousReport,state){
       if(!report||report.schema_version!==SCHEMA_VERSION||!report.data||!report.sources)throw new Error("Unsupported or malformed report");
       report=overviewWithRecentCompletions(report,previousReport,state);
@@ -2681,7 +2697,7 @@
         if(cachedTag)requestHeaders["If-None-Match"]=cachedTag;
         const response=await fetch(buildAPIURL(state),{headers:requestHeaders,cache:"no-store",signal:controller.signal});
         if(generation!==requestGeneration)return;
-        if(response.status===304){lastSuccess=Date.now();failureCount=0;connection(true,"connected");return;}
+        if(response.status===304){drawOwedReport(state);lastSuccess=Date.now();failureCount=0;connection(true,"connected");return;}
         const entityTag=response.headers.get("ETag");
         // A new ranking is a new set of facts about every opener in it, so the
         // breakdowns fetched against the previous one are no longer known to
@@ -2696,9 +2712,11 @@
         // replacement, and replaceChildren collapses an active text selection.
         const unchangedLeaderboard=sameView&&report.report_kind==="leaderboard"&&!leaderboardRowsChanged(report,lastReport);
         if(!sameView||(!unchangedLeaderboard&&!reportHasFocusedControl()&&!reportHasActiveSelection())){
-          applyReport(report,previous,state);displayedState=state;
+          applyReport(report,previous,state);displayedState=state;renderOwed=false;
         }else if(unchangedLeaderboard&&!reportHasActiveSelection())refreshLeaderboardMetrics(report);
-        lastReport=report;lastContext=context;lastSuccess=Date.now();failureCount=0;connection(true,"connected");
+        else renderOwed=true;
+        lastReport=report;lastContext=context;drawOwedReport(state);
+        lastSuccess=Date.now();failureCount=0;connection(true,"connected");
         pinBranchToSpine(report,state);
       }
       catch(error){
