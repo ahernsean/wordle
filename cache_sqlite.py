@@ -1456,9 +1456,29 @@ class ScoreCache:
         `rank` walks the index entries that qualify, so it is linear in the
         rank and bounded by the vocabulary; the neighbour windows stop at
         `neighbour_count` and are seeks.
+
+        All four read one snapshot.  A leaderboard build stores and deletes
+        folds, and it runs against the same cache a detail request is being
+        served from, so between two autocommit statements the field can change
+        underneath them -- and the four answers are one statement about one
+        field.  Counted separately they can disagree: a rank from a larger
+        field beside a total from a smaller one is a rank past the end of the
+        ranking it claims to be in, and neighbours that are not the rows
+        either side of it.
         """
         scope = (policy, self.answer_list_id, opener.lower())
         position = (erd, max_remaining_depth, opener.lower())
+        self._conn.execute("BEGIN")
+        try:
+            return self._standing_in_snapshot(
+                scope, position, neighbour_count)
+        finally:
+            # A read transaction holds a snapshot and nothing else, so it ends
+            # the same way whether or not the reads raised.
+            self._conn.execute("ROLLBACK")
+
+    def _standing_in_snapshot(self, scope, position, neighbour_count):
+        """The four standing reads, against whatever snapshot is open."""
         better = self._conn.execute(
             """SELECT COUNT(*) FROM opener_erd_by_policy
                 WHERE policy = ? AND answer_list_id = ? AND opener <> ?

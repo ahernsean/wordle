@@ -2106,6 +2106,44 @@ class ReportClientBrowserTest(unittest.TestCase):
             self.page.locator(".opener-lookup-form input").input_value(),
             "salet")
 
+    def test_a_first_lookup_is_asked_for_once(self):
+        """Nothing is stale before there is an answer to go stale.
+
+        The first load of a view has no stored entity tag to match, so the
+        ranking reads as changed.  Marking the standing stale on that would
+        leave the mark waiting for the reader's first lookup, whose own draw
+        would then send the very request that just answered it.
+        """
+        self.page.locator("[data-kind=leaderboard]").click()
+        self.page.wait_for_selector(".grid.leaderboard > .leaderboard-card")
+        # The fixture server serves the leaderboard without an entity tag, so
+        # the first poll to carry one has to be arranged -- which is the state
+        # the real server puts a freshly opened page in.
+        self.page.evaluate("""() => {
+          const realFetch = window.fetch.bind(window);
+          window.__detailFetches = 0;
+          window.fetch = (url, options) => {
+            if (String(url).includes('branch_target=')) {
+              window.__detailFetches += 1;
+              return realFetch(url, options);
+            }
+            return realFetch(url, options).then(async response => {
+              if (!String(url).includes('/leaderboard')) return response;
+              return new Response(await response.text(), {
+                status: 200,
+                headers: {'Content-Type': 'application/json', 'ETag': '"first"'},
+              });
+            });
+          };
+        }""")
+        self.page.evaluate(
+            "async () => { await window.__reportClient.fetchReport(); }")
+        box = self.page.locator(".opener-lookup-form input")
+        box.fill("salet")
+        box.press("Enter")
+        self.page.wait_for_selector(".leaderboard-card.looked-up")
+        self.assertEqual(self.page.evaluate("() => window.__detailFetches"), 1)
+
     def test_a_lookup_asks_again_once_the_ranking_has_moved(self):
         """A rank describes the ranking it was counted in, and that moves.
 

@@ -1127,6 +1127,65 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(rows[-1]["word"], last)
         self.assertEqual(rows[-1]["rank"], len(ranking))
 
+    def test_a_standing_counts_its_rank_and_its_field_in_one_snapshot(self):
+        """The four reads describe one field, so they read one version of it.
+
+        A leaderboard build stores and deletes folds against the same cache a
+        detail request is served from.  Counted in separate autocommit
+        statements, a rank taken over a larger field can be reported beside a
+        total taken over a smaller one -- a place past the end of the ranking
+        it claims to be in.
+        """
+        answers = ["crane", "slate"]
+        candidates = ["crane", "slate", "raise", "aisle", "ariel", "irate",
+                      "retia", "terai", "arise", "serai"]
+        sources = self._leaderboard_sources(answers, candidates)
+        ranking = leaderboard_rows(collect_report(
+            sources, ReportRequest(report_kind="leaderboard"))["data"])
+        self.assertGreater(len(ranking), 4)
+        last = ranking[-1]
+
+        cache = ScoreCache(sources.cache_path, answers,
+                           checkpoint_on_close=False)
+        self.addCleanup(cache.close)
+        writer = ScoreCache(sources.cache_path, answers,
+                            checkpoint_on_close=False)
+        self.addCleanup(writer.close)
+        dropped = [row["word"] for row in ranking[:-1]][:3]
+
+        class DeleteBeforeTheSecondCount:
+            """Drop folds between the rank count and the field count."""
+
+            def __init__(self, connection, on_second_count):
+                self._connection = connection
+                self._on_second_count = on_second_count
+                self._counts = 0
+
+            def execute(self, statement, *arguments):
+                if "COUNT(*)" in statement:
+                    self._counts += 1
+                    if self._counts == 2:
+                        self._on_second_count()
+                return self._connection.execute(statement, *arguments)
+
+            def __getattr__(self, name):
+                return getattr(self._connection, name)
+
+        cache._conn = DeleteBeforeTheSecondCount(
+            cache._conn, lambda: writer.delete_opener_erds(dropped, ERD_ALL))
+        standing = cache.opener_standing(
+            ERD_ALL, last["word"], last["erd"],
+            last["max_remaining_depth"], LEADERBOARD_NEIGHBOUR_COUNT)
+        self.assertEqual(standing["rank"], len(ranking))
+        self.assertEqual(standing["ranked_total"], len(ranking))
+        self.assertLessEqual(standing["rank"], standing["ranked_total"])
+        # The snapshot held, so the window is still the tail of the ranking
+        # the rank was counted in.
+        window = ([word for _erd, _depth, word in standing["above"]]
+                  + [last["word"]])
+        self.assertEqual(
+            window, [row["word"] for row in ranking[-len(window):]])
+
     def test_a_word_outside_the_vocabulary_is_absent_not_unfinished(self):
         # "No such candidate" and "still being solved" are different answers,
         # and a lookup that gave both the same one would have a reader waiting

@@ -2838,8 +2838,11 @@
           // A new ranking places every opener afresh, so a rank already on
           // screen describes the previous one.  The answer is not dropped --
           // that would empty the panel every time an opener completes -- it is
-          // marked for the lookup to ask again as it next draws.
-          openerStandingStale=true;
+          // marked for the lookup to ask again as it next draws.  Only an
+          // answer that exists can go stale: the first load of a view has no
+          // stored tag to match, so marking unconditionally would leave the
+          // mark waiting for the reader's first lookup and send it twice.
+          if(openerStanding)openerStandingStale=true;
         }
         if(entityTag)reportEntityTags.set(context,entityTag);else reportEntityTags.delete(context);
         if(!response.ok){let message="HTTP "+response.status;try{const body=await response.json();message=body.error?.message||message;}catch(_error){}if(response.status===400){connection(false,"invalid request",false);byId("report").replaceChildren(element("p","error",message));return;}throw new Error(message);}
