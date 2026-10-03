@@ -244,6 +244,15 @@
     .leaderboard-card { padding:.65rem .75rem; overflow-x:hidden; }
     .leaderboard-card .card-title { font-size:1.05rem; gap:.55rem; }
     .leaderboard-rank { color:var(--dim); }
+    .opener-lookup { margin:.5rem 0 .9rem; padding:.6rem .75rem; border:1px solid var(--border); border-radius:6px; }
+    .opener-lookup-form { display:flex; flex-wrap:wrap; align-items:center; gap:.4rem .5rem; }
+    .opener-lookup-form input { width:7rem; text-transform:uppercase; letter-spacing:.12em; font-family:inherit; }
+    .opener-lookup-answer { margin-top:.6rem; }
+    .opener-lookup-position { display:flex; flex-wrap:wrap; align-items:baseline; gap:.35rem .6rem; margin-bottom:.5rem; font-size:1.05rem; }
+    .opener-lookup-position .dim { font-size:.85rem; }
+    /* The looked-up opener is a row of its own neighbourhood, so it is marked
+       in place rather than repeated above it. */
+    .leaderboard-card.looked-up { border-color:var(--green); box-shadow:inset 3px 0 var(--green); }
     .response-visual-key { display:flex; flex-wrap:wrap; align-items:center; gap:.35rem .45rem; margin:.35rem 0 .45rem; font-size:.8rem; color:var(--dim); }
     .response-color-gradient { flex:0 1 10rem; min-width:5rem; height:.55rem; border-radius:999px; background:linear-gradient(90deg,hsl(320 70% 42%),hsl(0 62% 43%),hsl(62 62% 43%),hsl(125 62% 43%),hsl(210 62% 43%)); }
     .response-visual-label { margin:.4rem 0 .15rem; color:var(--dim); font-size:.8rem; }
@@ -438,6 +447,13 @@
     const collapsedNodes=new Set(), initializedNodes=new Set(), collapsedWordGroups=new Set(), initializedWordGroups=new Set(), collapsedResponseGroups=new Set(), stickyOrders=new Map(), packedOrders=new Map(), gridColumnCounts=new Map(), treePageHistory=new Map(), treeGroupPages=new Map(),
       expandedOpeners=new Set(), openerBreakdowns=new Map(),
       reportEntityTags=new Map();
+    // The lookup's own state, outside the DOM because the report is redrawn on
+    // every poll.  `openerLookupText` is what is typed, kept so a redraw that
+    // lands between typing and submitting does not empty the box;
+    // `openerStanding` is the answer on screen, and the word it answers about
+    // is its own `word`.
+    let openerLookupText="", openerStanding=null, openerStandingError=null,
+      openerStandingPending=null, openerStandingStale=false;
     const COMPLETED_BRANCH_HOLD_MILLIS=5000;
     const recentOverviewCompletionRows=new Map();
     let completionExpiryTimer=null;
@@ -2314,20 +2330,130 @@
       metrics.append(metric("complete",counts.complete),metric("pending",counts.pending),metric("infeasible",counts.infeasible),metric("candidates",data.candidate_count));
       fragment.append(element("h2","","Opener leaderboard"),metrics);
       const rows=leaderboardRows(data);
+      const maximumResponseGroupCount=data.maximum_response_group_count||data.response_pattern_count||243;
+      fragment.append(renderOpenerLookup(state));
       fragment.append(element("p","dim","Ranked by ERD · showing "+numText(rows.length)+" of "+numText(data.total_rows??rows.length)+" complete"));
       if(!rows.length){fragment.append(element("p","empty","No opener has a complete tree yet"));return fragment;}
       const grid=element("div","grid leaderboard");
-      const maximumResponseGroupCount=data.maximum_response_group_count||data.response_pattern_count||243;
-      for(const row of rows){
-        const card=element("article","card leaderboard-card");card.dataset.identity=row.word;
-        const title=element("div","card-title"),entry=element("span","word-erd");
-        entry.append(wordTiles(row.word,null,row.word_is_answer,"word-md"),"/",element("span","erd-value",row.erdText));
-        title.append(element("span","leaderboard-rank","#"+numText(row.rank)),entry);
-        card.append(title,element("div","leaderboard-worst-case dim","Worst-case solve: "+row.max_remaining_depth+" guesses"),
-          renderLeaderboardBreakdown(row,state,maximumResponseGroupCount));
-        grid.append(card);
-      }
+      for(const row of rows)grid.append(leaderboardCard(row,state,{maximumResponseGroupCount}));
       fragment.append(grid);return fragment;
+    }
+    // One card, drawn the same way wherever a ranked opener appears, so a
+    // neighbourhood reads as a slice of the ranking rather than as a second
+    // way of showing the same row.  A neighbourhood passes no breakdown: the
+    // expander is keyed on the word in `expandedOpeners`, so two cards for one
+    // opener would open and close together.
+    function leaderboardCard(row,state,{breakdown=true,maximumResponseGroupCount=null}={}){
+      const card=element("article","card leaderboard-card");card.dataset.identity=row.word;
+      const title=element("div","card-title"),entry=element("span","word-erd");
+      entry.append(wordTiles(row.word,null,row.word_is_answer,"word-md"),"/",element("span","erd-value",row.erdText));
+      title.append(element("span","leaderboard-rank","#"+numText(row.rank)),entry);
+      card.append(title,element("div","leaderboard-worst-case dim","Worst-case solve: "+row.max_remaining_depth+" guesses"));
+      if(breakdown)card.append(renderLeaderboardBreakdown(row,state,maximumResponseGroupCount));
+      return card;
+    }
+    // At the full candidate vocabulary the ranking is the wrong front door for
+    // the question a reader actually has, which is where one word stands --
+    // not what fifteen thousand of them look like.  The lookup answers that in
+    // one bounded request: the server folds the named opener's own groups and
+    // counts its place in the stored ranking, so nothing on this path grows
+    // with the vocabulary.
+    function renderOpenerLookup(state){
+      const host=element("section","opener-lookup"),
+        form=element("form","opener-lookup-form"),
+        answer=element("div","opener-lookup-answer"),
+        input=document.createElement("input"),
+        submit=element("button","","Look up"),
+        clear=element("button","","Clear");
+      input.type="text";input.maxLength=5;input.spellcheck=false;
+      input.autocapitalize="characters";input.placeholder="word";
+      input.setAttribute("aria-label","Opener to look up");
+      input.value=openerLookupText;
+      submit.type="submit";clear.type="button";
+      form.append(element("span","dim","Where does"),input,submit,clear);
+      host.append(form,answer);
+      // Drawn in place rather than by asking for the report again: the answer
+      // is about one word, and redrawing the ranking to show it would discard
+      // the expansions and the scroll position the reader got here with.
+      const draw=()=>{
+        clear.hidden=!(openerStanding||openerStandingError||openerStandingPending);
+        if(openerStandingStale&&openerStanding?.word&&!openerStandingPending){
+          // Cleared before the request so this redraw -- and the one the
+          // answer triggers -- cannot ask again.
+          openerStandingStale=false;
+          lookUpOpener(state,openerStanding.word,draw);
+        }
+        if(openerStandingPending){
+          answer.replaceChildren(element("p","dim",
+            "Looking up "+openerStandingPending.toUpperCase()+"…"));
+          return;
+        }
+        if(openerStandingError){
+          answer.replaceChildren(element("p","error",openerStandingError));
+          return;
+        }
+        if(!openerStanding){answer.replaceChildren();return;}
+        const standing=openerStanding,word=String(standing.word||"").toUpperCase();
+        if(!standing.available){
+          answer.replaceChildren(element("p","empty",
+            standing.state==="absent"
+              ?word+" is not a candidate opener"
+              :word+" has no complete tree yet ("+standing.state+")"
+                +(standing.ranked_total
+                  ?" · "+numText(standing.ranked_total)+" openers ranked so far"
+                  :"")));
+          return;
+        }
+        const position=element("div","opener-lookup-position");
+        position.append(
+          element("strong","","Rank "+numText(standing.rank)+" of "
+            +numText(standing.ranked_total)),
+          element("span","dim","ranked openers · better than "
+            +fixed(standing.percentile,1)+"%"));
+        const grid=element("div","grid leaderboard"),
+          neighbours=leaderboardRows({columns:standing.neighbourhood});
+        neighbours.forEach((row,index)=>{
+          const card=leaderboardCard(row,state,{breakdown:false});
+          if(index===standing.position)card.classList.add("looked-up");
+          grid.append(card);
+        });
+        answer.replaceChildren(position,grid);
+      };
+      input.addEventListener("input",()=>{openerLookupText=input.value;});
+      form.addEventListener("submit",event=>{
+        event.preventDefault();lookUpOpener(state,input.value,draw);
+      });
+      clear.addEventListener("click",()=>{
+        openerStanding=null;openerStandingError=null;openerStandingPending=null;
+        openerStandingStale=false;openerLookupText="";input.value="";draw();
+      });
+      draw();
+      return host;
+    }
+    // The endpoint is the one a card expansion already uses: both questions
+    // rest on the same fold of one opener's groups, so asking for either pays
+    // for it once.
+    async function lookUpOpener(state,typed,draw){
+      const word=String(typed||"").trim().toLowerCase();
+      if(!/^[a-z]{5}$/.test(word)){
+        openerStanding=null;openerStandingPending=null;
+        openerStandingError="An opener is five letters";draw();return;
+      }
+      openerStandingPending=word;openerStandingError=null;draw();
+      try{
+        const response=await fetch(leaderboardDetailURL(state,word),
+          {headers:{Accept:"application/json"}});
+        if(!response.ok)throw new Error("Lookup failed ("+response.status+")");
+        const standing=(await response.json()).data.standing;
+        if(openerStandingPending!==word)return;
+        openerStandingPending=null;
+        openerStanding=standing||{word,available:false,state:"absent"};
+      }catch(error){
+        if(openerStandingPending!==word)return;
+        openerStandingPending=null;openerStanding=null;
+        openerStandingError=error.message;
+      }
+      draw();
     }
     // A card's response groups are 5.9 KB against the 20 bytes of column that
     // rank it, so they are fetched for the one opener a reader opened rather
@@ -2385,6 +2511,11 @@
       const width=columns.word_width||5,words=columns.words||"",count=Math.floor(words.length/width),
         numerators=columns.erd_numerator||[],
         denominator=columns.erd_denominator||data.answer_count||null,
+        // Rank is the position, and `first_rank` says what the position counts
+        // from, so a window cut out of the middle of the ranking carries its
+        // real ranks through this same reader.  A payload without it starts at
+        // 1, which is the ranking read from its top.
+        firstRank=columns.first_rank??1,
         depths=columns.max_remaining_depth||[],answerBits=decodeCandidateBitmap(columns.word_is_answer_bitmap);
       const rows=[];
       for(let index=0;index<count;index++){
@@ -2395,7 +2526,7 @@
         const numerator=numerators[index],erd=numerator/denominator;
         rows.push({
           word:words.slice(index*width,(index+1)*width),
-          rank:index+1,
+          rank:firstRank+index,
           erd,
           erdText:erdValue(erd,denominator),
           max_remaining_depth:depths[index],
@@ -2702,7 +2833,14 @@
         // A new ranking is a new set of facts about every opener in it, so the
         // breakdowns fetched against the previous one are no longer known to
         // hold.  Dropping them costs one fetch per card still open.
-        if(entityTag&&reportEntityTags.get(context)!==entityTag)openerBreakdowns.clear();
+        if(entityTag&&reportEntityTags.get(context)!==entityTag){
+          openerBreakdowns.clear();
+          // A new ranking places every opener afresh, so a rank already on
+          // screen describes the previous one.  The answer is not dropped --
+          // that would empty the panel every time an opener completes -- it is
+          // marked for the lookup to ask again as it next draws.
+          openerStandingStale=true;
+        }
         if(entityTag)reportEntityTags.set(context,entityTag);else reportEntityTags.delete(context);
         if(!response.ok){let message="HTTP "+response.status;try{const body=await response.json();message=body.error?.message||message;}catch(_error){}if(response.status===400){connection(false,"invalid request",false);byId("report").replaceChildren(element("p","error",message));return;}throw new Error(message);}
         const report=await response.json();if(generation!==requestGeneration)return;

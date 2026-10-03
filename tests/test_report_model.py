@@ -16,6 +16,7 @@ import erd_search
 import report_model
 from report_model import (
     leaderboard_rows,
+    LEADERBOARD_NEIGHBOUR_COUNT,
     encode_candidate_bitmap,
     decode_candidate_bitmap,
     _worker_process_is_running,
@@ -1001,6 +1002,161 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(leaderboard_rows(second["data"]),
                          leaderboard_rows(first["data"]))
         self.assertEqual(second["data"]["counts"], first["data"]["counts"])
+
+    def _standing_sources(self):
+        """Three openers that complete, and one that does not.
+
+        CRANE and SLATE are answers, so each splits the pair into an all-green
+        group and a lone survivor and folds to 1.5; RAISE separates them into
+        two lone survivors and folds to 2.0.  HOWDY collides both answers into
+        one group no branch result settles, so it stays pending.  CRANE and
+        SLATE therefore tie on ERD and on worst-case line, which is the only
+        shape that exercises the ranking's word-level tiebreak.
+        """
+        answers = ["crane", "slate"]
+        return answers, self._leaderboard_sources(
+            answers, ["crane", "slate", "raise", "howdy"])
+
+    def _standing_for(self, sources, word):
+        return collect_report(sources, ReportRequest(
+            report_kind="leaderboard",
+            branch_target=parse_report_branch_target(word),
+        ))["data"]["standing"]
+
+    def test_a_named_opener_carries_where_it_stands(self):
+        # The lookup's whole point: naming one word answers where it stands
+        # without the ranking being built, so the response holds no columns
+        # for the vocabulary and the ERD arrives exactly.
+        answers, sources = self._standing_sources()
+        collect_report(sources, ReportRequest(report_kind="leaderboard"))
+        data = collect_report(sources, ReportRequest(
+            report_kind="leaderboard",
+            branch_target=parse_report_branch_target("raise"),
+        ))["data"]
+        self.assertNotIn("columns", data)
+        standing = data["standing"]
+        self.assertEqual(standing["state"], "complete")
+        self.assertEqual(standing["rank"], 3)
+        self.assertEqual(standing["ranked_total"], 3)
+        self.assertEqual(
+            standing["erd_numerator"] / standing["erd_denominator"], 2.0)
+        self.assertEqual(standing["erd_denominator"], len(answers))
+        self.assertEqual(standing["percentile"], 0.0)
+
+    def test_a_standing_rank_is_the_position_the_ranking_puts_the_word_at(self):
+        # Rank is counted in SQL over stored folds while the ranking is sorted
+        # in Python over freshly folded ones.  Those are two orderings of the
+        # same triple, and a lookup is only worth anything if they agree -- so
+        # every ranked opener is looked up and checked against its own row.
+        _answers, sources = self._standing_sources()
+        data = collect_report(
+            sources, ReportRequest(report_kind="leaderboard"))["data"]
+        ranking = leaderboard_rows(data)
+        self.assertEqual([row["word"] for row in ranking],
+                         ["crane", "slate", "raise"])
+        for row in ranking:
+            standing = self._standing_for(sources, row["word"])
+            self.assertEqual(standing["rank"], row["rank"], row["word"])
+            self.assertEqual(standing["ranked_total"], len(ranking))
+            self.assertEqual(standing["erd_numerator"], row["erd_numerator"])
+
+    def test_a_standing_ignores_the_stored_fold_of_the_word_it_places(self):
+        # The looked-up opener is placed by the fold this request screened,
+        # never by its own stored row, which can predate a repair.  Poison
+        # that row with an ERD better than the whole field: counting it as
+        # well would push RAISE past itself and report a rank past the end of
+        # the ranking it is in.
+        answers, sources = self._standing_sources()
+        collect_report(sources, ReportRequest(report_kind="leaderboard"))
+        cache = ScoreCache(sources.cache_path, answers,
+                           checkpoint_on_close=False)
+        cache.write_opener_erds([("raise", 0.5, 1, 2)], ERD_ALL)
+        cache.close()
+
+        standing = self._standing_for(sources, "raise")
+        self.assertEqual(standing["rank"], 3)
+        self.assertEqual(standing["ranked_total"], 3)
+        self.assertEqual(
+            standing["erd_numerator"] / standing["erd_denominator"], 2.0)
+        neighbourhood = leaderboard_rows(
+            {"columns": standing["neighbourhood"]})
+        self.assertEqual([row["word"] for row in neighbourhood],
+                         ["crane", "slate", "raise"])
+
+    def test_a_standing_neighbourhood_carries_the_ranks_it_was_cut_from(self):
+        # The window is a slice out of the middle of the ranking, and rank is
+        # implicit in the order of the columns, so it has to say where its
+        # order starts.  The looked-up opener is a row inside its own window
+        # rather than a figure beside it, because numbering rows either side
+        # of a gap across the gap is what `first_rank` alone cannot express.
+        #
+        # This fixture's window is the whole ranking, so it pins the position
+        # and the marker but not the offset -- a reader numbering every window
+        # from 1 still passes here.  The bounded-window test is what catches
+        # that, because its window starts partway down.
+        _answers, sources = self._standing_sources()
+        collect_report(sources, ReportRequest(report_kind="leaderboard"))
+        for word, position in (("crane", 0), ("slate", 1), ("raise", 2)):
+            standing = self._standing_for(sources, word)
+            rows = leaderboard_rows({"columns": standing["neighbourhood"]})
+            self.assertEqual([row["word"] for row in rows],
+                             ["crane", "slate", "raise"], word)
+            self.assertEqual([row["rank"] for row in rows], [1, 2, 3], word)
+            self.assertEqual(standing["position"], position)
+            self.assertEqual(rows[standing["position"]]["word"], word)
+            self.assertEqual(rows[standing["position"]]["rank"],
+                             standing["rank"])
+
+    def test_a_standing_window_is_bounded_either_side_of_the_word(self):
+        # The window exists so the answer stays small whatever the vocabulary
+        # does, so it is capped on both sides rather than running to the top
+        # of the ranking.
+        answers = ["crane", "slate"]
+        candidates = ["crane", "slate", "raise", "aisle", "ariel", "irate",
+                      "retia", "terai", "arise", "serai", "easel", "aesir"]
+        sources = self._leaderboard_sources(answers, candidates)
+        data = collect_report(
+            sources, ReportRequest(report_kind="leaderboard"))["data"]
+        ranking = leaderboard_rows(data)
+        self.assertGreater(len(ranking), 2 * LEADERBOARD_NEIGHBOUR_COUNT + 1)
+        last = ranking[-1]["word"]
+        standing = self._standing_for(sources, last)
+        rows = leaderboard_rows({"columns": standing["neighbourhood"]})
+        self.assertEqual(len(rows), LEADERBOARD_NEIGHBOUR_COUNT + 1)
+        self.assertEqual(standing["position"], LEADERBOARD_NEIGHBOUR_COUNT)
+        self.assertEqual(rows[-1]["word"], last)
+        self.assertEqual(rows[-1]["rank"], len(ranking))
+
+    def test_a_word_outside_the_vocabulary_is_absent_not_unfinished(self):
+        # "No such candidate" and "still being solved" are different answers,
+        # and a lookup that gave both the same one would have a reader waiting
+        # for a sweep to reach a word it will never reach.
+        _answers, sources = self._standing_sources()
+        standing = self._standing_for(sources, "zzzzz")
+        self.assertFalse(standing["available"])
+        self.assertEqual(standing["state"], "absent")
+        self.assertNotIn("ranked_total", standing)
+
+    def test_an_unfinished_opener_names_its_state_and_the_field_it_is_not_in(self):
+        # HOWDY is a real candidate whose tree is unfinished, which is the
+        # ordinary case while a sweep runs.  It reports the fold's own state
+        # and how large the ranked field already is, so the answer is "not yet,
+        # and here is how far along the sweep is" rather than a bare refusal.
+        _answers, sources = self._standing_sources()
+        collect_report(sources, ReportRequest(report_kind="leaderboard"))
+        standing = self._standing_for(sources, "howdy")
+        self.assertFalse(standing["available"])
+        self.assertEqual(standing["state"], "pending")
+        self.assertEqual(standing["ranked_total"], 3)
+
+    def test_a_standing_on_a_cache_no_build_has_screened_reports_an_empty_field(self):
+        # The field is whatever the last build stored, so before any build it
+        # is empty and the honest answer is "rank 1 of 1" -- which says the
+        # field holds nothing else rather than implying a place in one.
+        _answers, sources = self._standing_sources()
+        standing = self._standing_for(sources, "raise")
+        self.assertEqual(standing["rank"], 1)
+        self.assertEqual(standing["ranked_total"], 1)
 
     def test_a_screened_candidate_holding_a_loss_and_a_gap_is_infeasible(self):
         # GIPPY splits these answers into two groups of more than one answer.

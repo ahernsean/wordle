@@ -550,6 +550,16 @@ class ScoreCache:
                 PRIMARY KEY (opener, policy, answer_list_id)
             )
         """)
+        # The ranking's own sort key, so a question about one opener's place in
+        # it is a seek rather than a read of every fold.  The primary key is on
+        # the opener, which answers "what is SALET's ERD" and nothing about
+        # order; this index answers "how many openers beat it" and "which ones
+        # sit either side of it".  Covering, so neither query reaches the table.
+        self._conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_opener_erd_rank
+                ON opener_erd_by_policy
+                   (policy, answer_list_id, erd, max_remaining_depth, opener)
+        """)
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS opener_response_group_summaries (
                 opener TEXT NOT NULL, response_pattern TEXT NOT NULL,
@@ -1408,6 +1418,81 @@ class ScoreCache:
                     WHERE policy = ? AND answer_list_id = ?""",
                 (policy, self.answer_list_id),
             )
+        }
+
+    def ranked_opener_count(self, policy):
+        """How many openers hold a stored fold for this answer list."""
+        return self._conn.execute(
+            """SELECT COUNT(*) FROM opener_erd_by_policy
+                WHERE policy = ? AND answer_list_id = ?""",
+            (policy, self.answer_list_id),
+        ).fetchone()[0]
+
+    def opener_standing(self, policy, opener, erd, max_remaining_depth,
+                        neighbour_count):
+        """Where one opener sits in the stored ranking, without loading it.
+
+        `erd` and `max_remaining_depth` are the caller's own fold of this
+        opener, and they are the only live facts in the answer.  The opener's
+        stored row is excluded from every query here, so a fold that disagrees
+        with it -- an opener that completed since the last screen, or one whose
+        tree was repaired -- is placed by what it is now rather than by what
+        was recorded.  Counting its stale row as well would move it past
+        itself.
+
+        The sort key is the ranking's own, `(erd, max_remaining_depth,
+        opener)`, so `rank` is a position in the ranking as it is displayed
+        rather than a competition rank that ties share.  Both halves of a tie
+        therefore get a place of their own, and the neighbours are the rows
+        actually above and below.
+
+        The population is whatever the last leaderboard build screened.  A
+        stored fold is a record of that screen and is not evidence on its own
+        (`_screen_and_fold_openers` rescreens and `delete_opener_erds` prunes),
+        so this is a positional statement about that population and nothing
+        more.  The alternative is to rescreen the vocabulary, which is the cost
+        the whole lookup exists to avoid.
+
+        `rank` walks the index entries that qualify, so it is linear in the
+        rank and bounded by the vocabulary; the neighbour windows stop at
+        `neighbour_count` and are seeks.
+        """
+        scope = (policy, self.answer_list_id, opener.lower())
+        position = (erd, max_remaining_depth, opener.lower())
+        better = self._conn.execute(
+            """SELECT COUNT(*) FROM opener_erd_by_policy
+                WHERE policy = ? AND answer_list_id = ? AND opener <> ?
+                  AND (erd, max_remaining_depth, opener) < (?, ?, ?)""",
+            scope + position,
+        ).fetchone()[0]
+        others = self._conn.execute(
+            """SELECT COUNT(*) FROM opener_erd_by_policy
+                WHERE policy = ? AND answer_list_id = ? AND opener <> ?""",
+            scope,
+        ).fetchone()[0]
+        above = self._conn.execute(
+            """SELECT erd, max_remaining_depth, opener
+                 FROM opener_erd_by_policy
+                WHERE policy = ? AND answer_list_id = ? AND opener <> ?
+                  AND (erd, max_remaining_depth, opener) < (?, ?, ?)
+                ORDER BY erd DESC, max_remaining_depth DESC, opener DESC
+                LIMIT ?""",
+            scope + position + (neighbour_count,),
+        ).fetchall()
+        below = self._conn.execute(
+            """SELECT erd, max_remaining_depth, opener
+                 FROM opener_erd_by_policy
+                WHERE policy = ? AND answer_list_id = ? AND opener <> ?
+                  AND (erd, max_remaining_depth, opener) > (?, ?, ?)
+                ORDER BY erd, max_remaining_depth, opener
+                LIMIT ?""",
+            scope + position + (neighbour_count,),
+        ).fetchall()
+        return {
+            "rank": better + 1,
+            "ranked_total": others + 1,
+            "above": [tuple(row) for row in reversed(above)],
+            "below": [tuple(row) for row in below],
         }
 
     def write_opener_erds(self, rows, policy, folded_at=None):

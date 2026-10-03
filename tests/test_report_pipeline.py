@@ -141,12 +141,42 @@ class ReportPipelineTest(unittest.TestCase):
         self.assertIn("response groups", text)
 
     def test_leaderboard_detail_for_an_unknown_opener_renders(self):
+        """A word the vocabulary does not hold says so, not "unfinished".
+
+        "No such candidate" and "still being solved" are different answers to
+        the same question, and the renderer keeps them apart so a reader is not
+        left waiting for a sweep to reach a word it will never reach.
+        """
         report, text = self._render(ReportRequest(
             report_kind="leaderboard",
             branch_target=parse_report_branch_target("zzzzz"),
         ))
         self.assertFalse(report["data"]["detail"]["available"])
-        self.assertIn("no complete tree yet", text)
+        self.assertEqual(report["data"]["standing"]["state"], "absent")
+        self.assertIn("ZZZZZ is not a candidate opener", text)
+        self.assertNotIn("no complete tree yet", text)
+
+    def test_leaderboard_detail_renders_where_the_opener_stands(self):
+        """`view --leaderboard WORD` leads with the opener's place.
+
+        The question a word asks is where it stands, so the rendering carries
+        the rank, the field it is ranked in, and the openers either side of it
+        as the same table the ranking itself draws -- with the looked-up opener
+        marked inside that table rather than quoted beside it.
+        """
+        self._render(ReportRequest(report_kind="leaderboard"))
+        report, text = self._render(ReportRequest(
+            report_kind="leaderboard",
+            branch_target=parse_report_branch_target("salet"),
+        ))
+        standing = report["data"]["standing"]
+        self.assertTrue(standing["available"])
+        self.assertIn(
+            f"Rank {standing['rank']:,} of {standing['ranked_total']:,} "
+            f"ranked openers", text)
+        self.assertIn("better than", text)
+        self.assertIn("Rank  Opener   ERD", text)
+        self.assertRegex(text, r"-> +\d+ +SALET")
 
     def test_leaderboard_report_renders(self):
         report, text = self._render(ReportRequest(report_kind="leaderboard"))

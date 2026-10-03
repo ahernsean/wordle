@@ -521,6 +521,96 @@ class OverviewRendererTest(unittest.TestCase):
         output = render_report(report, width=100)
         self.assertIn("none complete yet", output)
 
+    @staticmethod
+    def _standing_report(standing):
+        report = overview_report()
+        report["report_kind"] = "leaderboard"
+        report["data"] = {
+            "detail": {"word": standing["word"], "available": False,
+                       "response_groups": []},
+            "standing": standing,
+        }
+        return report
+
+    def test_leaderboard_standing_renders_the_place_and_the_neighbourhood(self):
+        # The looked-up opener is a marked row of its own neighbourhood rather
+        # than a figure quoted above it, and the window carries the ranks it
+        # was cut from -- so the table reads as a slice of the ranking.
+        report = self._standing_report({
+            "word": "tarse", "available": True, "state": "complete",
+            "word_is_answer": False, "erd_numerator": 11424,
+            "erd_denominator": 3209, "max_remaining_depth": 5,
+            "rank": 42, "ranked_total": 958, "percentile": 95.6,
+            "position": 1,
+            "neighbourhood": {
+                "word_width": 5, "words": "cranetarseslant",
+                "erd_denominator": 3209,
+                "erd_numerator": [11423, 11424, 11425],
+                "max_remaining_depth": [5, 5, 6], "first_rank": 41,
+                "word_is_answer_bitmap": "AQ==",
+            },
+        })
+        output = render_report(report, width=100)
+        self.assertIn("Rank 42 of 958 ranked openers", output)
+        self.assertIn("better than 95.6%", output)
+        self.assertIn("11,424/3,209 guesses", output)
+        self.assertIn("worst case 5 guesses", output)
+        self.assertIn("CRANE*", output)  # the bitmap's one answer
+        marked = [line for line in output.splitlines()
+                  if line.startswith("->")]
+        self.assertEqual(len(marked), 1, output)
+        self.assertIn("  42  TARSE", marked[0])
+        # The rows either side are numbered 41 and 43, not 1 and 3.
+        self.assertRegex(output, r"\n +41 +CRANE")
+        self.assertRegex(output, r"\n +43 +SLANT")
+
+    def test_leaderboard_standing_for_an_unfinished_opener_sizes_the_field(self):
+        # The ordinary case while a sweep runs: a real candidate whose tree is
+        # not finished.  It says so, names the fold's own state, and says how
+        # large the ranked field already is, rather than refusing the question.
+        report = self._standing_report({
+            "word": "howdy", "available": False, "state": "pending",
+            "ranked_total": 958,
+        })
+        output = render_report(report, width=100)
+        self.assertIn("HOWDY has no complete tree yet (pending)", output)
+        self.assertIn("958 openers ranked so far", output)
+
+    def test_leaderboard_standing_for_an_absent_word_says_it_is_not_a_candidate(self):
+        # Distinct from unfinished: no sweep will ever reach this word, so
+        # answering "not yet" would leave a reader waiting for nothing.
+        report = self._standing_report(
+            {"word": "zzzzz", "available": False, "state": "absent"})
+        output = render_report(report, width=100)
+        self.assertIn("ZZZZZ is not a candidate opener", output)
+        self.assertNotIn("no complete tree yet", output)
+
+    def test_leaderboard_detail_without_a_standing_still_renders(self):
+        # A report carrying a breakdown and no standing is one a saved payload
+        # can hand the renderer, so the breakdown is drawn on its own rather
+        # than reaching into a section that is not there.
+        report = overview_report()
+        report["report_kind"] = "leaderboard"
+        report["data"] = {"detail": {
+            "word": "salet", "available": True, "answer_count": 4,
+            "word_is_answer": False,
+            "response_groups": [{"pattern": "-----", "answer_count": 4}],
+        }}
+        output = render_report(report, width=100)
+        self.assertIn("Opener SALET", output)
+        self.assertIn("1 response groups over 4 answers", output)
+        self.assertNotIn("ranked openers", output)
+
+    def test_leaderboard_detail_without_a_standing_reports_an_unfinished_opener(self):
+        # The same payload for an opener with no tree: with no standing to say
+        # so, the breakdown's own line has to.
+        report = overview_report()
+        report["report_kind"] = "leaderboard"
+        report["data"] = {"detail": {
+            "word": "howdy", "available": False, "response_groups": []}}
+        output = render_report(report, width=100)
+        self.assertIn("HOWDY has no complete tree yet", output)
+
     def test_watched_word_groups_preserve_full_identity_order(self):
         first = overview_report()
         first["report_kind"] = "word"

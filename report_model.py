@@ -3437,6 +3437,12 @@ def leaderboard_rows(data):
     rows goes through here so the encoding is stated once.  `erd` is
     reconstructed exactly from the numerator where there is one, and falls back
     to the decimal the producer carried for a value off the branch's lattice.
+
+    Rank stays implicit in the order.  `first_rank` says what the order starts
+    at, so a window cut out of the middle of the ranking -- the neighbours of
+    one opener -- carries its real ranks through the same encoding as the
+    ranking itself.  A payload without it is the ranking read from its top, so
+    it starts at 1.
     """
     columns = data.get("columns")
     if columns is None:
@@ -3446,6 +3452,7 @@ def leaderboard_rows(data):
     numerators = columns.get("erd_numerator") or []
     denominator = columns.get("erd_denominator") or data.get("answer_count")
     depths = columns.get("max_remaining_depth") or []
+    first_rank = columns.get("first_rank", 1)
     answer_bits = base64.b64decode(columns.get("word_is_answer_bitmap") or "")
     rows = []
     for index in range(len(words) // width):
@@ -3453,7 +3460,7 @@ def leaderboard_rows(data):
         erd = None if numerator is None else numerator / denominator
         rows.append({
             "word": words[index * width:(index + 1) * width],
-            "rank": index + 1,
+            "rank": first_rank + index,
             "erd": erd,
             "erd_numerator": numerator,
             "erd_denominator": denominator,
@@ -3465,7 +3472,13 @@ def leaderboard_rows(data):
     return rows
 
 
-def _leaderboard_columns(ranked, answer_count, answer_set):
+# How many openers either side of the looked-up one the standing carries.  The
+# point of the window is context for one position, so it is sized to be read at
+# a glance rather than scrolled; the ranking itself is the affordance for more.
+LEADERBOARD_NEIGHBOUR_COUNT = 5
+
+
+def _leaderboard_columns(ranked, answer_count, answer_set, first_rank=1):
     """The ranking as parallel arrays rather than one object per row.
 
     At the full candidate vocabulary a row-shaped ranking is mostly spelling:
@@ -3490,6 +3503,10 @@ def _leaderboard_columns(ranked, answer_count, answer_set):
     to fall back from; it means the fold produced something an ERD cannot be,
     and every other value in the ranking is suspect with it.  This raises
     rather than quietly showing a decimal.
+
+    `first_rank` is the rank of the first row, so the same encoding carries a
+    window cut out of the middle of the ranking as well as the ranking from
+    its top.
     """
     words = []
     erd_numerators = []
@@ -3515,13 +3532,100 @@ def _leaderboard_columns(ranked, answer_count, answer_set):
         "erd_denominator": answer_count,
         "erd_numerator": erd_numerators,
         "max_remaining_depth": max_remaining_depths,
+        "first_rank": first_rank,
         "word_is_answer_bitmap": base64.b64encode(bytes(answer_bits)).decode(),
     }
 
 
-def _one_opener_detail(sources, cache, all_answers, all_candidates, word,
+def _opener_standing(cache, word, summary, answer_count, answer_set):
+    """One opener's place in the ranking, without building the ranking.
+
+    The question is "where does TARSE stand", and the whole answer is four
+    facts: its ERD, its rank, the share of the field it beats, and the
+    openers either side of it.  Rank and the neighbourhood come from
+    `opener_erd_by_policy`, which holds one row per completed opener, so the
+    answer is two counts and two bounded seeks rather than a screen of the
+    vocabulary.
+
+    `summary` is this opener's own fold, screened against current branch
+    results, and it is the only live fact here.  The field it is placed in is
+    whatever the last leaderboard build screened -- a stored fold is a record
+    of that screen, not evidence on its own -- so the rank is as fresh as that
+    build and the ERD is as fresh as this request.  That asymmetry is the trade
+    the lookup is: rescreening the vocabulary to place one word costs more than
+    the ranking it would place the word in.
+
+    So `ranked_total` is the size of the field as the last build left it, and
+    it is reported rather than assumed: on a cache no build has screened yet
+    the only row is this opener's own and the answer is "rank 1 of 1", which
+    says the field is empty instead of implying a place in one.
+
+    A word the vocabulary does not hold is `absent`; one whose tree is
+    unfinished carries the fold's own `pending` or `infeasible` and the size of
+    the field it is not yet in.  Neither is an error -- asking about an opener
+    the sweep has not reached is an ordinary thing to do -- and the two are
+    kept apart because "no such word" and "still being solved" are different
+    answers.
+    """
+    if summary is None:
+        return {"word": word, "available": False, "state": "absent"}
+    if summary["state"] != "complete":
+        return {
+            "word": word,
+            "available": False,
+            "state": summary["state"],
+            "ranked_total": cache.ranked_opener_count(ERD_ALL),
+        }
+    erd = summary["erd"]
+    numerator = erd_lattice_numerator(erd, answer_count)
+    if numerator is None:
+        raise ValueError(
+            f"opener {word!r} has ERD {erd!r}, which is not {answer_count} "
+            f"answers' worth of whole guesses; an exact ERD is a mean of "
+            f"integer line lengths and cannot be off this lattice"
+        )
+    standing = cache.opener_standing(
+        ERD_ALL, word, erd, summary["max_remaining_depth"],
+        LEADERBOARD_NEIGHBOUR_COUNT)
+    above, below = standing["above"], standing["below"]
+    rank, ranked_total = standing["rank"], standing["ranked_total"]
+    return {
+        "word": word,
+        "available": True,
+        "state": "complete",
+        "word_is_answer": word in answer_set,
+        "erd_numerator": numerator,
+        "erd_denominator": answer_count,
+        "max_remaining_depth": summary["max_remaining_depth"],
+        "rank": rank,
+        "ranked_total": ranked_total,
+        # The share of the ranked field this opener strictly beats, so it
+        # reads as "better than N% of ranked openers" with no off-by-one to
+        # interpret: the top opener beats everything but itself, and the last
+        # beats nothing.
+        "percentile": (ranked_total - rank) / ranked_total * 100,
+        # The looked-up opener sits in its own window rather than beside it:
+        # the rows either side of a gap would have to be numbered across the
+        # gap, and the ranking's encoding leaves rank implicit in the order.
+        # So the window is contiguous, and `position` is the index within it
+        # that the question was about.
+        "neighbourhood": _leaderboard_columns(
+            [*above, (erd, summary["max_remaining_depth"], word), *below],
+            answer_count, answer_set, first_rank=rank - len(above)),
+        "position": len(above),
+    }
+
+
+def _one_opener_answer(sources, cache, all_answers, all_candidates, word,
                        group_budget, answer_set):
-    """One opener's response groups, computed without ranking anything.
+    """Everything one named opener's own question needs, and nothing else.
+
+    Two answers come out of one fold.  `detail` is the opener's response-group
+    breakdown, which is what an opened card in the ranking wants; `standing` is
+    where the opener sits in the ranking, which is what a reader who named a
+    word and holds no ranking at all wants.  Both rest on the same screen of
+    this opener's groups, so they are produced together rather than by two
+    requests that would each pay for it.
 
     A card is opened one at a time, so the work is one candidate's partition
     against the answer list and a fold over its own groups -- milliseconds,
@@ -3529,12 +3633,17 @@ def _one_opener_detail(sources, cache, all_answers, all_candidates, word,
     would also displace the ranking's own cache entry, so a reader who opened a
     few cards would make the next poll rebuild the thing they were reading.
 
-    A word the vocabulary does not hold, or one whose tree is unfinished,
-    returns an unavailable detail rather than an error: asking about an opener
-    the sweep has not reached is an ordinary thing for a client to do.
+    A word the vocabulary does not hold, or one whose tree is unfinished, is
+    answered rather than refused: asking about an opener the sweep has not
+    reached is an ordinary thing for a client to do.
     """
     if word not in set(all_candidates):
-        return {"word": word, "available": False, "response_groups": []}
+        return {
+            "detail": {"word": word, "available": False,
+                       "response_groups": []},
+            "standing": _opener_standing(
+                cache, word, None, len(all_answers), answer_set),
+        }
     matrix = PatternMatrix.load_or_build(
         sources.cache_path, all_candidates, all_answers, cache)
     pattern_text = {code: fmt_pattern(code) for code in range(3 ** 5)}
@@ -3564,7 +3673,11 @@ def _one_opener_detail(sources, cache, all_answers, all_candidates, word,
         ],
         group_budget,
     )
-    return _leaderboard_detail(word, summary, groups, answer_set)
+    return {
+        "detail": _leaderboard_detail(word, summary, groups, answer_set),
+        "standing": _opener_standing(
+            cache, word, summary, len(all_answers), answer_set),
+    }
 
 
 def _leaderboard_detail(word, summary, response_group_skeletons, answer_set):
@@ -3626,13 +3739,14 @@ def collect_leaderboard_report(sources: ReportOpeners, request: ReportRequest) -
             sources.cache_path, all_answers, checkpoint_on_close=False
         )
         if detail_word:
-            # One opener's groups, and nothing else.  Screening the whole
-            # vocabulary to answer a question about a single card would cost
-            # more than the ranking that card came from, and would send the
-            # columns back to a client already holding them.
-            data["detail"] = _one_opener_detail(
+            # One opener's groups and its place in the ranking, and nothing
+            # else.  Screening the whole vocabulary to answer a question about
+            # a single word would cost more than the ranking that word sits
+            # in, and would send the columns back to a client already holding
+            # them.
+            data.update(_one_opener_answer(
                 sources, cache, all_answers, all_candidates, detail_word,
-                group_budget, answer_set)
+                group_budget, answer_set))
             report["sources"]["cache"]["ok"] = True
             return report
         skeletons = _candidate_group_skeletons(
