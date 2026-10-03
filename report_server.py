@@ -7,6 +7,7 @@ import argparse
 from dataclasses import dataclass
 import errno
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import hashlib
 import json
 import os
 import re
@@ -54,6 +55,7 @@ FIXTURE_FILENAMES = (
     "hotspots.json",
     "work_distribution.json",
     "leaderboard.json",
+    "leaderboard-word.json",
     "root_progress.json",
     "root_progress-inherited.json",
     "openers.json",
@@ -397,6 +399,10 @@ def fixture_name_for_request(path, request):
     # named, so the two shapes need two fixtures.
     if kind == "openers" and request.branch_target.kind == "word":
         return "openers-word.json"
+    # The leaderboard carries one opener's response groups only once that
+    # opener is named, for the same reason and with the same split.
+    if kind == "leaderboard" and request.branch_target.kind == "word":
+        return "leaderboard-word.json"
     return f"{kind}{progressive_stage_suffix(request)}.json"
 
 
@@ -440,6 +446,33 @@ def make_handler(configuration):
             if isinstance(source, dict)
         )
 
+    def names_one_opener(request):
+        """Is this a request for one opener's detail rather than the ranking?
+
+        Such a request builds in milliseconds and is keyed by the word, so it
+        belongs outside the revalidated cache on both counts: there is nothing
+        to save, and the cache holds eight entries against a whole vocabulary
+        of words.  Letting a few opened cards in would evict the ranking the
+        reader is polling, and the next poll would rebuild it.
+        """
+        target = request.branch_target
+        return target.kind == "word" and not target.steps
+
+    def body_validator(body):
+        """An entity tag naming these exact bytes.
+
+        Hashing the representation is what makes the tag answer the question a
+        conditional request asks -- "is what I hold still current?" -- rather
+        than the different question the cache asks itself, which is whether a
+        rebuild is worth doing.  A rebuild that produces identical bytes then
+        still revalidates for free, and one that produces different bytes
+        cannot be mistaken for it.
+
+        Paid once per build, never per poll: the tag is stored beside the body
+        it names.
+        """
+        return f'"{hashlib.blake2b(body, digest_size=16).hexdigest()}"'
+
     def store_cached_body(request, token, started_at, body):
         """Record a body under the token its build read, aged from its start.
 
@@ -456,7 +489,8 @@ def make_handler(configuration):
         """
         now = time.time()
         with cached_reports_lock:
-            cached_reports[request] = (token, started_at, body)
+            cached_reports[request] = (
+                token, started_at, body, body_validator(body))
             for stale in [
                 key for key, entry in cached_reports.items()
                 if now - entry[1] > REPORT_CACHE_MAX_AGE_SECONDS
@@ -479,6 +513,16 @@ def make_handler(configuration):
         The encoded body is cached with the report, because re-encoding a
         multi-megabyte ranking on every poll is its own cost once the build is
         gone.
+
+        Returns the body and a validator naming that body, not the signal the
+        rebuild decision was made on.  The two are not the same question: the
+        signal says whether the answer *could* have moved, and it is
+        deliberately not exhaustive -- a repair, a reverification or an import
+        changes the cache while completing no queue work, which is what
+        REPORT_CACHE_MAX_AGE_SECONDS exists to catch.  A validator taken from
+        the signal would go on matching across exactly those rebuilds, so a
+        client would be told nothing had changed while holding a ranking the
+        server had already replaced -- and with the queue stopped, forever.
         """
         token = opener_completion_signal(configuration.sources)
         started_at = time.time()
@@ -487,8 +531,9 @@ def make_handler(configuration):
                 entry = cached_reports.get(request)
             if (entry is not None and entry[0] == token
                     and time.time() - entry[1] <= REPORT_CACHE_MAX_AGE_SECONDS):
-                return entry[2]
-        return collect_report_once(request, token, started_at)
+                return entry[2], entry[3]
+        body = collect_report_once(request, token, started_at)
+        return body, body_validator(body)
 
     def collect_report_once(request, token, started_at):
         """Collect `request` once, however many callers are waiting on it.
@@ -516,6 +561,13 @@ def make_handler(configuration):
         if is_builder:
             try:
                 report = collect_report(configuration.sources, request)
+                # This kind is not rebuilt on the poll, so its data is as old
+                # as the last time the signal moved -- up to
+                # REPORT_CACHE_MAX_AGE_SECONDS, and in practice as old as the
+                # last opener to finish.  The client says so on screen rather
+                # than letting a two-second poll imply a freshness the report
+                # does not have.
+                report["revalidated"] = True
                 in_flight.body = encode_report(report)
                 in_flight.intact = report_is_intact(report)
                 # Published before the waiters are released and before the
@@ -560,6 +612,17 @@ def make_handler(configuration):
             self.end_headers()
             self.wfile.write(body)
 
+        def _not_modified(self, entity_tag):
+            """304 with no body: the client already holds this exact report.
+
+            Content-Length is deliberately absent -- a 304 carries no body, and
+            sending a length for one confuses caches about what to expect.
+            """
+            self.send_response(304)
+            self.send_header("ETag", entity_tag)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+
         def _json(self, status, value, extra_headers=None):
             body = json.dumps(value, sort_keys=True).encode("utf-8")
             self._write(
@@ -594,13 +657,24 @@ def make_handler(configuration):
             except InvalidRequest as error:
                 self._error(400, "invalid_request", str(error))
                 return
+            extra_headers = None
             try:
                 if configuration.fixtures is not None:
                     body = encode_report(configuration.fixtures[
                         fixture_name_for_request(target.path, request)
                     ])
-                elif request.report_kind in REVALIDATED_REPORT_KINDS:
-                    body = cached_report_body(request)
+                elif (request.report_kind in REVALIDATED_REPORT_KINDS
+                      and not names_one_opener(request)):
+                    body, entity_tag = cached_report_body(request)
+                    # A client holding these exact bytes needs nothing sent at
+                    # all.  A leaderboard's answer changes when an opener
+                    # completes -- about every 27 minutes -- against a client
+                    # polling every two seconds, so this is the ordinary case
+                    # rather than an optimisation for a rare one.
+                    if self.headers.get("If-None-Match") == entity_tag:
+                        self._not_modified(entity_tag)
+                        return
+                    extra_headers = {"ETag": entity_tag}
                 else:
                     body = encode_report(
                         collect_report(configuration.sources, request))
@@ -622,7 +696,8 @@ def make_handler(configuration):
                 print("report server: report collection failed", file=sys.stderr)
                 self._error(500, "server_error", "report collection failed")
                 return
-            self._write(200, "application/json; charset=utf-8", body)
+            self._write(200, "application/json; charset=utf-8", body,
+                        extra_headers)
 
         def _method_not_allowed(self):
             self._error(

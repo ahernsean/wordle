@@ -1,0 +1,59 @@
+{
+  "branch_target": null,
+  "data": {
+    "detail": {
+      "answer_count": 100,
+      "available": true,
+      "response_groups": [
+        {
+          "answer_count": 31,
+          "pattern": "-----"
+        },
+        {
+          "answer_count": 24,
+          "pattern": "---g-"
+        },
+        {
+          "answer_count": 21,
+          "pattern": "---y-"
+        },
+        {
+          "answer_count": 14,
+          "pattern": "-y---"
+        },
+        {
+          "answer_count": 10,
+          "pattern": "--y--"
+        }
+      ],
+      "word": "salet",
+      "word_is_answer": false
+    },
+    "response_pattern_count": 243
+  },
+  "filters": {},
+  "generated_at": 1000,
+  "report_kind": "leaderboard",
+  "schema_version": 4,
+  "sources": {
+    "cache": {
+      "error": null,
+      "ok": true,
+      "path": "fixture/cache.sqlite3"
+    },
+    "queue": {
+      "epoch": null,
+      "error": null,
+      "git_sha": null,
+      "label": null,
+      "ok": false,
+      "path": "fixture/queue.sqlite3"
+    },
+    "telemetry": {
+      "error": null,
+      "ok": false,
+      "path": "fixture/telemetry.sqlite3"
+    }
+  },
+  "tree": false
+}

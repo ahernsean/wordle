@@ -123,6 +123,31 @@ class ReportPipelineTest(unittest.TestCase):
         self.assertEqual(report["report_kind"], "hotspots")
         self.assertIsInstance(text, str)
 
+    def test_leaderboard_detail_report_renders(self):
+        """`view --leaderboard WORD` renders that opener, not the ranking.
+
+        Naming an opener returns its breakdown and no ranking at all, so a
+        renderer reaching for counts or a candidate count finds neither.  The
+        CLI accepts the combination, so it has to render rather than raise.
+        """
+        report, text = self._render(ReportRequest(
+            report_kind="leaderboard",
+            branch_target=parse_report_branch_target("salet"),
+        ))
+        self.assertEqual(report["report_kind"], "leaderboard")
+        self.assertIn("detail", report["data"])
+        self.assertNotIn("columns", report["data"])
+        self.assertIn("SALET", text)
+        self.assertIn("response groups", text)
+
+    def test_leaderboard_detail_for_an_unknown_opener_renders(self):
+        report, text = self._render(ReportRequest(
+            report_kind="leaderboard",
+            branch_target=parse_report_branch_target("zzzzz"),
+        ))
+        self.assertFalse(report["data"]["detail"]["available"])
+        self.assertIn("no complete tree yet", text)
+
     def test_leaderboard_report_renders(self):
         report, text = self._render(ReportRequest(report_kind="leaderboard"))
         self.assertEqual(report["report_kind"], "leaderboard")
