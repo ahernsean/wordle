@@ -1391,11 +1391,14 @@ def _candidate_erd_summary(response_groups, group_budget):
     which can name the folds that read it.  Folding from the groups in hand
     keeps a candidate's reported state a description of the cache as it stands.
 
-    `opener_erd_by_policy` stores this value for completed openers alone, and
-    only because that set is small enough to rescreen in full on every build
-    (`_screen_and_fold_openers`).  Nothing reads a stored fold in place of
-    folding; the rows are a record of the last screen, and the screen deletes
-    the ones it no longer settles.
+    An *opener's* own ERD is a different case, and `opener_erd_by_policy`
+    stores it: there is one row per opener rather than one per (branch,
+    candidate) pair, and it depends only on that opener's own top-level
+    groups.  That dependency set is small enough to settle precisely, which is
+    what makes the stored value the authoritative answer rather than a memo of
+    a derivation.  Today `_screen_and_fold_openers` still re-derives every one
+    of them on each build and the rows go unread -- an implementation gap
+    (#384), not a property of the value.
 
     `response_groups` carry each group's branch fact as
     `ScoreCache.report_branch_states` resolved it at `group_budget`, so a child
@@ -3548,12 +3551,12 @@ def _opener_standing(cache, word, summary, answer_count, answer_set):
     vocabulary.
 
     `summary` is this opener's own fold, screened against current branch
-    results, and it is the only live fact here.  The field it is placed in is
-    whatever the last leaderboard build screened -- a stored fold is a record
-    of that screen, not evidence on its own -- so the rank is as fresh as that
-    build and the ERD is as fresh as this request.  That asymmetry is the trade
-    the lookup is: rescreening the vocabulary to place one word costs more than
-    the ranking it would place the word in.
+    results.  The field it is placed in is whatever the last leaderboard build
+    stored, so the ERD is as fresh as this request and the rank as fresh as
+    that build.  That asymmetry is the trade the lookup is: rescreening the
+    vocabulary to place one word costs more than the ranking it would place
+    the word in.  It narrows as the stored folds become the build's own answer
+    rather than its output (#384).
 
     So `ranked_total` is the size of the field as the last build left it, and
     it is reported rather than assumed: on a cache no build has screened yet
