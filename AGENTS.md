@@ -1041,13 +1041,29 @@ or a clear, which keep the same container.
   mode: only the browser process lives in the container, started with
   `--network host` so it can reach the fixture server's `127.0.0.1` binding.
   The test process itself stays local and connects over `playwright.webkit.connect()`
-  via a `ws://` endpoint — nothing about `tests/test_report_client.py`'s
-  existing test bodies changes; `ReportClientWebKitBrowserTest` replays them by
-  subclassing `ReportClientBrowserTest` and swapping only
-  `setUpClass`/`tearDownClass`. The `run-server` wire protocol requires the
-  container image tag and the installed `playwright` package to be the exact
-  same version, so the tag is derived from the installed version at run time,
-  never pinned.
+  via a `ws://` endpoint — no test body knows the difference. The `run-server`
+  wire protocol requires the container image tag and the installed `playwright`
+  package to be the exact same version, so the tag is derived from the
+  installed version at run time, never pinned.
+
+  **The engines are peers, and the test bodies belong to neither.**
+  `ReportClientContract` holds the whole contract and names an engine only
+  through `start_browser`; `ChromiumReportClientTest` and
+  `WebKitReportClientTest` supply that and nothing else. The contract is
+  deliberately not a `TestCase`, so unittest collects the two bindings and
+  never it — a test body has no meaning until an engine is chosen for it. That
+  is what makes a test written once run on both without either engine being the
+  other's special case: an accommodation for one has somewhere to live that
+  does not reach the other.
+
+  **Each CI job names its own classes** rather than running the module and
+  skipping the engine it is not. Skipping left a standing `OK (skipped=275)` on
+  a fully green run — the other engine's job, readable as a suite that had not
+  run — and a permanent skip count cannot report an actual skip. Both jobs now
+  expect none.
+  `ReportClientStaticTest.test_every_browser_test_class_is_selected_by_a_ci_job`
+  keeps that enumeration honest, because a class no job names runs nowhere and
+  says nothing.
 
   **Rocky's bundled WebKit build needs a glibc newer than the box has**, so
   native launch always fails there and every run falls through to the

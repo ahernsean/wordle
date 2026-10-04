@@ -79,12 +79,20 @@ jobs:
       - name: Install Playwright Chromium
         run: python -m playwright install --with-deps chromium
 
-      # WebKit has its own job below; skipping it here keeps this one to the
-      # Chromium engine rather than running the same bodies twice.
+      # Each engine's job names its own classes rather than running the whole
+      # module and skipping the engine it is not.  Skipping produced a standing
+      # `OK (skipped=275)` on a green run -- the other engine's job, read as a
+      # suite that had not run -- and a permanent skip count cannot report an
+      # actual skip.  Both jobs now expect none.
+      #
+      # test_every_browser_test_class_is_selected_by_a_ci_job keeps this list
+      # honest: a class named by no job runs nowhere and says nothing.
       - name: Run Chromium browser suite with coverage
-        run: coverage run --parallel-mode -m unittest tests.test_report_client
-        env:
-          SKIP_WEBKIT_CONTAINER_TESTS: "1"
+        run: |
+          coverage run --parallel-mode -m unittest \
+            tests.test_report_client.ChromiumReportClientTest \
+            tests.test_report_client.ReportClientStaticTest \
+            tests.test_report_client.LaunchWebKitTest
 
       - name: Upload coverage data
         uses: actions/upload-artifact@v4
@@ -115,7 +123,7 @@ jobs:
       # (tests/webkit_container.py) is only a fallback for an environment
       # whose glibc can't run it, which this runner's isn't.
       - name: Run WebKit browser suite with coverage
-        run: coverage run --parallel-mode -m unittest tests.test_report_client.ReportClientWebKitBrowserTest
+        run: coverage run --parallel-mode -m unittest tests.test_report_client.WebKitReportClientTest
 
       - name: Upload coverage data
         uses: actions/upload-artifact@v4
