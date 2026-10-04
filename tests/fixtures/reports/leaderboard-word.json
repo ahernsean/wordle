@@ -29,7 +29,35 @@
       "word": "salet",
       "word_is_answer": false
     },
-    "response_pattern_count": 243
+    "response_pattern_count": 243,
+    "standing": {
+      "available": true,
+      "erd_denominator": 100,
+      "erd_numerator": 356,
+      "max_remaining_depth": 6,
+      "neighbourhood": {
+        "erd_denominator": 100,
+        "erd_numerator": [
+          356,
+          371
+        ],
+        "first_rank": 1,
+        "max_remaining_depth": [
+          6,
+          5
+        ],
+        "word_is_answer_bitmap": "Ag==",
+        "word_width": 5,
+        "words": "saletcrane"
+      },
+      "percentile": 50.0,
+      "position": 0,
+      "rank": 1,
+      "ranked_total": 2,
+      "state": "complete",
+      "word": "salet",
+      "word_is_answer": false
+    }
   },
   "filters": {},
   "generated_at": 1000,
