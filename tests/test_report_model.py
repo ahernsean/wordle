@@ -1186,6 +1186,73 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(
             window, [row["word"] for row in ranking[-len(window):]])
 
+    def test_an_unfinished_openers_field_leaves_out_its_own_stale_row(self):
+        """The field an unfinished opener is outside does not contain it.
+
+        An opener the last screen settled keeps its stored row until the next
+        build retires it, so one that a repair or a requeue has just made
+        pending is still in the table.  Counting that row reports a field one
+        larger than the one the opener is actually outside -- and the completed
+        branch already excludes it, so the two would disagree about what
+        `ranked_total` means.
+        """
+        answers = ["crane", "slate"]
+        sources = self._leaderboard_sources(
+            answers, ["crane", "slate", "raise", "howdy"])
+        collect_report(sources, ReportRequest(report_kind="leaderboard"))
+        cache = ScoreCache(sources.cache_path, answers,
+                           checkpoint_on_close=False)
+        # The row HOWDY would have been left holding by an earlier screen.
+        cache.write_opener_erds([("howdy", 1.5, 2, 2)], ERD_ALL)
+        self.assertEqual(cache.ranked_opener_count(ERD_ALL, "zzzzz"), 4)
+        cache.close()
+
+        standing = self._standing_for(sources, "howdy")
+        self.assertEqual(standing["state"], "pending")
+        self.assertEqual(standing["ranked_total"], 3)
+
+    def test_a_published_ranking_is_never_read_as_half_of_itself(self):
+        """The refresh lands as one field, not row by row.
+
+        Every row of an `executemany` on an autocommit connection is its own
+        transaction and visible the moment it lands, so without one surrounding
+        transaction a reader sees the openers this screen settled alongside the
+        stale rows it is about to retire -- a field no build produced.  A reader
+        holding a snapshot is no defence, because the snapshot is of the hybrid.
+        """
+        answers = ["crane", "slate"]
+        sources = self._leaderboard_sources(answers, ["crane"])
+        cache = ScoreCache(sources.cache_path, answers,
+                           checkpoint_on_close=False)
+        self.addCleanup(cache.close)
+        reader = ScoreCache(sources.cache_path, answers,
+                            checkpoint_on_close=False)
+        self.addCleanup(reader.close)
+
+        retired = [(f"aa{index:03d}", 3.5, 5, 2) for index in range(300)]
+        cache.publish_opener_erds(retired, (), ERD_ALL)
+        self.assertEqual(cache.ranked_opener_count(ERD_ALL, "zzzzz"), 300)
+        # Different sizes, so a count taken mid-publish cannot coincide with
+        # either end of it.
+        stored = [(f"bb{index:03d}", 3.4, 5, 2) for index in range(200)]
+
+        seen = set()
+
+        def peek():
+            seen.add(reader.ranked_opener_count(ERD_ALL, "zzzzz"))
+            return 0
+
+        cache._conn.set_progress_handler(peek, 20)
+        try:
+            cache.publish_opener_erds(
+                stored, [opener for opener, *_rest in retired], ERD_ALL)
+        finally:
+            cache._conn.set_progress_handler(None, 0)
+
+        self.assertTrue(seen, "the progress handler never ran")
+        self.assertEqual(reader.ranked_opener_count(ERD_ALL, "zzzzz"), 200)
+        self.assertEqual(seen - {300, 200}, set())
+
     def test_a_word_outside_the_vocabulary_is_absent_not_unfinished(self):
         # "No such candidate" and "still being solved" are different answers,
         # and a lookup that gave both the same one would have a reader waiting
@@ -1274,16 +1341,16 @@ class ReportModelTest(unittest.TestCase):
         sources = self._leaderboard_sources(answers, ["crane", "slate", "raise"])
         collect_report(sources, ReportRequest(report_kind="leaderboard"))
         with patch.object(
-            ScoreCache, "write_opener_erds", autospec=True,
-        ) as written, patch.object(
-            ScoreCache, "delete_opener_erds", autospec=True,
-        ) as deleted:
+            ScoreCache, "publish_opener_erds", autospec=True,
+        ) as published:
             collect_report(sources, ReportRequest(report_kind="leaderboard"))
+        self.assertTrue(published.call_args_list, "the build published nothing")
         self.assertEqual(
-            [row for call in written.call_args_list for row in call.args[1]],
+            [row for call in published.call_args_list for row in call.args[1]],
             [])
         self.assertEqual(
-            [row for call in deleted.call_args_list for row in call.args[1]],
+            [opener for call in published.call_args_list
+             for opener in call.args[2]],
             [])
 
     def test_a_stored_fold_is_deleted_once_its_opener_stops_screening(self):

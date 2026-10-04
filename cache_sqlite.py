@@ -1420,12 +1420,19 @@ class ScoreCache:
             )
         }
 
-    def ranked_opener_count(self, policy):
-        """How many openers hold a stored fold for this answer list."""
+    def ranked_opener_count(self, policy, excluding):
+        """How many openers other than `excluding` hold a stored fold.
+
+        The named opener is left out because the caller is asking about it, and
+        its own row can outlive the fold that wrote it: an opener that a repair
+        or a requeue has made unfinished still has the row the last screen
+        stored, and counting that would report a field one larger than the one
+        the opener is actually outside.
+        """
         return self._conn.execute(
             """SELECT COUNT(*) FROM opener_erd_by_policy
-                WHERE policy = ? AND answer_list_id = ?""",
-            (policy, self.answer_list_id),
+                WHERE policy = ? AND answer_list_id = ? AND opener <> ?""",
+            (policy, self.answer_list_id, excluding.lower()),
         ).fetchone()[0]
 
     def opener_standing(self, policy, opener, erd, max_remaining_depth,
@@ -1515,52 +1522,69 @@ class ScoreCache:
             "below": [tuple(row) for row in below],
         }
 
-    def write_opener_erds(self, rows, policy, folded_at=None):
-        """Store folds for openers whose whole tree is solved.
+    def publish_opener_erds(self, rows, retired_openers, policy,
+                            folded_at=None):
+        """Replace the stored ranking in one step, or not at all.
 
         `rows` is an iterable of (opener, erd, max_remaining_depth,
-        response_group_count).  Replaces any stored fold for the same opener,
-        because the caller has just rescreened it against current branch
-        results and its value is the newer of the two.
+        response_group_count) for the openers a screen settled, and
+        `retired_openers` names the ones it no longer settles.  A stored row is
+        replaced rather than reconciled, because the caller has just rescreened
+        it against current branch results and its value is the newer of the
+        two.
+
+        The two halves are one statement about the field and commit together.
+        On an autocommit connection each row of an `executemany` is its own
+        transaction and visible the moment it lands, so a reader could see the
+        openers this screen settled alongside the stale rows it was about to
+        retire -- a field no build ever produced.  A reader holding a snapshot
+        is no help against that: the snapshot would be of the hybrid.
         """
         rows = list(rows)
-        if not rows:
+        retired_openers = list(retired_openers)
+        if not rows and not retired_openers:
             return
         now = int(time.time()) if folded_at is None else folded_at
         try:
-            self._conn.executemany(
-                """INSERT OR REPLACE INTO opener_erd_by_policy
-                       (opener, policy, answer_list_id, erd,
-                        max_remaining_depth, response_group_count, folded_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                [(opener.lower(), policy, self.answer_list_id, erd,
-                  max_remaining_depth, response_group_count, now)
-                 for opener, erd, max_remaining_depth, response_group_count
-                 in rows],
-            )
+            self._conn.execute("BEGIN IMMEDIATE")
+            if rows:
+                self._conn.executemany(
+                    """INSERT OR REPLACE INTO opener_erd_by_policy
+                           (opener, policy, answer_list_id, erd,
+                            max_remaining_depth, response_group_count,
+                            folded_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    [(opener.lower(), policy, self.answer_list_id, erd,
+                      max_remaining_depth, response_group_count, now)
+                     for opener, erd, max_remaining_depth, response_group_count
+                     in rows],
+                )
+            if retired_openers:
+                self._conn.executemany(
+                    """DELETE FROM opener_erd_by_policy
+                        WHERE opener = ? AND policy = ? AND answer_list_id = ?""",
+                    [(opener.lower(), policy, self.answer_list_id)
+                     for opener in retired_openers],
+                )
+            self._conn.execute("COMMIT")
         except sqlite3.OperationalError as exc:
+            try:
+                self._conn.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
             if not _is_disk_io_error(exc):
                 raise
-            logger.warning("write_opener_erds(%d rows, %s) failed: %s",
-                           len(rows), policy, exc)
+            logger.warning(
+                "publish_opener_erds(%d stored, %d retired, %s) failed: %s",
+                len(rows), len(retired_openers), policy, exc)
+
+    def write_opener_erds(self, rows, policy, folded_at=None):
+        """Store folds for openers whose whole tree is solved."""
+        self.publish_opener_erds(rows, (), policy, folded_at)
 
     def delete_opener_erds(self, openers, policy):
         """Drop stored folds for openers that no longer screen complete."""
-        openers = list(openers)
-        if not openers:
-            return
-        try:
-            self._conn.executemany(
-                """DELETE FROM opener_erd_by_policy
-                    WHERE opener = ? AND policy = ? AND answer_list_id = ?""",
-                [(opener.lower(), policy, self.answer_list_id)
-                 for opener in openers],
-            )
-        except sqlite3.OperationalError as exc:
-            if not _is_disk_io_error(exc):
-                raise
-            logger.warning("delete_opener_erds(%d rows, %s) failed: %s",
-                           len(openers), policy, exc)
+        self.publish_opener_erds((), openers, policy)
 
     def completed_opener_summary_map(self, policy):
         return {row["opener"].lower(): dict(row) for row in self._conn.execute("""

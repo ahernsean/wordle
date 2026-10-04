@@ -1545,6 +1545,10 @@ def _store_opener_folds(cache, summaries, policy, stored=None):
     rewritten only when its value differs from the one stored: the build runs
     on a poll against the cache the swarm is writing into, and rewriting an
     unchanged vocabulary would add WAL traffic for no change in the answer.
+
+    Both halves go through one `publish_opener_erds`, so the refresh lands as
+    one field rather than as stored rows that appear before the retired ones
+    disappear.
     """
     if cache.read_only:
         return
@@ -1554,7 +1558,7 @@ def _store_opener_folds(cache, summaries, policy, stored=None):
     }
     if stored is None:
         stored = cache.opener_erd_map(policy)
-    cache.write_opener_erds(
+    cache.publish_opener_erds(
         (
             (opener, summary["erd"], summary["max_remaining_depth"],
              summary["response_group_count"])
@@ -1563,9 +1567,9 @@ def _store_opener_folds(cache, summaries, policy, stored=None):
             or stored.get(opener, {}).get("max_remaining_depth")
             != summary["max_remaining_depth"]
         ),
+        set(stored) - set(complete),
         policy,
     )
-    cache.delete_opener_erds(set(stored) - set(complete), policy)
 
 
 def _response_group_key(row: dict, group_by: str) -> tuple:
@@ -3577,7 +3581,7 @@ def _opener_standing(cache, word, summary, answer_count, answer_set):
             "word": word,
             "available": False,
             "state": summary["state"],
-            "ranked_total": cache.ranked_opener_count(ERD_ALL),
+            "ranked_total": cache.ranked_opener_count(ERD_ALL, word),
         }
     erd = summary["erd"]
     numerator = erd_lattice_numerator(erd, answer_count)
