@@ -454,6 +454,13 @@
     // is its own `word`.
     let openerLookupText="", openerStanding=null, openerStandingError=null,
       openerStandingPending=null, openerStandingStale=false;
+    // The panel is rebuilt by every redraw, so its own redraw has to be
+    // reachable from outside the closure that made it.  Two things need the
+    // one that is mounted *now*: an answer arriving after a redraw replaced
+    // the panel that asked for it, and a poll that refreshes the metrics
+    // without redrawing anything.  Both would otherwise reach a detached node,
+    // and nothing afterwards repairs it -- a 304 poll draws nothing at all.
+    let openerLookupRedraw=null;
     const COMPLETED_BRANCH_HOLD_MILLIS=5000;
     const recentOverviewCompletionRows=new Map();
     let completionExpiryTimer=null;
@@ -2381,7 +2388,7 @@
           // Cleared before the request so this redraw -- and the one the
           // answer triggers -- cannot ask again.
           openerStandingStale=false;
-          lookUpOpener(state,openerStanding.word,draw);
+          lookUpOpener(state,openerStanding.word);
         }
         if(openerStandingPending){
           answer.replaceChildren(element("p","dim",
@@ -2421,19 +2428,21 @@
       };
       input.addEventListener("input",()=>{openerLookupText=input.value;});
       form.addEventListener("submit",event=>{
-        event.preventDefault();lookUpOpener(state,input.value,draw);
+        event.preventDefault();lookUpOpener(state,input.value);
       });
       clear.addEventListener("click",()=>{
         openerStanding=null;openerStandingError=null;openerStandingPending=null;
         openerStandingStale=false;openerLookupText="";input.value="";draw();
       });
+      openerLookupRedraw=draw;
       draw();
       return host;
     }
     // The endpoint is the one a card expansion already uses: both questions
     // rest on the same fold of one opener's groups, so asking for either pays
     // for it once.
-    async function lookUpOpener(state,typed,draw){
+    async function lookUpOpener(state,typed){
+      const draw=()=>openerLookupRedraw?.();
       const word=String(typed||"").trim().toLowerCase();
       if(!/^[a-z]{5}$/.test(word)){
         openerStanding=null;openerStandingPending=null;
@@ -2854,7 +2863,15 @@
         const unchangedLeaderboard=sameView&&report.report_kind==="leaderboard"&&!leaderboardRowsChanged(report,lastReport);
         if(!sameView||(!unchangedLeaderboard&&!reportHasFocusedControl()&&!reportHasActiveSelection())){
           applyReport(report,previous,state);displayedState=state;renderOwed=false;
-        }else if(unchangedLeaderboard&&!reportHasActiveSelection())refreshLeaderboardMetrics(report);
+        }else if(unchangedLeaderboard&&!reportHasActiveSelection()){
+          // The ranking the client holds is unchanged, so the cards are left
+          // alone -- but the field behind them can still have moved: a repair
+          // that reorders openers outside the displayed slice changes neither
+          // the columns nor the total.  The lookup is about one word anywhere
+          // in that field, so it is settled here rather than left waiting for
+          // a redraw this path never performs.
+          refreshLeaderboardMetrics(report);openerLookupRedraw?.();
+        }
         else renderOwed=true;
         lastReport=report;lastContext=context;drawOwedReport(state);
         lastSuccess=Date.now();failureCount=0;connection(true,"connected");

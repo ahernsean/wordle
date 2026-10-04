@@ -2144,6 +2144,113 @@ class ReportClientBrowserTest(unittest.TestCase):
         self.page.wait_for_selector(".leaderboard-card.looked-up")
         self.assertEqual(self.page.evaluate("() => window.__detailFetches"), 1)
 
+    def test_a_lookup_asks_again_when_only_the_metrics_refresh(self):
+        """A poll that redraws nothing still settles the lookup.
+
+        An unchanged ranking leaves the cards alone and refreshes the metrics
+        only, so no redraw happens -- but the field behind the cards can still
+        have moved.  A repair that reorders openers outside the displayed slice
+        changes neither the columns nor the total, and the lookup is about one
+        word anywhere in that field, so a rank left over from the previous one
+        would otherwise stand indefinitely: later 304 polls draw nothing
+        either.
+        """
+        self._look_up_opener("salet")
+        self.page.wait_for_selector(".leaderboard-card.looked-up")
+        self.page.evaluate("() => document.activeElement.blur()")
+        self.page.evaluate("""() => {
+          const realFetch = window.fetch.bind(window);
+          window.__detailFetches = 0;
+          window.fetch = (url, options) => {
+            if (String(url).includes('branch_target=')) {
+              window.__detailFetches += 1;
+              return realFetch(url, options);
+            }
+            return realFetch(url, options).then(async response => {
+              if (!String(url).includes('/leaderboard')) return response;
+              // A new entity tag over an identical ranking: the rows and the
+              // total match, so the client takes the metrics-only path.
+              return new Response(await response.text(), {
+                status: 200,
+                headers: {'Content-Type': 'application/json',
+                          'ETag': '"metrics-only"'},
+              });
+            });
+          };
+        }""")
+        self.page.evaluate(
+            "async () => { await window.__reportClient.fetchReport(); }")
+        self.page.wait_for_function("() => window.__detailFetches === 1")
+        self.assertIn("Rank 1 of 2",
+                      self.page.locator(".opener-lookup-answer").inner_text())
+
+    def test_a_lookup_answers_the_panel_that_is_mounted_when_it_finishes(self):
+        """A redraw mid-flight must not strand the answer in a dead node.
+
+        The panel is rebuilt by every redraw, so an answer that reaches the
+        panel which asked for it can reach a node already detached.  The
+        visible panel then reads "Looking up…" with nothing left to finish it.
+
+        The polls after the redraw answer 304 here, which draws nothing at all.
+        Without that the metrics-only path would redraw the mounted panel
+        within one poll and repair the symptom, so the test would pass against
+        a lookup that still answers into a dead node.
+        """
+        self.page.locator("[data-kind=leaderboard]").click()
+        self.page.wait_for_selector(".grid.leaderboard > .leaderboard-card")
+        # The detail request waits on a gate this test opens, so the redraw
+        # below lands while the lookup is genuinely in flight.
+        self.page.evaluate("""() => {
+          const realFetch = window.fetch.bind(window);
+          window.__gate = {};
+          window.__gate.open = new Promise(resolve => {
+            window.__gate.release = resolve;
+          });
+          window.__settled = false;
+          window.fetch = (url, options) => {
+            if (String(url).includes('branch_target=')) {
+              return window.__gate.open.then(() => realFetch(url, options));
+            }
+            if (!String(url).includes('/leaderboard')) {
+              return realFetch(url, options);
+            }
+            if (window.__settled) {
+              return Promise.resolve(new Response(null, {
+                status: 304, headers: {'ETag': '"moved"'},
+              }));
+            }
+            return realFetch(url, options).then(async response => {
+              const report = await response.json();
+              report.data.columns.erd_numerator[0] = 987;
+              return new Response(JSON.stringify(report), {
+                status: 200,
+                headers: {'Content-Type': 'application/json',
+                          'ETag': '"moved"'},
+              });
+            });
+          };
+        }""")
+        box = self.page.locator(".opener-lookup-form input")
+        box.fill("salet")
+        box.press("Enter")
+        self.page.wait_for_selector(".opener-lookup-answer .dim")
+        self.page.evaluate("() => document.activeElement.blur()")
+        # A changed ranking, so the report is redrawn and the panel holding the
+        # request is replaced while the request is still open.
+        self.page.evaluate(
+            "async () => { await window.__reportClient.fetchReport(); }")
+        self.assertIn("9.870 987/100", self.page.locator("#report").inner_text())
+        self.assertIn("Looking up SALET",
+                      self.page.locator(".opener-lookup-answer").inner_text())
+
+        # From here every poll answers 304, so nothing else will redraw the
+        # panel: the answer has to find it on its own.
+        self.page.evaluate("() => { window.__settled = true; }")
+        self.page.evaluate("() => window.__gate.release()")
+        self.page.wait_for_selector(".leaderboard-card.looked-up")
+        self.assertIn("Rank 1 of 2",
+                      self.page.locator(".opener-lookup-answer").inner_text())
+
     def test_a_lookup_asks_again_once_the_ranking_has_moved(self):
         """A rank describes the ranking it was counted in, and that moves.
 
