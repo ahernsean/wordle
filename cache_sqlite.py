@@ -550,6 +550,16 @@ class ScoreCache:
                 PRIMARY KEY (opener, policy, answer_list_id)
             )
         """)
+        # The ranking's own sort key, so a question about one opener's place in
+        # it is a seek rather than a read of every fold.  The primary key is on
+        # the opener, which answers "what is SALET's ERD" and nothing about
+        # order; this index answers "how many openers beat it" and "which ones
+        # sit either side of it".  Covering, so neither query reaches the table.
+        self._conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_opener_erd_rank
+                ON opener_erd_by_policy
+                   (policy, answer_list_id, erd, max_remaining_depth, opener)
+        """)
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS opener_response_group_summaries (
                 opener TEXT NOT NULL, response_pattern TEXT NOT NULL,
@@ -1410,52 +1420,171 @@ class ScoreCache:
             )
         }
 
-    def write_opener_erds(self, rows, policy, folded_at=None):
-        """Store folds for openers whose whole tree is solved.
+    def ranked_opener_count(self, policy, excluding):
+        """How many openers other than `excluding` hold a stored fold.
+
+        The named opener is left out because the caller is asking about it, and
+        its own row can outlive the fold that wrote it: an opener that a repair
+        or a requeue has made unfinished still has the row the last screen
+        stored, and counting that would report a field one larger than the one
+        the opener is actually outside.
+        """
+        return self._conn.execute(
+            """SELECT COUNT(*) FROM opener_erd_by_policy
+                WHERE policy = ? AND answer_list_id = ? AND opener <> ?""",
+            (policy, self.answer_list_id, excluding.lower()),
+        ).fetchone()[0]
+
+    def opener_standing(self, policy, opener, erd, max_remaining_depth,
+                        neighbour_count):
+        """Where one opener sits in the stored ranking, without loading it.
+
+        `erd` and `max_remaining_depth` are the caller's own fold of this
+        opener, and they are the only live facts in the answer.  The opener's
+        stored row is excluded from every query here, so a fold that disagrees
+        with it -- an opener that completed since the last screen, or one whose
+        tree was repaired -- is placed by what it is now rather than by what
+        was recorded.  Counting its stale row as well would move it past
+        itself.
+
+        The sort key is the ranking's own, `(erd, max_remaining_depth,
+        opener)`, so `rank` is a position in the ranking as it is displayed
+        rather than a competition rank that ties share.  Both halves of a tie
+        therefore get a place of their own, and the neighbours are the rows
+        actually above and below.
+
+        The population is whatever the last leaderboard build screened.  A
+        stored fold is a record of that screen and is not evidence on its own
+        (`_screen_and_fold_openers` rescreens and `delete_opener_erds` prunes),
+        so this is a positional statement about that population and nothing
+        more.  The alternative is to rescreen the vocabulary, which is the cost
+        the whole lookup exists to avoid.
+
+        `rank` walks the index entries that qualify, so it is linear in the
+        rank and bounded by the vocabulary; the neighbour windows stop at
+        `neighbour_count` and are seeks.
+
+        All four read one snapshot.  A leaderboard build stores and deletes
+        folds, and it runs against the same cache a detail request is being
+        served from, so between two autocommit statements the field can change
+        underneath them -- and the four answers are one statement about one
+        field.  Counted separately they can disagree: a rank from a larger
+        field beside a total from a smaller one is a rank past the end of the
+        ranking it claims to be in, and neighbours that are not the rows
+        either side of it.
+        """
+        scope = (policy, self.answer_list_id, opener.lower())
+        position = (erd, max_remaining_depth, opener.lower())
+        self._conn.execute("BEGIN")
+        try:
+            return self._standing_in_snapshot(
+                scope, position, neighbour_count)
+        finally:
+            # A read transaction holds a snapshot and nothing else, so it ends
+            # the same way whether or not the reads raised.
+            self._conn.execute("ROLLBACK")
+
+    def _standing_in_snapshot(self, scope, position, neighbour_count):
+        """The four standing reads, against whatever snapshot is open."""
+        better = self._conn.execute(
+            """SELECT COUNT(*) FROM opener_erd_by_policy
+                WHERE policy = ? AND answer_list_id = ? AND opener <> ?
+                  AND (erd, max_remaining_depth, opener) < (?, ?, ?)""",
+            scope + position,
+        ).fetchone()[0]
+        others = self._conn.execute(
+            """SELECT COUNT(*) FROM opener_erd_by_policy
+                WHERE policy = ? AND answer_list_id = ? AND opener <> ?""",
+            scope,
+        ).fetchone()[0]
+        above = self._conn.execute(
+            """SELECT erd, max_remaining_depth, opener
+                 FROM opener_erd_by_policy
+                WHERE policy = ? AND answer_list_id = ? AND opener <> ?
+                  AND (erd, max_remaining_depth, opener) < (?, ?, ?)
+                ORDER BY erd DESC, max_remaining_depth DESC, opener DESC
+                LIMIT ?""",
+            scope + position + (neighbour_count,),
+        ).fetchall()
+        below = self._conn.execute(
+            """SELECT erd, max_remaining_depth, opener
+                 FROM opener_erd_by_policy
+                WHERE policy = ? AND answer_list_id = ? AND opener <> ?
+                  AND (erd, max_remaining_depth, opener) > (?, ?, ?)
+                ORDER BY erd, max_remaining_depth, opener
+                LIMIT ?""",
+            scope + position + (neighbour_count,),
+        ).fetchall()
+        return {
+            "rank": better + 1,
+            "ranked_total": others + 1,
+            "above": [tuple(row) for row in reversed(above)],
+            "below": [tuple(row) for row in below],
+        }
+
+    def publish_opener_erds(self, rows, retired_openers, policy,
+                            folded_at=None):
+        """Replace the stored ranking in one step, or not at all.
 
         `rows` is an iterable of (opener, erd, max_remaining_depth,
-        response_group_count).  Replaces any stored fold for the same opener,
-        because the caller has just rescreened it against current branch
-        results and its value is the newer of the two.
+        response_group_count) for the openers a screen settled, and
+        `retired_openers` names the ones it no longer settles.  A stored row is
+        replaced rather than reconciled, because the caller has just rescreened
+        it against current branch results and its value is the newer of the
+        two.
+
+        The two halves are one statement about the field and commit together.
+        On an autocommit connection each row of an `executemany` is its own
+        transaction and visible the moment it lands, so a reader could see the
+        openers this screen settled alongside the stale rows it was about to
+        retire -- a field no build ever produced.  A reader holding a snapshot
+        is no help against that: the snapshot would be of the hybrid.
         """
         rows = list(rows)
-        if not rows:
+        retired_openers = list(retired_openers)
+        if not rows and not retired_openers:
             return
         now = int(time.time()) if folded_at is None else folded_at
         try:
-            self._conn.executemany(
-                """INSERT OR REPLACE INTO opener_erd_by_policy
-                       (opener, policy, answer_list_id, erd,
-                        max_remaining_depth, response_group_count, folded_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                [(opener.lower(), policy, self.answer_list_id, erd,
-                  max_remaining_depth, response_group_count, now)
-                 for opener, erd, max_remaining_depth, response_group_count
-                 in rows],
-            )
+            self._conn.execute("BEGIN IMMEDIATE")
+            if rows:
+                self._conn.executemany(
+                    """INSERT OR REPLACE INTO opener_erd_by_policy
+                           (opener, policy, answer_list_id, erd,
+                            max_remaining_depth, response_group_count,
+                            folded_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    [(opener.lower(), policy, self.answer_list_id, erd,
+                      max_remaining_depth, response_group_count, now)
+                     for opener, erd, max_remaining_depth, response_group_count
+                     in rows],
+                )
+            if retired_openers:
+                self._conn.executemany(
+                    """DELETE FROM opener_erd_by_policy
+                        WHERE opener = ? AND policy = ? AND answer_list_id = ?""",
+                    [(opener.lower(), policy, self.answer_list_id)
+                     for opener in retired_openers],
+                )
+            self._conn.execute("COMMIT")
         except sqlite3.OperationalError as exc:
+            try:
+                self._conn.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
             if not _is_disk_io_error(exc):
                 raise
-            logger.warning("write_opener_erds(%d rows, %s) failed: %s",
-                           len(rows), policy, exc)
+            logger.warning(
+                "publish_opener_erds(%d stored, %d retired, %s) failed: %s",
+                len(rows), len(retired_openers), policy, exc)
+
+    def write_opener_erds(self, rows, policy, folded_at=None):
+        """Store folds for openers whose whole tree is solved."""
+        self.publish_opener_erds(rows, (), policy, folded_at)
 
     def delete_opener_erds(self, openers, policy):
         """Drop stored folds for openers that no longer screen complete."""
-        openers = list(openers)
-        if not openers:
-            return
-        try:
-            self._conn.executemany(
-                """DELETE FROM opener_erd_by_policy
-                    WHERE opener = ? AND policy = ? AND answer_list_id = ?""",
-                [(opener.lower(), policy, self.answer_list_id)
-                 for opener in openers],
-            )
-        except sqlite3.OperationalError as exc:
-            if not _is_disk_io_error(exc):
-                raise
-            logger.warning("delete_opener_erds(%d rows, %s) failed: %s",
-                           len(openers), policy, exc)
+        self.publish_opener_erds((), openers, policy)
 
     def completed_opener_summary_map(self, policy):
         return {row["opener"].lower(): dict(row) for row in self._conn.execute("""

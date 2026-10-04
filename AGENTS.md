@@ -492,6 +492,36 @@ Groups of fewer than two answers hold no branch result and never will — the
 fold solves them from the response pattern — so the screen must skip them
 rather than ask the cache about them.
 
+**The stored folds are also read for an opener's *position*, and that is not
+reading a fold in place of folding.**  `ScoreCache.opener_standing` answers
+"where does TARSE stand" from two counts and two bounded seeks over
+`opener_erd_by_policy` (`idx_opener_erd_rank` covers the ranking's own sort
+key, `(erd, max_remaining_depth, opener)`, so the neighbour windows are seeks
+rather than a scan -- measured 0.018 ms against 2.3 ms at 14,855 openers).  The
+looked-up opener's own ERD still comes from a live fold of its groups; what the
+table supplies is the *field*, which is the one thing folding a single opener
+cannot.  Its own stored row is excluded from every one of those queries, so a
+fold that disagrees with it is placed by what it is now and cannot be counted
+past itself.
+
+So a standing is as fresh as this request in its ERD and as fresh as the last
+leaderboard build in its rank, and `ranked_total` reports the field it was
+counted in rather than implying one.  Rescreening the vocabulary to place one
+word costs more than the ranking it would place the word in, which is the whole
+reason the lookup exists.
+
+**An opener's stored ERD is meant to be the authoritative answer, and the rule
+above is about a different table.**  What #288 dropped was
+`candidate_erd_by_policy`, a fold keyed by (branch, candidate): an unbounded
+set whose dependencies could not be enumerated, so a deleted branch row
+falsified folds nobody could name.  `opener_erd_by_policy` holds one row per
+opener and depends only on that opener's own top-level groups -- a dependency
+set the screen already walks on every build.  Do not read "a fold cannot
+defend itself" as covering it.  That the leaderboard still re-derives all of
+them on every build, and never reads the rows it writes, is an implementation
+gap tracked in #384, not a property of the value: computing an exact ERD for
+every opener is what the swarm is for.
+
 `opener_erd_by_policy` is local to each machine and travels in neither
 `EXPORT_TABLES` nor `TABLES`: it is derived from branch results the export
 already carries, and the other side rescreens against its own cache.

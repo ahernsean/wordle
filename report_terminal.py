@@ -1817,19 +1817,65 @@ def _render_opener_sections(report, width, display_order):
     return [("header", header), ("opener_rows", lines)]
 
 
-def _render_leaderboard_detail_sections(report, width, detail):
-    """One opener's response groups, for `view --leaderboard WORD`.
+def _render_standing_lines(standing, width):
+    """Where one opener stands, and the openers either side of it.
 
-    Naming an opener asks about that opener, so the report carries its
-    breakdown and no ranking at all -- ranking the vocabulary to describe one
-    word costs more than the ranking does.  There are no counts to summarise
-    here because nothing was counted.
+    The standing is the answer to "where does TARSE stand", so it leads with
+    the position and carries the neighbourhood as the same table the ranking
+    uses -- the looked-up opener is a row in it, marked, rather than a figure
+    quoted beside it.
+    """
+    word = str(standing.get("word") or "").upper()
+    if not standing.get("available"):
+        ranked_total = standing.get("ranked_total")
+        if standing.get("state") == "absent":
+            return [_fit(f"{word} is not a candidate opener", width)]
+        field = (f"; {ranked_total:,} openers ranked so far"
+                 if ranked_total else "")
+        return [_fit(
+            f"{word} has no complete tree yet "
+            f"({standing.get('state')}){field}", width)]
+    rank, ranked_total = standing["rank"], standing["ranked_total"]
+    numerator = standing["erd_numerator"]
+    denominator = standing["erd_denominator"]
+    lines = [
+        _fit(f"Rank {rank:,} of {ranked_total:,} ranked openers  "
+             f"(better than {standing['percentile']:.1f}%)", width),
+        _fit(f"ERD {numerator / denominator:.3f} = {numerator:,}/"
+             f"{denominator:,} guesses  worst case "
+             f"{standing['max_remaining_depth']} guesses", width),
+    ]
+    rows = ["    Rank  Opener   ERD    Worst-case guesses"]
+    for index, row in enumerate(leaderboard_rows({"columns":
+                                                  standing["neighbourhood"]})):
+        marker = "-> " if index == standing["position"] else "   "
+        neighbour = row["word"].upper() + ("*" if row["word_is_answer"] else "")
+        rows.append(_fit(
+            f"{marker}{row['rank']:>4}  {neighbour:<7}  {row['erd']:.3f}  "
+            f"{row['max_remaining_depth']}",
+            width,
+        ))
+    return lines + [""] + rows
+
+
+def _render_leaderboard_detail_sections(report, width, detail, standing):
+    """One opener's own answer, for `view --leaderboard WORD`.
+
+    Naming an opener asks about that opener, so the report carries where it
+    stands and how it splits the answer list, and no ranking at all -- ranking
+    the vocabulary to describe one word costs more than the ranking does.
+    There are no counts to summarise here because nothing was counted.
     """
     word = str(detail.get("word") or "").upper()
-    header = _semantic_header(report, f"Opener {word}  response groups", width)
+    header = _semantic_header(report, f"Opener {word}", width)
+    sections = [("header", header)]
+    if standing is not None:
+        sections.append(("standing", _render_standing_lines(standing, width)))
     if not detail.get("available"):
-        return [("header", header),
-                ("summary", [_fit(f"{word} has no complete tree yet", width)])]
+        if standing is None:
+            sections.append(
+                ("summary", [_fit(f"{word} has no complete tree yet", width)]))
+        return sections
     answer_count = detail.get("answer_count") or 0
     groups = detail.get("response_groups") or []
     summary = [_fit(
@@ -1842,14 +1888,15 @@ def _render_leaderboard_detail_sections(report, width, detail):
             f"{share * 100:>5.1f}%",
             width,
         ))
-    return [("header", header), ("summary", summary), ("leaderboard", rows)]
+    return sections + [("summary", summary), ("leaderboard", rows)]
 
 
 def _render_leaderboard_sections(report, width):
     data = report["data"]
     detail = data.get("detail")
     if detail is not None:
-        return _render_leaderboard_detail_sections(report, width, detail)
+        return _render_leaderboard_detail_sections(
+            report, width, detail, data.get("standing"))
     counts = data["counts"]
     header = _semantic_header(
         report,

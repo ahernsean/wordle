@@ -2006,6 +2006,347 @@ class ReportClientContract:
         self.page.evaluate("async () => { await window.__reportClient.fetchReport(); }")
         self.assertIn("9.870 987/100", self.page.locator("#report").inner_text())
 
+    def _look_up_opener(self, word):
+        """Open the leaderboard and ask where one opener stands."""
+        self.page.locator("[data-kind=leaderboard]").click()
+        self.page.wait_for_selector(".grid.leaderboard > .leaderboard-card")
+        box = self.page.locator(".opener-lookup-form input")
+        box.fill(word)
+        box.press("Enter")
+
+    def test_the_leaderboard_lookup_answers_where_one_opener_stands(self):
+        """Naming a word answers its place without the ranking being read.
+
+        The question the lookup exists for is "where does this opener stand",
+        and the whole answer is the rank, the field it is ranked in, the share
+        it beats, and the openers either side of it -- drawn as the same cards
+        the ranking draws, with the looked-up one marked in place.
+        """
+        self._look_up_opener("salet")
+        self.page.wait_for_selector(".leaderboard-card.looked-up")
+        answer = self.page.locator(".opener-lookup-answer")
+        text = answer.inner_text()
+        self.assertIn("Rank 1 of 2", text)
+        self.assertIn("better than 50.0%", text)
+        cards = answer.locator(".grid.leaderboard > .leaderboard-card")
+        self.assertEqual(cards.count(), 2)
+        self.assertEqual(cards.nth(0).locator(".leaderboard-rank").inner_text(),
+                         "#1")
+        self.assertEqual(cards.nth(1).locator(".leaderboard-rank").inner_text(),
+                         "#2")
+        self.assertIn("looked-up", cards.nth(0).get_attribute("class").split())
+        self.assertNotIn("looked-up", cards.nth(1).get_attribute("class").split())
+        # A neighbourhood card carries no expander: the open set is keyed on
+        # the word, so a second card for one opener would open with the first.
+        self.assertEqual(cards.nth(0).locator("summary").count(), 0)
+        # The ranking is still below its own heading, not replaced by the
+        # answer to a question about one row of it.
+        self.assertEqual(
+            self.page.locator(".grid.leaderboard").count(), 2)
+
+    def test_a_lookup_window_is_numbered_from_where_it_was_cut(self):
+        """A window out of the middle of the ranking carries its real ranks.
+
+        Rank is the position in the columns, so a window has to say what its
+        order counts from.  A reader that numbered every window from 1 would
+        put the openers around rank 42 at ranks 1 to 5 and still look right,
+        which is why the ranks are asserted and not just the order.
+        """
+        self.page.locator("[data-kind=leaderboard]").click()
+        self.page.wait_for_selector(".grid.leaderboard > .leaderboard-card")
+        self.page.evaluate("""() => {
+          const realFetch = window.fetch.bind(window);
+          window.fetch = (url, options) => {
+            if (!String(url).includes('branch_target=')) return realFetch(url, options);
+            return realFetch(url, options).then(response => response.json()).then(body => {
+              body.data.standing = {
+                word: 'tarse', available: true, state: 'complete',
+                word_is_answer: false, erd_numerator: 356,
+                erd_denominator: 100, max_remaining_depth: 5,
+                rank: 42, ranked_total: 958, percentile: 95.6,
+                position: 2,
+                neighbourhood: {
+                  word_width: 5, words: 'alphabravotarsedeltagamma',
+                  erd_denominator: 100,
+                  erd_numerator: [354, 355, 356, 357, 358],
+                  max_remaining_depth: [5, 5, 5, 5, 6],
+                  first_rank: 40, word_is_answer_bitmap: 'AA==',
+                },
+              };
+              return new Response(JSON.stringify(body), {
+                status: 200,
+                headers: {'Content-Type': 'application/json'},
+              });
+            });
+          };
+        }""")
+        box = self.page.locator(".opener-lookup-form input")
+        box.fill("tarse")
+        box.press("Enter")
+        self.page.wait_for_selector(".leaderboard-card.looked-up")
+        answer = self.page.locator(".opener-lookup-answer")
+        self.assertIn("Rank 42 of 958", answer.inner_text())
+        self.assertIn("better than 95.6%", answer.inner_text())
+        cards = answer.locator(".grid.leaderboard > .leaderboard-card")
+        self.assertEqual(
+            [cards.nth(index).locator(".leaderboard-rank").inner_text()
+             for index in range(cards.count())],
+            ["#40", "#41", "#42", "#43", "#44"])
+        marked = answer.locator(".leaderboard-card.looked-up")
+        self.assertEqual(marked.count(), 1)
+        self.assertEqual(marked.locator(".leaderboard-rank").inner_text(), "#42")
+        self.assertIn("TARSE", marked.inner_text())
+
+    def test_the_leaderboard_lookup_asks_for_five_letters_without_a_request(self):
+        # A box that forwards anything typed would spend a request to be told
+        # the obvious, so the shape of an opener is checked before asking.
+        self.page.locator("[data-kind=leaderboard]").click()
+        self.page.wait_for_selector(".grid.leaderboard > .leaderboard-card")
+        self.page.evaluate("""() => {
+          const realFetch = window.fetch.bind(window);
+          window.__detailFetches = 0;
+          window.fetch = (url, options) => {
+            if (String(url).includes('branch_target=')) window.__detailFetches += 1;
+            return realFetch(url, options);
+          };
+        }""")
+        box = self.page.locator(".opener-lookup-form input")
+        box.fill("sal")
+        box.press("Enter")
+        self.page.wait_for_selector(".opener-lookup-answer .error")
+        self.assertIn("An opener is five letters",
+                      self.page.locator(".opener-lookup-answer").inner_text())
+        self.assertEqual(self.page.evaluate("() => window.__detailFetches"), 0)
+
+    def test_a_lookup_answer_does_not_overflow_a_phone(self):
+        """The answer panel is a view state the standing width guard misses.
+
+        `test_no_horizontal_scroll_at_required_widths` loads the leaderboard
+        but never asks a question of it, so the panel it draws in reply has
+        never been measured there.  A full-page screenshot cannot settle this
+        either -- it sizes itself to `scrollWidth`, so an overflowing page
+        renders as a wider image that looks correctly laid out.
+        """
+        self._look_up_opener("salet")
+        self.page.wait_for_selector(".leaderboard-card.looked-up")
+        self.page.evaluate("() => document.activeElement.blur()")
+        for width in (375, 390, 480, 800, 1200):
+            with self.subTest(width=width):
+                self.page.set_viewport_size({"width": width, "height": 800})
+                scroll_width, client_width = self.page.evaluate(
+                    "() => [document.documentElement.scrollWidth,"
+                    " document.documentElement.clientWidth]")
+                self.assertLessEqual(scroll_width, client_width)
+
+    def test_a_lookup_answer_outlives_the_poll_that_redraws_the_ranking(self):
+        """The answer is state, not markup, so a redraw does not take it.
+
+        The report is replaced wholesale every two seconds.  An answer held in
+        the DOM would last one poll, which is less than it takes to read.
+        """
+        self._look_up_opener("salet")
+        self.page.wait_for_selector(".leaderboard-card.looked-up")
+        self.page.evaluate(
+            "async () => { await window.__reportClient.fetchReport(); }")
+        self.assertIn("Rank 1 of 2",
+                      self.page.locator(".opener-lookup-answer").inner_text())
+        self.assertEqual(
+            self.page.locator(".leaderboard-card.looked-up").count(), 1)
+        # And the box still holds what was typed, so a redraw landing between
+        # typing and submitting does not empty it.
+        self.assertEqual(
+            self.page.locator(".opener-lookup-form input").input_value(),
+            "salet")
+
+    def test_a_first_lookup_is_asked_for_once(self):
+        """Nothing is stale before there is an answer to go stale.
+
+        The first load of a view has no stored entity tag to match, so the
+        ranking reads as changed.  Marking the standing stale on that would
+        leave the mark waiting for the reader's first lookup, whose own draw
+        would then send the very request that just answered it.
+        """
+        self.page.locator("[data-kind=leaderboard]").click()
+        self.page.wait_for_selector(".grid.leaderboard > .leaderboard-card")
+        # The fixture server serves the leaderboard without an entity tag, so
+        # the first poll to carry one has to be arranged -- which is the state
+        # the real server puts a freshly opened page in.
+        self.page.evaluate("""() => {
+          const realFetch = window.fetch.bind(window);
+          window.__detailFetches = 0;
+          window.fetch = (url, options) => {
+            if (String(url).includes('branch_target=')) {
+              window.__detailFetches += 1;
+              return realFetch(url, options);
+            }
+            return realFetch(url, options).then(async response => {
+              if (!String(url).includes('/leaderboard')) return response;
+              return new Response(await response.text(), {
+                status: 200,
+                headers: {'Content-Type': 'application/json', 'ETag': '"first"'},
+              });
+            });
+          };
+        }""")
+        self.page.evaluate(
+            "async () => { await window.__reportClient.fetchReport(); }")
+        box = self.page.locator(".opener-lookup-form input")
+        box.fill("salet")
+        box.press("Enter")
+        self.page.wait_for_selector(".leaderboard-card.looked-up")
+        self.assertEqual(self.page.evaluate("() => window.__detailFetches"), 1)
+
+    def test_a_lookup_asks_again_when_only_the_metrics_refresh(self):
+        """A poll that redraws nothing still settles the lookup.
+
+        An unchanged ranking leaves the cards alone and refreshes the metrics
+        only, so no redraw happens -- but the field behind the cards can still
+        have moved.  A repair that reorders openers outside the displayed slice
+        changes neither the columns nor the total, and the lookup is about one
+        word anywhere in that field, so a rank left over from the previous one
+        would otherwise stand indefinitely: later 304 polls draw nothing
+        either.
+        """
+        self._look_up_opener("salet")
+        self.page.wait_for_selector(".leaderboard-card.looked-up")
+        self.page.evaluate("() => document.activeElement.blur()")
+        self.page.evaluate("""() => {
+          const realFetch = window.fetch.bind(window);
+          window.__detailFetches = 0;
+          window.fetch = (url, options) => {
+            if (String(url).includes('branch_target=')) {
+              window.__detailFetches += 1;
+              return realFetch(url, options);
+            }
+            return realFetch(url, options).then(async response => {
+              if (!String(url).includes('/leaderboard')) return response;
+              // A new entity tag over an identical ranking: the rows and the
+              // total match, so the client takes the metrics-only path.
+              return new Response(await response.text(), {
+                status: 200,
+                headers: {'Content-Type': 'application/json',
+                          'ETag': '"metrics-only"'},
+              });
+            });
+          };
+        }""")
+        self.page.evaluate(
+            "async () => { await window.__reportClient.fetchReport(); }")
+        self.page.wait_for_function("() => window.__detailFetches === 1")
+        self.assertIn("Rank 1 of 2",
+                      self.page.locator(".opener-lookup-answer").inner_text())
+
+    def test_a_lookup_answers_the_panel_that_is_mounted_when_it_finishes(self):
+        """A redraw mid-flight must not strand the answer in a dead node.
+
+        The panel is rebuilt by every redraw, so an answer that reaches the
+        panel which asked for it can reach a node already detached.  The
+        visible panel then reads "Looking up…" with nothing left to finish it.
+
+        The polls after the redraw answer 304 here, which draws nothing at all.
+        Without that the metrics-only path would redraw the mounted panel
+        within one poll and repair the symptom, so the test would pass against
+        a lookup that still answers into a dead node.
+        """
+        self.page.locator("[data-kind=leaderboard]").click()
+        self.page.wait_for_selector(".grid.leaderboard > .leaderboard-card")
+        # The detail request waits on a gate this test opens, so the redraw
+        # below lands while the lookup is genuinely in flight.
+        self.page.evaluate("""() => {
+          const realFetch = window.fetch.bind(window);
+          window.__gate = {};
+          window.__gate.open = new Promise(resolve => {
+            window.__gate.release = resolve;
+          });
+          window.__settled = false;
+          window.fetch = (url, options) => {
+            if (String(url).includes('branch_target=')) {
+              return window.__gate.open.then(() => realFetch(url, options));
+            }
+            if (!String(url).includes('/leaderboard')) {
+              return realFetch(url, options);
+            }
+            if (window.__settled) {
+              return Promise.resolve(new Response(null, {
+                status: 304, headers: {'ETag': '"moved"'},
+              }));
+            }
+            return realFetch(url, options).then(async response => {
+              const report = await response.json();
+              report.data.columns.erd_numerator[0] = 987;
+              return new Response(JSON.stringify(report), {
+                status: 200,
+                headers: {'Content-Type': 'application/json',
+                          'ETag': '"moved"'},
+              });
+            });
+          };
+        }""")
+        box = self.page.locator(".opener-lookup-form input")
+        box.fill("salet")
+        box.press("Enter")
+        self.page.wait_for_selector(".opener-lookup-answer .dim")
+        self.page.evaluate("() => document.activeElement.blur()")
+        # A changed ranking, so the report is redrawn and the panel holding the
+        # request is replaced while the request is still open.
+        self.page.evaluate(
+            "async () => { await window.__reportClient.fetchReport(); }")
+        self.assertIn("9.870 987/100", self.page.locator("#report").inner_text())
+        self.assertIn("Looking up SALET",
+                      self.page.locator(".opener-lookup-answer").inner_text())
+
+        # From here every poll answers 304, so nothing else will redraw the
+        # panel: the answer has to find it on its own.
+        self.page.evaluate("() => { window.__settled = true; }")
+        self.page.evaluate("() => window.__gate.release()")
+        self.page.wait_for_selector(".leaderboard-card.looked-up")
+        self.assertIn("Rank 1 of 2",
+                      self.page.locator(".opener-lookup-answer").inner_text())
+
+    def test_a_lookup_asks_again_once_the_ranking_has_moved(self):
+        """A rank describes the ranking it was counted in, and that moves.
+
+        An opener completing reorders the field, so an answer already on screen
+        is a place in the previous one.  It is asked for again rather than
+        dropped: emptying the panel every time the sweep finishes an opener
+        would take the answer away from a reader mid-sentence.
+        """
+        self._look_up_opener("salet")
+        self.page.wait_for_selector(".leaderboard-card.looked-up")
+        # The answer is asked for again as the panel redraws, and the box still
+        # has focus from submitting, which is one of the interactions that
+        # defers a redraw.  Letting go of it is what a reader does to read the
+        # answer.
+        self.page.evaluate("() => document.activeElement.blur()")
+        self.page.evaluate("""() => {
+          const realFetch = window.fetch.bind(window);
+          window.__detailFetches = 0;
+          window.fetch = (url, options) => {
+            if (String(url).includes('branch_target=')) {
+              window.__detailFetches += 1;
+              return realFetch(url, options);
+            }
+            return realFetch(url, options).then(async response => {
+              if (!String(url).includes('/leaderboard')) return response;
+              const report = await response.json();
+              report.data.columns.erd_numerator[0] = 987;
+              return new Response(JSON.stringify(report), {
+                status: 200,
+                headers: {'Content-Type': 'application/json', 'ETag': '"moved"'},
+              });
+            });
+          };
+        }""")
+        self.page.evaluate(
+            "async () => { await window.__reportClient.fetchReport(); }")
+        self.page.wait_for_function("() => window.__detailFetches === 1")
+        # Asked once, not once per redraw: the mark is cleared before the
+        # request, so neither this draw nor the one the answer triggers repeats
+        # it.
+        self.page.evaluate(
+            "async () => { await window.__reportClient.fetchReport(); }")
+        self.assertEqual(self.page.evaluate("() => window.__detailFetches"), 1)
+
     def test_an_unfinished_breakdown_is_asked_for_again(self):
         """"Not finished yet" describes this instant, not the opener.
 
