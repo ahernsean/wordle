@@ -271,7 +271,8 @@ class DepthAudit:
                 'branch_size': len(branch_words),
                 'best_guess': best_guess,
                 'stored_max_depth': stored_depth,
-                'reduced_max_depth': reduction.depth,
+                # The JSON key keeps the name consumers of --json read.
+                'folded_max_depth': reduction.depth,
                 'solve_budget': solve_budget,
             })
         if not self._repair:
@@ -395,7 +396,7 @@ def render_report(summary, elapsed, repair):
         lines.append(
             f"    {finding['branch_reference']}  n={finding['branch_size']:,}  "
             f"{finding['best_guess']}  stored {finding['stored_max_depth']} "
-            f"-> reduced {finding['reduced_max_depth']}  "
+            f"-> reduced {finding['folded_max_depth']}  "
             f"solve_budget={finding['solve_budget']}")
     return '\n'.join(lines)
 

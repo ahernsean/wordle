@@ -380,7 +380,7 @@ class AliasedOverwriteTest(_CacheFixture):
         self.assertIn(_fact_reference(parent), flagged)
         finding = flagged[_fact_reference(parent)]
         self.assertEqual(finding['stored_max_depth'], true_depth - 1)
-        self.assertEqual(finding['reduced_max_depth'], true_depth)
+        self.assertEqual(finding['folded_max_depth'], true_depth)
         self.assertEqual(audit.depth_deltas[(true_depth - 1, true_depth)], 1)
         self.assertEqual(audit.mismatch_sizes[len(decode_subset(parent[0]))], 1)
 
