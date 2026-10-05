@@ -1584,6 +1584,25 @@ class ScoreCache:
                 "publish_opener_erds(%d stored, %d retired, %s) failed: %s",
                 len(rows), len(retired_openers), policy, exc)
 
+    def delete_opener_erd(self, opener, policy):
+        """Drop one opener's stored ERD.
+
+        For an operation that is about to falsify it -- recomputing the
+        opener's response groups -- to call itself.  Nothing on the normal
+        path reads or repairs a stored ERD against current branch results.
+        """
+        self._conn.execute(
+            "DELETE FROM opener_erd_by_policy "
+            "WHERE opener = ? AND policy = ? AND answer_list_id = ?",
+            (opener.lower(), policy, self.answer_list_id))
+
+    def delete_all_opener_erds(self, policy):
+        """Drop every stored opener ERD for this answer list and policy."""
+        self._conn.execute(
+            "DELETE FROM opener_erd_by_policy "
+            "WHERE policy = ? AND answer_list_id = ?",
+            (policy, self.answer_list_id))
+
     def opener_names_with_erd(self, policy):
         """The openers whose ERD is stored for this answer list."""
         return {row["opener"] for row in self._conn.execute(
@@ -1629,20 +1648,21 @@ class ScoreCache:
     def write_completed_opener_summary(self, opener, policy, completed_at,
                                        elapsed_millis, worker_millis,
                                        telemetry_epochs=()):
-        try:
-            self._conn.execute("""
-                INSERT OR REPLACE INTO completed_opener_summaries
-                    (opener, policy, answer_list_id, completed_at,
-                     elapsed_millis, worker_millis, telemetry_epochs)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (opener.lower(), policy, self.answer_list_id, completed_at,
-                  elapsed_millis, worker_millis,
-                  ",".join(str(epoch) for epoch in sorted(set(telemetry_epochs)))))
-        except sqlite3.OperationalError as exc:
-            if not _is_disk_io_error(exc):
-                raise
-            logger.warning("write_completed_opener_summary(%s, %s) failed: %s",
-                           opener, policy, exc)
+        """Record when an opener finished and what it cost.
+
+        A failed write raises, disk errors included.  The swarm records this
+        as part of finishing an opener and marks the opener done only after
+        it returns; nothing else writes it afterwards, so a write that failed
+        quietly would lose the timing for good.
+        """
+        self._conn.execute("""
+            INSERT OR REPLACE INTO completed_opener_summaries
+                (opener, policy, answer_list_id, completed_at,
+                 elapsed_millis, worker_millis, telemetry_epochs)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (opener.lower(), policy, self.answer_list_id, completed_at,
+              elapsed_millis, worker_millis,
+              ",".join(str(epoch) for epoch in sorted(set(telemetry_epochs)))))
 
     def add_opener_response_group_summary(self, opener, response_pattern,
                                           policy, nodes, worker_millis,

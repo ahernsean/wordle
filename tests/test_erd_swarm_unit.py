@@ -4275,6 +4275,16 @@ class TestCompletingOpeners(unittest.TestCase):
 
         worker.queue.mark_openers_complete.assert_not_called()
 
+    def test_a_failed_timing_write_leaves_the_opener_not_done(self):
+        worker = self._worker(_reduction("complete"))
+        worker.score_cache.write_completed_opener_summary.side_effect = (
+            sqlite3.OperationalError("disk I/O error"))
+
+        with self.assertLogs("wordle", level="ERROR"):
+            worker._complete_openers(["salet"])
+
+        worker.queue.mark_openers_complete.assert_not_called()
+
     def test_one_openers_failure_does_not_stop_the_next(self):
         worker = self._worker(_reduction("complete"))
         worker.score_cache.write_opener_erd.side_effect = [

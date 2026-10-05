@@ -957,9 +957,11 @@ the row's `best_score` agrees with its own reduction, and withheld otherwise rat
 than extending the reach of a score the same pass just contradicted.  The
 report counts what it withheld.
 
-A repair needs nothing invalidated above it.  A candidate's own ERD is reduced
-from its response groups' rows on every read, so the next report serves the
-repaired depth without any invalidation step to get wrong.
+A candidate's own ERD at a branch is reduced from its response groups' rows on
+every read, so the next report serves the repaired depth with nothing to
+invalidate.  An opener's ERD is stored, so a repair that changes any row drops
+every stored opener ERD itself, and `erd_search.py reconcile-opener-erds` stores
+them again.
 
 **A repair does not travel between caches.**  It moves `updated_at`, so an
 incremental `export_cache.py --since` carries the row, but `import_cache.py`

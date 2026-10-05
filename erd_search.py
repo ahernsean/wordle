@@ -285,10 +285,11 @@ def invalidate_branches_for_recompute(queue, score_cache, branch_keys):
     """Drop each branch's cached result and the work state that would keep it
     unclaimable, so it is genuinely recomputed.
 
-    Nothing above these branches needs invalidating alongside them.  A word's
-    own ERD is reduced from its response groups' cached results on every read,
-    so a group deleted here reports as unresolved immediately, and the word
-    reads as pending until it is solved again.
+    A candidate's ERD at a branch is reduced from its response groups' cached
+    results on every read, so deleting a group needs nothing invalidated above
+    it.  An *opener's* stored ERD is not re-derived on read: the caller that
+    deletes an opener's response groups also deletes that opener's stored ERD,
+    since this function sees branches and not whose they are.
 
     A branch the queue finished keeps a `done` pending row, and can still
     hold candidate claims and an `active_branches` row.  Re-adding it leaves
@@ -464,6 +465,7 @@ def cmd_queue_add(args):
                 if state['cache_state'] in ('exact', 'loss')}
 
             if args.delete_erd_cache:
+                score_cache.delete_opener_erd(word, ERD_ALL)
                 word_reset, word_busy = invalidate_branches_for_recompute(
                     queue, score_cache, branch_keys)
                 n_reset += word_reset

@@ -2478,7 +2478,13 @@ class ERDQueue:
         """Make branch ownership unschedulable and update request lifecycle."""
         branch_condition = "" if branch_id is None else " AND branch_id = ?"
         parameters = () if branch_id is None else (branch_id,)
+        withdrawn_request_ids = set()
         if withdraw:
+            withdrawn_request_ids = {
+                row["opener_work_id"] for row in self._conn.execute(
+                    "SELECT DISTINCT opener_work_id FROM branch_opener_work "
+                    "WHERE resolved_at IS NULL" + branch_condition,
+                    parameters)}
             if branch_id is None:
                 self._conn.execute("DELETE FROM branch_opener_work")
             else:
@@ -2493,10 +2499,28 @@ class ERDQueue:
         completed_words = self.openers_ready_to_complete()
         if withdraw:
             # Withdrawal is an operator removing work, not an opener finishing:
-            # the request is terminal and there is no ERD to reduce.
-            self.mark_openers_complete(completed_words)
+            # the requests it took work from, and left with nothing owed, are
+            # terminal and have no ERD to reduce.  A request that finished on
+            # its own and is waiting on its reduction is not this withdrawal's
+            # to complete.
+            self._finish_opener_work_ids(
+                withdrawn_request_ids & self._ready_opener_work_ids())
         self._demote_orphaned_owned_branches()
         return completed_words
+
+    def _ready_opener_work_ids(self):
+        return {row["opener_work_id"] for row in self._conn.execute(
+            "SELECT opener_work_id FROM opener_work AS s WHERE "
+            + self._FINISHED_OPENER_WORK_PREDICATE)}
+
+    def _finish_opener_work_ids(self, opener_work_ids):
+        opener_work_ids = sorted(opener_work_ids)
+        if opener_work_ids:
+            self._conn.execute(
+                "UPDATE opener_work SET state = 'complete' "
+                "WHERE opener_work_id IN ("
+                + ",".join("?" for _ in opener_work_ids) + ")",
+                opener_work_ids)
 
     def _retire_exact_direct_response_groups(self, branch_id: int) -> list[str]:
         """Retire work below direct response groups whose exact result is done.

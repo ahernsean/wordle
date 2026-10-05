@@ -339,6 +339,22 @@ class TestQueueAddDeleteErdCache(unittest.TestCase):
         self.assertEqual(self._status(queue), 'pending')
         self.assertIsNotNone(queue.claim_next('worker-1'))
 
+    def test_the_openers_stored_erd_is_dropped_with_its_response_groups(self):
+        # The opener's ERD is stored, not re-derived on read, so recomputing
+        # its groups has to take the row that read them with it.
+        queue, _ = self._finalize_as_the_swarm_does()
+        answers = load_word_list(erd_search.ANSWER_FILE)
+        cache = ScoreCache(self.args.cache, answers, checkpoint_on_close=False)
+        cache.write_opener_erd(LARGE_BRANCH_WORD, ERD_ALL, 3.5, 6, 100)
+        cache.write_opener_erd(SECOND_WORD, ERD_ALL, 3.5, 6, 100)
+        cache.close()
+
+        self._add(delete_erd_cache=True)
+
+        cache = ScoreCache(self.args.cache, answers, checkpoint_on_close=False)
+        self.addCleanup(cache.close)
+        self.assertEqual(cache.opener_names_with_erd(ERD_ALL), {SECOND_WORD})
+
     def test_pending_row_is_reset_in_place_never_removed(self):
         queue, branch_key = self._finalize_as_the_swarm_does()
 

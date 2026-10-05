@@ -46,9 +46,10 @@ about a strategy — so it is applied only when the row's `best_score` agrees
 with its own reduction, and withheld otherwise rather than extending the reach of a
 score this pass has just contradicted.
 
-A repaired row needs nothing invalidated above it.  A candidate's own ERD is
-reduced from its response groups' rows on every read, so the next report sees
-the repaired depth.
+A repaired row needs nothing invalidated above it for a candidate's ERD at a
+branch, which is reduced from its response groups' rows on every read.  An
+opener's stored ERD is not, so a repair that changes any row drops them all and
+`erd_search.py reconcile-opener-erds` stores them again.
 
 An audit-only run opens the cache read-only, so it can be run against a live
 one.  Stop the swarm before running with --repair.
@@ -184,6 +185,7 @@ class DepthAudit:
         self.score_stale = 0
         self.repaired = 0
         self.repair_withheld = 0
+        self.opener_erds_cleared = False
         self.depth_deltas = Counter()
         self.tainted_split = Counter()
         self.mismatch_sizes = Counter()
@@ -295,6 +297,7 @@ class DepthAudit:
             'score_stale': self.score_stale,
             'repaired': self.repaired,
             'repair_withheld': self.repair_withheld,
+            'opener_erds_cleared': self.opener_erds_cleared,
             'depth_deltas': {f'{was} -> {now}': count
                              for (was, now), count in sorted(self.depth_deltas.items())},
             'tainted_split': dict(sorted(self.tainted_split.items())),
@@ -391,6 +394,10 @@ def render_report(summary, elapsed, repair):
         lines.append(
             f"  repairs withheld (would widen reuse for a stale score): "
             f"{summary['repair_withheld']:,}")
+        if summary['opener_erds_cleared']:
+            lines.append(
+                "  stored opener ERDs dropped; run `erd_search.py "
+                "reconcile-opener-erds` to store them again")
     for finding in summary['findings']:
         lines.append(
             f"    {finding['branch_reference']}  n={finding['branch_size']:,}  "
@@ -443,6 +450,12 @@ def main(argv=None):
     audit = DepthAudit(score_cache, args.policy, responses, repair=args.repair)
     try:
         audit.run(iter_rows(score_cache, args.policy), list_limit=args.list)
+        if args.repair and audit.repaired:
+            # A repaired row can be one of an opener's own response groups,
+            # and a stored opener ERD does not follow it.  Drop them all;
+            # `erd_search.py reconcile-opener-erds` stores them again.
+            score_cache.delete_all_opener_erds(args.policy)
+            audit.opener_erds_cleared = True
     finally:
         score_cache.close()
     summary = audit.summary()

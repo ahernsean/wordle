@@ -10,6 +10,7 @@ ancestor that reduced the value it replaced.
 import io
 import json
 import sqlite3
+import contextlib
 import os
 import random
 import shutil
@@ -489,6 +490,63 @@ class RepairTest(_CacheFixture):
             original[2] + 1)
 
 
+class RepairClearsOpenerERDsTest(_CacheFixture):
+    """A repaired row may be an opener's own response group, so a repair that
+    changes anything drops the stored opener ERDs it may have falsified."""
+
+    def _damage(self):
+        chain = self.deepest_chain()
+        for fact in chain:
+            self.understate(fact)
+        return chain
+
+    def _store_opener(self):
+        cache = self.open_cache()
+        cache.write_opener_erd("crane", ERD_ALL, 3.5, 6, 100)
+        return cache
+
+    def _stored(self):
+        cache = ScoreCache(self.cache_path, self.answer_words,
+                           checkpoint_on_close=False)
+        try:
+            return cache.opener_names_with_erd(ERD_ALL)
+        finally:
+            cache.close()
+
+    def _main(self, *flags):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            verify_branch_depths.main(
+                ['--cache', self.cache_path, '--answers', self.answers_path,
+                 *flags])
+        return output.getvalue()
+
+    def test_a_repair_that_changed_a_row_drops_the_stored_opener_erds(self):
+        chain = self._damage()
+        self.assertTrue(chain)
+        self._store_opener()
+
+        output = self._main('--repair')
+
+        self.assertEqual(self._stored(), set())
+        self.assertIn("reconcile-opener-erds", output)
+
+    def test_a_repair_that_changed_nothing_leaves_them(self):
+        self._store_opener()
+
+        self._main('--repair')
+
+        self.assertEqual(self._stored(), {"crane"})
+
+    def test_an_audit_alone_leaves_them(self):
+        self._damage()
+        self._store_opener()
+
+        self._main()
+
+        self.assertEqual(self._stored(), {"crane"})
+
+
 class RepairSafetyTest(_CacheFixture):
     """Which direction of disagreement --repair is willing to act on."""
 
@@ -675,12 +733,14 @@ class CommandLineTest(_CacheFixture):
              'unresolved_groups': 0,
              'depth_too_low': 1070, 'depth_too_high': 36, 'score_stale': 2500,
              'repaired': 1106, 'repair_withheld': 30,
+             'opener_erds_cleared': True,
              'depth_deltas': {'3 -> 4': 1065, '4 -> 5': 5},
              'tainted_split': {'tainted': 1070},
              'mismatch_sizes': {16: 500, 25: 570},
              'findings': []},
             30.0, repair=True)
         self.assertIn('checked 739,662', report)
+        self.assertIn('reconcile-opener-erds', report)
         self.assertIn('3 -> 4: 1,065', report)
         self.assertIn('unsound reuse): 1,070', report)
         self.assertIn('n=16-25', report)

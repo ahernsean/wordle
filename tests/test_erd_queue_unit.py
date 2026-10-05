@@ -2049,6 +2049,9 @@ class TestOpenerWorkConcurrency(_TmpQueue):
                     self.assertTrue(queue.try_finalize_branch(branch_key))
                     queue.mark_done(branch_key)
                     queue.delete_branch(branch_key)
+                    # What the worker does once it has stored the ERD.
+                    queue.mark_openers_complete(
+                        queue.openers_ready_to_complete())
 
                     removable_word = f"r{batch}{worker_index}aa"
                     removable_key = ScoreCache.encode_subset([removable_word])
@@ -2489,6 +2492,20 @@ class TestOpenerCompletion(_TmpQueue):
 
         self.assertEqual(sorted(resolved), ["crane", "slate"])
         self.q.mark_openers_complete(resolved)
+
+    def test_a_withdrawal_does_not_finish_an_opener_waiting_on_its_reduction(self):
+        self._resolve_only_branch()
+        other_key = ScoreCache.encode_subset(WORDS[:3])
+        self.q.add_pending_many([(other_key, 3, 0, "slate", 1)])
+
+        self.assertTrue(self.q.remove_pending(other_key))
+
+        # The withdrawn request is terminal; the finished one still owes its
+        # reduction and must not be marked done without an ERD.
+        self.assertEqual(self._state("slate"), "complete")
+        self.assertNotEqual(self._state("crane"), "complete")
+        self.assertEqual(self.q.openers_ready_to_complete(), ["crane"])
+        self.q.mark_openers_complete(["crane"])
 
     def test_marking_nothing_complete_is_a_no_op(self):
         self.q.mark_openers_complete([])
