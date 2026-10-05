@@ -2416,6 +2416,92 @@ class TestPendingRowHelpers(_TmpQueue):
         self.assertTrue(self.q.complete_pending_for_loss(
             self.key, loss_budget=5, root_budget=6))
         self.assertEqual(self.q.get_pending_branch(self.key)["status"], "done")
+        self.q.mark_openers_complete(self.q.openers_ready_to_complete())
+
+
+class TestOpenerCompletion(_TmpQueue):
+    """An opener whose last branch resolves owes a reduction; it is done after."""
+
+    def _resolve_only_branch(self):
+        self.q.add_pending_many([(self.key, len(WORDS), 0, "crane", 0)])
+        self.q.claim_next("worker-0")
+        # The real queue, not the harness's stand-in for the worker.
+        return ProductionERDQueue.mark_done(self.q, self.key)
+
+    def _state(self, opener="crane"):
+        return self.q._conn.execute(
+            "SELECT state FROM opener_work WHERE opener = ?",
+            (opener,)).fetchone()[0]
+
+    def test_resolving_the_last_branch_leaves_the_opener_owing_its_reduction(self):
+        self.assertEqual(self._resolve_only_branch(), ["crane"])
+
+        self.assertEqual(self.q.openers_ready_to_complete(), ["crane"])
+        self.assertNotEqual(self._state(), "complete")
+        self.q.mark_openers_complete(["crane"])
+
+    def test_an_opener_with_branches_still_owed_is_not_ready(self):
+        other_key = ScoreCache.encode_subset(WORDS[:3])
+        self.q.add_pending_many([
+            (self.key, len(WORDS), 0, "crane", 0),
+            (other_key, 3, 0, "crane", 1),
+        ])
+        self.q.claim_next("worker-0")
+        ProductionERDQueue.mark_done(self.q, self.key)
+
+        self.assertEqual(self.q.openers_ready_to_complete(), [])
+
+    def test_marking_an_opener_complete_makes_it_done_and_no_longer_ready(self):
+        self._resolve_only_branch()
+
+        self.q.mark_openers_complete(["crane"])
+
+        self.assertEqual(self._state(), "complete")
+        self.assertEqual(self.q.openers_ready_to_complete(), [])
+
+    def test_a_request_with_work_still_owed_is_not_marked_complete(self):
+        self._resolve_only_branch()
+        later_key = ScoreCache.encode_subset(WORDS[:3])
+        self.q.add_pending_many([(later_key, 3, 5, "crane", 1)])
+
+        # Naming the opener finishes the request that is finished and leaves
+        # the one that has work owed.
+        self.q.mark_openers_complete(["crane"])
+
+        states = [row[0] for row in self.q._conn.execute(
+            "SELECT state FROM opener_work WHERE opener = 'crane' "
+            "ORDER BY opener_work_id")]
+        self.assertEqual(states[0], "complete")
+        self.assertNotIn("complete", states[1:])
+        self.q.claim_next("worker-0")
+        ProductionERDQueue.mark_done(self.q, later_key)
+        self.q.mark_openers_complete(self.q.openers_ready_to_complete())
+
+    def test_an_opener_nobody_flipped_is_offered_again_at_the_next_finalize(self):
+        self._resolve_only_branch()
+        other_key = ScoreCache.encode_subset(WORDS[:3])
+        self.q.add_pending_many([(other_key, 3, 0, "slate", 1)])
+        self.q.claim_next("worker-1")
+
+        # A different opener finishing returns every opener still owing its
+        # reduction, not only its own, which is how an abandoned one recovers.
+        resolved = ProductionERDQueue.mark_done(self.q, other_key)
+
+        self.assertEqual(sorted(resolved), ["crane", "slate"])
+        self.q.mark_openers_complete(resolved)
+
+    def test_marking_nothing_complete_is_a_no_op(self):
+        self.q.mark_openers_complete([])
+
+    def test_the_invariant_check_names_an_opener_that_never_got_its_reduction(self):
+        self._resolve_only_branch()
+
+        violations = self.q.check_opener_work_invariants()
+
+        self.assertEqual(len(violations), 1)
+        self.assertIn("is not done", violations[0])
+        self.q.mark_openers_complete(["crane"])
+        self.assertEqual(self.q.check_opener_work_invariants(), [])
 
 
 class TestCeilingTelemetry(_TmpQueue):

@@ -1428,42 +1428,6 @@ def _screen_and_reduce_openers(cache, skeletons, group_budget, policy):
     return summaries, counts
 
 
-def _store_opener_reductions(cache, summaries, policy, stored=None):
-    """Bring stored opener reductions into line with those just screened.
-
-    Writes every opener the screen settled and deletes the stored rows for
-    openers it no longer settles, so a branch result removed by a repair or a
-    requeue takes the reductions that read it with it on the next read.  A row is
-    rewritten only when its value differs from the one stored: the build runs
-    on a poll against the cache the swarm is writing into, and rewriting an
-    unchanged vocabulary would add WAL traffic for no change in the answer.
-
-    Both halves go through one `publish_opener_erds`, so the refresh lands as
-    one field rather than as stored rows that appear before the retired ones
-    disappear.
-    """
-    if cache.read_only:
-        return
-    complete = {
-        opener: summary for opener, summary in summaries.items()
-        if summary["state"] == "complete"
-    }
-    if stored is None:
-        stored = cache.opener_erd_map(policy)
-    cache.publish_opener_erds(
-        (
-            (opener, summary["erd"], summary["max_remaining_depth"],
-             summary["response_group_count"])
-            for opener, summary in complete.items()
-            if stored.get(opener, {}).get("erd") != summary["erd"]
-            or stored.get(opener, {}).get("max_remaining_depth")
-            != summary["max_remaining_depth"]
-        ),
-        set(stored) - set(complete),
-        policy,
-    )
-
-
 def _response_group_key(row: dict, group_by: str) -> tuple:
     """Map a response-group row to (sort_key, label) for the given strategy."""
     if group_by == "status":
@@ -3615,9 +3579,8 @@ def collect_leaderboard_report(sources: ReportOpeners, request: ReportRequest) -
 
     Every candidate is rescreened against current cache state on every build,
     and `_screen_and_reduce_openers` reaches the reduction only for the openers
-    a reduction can settle.  `_store_opener_reductions` then records those
-    reductions, so the ranking is a description of the cache as it stands
-    rather than a reading of what an earlier build stored.
+    a reduction can settle, so the ranking is a description of the cache as it
+    stands.  A report never stores what it computes.
     """
     generated_at = int(time.time())
     all_answers = load_word_list(sources.answer_list_path)
@@ -3660,7 +3623,6 @@ def collect_leaderboard_report(sources: ReportOpeners, request: ReportRequest) -
         summaries, counts = _screen_and_reduce_openers(
             cache, skeletons, group_budget, ERD_ALL
         )
-        _store_opener_reductions(cache, summaries, ERD_ALL)
         groups_by_candidate = dict(skeletons)
         ranked = sorted(
             (
@@ -4502,32 +4464,6 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
             timing_cache = ScoreCache(sources.cache_path, all_answers,
                                       checkpoint_on_close=False)
             timings = timing_cache.completed_opener_summary_map(ERD_ALL)
-            for row in summary_rows:
-                summary_opener = (
-                    _row_value(row, "opener") or "").lower()
-                if (not summary_opener
-                        or summary_opener in timings
-                        or _merged_opener_state(row) != "complete"):
-                    continue
-                timing = queue.completed_opener_timing(summary_opener)
-                if timing["completed_at"] is None:
-                    continue
-                telemetry_epochs = tuple(
-                    int(epoch) for epoch in (timing["telemetry_epochs"] or "").split(",")
-                    if epoch)
-                elapsed_millis = (
-                    (timing["completed_at"] - timing["first_created_at"]) * 1000)
-                timing_cache.write_completed_opener_summary(
-                    summary_opener, ERD_ALL, timing["completed_at"],
-                    elapsed_millis, timing["worker_millis"] or 0,
-                    telemetry_epochs)
-                timings[summary_opener] = {
-                    "completed_at": timing["completed_at"],
-                    "elapsed_millis": elapsed_millis,
-                    "worker_millis": timing["worker_millis"] or 0,
-                    "telemetry_epochs": ",".join(
-                        str(epoch) for epoch in telemetry_epochs),
-                }
         except (sqlite3.Error, OSError) as error:
             timings = {}
             report["sources"]["cache"]["error"] = str(error)

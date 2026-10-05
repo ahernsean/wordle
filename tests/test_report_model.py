@@ -471,7 +471,7 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(report["data"]["word"], "raise")
         self.assertEqual(report["data"]["estimate"], None)
 
-    def test_opener_report_persists_missing_completed_timing(self):
+    def test_opener_report_never_writes_the_timing_it_finds_missing(self):
         queue = Mock()
         queue.opener_rows.return_value = [{"opener": "raise", "state": "done"}]
         queue.opener_membership_rows.return_value = []
@@ -493,7 +493,7 @@ class ReportModelTest(unittest.TestCase):
             patch("report_model._opener_erd_summaries", return_value={}),
         ):
             report = collect_opener_report(self.sources, ReportRequest(report_kind="openers"))
-        timing_cache.write_completed_opener_summary.assert_called_once()
+        timing_cache.write_completed_opener_summary.assert_not_called()
         self.assertEqual(report["data"]["summary"], [payload])
 
     def test_response_group_scale_skips_empty_and_unbuilt_matrices(self):
@@ -989,7 +989,6 @@ class ReportModelTest(unittest.TestCase):
         first = collect_report(sources, ReportRequest(report_kind="leaderboard"))
         cache = ScoreCache(sources.cache_path, answers,
                            checkpoint_on_close=False)
-        self.assertTrue(cache.opener_erd_map(ERD_ALL))
         cache.write_opener_erds(
             [(row["word"], row["erd"] + 99.0, 6, 4)
              for row in leaderboard_rows(first["data"])],
@@ -1001,6 +1000,23 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(leaderboard_rows(second["data"]),
                          leaderboard_rows(first["data"]))
         self.assertEqual(second["data"]["counts"], first["data"]["counts"])
+
+    def _store_opener_reductions(self, sources, answers):
+        """Store each finished opener's reduction, as the swarm does.
+
+        The leaderboard reads these rows and never writes them, so a test that
+        wants a stored ranking puts it there the way the worker that finished
+        the opener would.
+        """
+        data = collect_report(
+            sources, ReportRequest(report_kind="leaderboard"))["data"]
+        cache = ScoreCache(sources.cache_path, answers,
+                           checkpoint_on_close=False)
+        for row in leaderboard_rows(data):
+            cache.write_opener_erd(
+                row["word"], ERD_ALL, row["erd"], row["max_remaining_depth"],
+                len(answers))
+        cache.close()
 
     def _standing_sources(self):
         """Three openers that complete, and one that does not.
@@ -1027,7 +1043,7 @@ class ReportModelTest(unittest.TestCase):
         # without the ranking being built, so the response holds no columns
         # for the vocabulary and the ERD arrives exactly.
         answers, sources = self._standing_sources()
-        collect_report(sources, ReportRequest(report_kind="leaderboard"))
+        self._store_opener_reductions(sources, answers)
         data = collect_report(sources, ReportRequest(
             report_kind="leaderboard",
             branch_target=parse_report_branch_target("raise"),
@@ -1048,6 +1064,7 @@ class ReportModelTest(unittest.TestCase):
         # same triple, and a lookup is only worth anything if they agree -- so
         # every ranked opener is looked up and checked against its own row.
         _answers, sources = self._standing_sources()
+        self._store_opener_reductions(sources, _answers)
         data = collect_report(
             sources, ReportRequest(report_kind="leaderboard"))["data"]
         ranking = leaderboard_rows(data)
@@ -1066,7 +1083,7 @@ class ReportModelTest(unittest.TestCase):
         # well would push RAISE past itself and report a rank past the end of
         # the ranking it is in.
         answers, sources = self._standing_sources()
-        collect_report(sources, ReportRequest(report_kind="leaderboard"))
+        self._store_opener_reductions(sources, answers)
         cache = ScoreCache(sources.cache_path, answers,
                            checkpoint_on_close=False)
         cache.write_opener_erds([("raise", 0.5, 1, 2)], ERD_ALL)
@@ -1094,7 +1111,7 @@ class ReportModelTest(unittest.TestCase):
         # from 1 still passes here.  The bounded-window test is what catches
         # that, because its window starts partway down.
         _answers, sources = self._standing_sources()
-        collect_report(sources, ReportRequest(report_kind="leaderboard"))
+        self._store_opener_reductions(sources, _answers)
         for word, position in (("crane", 0), ("slate", 1), ("raise", 2)):
             standing = self._standing_for(sources, word)
             rows = leaderboard_rows({"columns": standing["neighbourhood"]})
@@ -1114,6 +1131,7 @@ class ReportModelTest(unittest.TestCase):
         candidates = ["crane", "slate", "raise", "aisle", "ariel", "irate",
                       "retia", "terai", "arise", "serai", "easel", "aesir"]
         sources = self._leaderboard_sources(answers, candidates)
+        self._store_opener_reductions(sources, answers)
         data = collect_report(
             sources, ReportRequest(report_kind="leaderboard"))["data"]
         ranking = leaderboard_rows(data)
@@ -1139,6 +1157,7 @@ class ReportModelTest(unittest.TestCase):
         candidates = ["crane", "slate", "raise", "aisle", "ariel", "irate",
                       "retia", "terai", "arise", "serai"]
         sources = self._leaderboard_sources(answers, candidates)
+        self._store_opener_reductions(sources, answers)
         ranking = leaderboard_rows(collect_report(
             sources, ReportRequest(report_kind="leaderboard"))["data"])
         self.assertGreater(len(ranking), 4)
@@ -1198,7 +1217,7 @@ class ReportModelTest(unittest.TestCase):
         answers = ["crane", "slate"]
         sources = self._leaderboard_sources(
             answers, ["crane", "slate", "raise", "howdy"])
-        collect_report(sources, ReportRequest(report_kind="leaderboard"))
+        self._store_opener_reductions(sources, answers)
         cache = ScoreCache(sources.cache_path, answers,
                            checkpoint_on_close=False)
         # The row HOWDY would have been left holding by an earlier screen.
@@ -1268,7 +1287,7 @@ class ReportModelTest(unittest.TestCase):
         # and how large the ranked field already is, so the answer is "not yet,
         # and here is how far along the sweep is" rather than a bare refusal.
         _answers, sources = self._standing_sources()
-        collect_report(sources, ReportRequest(report_kind="leaderboard"))
+        self._store_opener_reductions(sources, _answers)
         standing = self._standing_for(sources, "howdy")
         self.assertFalse(standing["available"])
         self.assertEqual(standing["state"], "pending")
@@ -1329,59 +1348,6 @@ class ReportModelTest(unittest.TestCase):
                          {"complete": 1, "pending": 0, "infeasible": 0})
         self.assertEqual([row["word"] for row in leaderboard_rows(data)],
                          ["raise"])
-
-    def test_a_rebuild_over_an_unchanged_cache_writes_no_stored_reductions(self):
-        # The leaderboard is polled, and the cache it writes to is the one the
-        # swarm is writing branch results into.  A build that rewrote every
-        # stored reduction would add WAL traffic proportional to the vocabulary for
-        # a set of values none of which changed, so a reduction is written only when
-        # it differs from the row already there.
-        answers = ["crane", "slate"]
-        sources = self._leaderboard_sources(answers, ["crane", "slate", "raise"])
-        collect_report(sources, ReportRequest(report_kind="leaderboard"))
-        with patch.object(
-            ScoreCache, "publish_opener_erds", autospec=True,
-        ) as published:
-            collect_report(sources, ReportRequest(report_kind="leaderboard"))
-        self.assertTrue(published.call_args_list, "the build published nothing")
-        self.assertEqual(
-            [row for call in published.call_args_list for row in call.args[1]],
-            [])
-        self.assertEqual(
-            [opener for call in published.call_args_list
-             for opener in call.args[2]],
-            [])
-
-    def test_a_stored_reduction_is_deleted_once_its_opener_stops_screening(self):
-        # The stored reduction asserts that every one of an opener's groups holds a
-        # result.  Deleting one of those results falsifies that, so the next
-        # build must take the stored row with it rather than leave it naming a
-        # tree that is gone.
-        answers = ["crane", "slate"]
-        sources = self._leaderboard_sources(answers, ["crane", "howdy"])
-        collided_key = ScoreCache.encode_subset(answers)
-        cache = ScoreCache(sources.cache_path, answers,
-                           checkpoint_on_close=False)
-        cache.write(collided_key, ERD_ALL, "crane", 1.5,
-                    max_depth=2, solve_budget=None)
-        cache.close()
-        collect_report(sources, ReportRequest(report_kind="leaderboard"))
-        cache = ScoreCache(sources.cache_path, answers,
-                           checkpoint_on_close=False)
-        self.assertIn("howdy", cache.opener_erd_map(ERD_ALL))
-        cache._conn.execute(
-            "DELETE FROM branch_best_by_policy WHERE branch_key = ?",
-            (collided_key,))
-        cache.close()
-
-        data = collect_report(
-            sources, ReportRequest(report_kind="leaderboard"))["data"]
-        self.assertNotIn("howdy",
-                         {row["word"] for row in leaderboard_rows(data)})
-        cache = ScoreCache(sources.cache_path, answers,
-                           checkpoint_on_close=False)
-        self.addCleanup(cache.close)
-        self.assertNotIn("howdy", cache.opener_erd_map(ERD_ALL))
 
     def test_leaderboard_reduces_only_the_candidates_its_screen_admits(self):
         # Reducing builds a state dict per response group, so a vocabulary of
@@ -3480,6 +3446,7 @@ class OpenerReportTest(unittest.TestCase):
         for item in range(2):
             queue.mark_done(
                 ScoreCache.encode_subset(ANSWERS[:2] + [f"crane{item:04d}"]))
+        queue.mark_openers_complete(queue.openers_ready_to_complete())
         queue.close()
 
         every = self._openers()
@@ -3578,6 +3545,7 @@ class OpenerReportTest(unittest.TestCase):
         queue.mark_done(branch_keys["salet"][0])
         for key in branch_keys["nurdy"]:
             queue.mark_done(key)
+        queue.mark_openers_complete(queue.openers_ready_to_complete())
         queue.close()
         cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
         cache.write_completed_opener_summary("nurdy", ERD_ALL, 30, 10_000, 5_000)
@@ -3627,6 +3595,7 @@ class OpenerReportTest(unittest.TestCase):
         )
         queue.mark_done(salet_key)
         queue.mark_done(crane_key)
+        queue.mark_openers_complete(queue.openers_ready_to_complete())
         queue.close()
         cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
         cache.write_completed_opener_summary("salet", ERD_ALL, 40, 30_000, 2_000)

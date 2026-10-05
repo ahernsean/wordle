@@ -1584,6 +1584,32 @@ class ScoreCache:
                 "publish_opener_erds(%d stored, %d retired, %s) failed: %s",
                 len(rows), len(retired_openers), policy, exc)
 
+    def opener_names_with_erd(self, policy):
+        """The openers whose ERD is stored for this answer list."""
+        return {row["opener"] for row in self._conn.execute(
+            "SELECT opener FROM opener_erd_by_policy "
+            "WHERE policy = ? AND answer_list_id = ?",
+            (policy, self.answer_list_id))}
+
+    def write_opener_erd(self, opener, policy, erd, max_remaining_depth,
+                         response_group_count):
+        """Store one opener's reduced ERD.
+
+        Unlike `write` and `write_decomposition`, a failed write raises, disk
+        errors included.  Those swallow because a missing row only costs a
+        recomputation; here the caller marks the opener done on the strength of
+        this row existing, so continuing past a failed write would record an
+        opener done with no ERD.  The same opener and values replace
+        themselves, which is what makes a repeated reduction harmless.
+        """
+        self._conn.execute(
+            """INSERT OR REPLACE INTO opener_erd_by_policy
+                   (opener, policy, answer_list_id, erd, max_remaining_depth,
+                    response_group_count, folded_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (opener.lower(), policy, self.answer_list_id, erd,
+             max_remaining_depth, response_group_count, int(time.time())))
+
     def write_opener_erds(self, rows, policy, folded_at=None):
         """Store reductions for openers whose whole tree is solved."""
         self.publish_opener_erds(rows, (), policy, folded_at)

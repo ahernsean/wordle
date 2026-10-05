@@ -117,3 +117,35 @@ def reduce_candidate_erd(response_groups, group_budget):
         "infeasible_group_count": infeasible_group_count,
         "response_group_count": len(response_groups),
     }
+
+
+def reduce_opener(opener, all_answers, response_cache, score_cache, policy,
+                  group_budget):
+    """Reduce one opener's response groups, read from cached branch results.
+
+    `response_cache` partitions the answer list by the opener's response
+    patterns and `score_cache` supplies each group's result at `group_budget`;
+    both are used through the methods named here, so this module imports
+    neither.  An opener spends the first guess, so the caller's budget is the
+    root budget less one.  The partition is the same one the word report
+    uses, which is what keeps a stored reduction and a report of the same
+    opener from disagreeing.
+    """
+    groups = response_cache.group_words(opener, all_answers)
+    rows = []
+    for pattern_code, answer_words in sorted(groups.items()):
+        if answer_words:
+            rows.append((fmt_pattern(pattern_code), len(answer_words),
+                         score_cache.encode_subset(answer_words)))
+    states = score_cache.report_branch_states(
+        [branch_key for _pattern, _count, branch_key in rows], policy,
+        group_budget)
+    return reduce_candidate_erd(
+        [{
+            "pattern": pattern,
+            "answer_count": answer_count,
+            "best_erd": states[bytes(branch_key)]["best_erd"],
+            "max_remaining_depth": states[bytes(branch_key)]["max_remaining_depth"],
+            "cache_state": states[bytes(branch_key)]["cache_state"],
+        } for pattern, answer_count, branch_key in rows],
+        group_budget)

@@ -131,6 +131,7 @@ from erd_queue import (
     disk_stats,
     encode_subset,
 )
+from erd_reduction import reduce_opener
 import erd_swarm
 
 ANSWER_FILE = DEFAULT_ANSWER_LIST_PATH
@@ -1401,6 +1402,67 @@ def cmd_queue_reconcile_orphaned_ownership(args):
           f'{", ".join(str(b) for b in branch_ids)}')
 
 
+# ---------------------------------------------------------------------------
+# reconcile-opener-erds
+# ---------------------------------------------------------------------------
+
+def cmd_reconcile_opener_erds(args):
+    """Store the ERD of every opener that is done or ready but has none.
+
+    The swarm stores an opener's ERD as the last step of finishing it, so this
+    finds nothing in normal operation.  It exists for the openers finished
+    before that was so, and for the exceptional case where a worker died, or a
+    write failed, between resolving an opener's last branch and storing its
+    ERD.  Safe to run beside a live swarm: the reduction is a pure function of
+    cached results and a row is replaced with identical values.
+    """
+    answers = load_word_list(ANSWER_FILE)
+    queue = ERDQueue(args.queue)
+    cache = ScoreCache(args.cache, answers)
+    try:
+        response_cache = ResponseCache(answers, cache)
+        ready = set(queue.openers_ready_to_complete())
+        owing = sorted(
+            (set(queue.completed_opener_names()) | ready)
+            - cache.opener_names_with_erd(ERD_ALL))
+        stored, infeasible, pending, failed, finished = [], [], [], [], []
+        for opener in owing:
+            reduction = reduce_opener(
+                opener, answers, response_cache, cache, ERD_ALL,
+                GAME_GUESSES - 1)
+            if reduction['state'] == 'pending':
+                pending.append(opener)
+                continue
+            if reduction['state'] == 'infeasible':
+                infeasible.append(opener)
+            else:
+                try:
+                    cache.write_opener_erd(
+                        opener, ERD_ALL, reduction['erd'],
+                        reduction['max_remaining_depth'],
+                        reduction['response_group_count'])
+                except sqlite3.Error as error:
+                    failed.append(f'{opener} ({error})')
+                    continue
+                stored.append(opener)
+            if opener in ready:
+                finished.append(opener)
+        queue.mark_openers_complete(finished)
+    finally:
+        cache.close()
+        queue.close()
+    print(f'{len(owing):,} opener(s) owed an ERD: stored {len(stored):,}, '
+          f'finished {len(finished):,}.')
+    if infeasible:
+        print(f'Infeasible (done, no ERD): {", ".join(infeasible)}')
+    if pending:
+        print(f'Not reducible, response groups unsettled: {", ".join(pending)}')
+    if failed:
+        print(f'Could not store: {", ".join(failed)}')
+    if pending or failed:
+        sys.exit(1)
+
+
 def _normalize_queue_cli_args(args):
     """Apply the queue-level path to nested mutation commands."""
     if args.cmd != 'queue':
@@ -1757,6 +1819,13 @@ def main():
                        help='Reason shown when run refuses to start')
     p_sds.add_argument('--queue', default=argparse.SUPPRESS, metavar='PATH')
 
+    # -- reconcile-opener-erds --
+    p_roe = sub.add_parser(
+        'reconcile-opener-erds',
+        help='Store the ERD of every done opener that has none')
+    p_roe.add_argument('--queue', default=DEFAULT_QUEUE, metavar='PATH')
+    p_roe.add_argument('--cache', default=DEFAULT_CACHE, metavar='PATH')
+
     # -- epoch --
     p_epoch = sub.add_parser(
         'epoch', help='Show or change the telemetry epoch'
@@ -1930,6 +1999,7 @@ def main():
         'restart': cmd_restart,
         'run': cmd_run,
         'view': cmd_view,
+        'reconcile-opener-erds': cmd_reconcile_opener_erds,
     }
     dispatch[args.cmd](args)
 

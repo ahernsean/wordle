@@ -29,7 +29,8 @@ SWARM.md for the stopped-swarm procedure required to change it.
 Queue mutations remain grouped under `erd_search.py queue`: `add`, `remove`,
 `clear`, `priority`, `opener-priority`, `reset-stale`, and
 `reconcile-orphaned-ownership`. The `queue` group has no read-only dashboard
-commands.
+commands.  `erd_search.py reconcile-opener-erds` is top-level because it writes
+the cache as well as reading the queue.
 
 ### Numba is optional, and only one function uses it
 
@@ -459,16 +460,31 @@ as `missing`, and the candidate reads `pending` — never reduced in.
 Do not reintroduce a durable memo keyed by branch, and do not add one to
 `EXPORT_TABLES`/`TABLES`.
 
-**One reduction is stored, and only because it can be rechecked for less than it
-costs to keep honest.**  `opener_erd_by_policy` holds each completed opener's
-own ERD: one row per candidate word, bounded at the vocabulary rather than at
-every (branch, candidate) pair the dropped `candidate_erd_by_policy` was keyed
-by.  That bound is what makes the difference.  A reader does not trust a stored
-row — `_screen_and_reduce_openers` rescreens every opener's groups against
-current branch results on every build, and `_store_opener_reductions` deletes the
-rows whose openers no longer screen complete.  So a repair or a requeue that
-removes a branch result removes the reductions that read it at the next read, which
-is the guarantee a branch-keyed memo could not give.
+**An opener's reduction is stored, by the worker that finishes the opener.**
+`opener_erd_by_policy` holds each finished opener's own ERD: one row per
+candidate word, bounded at the vocabulary rather than at every (branch,
+candidate) pair the dropped `candidate_erd_by_policy` was keyed by.  The worker
+whose branch finalize resolves an opener's last branch reduces its response
+groups, stores the row, records the completion timing, and only then marks the
+opener done (`_BranchWorker._complete_openers`).  That order is forced: the
+queue and the cache are separate databases with no shared transaction, so
+flipping first would leave a window in which an opener is done with no ERD.
+A failure before the flip leaves the opener not done, which is true, and
+`ERDQueue.openers_ready_to_complete` offers it again at the next finalize
+anywhere.  `ScoreCache.write_opener_erd` raises on a failed write, disk errors
+included, because the flip is conditioned on the row existing.
+
+An opener is done when no further computation is needed on it, which in
+practice means its ERD is stored.  Two workers finishing an opener's last two
+branches together can both reduce it; the reduction is a pure function of cached
+results and the row is replaced with identical values, so the repeat is
+harmless and is deliberately not locked against.
+
+A repair, a reverification or a `queue add --delete-erd-cache` is an
+exceptional event and owns its own surgery on the rows it falsifies; nothing
+on the normal path is shaped around it.  `erd_search.py reconcile-opener-erds`
+stores the ERD of any done opener that has none, which is also how openers
+finished before this was so are brought in.
 
 The screen is what makes rescreening affordable.  Reducing a whole vocabulary
 builds a state dict per response group — about 1.4 million of them, nearly all

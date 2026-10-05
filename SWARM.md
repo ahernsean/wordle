@@ -738,6 +738,22 @@ this automatically on every membership resolution (see
 reconcile branches stranded before that existed, or accumulated while the
 swarm was down.
 
+### Store the ERD of openers that lack one
+
+```bash
+python3.13 erd_search.py reconcile-opener-erds
+```
+
+An opener is done when its ERD is stored: the worker that resolves its last
+branch reduces the opener's response groups, stores the row, and only then
+marks the opener done.  This finds nothing in normal operation.  Run it once
+after deploying that behaviour, to store the ERD of every opener that finished
+before it, and again after a crash or a failed write has left an opener
+resolved but not done (the invariant check logs it as "has resolved every
+branch but is not done").  It prints the openers it stored, any that are
+infeasible (done, no ERD), and any whose response groups are unsettled, and
+exits nonzero if some could not be stored.  It is safe beside a live swarm.
+
 ---
 
 ## Cache operations

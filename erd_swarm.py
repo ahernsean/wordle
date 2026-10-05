@@ -33,6 +33,7 @@ import pattern_matrix as pattern_matrix_module
 from cache_sqlite import ScoreCache, mem_cache_limit
 from hint_cache import open_hint_cache
 from erd_lattice import erd_ge
+from erd_reduction import reduce_opener
 from wordle_engine import (
     ERD_ALL,
     GAME_GUESSES,
@@ -1941,22 +1942,68 @@ class _BranchWorker:
                             wall_t0, censored=False)
         return True
 
-    def _snapshot_completed_openers(self, openers):
+    def _complete_openers(self, openers):
+        """Reduce, store and then finish each opener whose last branch resolved.
+
+        An opener is done when its ERD is stored, so the order is forced: the
+        queue and the cache are separate databases, and flipping the opener
+        first would leave a window in which it is done with no ERD.  Any
+        failure before the flip leaves the opener not done, and it is offered
+        again at the next finalize anywhere (`openers_ready_to_complete` is a
+        query over durable state, not a stored obligation).
+
+        Two workers finishing an opener's last two branches together can both
+        arrive here.  The reduction is a pure function of cached results and
+        its row is replaced with identical values, so the repeat is harmless.
+        """
+        finished = []
         for opener in openers or ():
             try:
-                timing = self.queue.completed_opener_timing(opener)
-                if timing["completed_at"] is None:
-                    continue
-                telemetry_epochs = tuple(
-                    int(epoch) for epoch in (timing["telemetry_epochs"] or "").split(",")
-                    if epoch)
-                self.score_cache.write_completed_opener_summary(
-                    opener, ERD_ALL, timing["completed_at"],
-                    (timing["completed_at"] - timing["first_created_at"]) * 1000,
-                    timing["worker_millis"] or 0, telemetry_epochs)
+                if self._reduce_and_store_opener(opener):
+                    finished.append(opener)
             except Exception:
-                logger.exception("%s could not snapshot completed opener %s",
-                                 self.name, opener)
+                logger.exception("%s could not reduce opener %s; it stays "
+                                 "not done", self.name, opener)
+        if finished:
+            self.queue.mark_openers_complete(finished)
+
+    def _reduce_and_store_opener(self, opener):
+        """Store `opener`'s ERD and its completion timing; whether it is done."""
+        reduction = reduce_opener(
+            opener, self.all_answers, self.rcache, self.score_cache, ERD_ALL,
+            GAME_GUESSES - 1)
+        if reduction["state"] == "pending":
+            logger.error(
+                "%s: opener %s has every branch resolved but %d of %d response "
+                "groups have no exact result; leaving it not done",
+                self.name, opener, reduction["response_group_count"]
+                - reduction["resolved_group_count"],
+                reduction["response_group_count"])
+            return False
+        if reduction["state"] == "infeasible":
+            logger.error(
+                "%s: opener %s is infeasible: %d response groups cannot be "
+                "solved within budget; marking it done with no ERD",
+                self.name, opener, reduction["infeasible_group_count"])
+        else:
+            self.score_cache.write_opener_erd(
+                opener, ERD_ALL, reduction["erd"],
+                reduction["max_remaining_depth"],
+                reduction["response_group_count"])
+        self._write_completion_timing(opener)
+        return True
+
+    def _write_completion_timing(self, opener):
+        timing = self.queue.completed_opener_timing(opener)
+        if timing["completed_at"] is None:
+            return
+        telemetry_epochs = tuple(
+            int(epoch) for epoch in (timing["telemetry_epochs"] or "").split(",")
+            if epoch)
+        self.score_cache.write_completed_opener_summary(
+            opener, ERD_ALL, timing["completed_at"],
+            (timing["completed_at"] - timing["first_created_at"]) * 1000,
+            timing["worker_millis"] or 0, telemetry_epochs)
 
     def _finish_bundle(self, branch_key, bundle_id, nodes_at_start, wall_t0,
                        censored):
@@ -2159,7 +2206,7 @@ class _BranchWorker:
                 logger.exception('%s could not requeue branch %s', self.name,
                                  branch_key[:25])
         completed_openers.extend(self.queue.delete_branch(branch_key) or [])
-        self._snapshot_completed_openers(completed_openers)
+        self._complete_openers(completed_openers)
         # Every budget this worker cached an order for: the key carries the
         # branch's budget, and a branch re-created later at a different one
         # must not inherit the finalized branch's order.
@@ -2933,7 +2980,7 @@ class _BranchWorker:
                 budget)
             if reuse is None:
                 break
-            self._snapshot_completed_openers(self.queue.mark_done(claimed['branch_key']))
+            self._complete_openers(self.queue.mark_done(claimed['branch_key']))
 
         n_words = claimed['n_words']
         self.queue.create_branch(
