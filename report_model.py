@@ -1181,9 +1181,7 @@ def _queue_overview(sources, generated_at, answer_set, report):
 def _cache_overview(sources, generated_at, answer_words, report):
     cache = None
     try:
-        cache = ScoreCache(
-            sources.cache_path, answer_words, checkpoint_on_close=False
-        )
+        cache = _open_report_cache(sources, answer_words)
         report["data"]["cache_summary"] = cache.erd_report_summary(
             ERD_ALL, generated_at - 300
         )
@@ -1316,6 +1314,18 @@ def _with_best_guess_is_answer(cache_state, answer_set):
     }
 
 
+def _open_report_cache(sources, answer_words):
+    """Open the score cache for a report: read-only, always.
+
+    A report reads.  What needs computing and persisting is computed upstream
+    by the swarm, so the connection refuses every write rather than relying on
+    each report to abstain.
+    """
+    return ScoreCache(
+        sources.cache_path, answer_words, checkpoint_on_close=False,
+        read_only=True)
+
+
 def _mark_queue_opener_ok(report):
     report["sources"]["queue"]["ok"] = True
     report["sources"]["telemetry"]["ok"] = True
@@ -1363,69 +1373,6 @@ def erd_lattice_numerator(value, answer_count):
     if abs(scaled - numerator) >= ERD_LATTICE_NOISE_MARGIN:
         return None
     return int(numerator)
-
-
-def _screen_and_reduce_openers(cache, skeletons, group_budget, policy):
-    """Reduce every candidate opener that current branch results can settle.
-
-    Reducing a whole vocabulary the way the word report reduces one word costs
-    a per-group state dict for each of ~1.4 million response groups, almost all
-    of them belonging to openers still being searched.  Screening first reads
-    the same facts as two set lookups per group and reaches the reduction only
-    for the openers a reduction can finish, which on a production cache is the
-    small minority.
-
-    The screen visits every group rather than stopping at the first unsettled
-    one, because a candidate holding both an unsettled group and a proven loss
-    is `infeasible` and not `pending` — `reduce_candidate_erd` decides
-    infeasibility ahead of pendency, and a screen that stopped early could
-    exit before reaching the loss that decides it.
-
-    Returns (summaries, counts): one `reduce_candidate_erd` per opener the
-    reduction could settle, and the three-way state tally over the whole
-    vocabulary.  An opener absent from `summaries` is pending, which is what
-    the tally counts it as.
-    """
-    erd_by_key, loss_keys = cache.report_reusable_branch_facts(
-        policy, group_budget)
-    summaries = {}
-    counts = {"complete": 0, "pending": 0, "infeasible": 0}
-    for candidate, groups in skeletons:
-        settled = True
-        holds_loss = False
-        for _pattern, answer_count, branch_key in groups:
-            # A group of fewer than two answers needs no stored result: the
-            # reduction solves it from the response pattern alone.
-            if answer_count < 2:
-                continue
-            if branch_key in loss_keys:
-                holds_loss = True
-            elif branch_key not in erd_by_key:
-                settled = False
-        if not (settled or holds_loss):
-            counts["pending"] += 1
-            continue
-        summary = reduce_candidate_erd(
-            [
-                {
-                    "pattern": pattern,
-                    "answer_count": answer_count,
-                    "best_erd": erd_by_key.get(branch_key, (None, None))[0],
-                    "max_remaining_depth":
-                        erd_by_key.get(branch_key, (None, None))[1],
-                    "cache_state": (
-                        "exact" if branch_key in erd_by_key
-                        else "loss" if branch_key in loss_keys else "missing"
-                    ),
-                }
-                for pattern, answer_count, branch_key in groups
-            ],
-            group_budget,
-        )
-        counts[summary["state"]] += 1
-        if summary["state"] != "pending":
-            summaries[candidate] = summary
-    return summaries, counts
 
 
 def _response_group_key(row: dict, group_by: str) -> tuple:
@@ -1602,9 +1549,7 @@ def collect_word_report(sources: ReportOpeners, request: ReportRequest) -> dict:
     cache = None
     erd_summary = None
     try:
-        cache = ScoreCache(
-            sources.cache_path, all_answers, checkpoint_on_close=False
-        )
+        cache = _open_report_cache(sources, all_answers)
         cache_states = cache.report_branch_states(
             branch_keys, ERD_ALL, group_budget
         )
@@ -2029,9 +1974,7 @@ def collect_root_progress_report(sources: ReportOpeners,
     cache = None
     cache_states = {}
     try:
-        cache = ScoreCache(
-            sources.cache_path, all_answers, checkpoint_on_close=False
-        )
+        cache = _open_report_cache(sources, all_answers)
         cache_states = cache.report_branch_states(
             list(branch_keys_by_pattern.values()), ERD_ALL, group_budget)
         if (not progress["groups"] and not resolved.steps
@@ -2582,9 +2525,7 @@ def collect_branch_report(sources: ReportOpeners, request: ReportRequest) -> dic
     cache = None
     cache_error = None
     try:
-        cache = ScoreCache(
-            sources.cache_path, all_answers, checkpoint_on_close=False
-        )
+        cache = _open_report_cache(sources, all_answers)
     except (sqlite3.Error, OSError) as error:
         cache_error = error
     try:
@@ -3244,55 +3185,6 @@ def collect_workers_report(sources: ReportOpeners, request: ReportRequest) -> di
     return report
 
 
-# One vocabulary's skeletons at a time.  For the full vocabulary this holds
-# ~0.25 GB — every candidate materializes a branch key per response group — so a
-# growing cache in a long-lived report server is a liability; only the most
-# recent vocabulary is retained.
-_candidate_skeleton_memo = None
-
-
-def _candidate_group_skeletons(sources, all_answers, all_candidates, cache):
-    """Per-candidate top-level response groups as (pattern, count, branch_key).
-
-    Partitioning every candidate against the answer list is the expensive part
-    of a leaderboard build (~9s for the full vocabulary) and depends only on the
-    vocabulary, not the cache, so it is memoized and reused across builds.  The
-    skeletons are large (~0.25 GB for the full vocabulary), so only the most
-    recent vocabulary is kept, and the 243 distinct pattern strings are shared
-    rather than reformatted per group.  Keyed on the list files' paths and
-    mtimes, so a changed list rebuilds without re-hashing the vocabulary.
-    """
-    global _candidate_skeleton_memo
-    memo_key = (
-        sources.answer_list_path, os.path.getmtime(sources.answer_list_path),
-        sources.candidate_list_path,
-        os.path.getmtime(sources.candidate_list_path),
-    )
-    if _candidate_skeleton_memo is not None and _candidate_skeleton_memo[0] == memo_key:
-        return _candidate_skeleton_memo[1]
-    matrix = PatternMatrix.load_or_build(
-        sources.cache_path, all_candidates, all_answers, cache
-    )
-    branch_indices = matrix.answer_indices(all_answers)
-    branch_words = list(all_answers)
-    pattern_text = {code: fmt_pattern(code) for code in range(3 ** 5)}
-    skeletons = [
-        (
-            candidate,
-            [
-                (pattern_text[pattern], len(words), ScoreCache.encode_subset(words))
-                for pattern, words in matrix.group_words(
-                    candidate, branch_words, branch_indices
-                ).items()
-                if words
-            ],
-        )
-        for candidate in all_candidates
-    ]
-    _candidate_skeleton_memo = (memo_key, skeletons)
-    return skeletons
-
-
 def leaderboard_rows(data):
     """The ranking's columns read back as one dict per row, in rank order.
 
@@ -3400,47 +3292,31 @@ def _leaderboard_columns(ranked, answer_count, answer_set, first_rank=1):
     }
 
 
-def _opener_standing(cache, word, summary, answer_count, answer_set):
+def _opener_standing(cache, word, stored, answer_count, answer_set):
     """One opener's place in the ranking, without building the ranking.
 
     The question is "where does TARSE stand", and the whole answer is four
     facts: its ERD, its rank, the share of the field it beats, and the
-    openers either side of it.  Rank and the neighbourhood come from
-    `opener_erd_by_policy`, which holds one row per completed opener, so the
-    answer is two counts and two bounded seeks rather than a screen of the
-    vocabulary.
+    openers either side of it.  All of it comes from `opener_erd_by_policy`,
+    which holds one row per finished opener, so the answer is two counts and
+    two bounded seeks.
 
-    `summary` is this opener's own reduction, screened against current branch
-    results.  The field it is placed in is whatever the last leaderboard build
-    stored, so the ERD is as fresh as this request and the rank as fresh as
-    that build.  That asymmetry is the trade the lookup is: rescreening the
-    vocabulary to place one word costs more than the ranking it would place
-    the word in.  It narrows as the stored reductions become the build's own
-    answer rather than its output (#384).
-
-    So `ranked_total` is the size of the field as the last build left it, and
-    it is reported rather than assumed: on a cache no build has screened yet
-    the only row is this opener's own and the answer is "rank 1 of 1", which
-    says the field is empty instead of implying a place in one.
-
-    A word the vocabulary does not hold is `absent`; one whose tree is
-    unfinished carries the reduction's own `pending` or `infeasible` and the
-    size of the field it is not yet in.  Neither is an error -- asking about an
-    opener
-    the sweep has not reached is an ordinary thing to do -- and the two are
-    kept apart because "no such word" and "still being solved" are different
-    answers.
+    `stored` is the opener's stored (erd, max_remaining_depth), or None when
+    it has none, which makes it `pending` and carries the size of the field it
+    is not yet in.  A word the vocabulary does not hold is `absent`, and the
+    caller answers that before asking here.  Neither is an error -- asking
+    about an opener the sweep has not reached is an ordinary thing to do --
+    and the two are kept apart because "no such word" and "still being solved"
+    are different answers.
     """
-    if summary is None:
-        return {"word": word, "available": False, "state": "absent"}
-    if summary["state"] != "complete":
+    if stored is None:
         return {
             "word": word,
             "available": False,
-            "state": summary["state"],
-            "ranked_total": cache.ranked_opener_count(ERD_ALL, word),
+            "state": "pending",
+            "ranked_total": cache.ranked_opener_count(ERD_ALL),
         }
-    erd = summary["erd"]
+    erd, max_remaining_depth = stored
     numerator = erd_lattice_numerator(erd, answer_count)
     if numerator is None:
         raise ValueError(
@@ -3449,8 +3325,7 @@ def _opener_standing(cache, word, summary, answer_count, answer_set):
             f"integer line lengths and cannot be off this lattice"
         )
     standing = cache.opener_standing(
-        ERD_ALL, word, erd, summary["max_remaining_depth"],
-        LEADERBOARD_NEIGHBOUR_COUNT)
+        ERD_ALL, word, erd, max_remaining_depth, LEADERBOARD_NEIGHBOUR_COUNT)
     above, below = standing["above"], standing["below"]
     rank, ranked_total = standing["rank"], standing["ranked_total"]
     return {
@@ -3460,7 +3335,7 @@ def _opener_standing(cache, word, summary, answer_count, answer_set):
         "word_is_answer": word in answer_set,
         "erd_numerator": numerator,
         "erd_denominator": answer_count,
-        "max_remaining_depth": summary["max_remaining_depth"],
+        "max_remaining_depth": max_remaining_depth,
         "rank": rank,
         "ranked_total": ranked_total,
         # The share of the ranked field this opener strictly beats, so it
@@ -3474,31 +3349,23 @@ def _opener_standing(cache, word, summary, answer_count, answer_set):
         # So the window is contiguous, and `position` is the index within it
         # that the question was about.
         "neighbourhood": _leaderboard_columns(
-            [*above, (erd, summary["max_remaining_depth"], word), *below],
+            [*above, (erd, max_remaining_depth, word), *below],
             answer_count, answer_set, first_rank=rank - len(above)),
         "position": len(above),
     }
 
 
-def _one_opener_answer(sources, cache, all_answers, all_candidates, word,
-                       group_budget, answer_set):
+def _one_opener_answer(cache, all_answers, all_candidates, word, answer_set):
     """Everything one named opener's own question needs, and nothing else.
 
-    Two answers come out of one reduction.  `detail` is the opener's
+    Two answers come out of one stored row.  `detail` is the opener's
     response-group breakdown, which is what an opened card in the ranking
-    wants; `standing` is
-    where the opener sits in the ranking, which is what a reader who named a
-    word and holds no ranking at all wants.  Both rest on the same screen of
-    this opener's groups, so they are produced together rather than by two
-    requests that would each pay for it.
+    wants; `standing` is where the opener sits in the ranking, which is what
+    a reader who named a word and holds no ranking at all wants.  The ranking
+    itself is not read, so a reader who opened a few cards does not displace
+    the ranking's own cache entry.
 
-    A card is opened one at a time, so the work is one candidate's partition
-    against the answer list and a reduction over its own groups -- milliseconds,
-    against the seconds a vocabulary screen costs.  Asking for the ranking here
-    would also displace the ranking's own cache entry, so a reader who opened a
-    few cards would make the next poll rebuild the thing they were reading.
-
-    A word the vocabulary does not hold, or one whose tree is unfinished, is
+    A word the vocabulary does not hold, or one with no stored ERD, is
     answered rather than refused: asking about an opener the sweep has not
     reached is an ordinary thing for a client to do.
     """
@@ -3506,81 +3373,57 @@ def _one_opener_answer(sources, cache, all_answers, all_candidates, word,
         return {
             "detail": {"word": word, "available": False,
                        "response_groups": []},
+            "standing": {"word": word, "available": False, "state": "absent"},
+        }
+    stored = cache.opener_erd(ERD_ALL, word)
+    if stored is None:
+        return {
+            "detail": {"word": word, "available": False,
+                       "response_groups": []},
             "standing": _opener_standing(
                 cache, word, None, len(all_answers), answer_set),
         }
-    matrix = PatternMatrix.load_or_build(
-        sources.cache_path, all_candidates, all_answers, cache)
-    pattern_text = {code: fmt_pattern(code) for code in range(3 ** 5)}
-    groups = [
-        (pattern_text[pattern], len(words), ScoreCache.encode_subset(words))
-        for pattern, words in matrix.group_words(
-            word, list(all_answers), matrix.answer_indices(all_answers)
-        ).items()
-        if words
-    ]
-    # Bounded to this opener's own groups.  _screen_and_reduce_openers loads
-    # every reusable branch fact in the cache -- 652,989 rows, about 1.9s --
-    # because it screens the whole vocabulary; a single card needs the states
-    # of its own 158, which is one indexed read.
-    states = cache.report_branch_states(
-        [key for _pattern, _count, key in groups], ERD_ALL, group_budget)
-    summary = reduce_candidate_erd(
-        [
-            {
-                "pattern": pattern,
-                "answer_count": count,
-                "best_erd": states[key]["best_erd"],
-                "max_remaining_depth": states[key]["max_remaining_depth"],
-                "cache_state": states[key]["cache_state"],
-            }
-            for pattern, count, key in groups
-        ],
-        group_budget,
-    )
+    groups = ResponseCache(all_answers, score_cache=cache).group_words(
+        word, list(all_answers))
     return {
-        "detail": _leaderboard_detail(word, summary, groups, answer_set),
+        "detail": _leaderboard_detail(word, [
+            (fmt_pattern(code), len(words))
+            for code, words in groups.items() if words
+        ], answer_set),
         "standing": _opener_standing(
-            cache, word, summary, len(all_answers), answer_set),
+            cache, word, stored, len(all_answers), answer_set),
     }
 
 
-def _leaderboard_detail(word, summary, response_group_skeletons, answer_set):
+def _leaderboard_detail(word, response_groups, answer_set):
     """One opener's response-group breakdown, for a card that was opened.
 
-    Absent or incomplete openers return a detail that says so rather than an
-    error: asking for a word the ranking does not hold is an ordinary thing for
-    a client to do while the sweep is still running.
+    `response_groups` is (pattern, answer_count) for each group.  Absent or
+    unfinished openers return a detail that says so rather than an error:
+    asking for a word the ranking does not hold is an ordinary thing for a
+    client to do while the sweep is still running.
     """
-    if summary is None or summary["state"] != "complete" or not response_group_skeletons:
-        return {"word": word, "available": False, "response_groups": []}
     return {
         "word": word,
         "available": True,
         "word_is_answer": word in answer_set,
-        "answer_count": sum(count for _, count, _ in response_group_skeletons),
+        "answer_count": sum(count for _, count in response_groups),
         "response_groups": [
             {"pattern": pattern, "answer_count": count}
-            for pattern, count, _ in sorted(
-                response_group_skeletons, key=lambda group: group[1],
-                reverse=True)
+            for pattern, count in sorted(
+                response_groups, key=lambda group: group[1], reverse=True)
         ],
     }
 
 
 def collect_leaderboard_report(sources: ReportOpeners, request: ReportRequest) -> dict:
-    """Rank every candidate opener by its own ERD.
+    """Rank every finished opener by its own ERD.
 
-    Each candidate's ERD is reduced exactly as the word report reduces it
-    (`reduce_candidate_erd`), over branch states read through the cache's own
-    reusability gate, so the numbers agree with `view WORD`.  Only openers
-    whose whole tree is solved have a finite ERD and appear ranked; the rest
-    are summarized as pending or infeasible.
-
-    Every candidate is rescreened against current cache state on every build,
-    and `_screen_and_reduce_openers` reaches the reduction only for the openers
-    a reduction can settle, so the ranking is a description of the cache as it
-    stands.  A report never stores what it computes.
+    The ranking is an ordered read of the ERDs the swarm stored as it finished
+    each opener, so the numbers agree with `view WORD`, which reduces the same
+    groups.  Only openers whose ERD is stored are ranked; every other
+    candidate is counted as pending.  Nothing is computed here and nothing is
+    written: an opener's ERD is the swarm's to produce.
     """
     generated_at = int(time.time())
     all_answers = load_word_list(sources.answer_list_path)
@@ -3590,7 +3433,6 @@ def collect_leaderboard_report(sources: ReportOpeners, request: ReportRequest) -
     report = _semantic_report(
         "leaderboard", sources, request.branch_target, generated_at, data, request
     )
-    group_budget = GAME_GUESSES - 1
     limit = request.filters.limit
     # A bare opener only: a deeper spine names a branch inside a tree, not a
     # row of this ranking.
@@ -3599,51 +3441,34 @@ def collect_leaderboard_report(sources: ReportOpeners, request: ReportRequest) -
                    if target.kind == "word" and not target.steps else None)
     cache = None
     try:
-        cache = ScoreCache(
-            sources.cache_path, all_answers, checkpoint_on_close=False
-        )
+        cache = _open_report_cache(sources, all_answers)
         if detail_word:
             # One opener's groups and its place in the ranking, and nothing
-            # else.  Screening the whole vocabulary to answer a question about
-            # a single word would cost more than the ranking that word sits
-            # in, and would send the columns back to a client already holding
-            # them.
+            # else: the response would otherwise send the columns back to a
+            # client already holding them.
             data.update(_one_opener_answer(
-                sources, cache, all_answers, all_candidates, detail_word,
-                group_budget, answer_set))
+                cache, all_answers, all_candidates, detail_word, answer_set))
             report["sources"]["cache"]["ok"] = True
             return report
-        skeletons = _candidate_group_skeletons(
-            sources, all_answers, all_candidates, cache
-        )
-        data["maximum_response_group_count"] = max(
-            (len(groups) for _, groups in skeletons),
-            default=0,
-        )
-        summaries, counts = _screen_and_reduce_openers(
-            cache, skeletons, group_budget, ERD_ALL
-        )
-        groups_by_candidate = dict(skeletons)
-        ranked = sorted(
-            (
-                (summary["erd"], summary["max_remaining_depth"], candidate)
-                for candidate, summary in summaries.items()
-                if summary["state"] == "complete"
-            )
-        )
-        displayed = ranked[:limit] if limit is not None else ranked
+        ranked = cache.ranked_openers(ERD_ALL, limit)
+        complete_count = cache.ranked_opener_count(ERD_ALL)
+        maximum_response_group_count = (
+            cache.maximum_opener_response_group_count(ERD_ALL))
         # Every opener partitions the whole answer list, so the count -- and
         # therefore the ERD denominator -- is one number for the ranking rather
         # than a copy per row.
         answer_count = len(all_answers)
-        columns = _leaderboard_columns(displayed, answer_count, answer_set)
-        # Publish only after the whole vocabulary is reduced.  A mid-loop cache
-        # error must not leave a truncated ranking that reads as complete.
+        columns = _leaderboard_columns(ranked, answer_count, answer_set)
+        if maximum_response_group_count is not None:
+            data["maximum_response_group_count"] = maximum_response_group_count
         data.update({
             "candidate_count": len(all_candidates),
-            "counts": counts,
-            "total_rows": len(ranked),
-            "matched_rows": len(ranked),
+            "counts": {
+                "complete": complete_count,
+                "pending": len(all_candidates) - complete_count,
+            },
+            "total_rows": complete_count,
+            "matched_rows": complete_count,
             "answer_count": answer_count,
             "columns": columns,
         })
@@ -3652,7 +3477,7 @@ def collect_leaderboard_report(sources: ReportOpeners, request: ReportRequest) -
         report["sources"]["cache"]["error"] = str(error)
         data.update({
             "candidate_count": len(all_candidates),
-            "counts": {"complete": 0, "pending": 0, "infeasible": 0},
+            "counts": {"complete": 0, "pending": 0},
             "total_rows": 0,
             "matched_rows": 0,
             "rows": [],
@@ -3679,9 +3504,7 @@ def collect_cache_report(sources: ReportOpeners, request: ReportRequest) -> dict
         _mark_queue_opener_error(report, error)
     cache = None
     try:
-        cache = ScoreCache(
-            sources.cache_path, all_answers, checkpoint_on_close=False
-        )
+        cache = _open_report_cache(sources, all_answers)
         branch_target = request.branch_target
         if branch_target.kind == "root":
             limit = request.filters.limit or 50
@@ -4461,8 +4284,7 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
         all_answers = None
         try:
             all_answers = load_word_list(sources.answer_list_path)
-            timing_cache = ScoreCache(sources.cache_path, all_answers,
-                                      checkpoint_on_close=False)
+            timing_cache = _open_report_cache(sources, all_answers)
             timings = timing_cache.completed_opener_summary_map(ERD_ALL)
         except (sqlite3.Error, OSError) as error:
             timings = {}

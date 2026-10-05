@@ -21,6 +21,7 @@ import tempfile
 import time
 import unittest
 
+from tests.opener_erds import store_opener_erds
 from cache_sqlite import ScoreCache, branch_reference
 from erd_queue import ERDQueue
 from report_model import (
@@ -89,6 +90,9 @@ class ReportPipelineTest(unittest.TestCase):
         cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
         cache.write(self.branch_key, ERD_ALL, "crane", 2.25, max_depth=3)
         cache.close()
+        # The swarm stores an opener's ERD when it finishes the opener, and the
+        # leaderboard reads what it stored.
+        store_opener_erds(self.cache_path, ANSWERS, self.candidate_list_path)
 
     def tearDown(self):
         self.temporary_directory.cleanup()

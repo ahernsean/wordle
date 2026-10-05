@@ -447,60 +447,6 @@ class ReportingTest(_CacheTest):
             score_cache.report_branch_state(self.key, ERD_ALL, budget=2)
             ["cache_state"], "missing")
 
-    def test_the_lean_facts_agree_with_a_single_lookup_at_every_budget(self):
-        # report_reusable_branch_facts decides in SQL what
-        # _report_cache_state_from_rows decides per branch in Python.  Two
-        # spellings of one rule drift, so the test asserts they agree rather
-        # than restating either: a branch carrying an unrestricted result, a
-        # budget-specific one and a proven loss exercises every arm of the
-        # precedence at once.
-        score_cache = self.cache()
-        other_key = ScoreCache.encode_subset(WORDS[:2])
-        loss_key = ScoreCache.encode_subset(WORDS[:3])
-        score_cache.write(self.key, ERD_ALL, "crane", 2.0, max_depth=4)
-        score_cache.write(self.key, ERD_ALL, "slate", 2.5, max_depth=3,
-                          solve_budget=3)
-        # Both results apply at budget 5: the unrestricted one fits there, and
-        # a budget-specific row is stored at exactly that budget.  Without this
-        # pair no budget exercises the precedence, and a loader that let the
-        # budget-specific row displace the unrestricted one would agree with a
-        # single lookup everywhere the fixture looked.
-        score_cache.write(self.key, ERD_ALL, "trace", 2.9, max_depth=5,
-                          solve_budget=5)
-        score_cache.write(other_key, ERD_ALL, "trace", 2.2, max_depth=2,
-                          solve_budget=2)
-        score_cache.write_loss(loss_key, ERD_ALL, 4)
-        keys = [self.key, other_key, loss_key]
-
-        for budget in range(0, 7):
-            erd_by_key, loss_keys = score_cache.report_reusable_branch_facts(
-                ERD_ALL, budget)
-            states = score_cache.report_branch_states(keys, ERD_ALL, budget)
-            for key in keys:
-                state = states[key]
-                with self.subTest(budget=budget, key=key.hex()):
-                    if state["cache_state"] == "exact":
-                        self.assertEqual(
-                            erd_by_key.get(key),
-                            (state["best_erd"], state["max_remaining_depth"]))
-                    else:
-                        self.assertNotIn(key, erd_by_key)
-                    self.assertEqual(
-                        key in loss_keys, state["cache_state"] == "loss")
-
-    def test_the_bulk_maps_select_the_same_result_as_a_single_lookup(self):
-        score_cache = self.cache()
-        score_cache.write(self.key, ERD_ALL, "crane", 2.0, max_depth=5)
-        score_cache.write(self.key, ERD_ALL, "slate", 2.5, max_depth=3,
-                          solve_budget=3)
-        exact_by_key, loss_by_key = score_cache.report_branch_row_maps(ERD_ALL)
-        for budget in (None, 2, 3, 5):
-            self.assertEqual(
-                score_cache.report_branch_states_from_maps(
-                    [self.key], exact_by_key, loss_by_key, budget)[self.key],
-                score_cache.report_branch_states([self.key], ERD_ALL, budget)[self.key],
-                f"maps and query disagree at budget {budget}")
-
     def test_delete_clears_every_scope(self):
         score_cache = self.cache()
         score_cache.write(self.key, ERD_ALL, "crane", 2.0, max_depth=4)
@@ -1135,8 +1081,6 @@ class PreSplitReadOnlyTest(_CacheTest):
         self.assertEqual(
             score_cache.report_branch_state(self.key, ERD_ALL, budget=3)
             ["best_guess"], "crane")
-        exact_by_key, _loss = score_cache.report_branch_row_maps(ERD_ALL)
-        self.assertIn(self.key, exact_by_key)
 
     def test_a_cache_older_than_solve_budget_still_opens(self):
         # Older still: no solve_budget column at all, so every row is an

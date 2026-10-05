@@ -2334,7 +2334,7 @@
     }
     function renderLeaderboard(report,previous,state){
       const data=report.data,fragment=document.createDocumentFragment(),counts=data.counts||{},metrics=element("div","metrics");
-      metrics.append(metric("complete",counts.complete),metric("pending",counts.pending),metric("infeasible",counts.infeasible),metric("candidates",data.candidate_count));
+      metrics.append(metric("complete",counts.complete),metric("pending",counts.pending),metric("candidates",data.candidate_count));
       fragment.append(element("h2","","Opener leaderboard"),metrics);
       const rows=leaderboardRows(data);
       const maximumResponseGroupCount=data.maximum_response_group_count||data.response_pattern_count||243;
@@ -2758,7 +2758,7 @@
       return JSON.stringify(semanticProjection(shape(report.data)))!==JSON.stringify(semanticProjection(shape(previousReport.data)));
     }
     function refreshLeaderboardMetrics(report){
-      const counts=report.data.counts||{},values=[counts.complete,counts.pending,counts.infeasible,report.data.candidate_count];
+      const counts=report.data.counts||{},values=[counts.complete,counts.pending,report.data.candidate_count];
       byId("report").querySelectorAll("h2 + .metrics .metric strong").forEach((node,index)=>{node.textContent=valueOrDash(values[index]);});
     }
     // Settle an owed render.  The report is redrawn as its own predecessor

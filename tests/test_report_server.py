@@ -1,6 +1,7 @@
 """Tests for the read-only HTTP report adapter."""
 
 from contextlib import contextmanager
+from cache_sqlite import ScoreCache
 import errno
 from http.server import ThreadingHTTPServer
 from threading import Event, Lock, Thread
@@ -102,6 +103,11 @@ class ReportServerTest(unittest.TestCase):
             self.sources.queue_path, telemetry_path=self.sources.telemetry_path
         )
         queue.close()
+        # Reports open the cache read-only and never create it.
+        ScoreCache(self.sources.cache_path,
+                   self.sources.answer_list_path and
+                   open(self.sources.answer_list_path).read().split(),
+                   checkpoint_on_close=False).close()
         self.live_configuration = ServerConfiguration(self.sources, CLIENT_PATH)
 
     def test_everyday_reports_return_within_one_second(self):
