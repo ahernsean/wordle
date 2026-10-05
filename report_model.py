@@ -3450,10 +3450,10 @@ def collect_leaderboard_report(sources: ReportOpeners, request: ReportRequest) -
                 cache, all_answers, all_candidates, detail_word, answer_set))
             report["sources"]["cache"]["ok"] = True
             return report
-        ranked = cache.ranked_openers(ERD_ALL, limit)
-        complete_count = cache.ranked_opener_count(ERD_ALL)
-        maximum_response_group_count = (
-            cache.maximum_opener_response_group_count(ERD_ALL))
+        ranking = cache.opener_ranking(ERD_ALL, limit)
+        ranked = ranking["rows"]
+        complete_count = ranking["count"]
+        maximum_response_group_count = ranking["maximum_response_group_count"]
         # Every opener partitions the whole answer list, so the count -- and
         # therefore the ERD denominator -- is one number for the ranking rather
         # than a copy per row.

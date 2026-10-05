@@ -1396,6 +1396,28 @@ class ScoreCache:
                 WHERE policy = ? AND answer_list_id = ?""",
             (policy, self.answer_list_id)).fetchone()[0]
 
+    def opener_ranking(self, policy, limit=None):
+        """The ranking, and the facts that describe it, from one snapshot.
+
+        The swarm stores a row whenever it finishes an opener, so reads taken
+        in separate autocommit statements can describe different fields: a
+        count that includes a row the rows do not, or a response-group scale
+        taken over another population again.  One read transaction holds the
+        version they share.
+        """
+        self._conn.execute("BEGIN")
+        try:
+            return {
+                "rows": self.ranked_openers(policy, limit),
+                "count": self.ranked_opener_count(policy),
+                "maximum_response_group_count":
+                    self.maximum_opener_response_group_count(policy),
+            }
+        finally:
+            # A read transaction holds a snapshot and nothing else, so it ends
+            # the same way whether or not the reads raised.
+            self._conn.execute("ROLLBACK")
+
     def opener_standing(self, policy, opener, erd, max_remaining_depth,
                         neighbour_count):
         """Where one opener sits in the stored ranking, without loading it.

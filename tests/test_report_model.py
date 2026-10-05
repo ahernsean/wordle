@@ -2470,6 +2470,44 @@ class ReportModelTest(unittest.TestCase):
 
         self.assertEqual(fingerprint(), before)
 
+    def test_a_ranking_and_its_count_describe_one_field(self):
+        """The swarm stores a row whenever it finishes an opener, so rows read
+        and then counted in separate statements can disagree about the field."""
+        answers = ["crane", "slate"]
+        sources = self._leaderboard_sources(
+            answers, ["crane", "slate", "raise", "howdy"])
+        self._store_opener_reductions(sources, answers)
+        reader = ScoreCache(sources.cache_path, answers,
+                            checkpoint_on_close=False, read_only=True)
+        self.addCleanup(reader.close)
+        writer = ScoreCache(sources.cache_path, answers,
+                            checkpoint_on_close=False)
+        self.addCleanup(writer.close)
+
+        class FinishAnOpenerBeforeTheCount:
+            def __init__(self, connection, on_count):
+                self._connection = connection
+                self._on_count = on_count
+
+            def execute(self, statement, *arguments):
+                if "COUNT(*)" in statement:
+                    self._on_count()
+                return self._connection.execute(statement, *arguments)
+
+            def __getattr__(self, name):
+                return getattr(self._connection, name)
+
+        reader._conn = FinishAnOpenerBeforeTheCount(
+            reader._conn,
+            lambda: writer.write_opener_erd("howdy", ERD_ALL, 3.0, 4, 2))
+
+        ranking = reader.opener_ranking(ERD_ALL)
+
+        self.assertEqual(len(ranking["rows"]), 3)
+        self.assertEqual(ranking["count"], 3)
+        # The next read sees the opener the swarm finished meanwhile.
+        self.assertEqual(reader.opener_ranking(ERD_ALL)["count"], 4)
+
     def test_the_ranking_stops_at_the_limit_but_counts_every_finished_opener(self):
         sources = self._leaderboard_sources(
             ["crane", "slate"], ["crane", "slate", "raise", "howdy"])

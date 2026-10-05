@@ -516,6 +516,12 @@ itself" as covering it: computing an exact ERD for every opener is what the
 swarm is for, and the exceptional operation that deletes those groups deletes
 the row with them.
 
+Its rows are keyed by answer list and carry no candidate-list identity, because
+the candidate list is the fixed vocabulary every queued opener is drawn from.
+Changing that vocabulary is an exceptional operation, and it clears the table
+(`ScoreCache.delete_all_opener_erds`) and runs `reconcile-opener-erds` itself;
+the leaderboard does not filter against the list on every read.
+
 `opener_erd_by_policy` is local to each machine and travels in neither
 `EXPORT_TABLES` nor `TABLES`: it is derived from branch results the export
 already carries, and each machine's swarm stores its own.
