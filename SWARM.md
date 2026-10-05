@@ -295,10 +295,10 @@ requested priority, its state, its own ERD, how many branches it has ever
 owned, how many of those are still open versus done, the live workers on them,
 and how long ago it was requested.
 
-The `ERD` column is the word's own expected remaining depth, folded from the
-cached result of each of its response groups the way the word report folds it:
+The `ERD` column is the word's own expected remaining depth, reduced from the
+cached result of each of its response groups the way the word report reduces it:
 an exact value once every group is solved, `∞` once one is proven unsolvable,
-and `solved/total` groups while it is still being searched. The fold is done
+and `solved/total` groups while it is still being searched. The reduction is done
 only for the rows on the page — about 6 ms a word against the full answer list
 — so a long queue costs no more than a short one. In the browser the same
 number is on each card, and clicking the card opens that word's full report,
@@ -753,8 +753,8 @@ the best strategy over all strategies, reusable at any remaining budget its own
 solve_budget)` — the optimum among strategies feasible at exactly that budget.
 
 Both can be right and differ, which is why they are not one row.  Sharing a key
-made either write destroy the other, after ancestors may already have folded
-the value it displaced, and nothing records which one they folded (issue #302).
+made either write destroy the other, after ancestors may already have reduced
+the value it displaced, and nothing records which one they reduced (issue #302).
 
 A search at budget `b` reads the unrestricted result first and takes it when
 `max_depth <= b`: globally optimal is also optimal within any budget it can
@@ -770,23 +770,23 @@ other reconciles against what that one stored.  A read followed by an insert
 would leave a window two workers both pass through.
 
 Two results are the same certificate only when they agree on cost **and** on
-`max_depth`.  A parent folds a child's worst case into its own, so equal cost
+`max_depth`.  A parent reduces a child's worst case into its own, so equal cost
 with a different worst case is two certificates, not one.
 
 **A second exact result for a branch at a scope it already holds does not
 replace it.**  Two exact searches of one scope agree on the cost, and
 equal-cost strategies can still differ in `max_depth`, so overwriting would
-leave every ancestor that folded the stored depth describing a subtree the
+leave every ancestor that reduced the stored depth describing a subtree the
 cache no longer holds.  A second result that *disagrees* on the cost cannot be
 reconciled that way and raises `CacheWriteConflict` — the two searches cannot
-both be right, and recording either invalidates whichever ancestors folded the
+both be right, and recording either invalidates whichever ancestors reduced the
 other.  Expect that never to fire; if it does, the log line names the branch,
 policy, budget and both values.
 
 An equal-cost result whose worst case differs is not an error: the stored
 certificate stands and `write` returns it for the caller to adopt, so what a
 solver hands its parent is always what the cache holds.  `import_cache` cannot
-adopt — a merge's incoming ancestors are already folded — so it refuses the
+adopt — a merge's incoming ancestors are already reduced — so it refuses the
 merge instead and names both sides.
 
 Counts say which they mean.  `exact_branch_count` counts branches with an
@@ -798,7 +798,7 @@ for a branch count — a branch with results at three budgets is one branch.
 rows into the budget table.  The canonical table is not rebuilt, so the
 migration is a row move on the minority rather than a rewrite of a multi-GB
 file.  Every writable open also drops `candidate_erd_by_policy`: it memoised
-a candidate's folded ERD at an arbitrary branch, which is now derived on every
+a candidate's reduced ERD at an arbitrary branch, which is now derived on every
 read, so the table is derived data with no reader.  The drop is not recorded as
 a migration, because a process running older code recreates the table and a
 migration already marked done would never look again.  An audit-only pass opens
@@ -814,7 +814,7 @@ before merging any export into a migrated cache.
 
 **The quarantined cache is hints-only.**  Moving its rows under the new schema
 does not certify them: nothing in the migration re-derives a value or repairs
-an ancestor that folded a displaced one.  Treat that file as candidate-ordering
+an ancestor that reduced a displaced one.  Treat that file as candidate-ordering
 hints and write clean exact results under the new schema.  `--hint-cache` is
 the supported way to do that; see below.
 
@@ -838,7 +838,7 @@ incumbent only on its own recomputed result.  If it is absent, or the artifact
 has no row for the branch, the ordinary best-first order stands.
 
 What a historical row cannot do: be returned as an exact hit, contribute a
-stored ERD or `max_remaining_depth` to a fold, seed an alpha-beta ceiling,
+stored ERD or `max_remaining_depth` to a reduction, seed an alpha-beta ceiling,
 prove a loss, satisfy queue admission, or reach an export.  `HintCache`'s
 queries select `best_guess` and nothing else, so no other value has a path out
 of the module.
@@ -913,35 +913,35 @@ python3.13 verify_branch_depths.py --repair
 ```
 
 A branch row's `max_depth` is determined by its own `best_guess` and the
-`max_depth` of each response group that guess produces, so folding it back up
+`max_depth` of each response group that guess produces, so reducing it back up
 turns any disagreement into a finding rather than an opinion.  It matters
 because `branch_best_by_policy` keys a branch without `solve_budget`: a
 branch's tainted and untainted values compete for one row, and an ancestor
-that folded the value the last write replaced is left describing a subtree the
-cache no longer holds.  Nothing records which value a parent folded, so those
-ancestors are reachable only by redoing the fold.
+that reduced the value the last write replaced is left describing a subtree the
+cache no longer holds.  Nothing records which value a parent reduced, so those
+ancestors are reachable only by redoing the reduction.
 
-Stored below the fold is the direction that matters — `_cache_reuse` gates an
+Stored below the reduction is the direction that matters — `_cache_reuse` gates an
 untainted entry on `max_depth <= budget`, so an understated depth hands out a
-strategy at a budget it cannot meet.  Stored above the fold only refuses reuse
+strategy at a budget it cannot meet.  Stored above the reduction only refuses reuse
 that was available.  The pass runs bottom-up, so a branch corrected in this run
-is what its parents are folded against; a fold that re-read stored children
-would agree with every parent that folded the same understated child, and its
+is what its parents are reduced against; a reduction that re-read stored children
+would agree with every parent that reduced the same understated child, and its
 count is a floor rather than a measurement.
 
-`--repair` writes each folded depth back, and only that column.  A `best_score`
-that disagrees with its own fold is counted but never rewritten — a wrong ERD
+`--repair` writes each reduced depth back, and only that column.  A `best_score`
+that disagrees with its own reduction is counted but never rewritten — a wrong ERD
 may mean `best_guess` is no longer the argmin, which only a re-search
 (`verify_erd_cache.py`) settles.
 
 The two directions are not repaired alike.  Raising a depth only withdraws
 reuse, so it is always applied.  Lowering one widens the budget range the row
 is offered at, which is a claim about a strategy — so it is applied only when
-the row's `best_score` agrees with its own fold, and withheld otherwise rather
+the row's `best_score` agrees with its own reduction, and withheld otherwise rather
 than extending the reach of a score the same pass just contradicted.  The
 report counts what it withheld.
 
-A repair needs nothing invalidated above it.  A candidate's own ERD is folded
+A repair needs nothing invalidated above it.  A candidate's own ERD is reduced
 from its response groups' rows on every read, so the next report serves the
 repaired depth without any invalidation step to get wrong.
 
@@ -949,13 +949,13 @@ repaired depth without any invalidation step to get wrong.
 incremental `export_cache.py --since` carries the row, but `import_cache.py`
 keeps the target's row for any collision that is not tainted→untainted — so
 the repaired value does not land.  Repair each cache on its own machine; the
-fold is deterministic, so both arrive at the same answer.
+reduction is deterministic, so both arrive at the same answer.
 
 An audit-only run opens the cache **read-only** (SQLite `mode=ro`): it writes
 no schema migration, no answer-list row, and no response decomposition, so it
 is safe against a live cache while workers are active.  A cache path that does
 not exist is an error, not an empty clean audit.  An audit-only run exits 1
-when it finds a row stored below its fold.  Stop the swarm before `--repair`.
+when it finds a row stored below its reduction.  Stop the swarm before `--repair`.
 
 ### Export for the iPhone
 

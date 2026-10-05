@@ -869,7 +869,7 @@ class ReportModelTest(unittest.TestCase):
             "cache_state": cache_state,
         }
 
-    def test_candidate_erd_summary_folds_solved_groups_with_the_candidate_guess(self):
+    def test_reduce_candidate_erd_reduces_solved_groups_with_the_candidate_guess(self):
         summary = reduce_candidate_erd([
             self._group("-----", 8, 2.1, 3),
             self._group("----g", 2, 1.5, 2),
@@ -883,7 +883,7 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(summary["resolved_group_count"], 3)
         self.assertEqual(summary["response_group_count"], 3)
 
-    def test_candidate_erd_summary_is_pending_while_a_group_is_unsolved(self):
+    def test_reduce_candidate_erd_is_pending_while_a_group_is_unsolved(self):
         summary = reduce_candidate_erd([
             self._group("-----", 8, 2.1, 3),
             self._group("y----", 5, None, None, cache_state="missing"),
@@ -896,7 +896,7 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(summary["infeasible_group_count"], 0)
         self.assertEqual(summary["response_group_count"], 3)
 
-    def test_candidate_erd_summary_is_infeasible_when_a_group_is_a_proven_loss(self):
+    def test_reduce_candidate_erd_is_infeasible_when_a_group_is_a_proven_loss(self):
         summary = reduce_candidate_erd([
             self._group("-----", 8, 2.1, 3),
             self._group("yy---", 5, None, None, cache_state="loss"),
@@ -909,20 +909,20 @@ class ReportModelTest(unittest.TestCase):
         self.assertIsNone(summary["max_remaining_depth"])
         self.assertEqual(summary["infeasible_group_count"], 1)
 
-    def test_candidate_erd_summary_solves_a_lone_survivor_in_one_more_guess(self):
+    def test_reduce_candidate_erd_solves_a_lone_survivor_in_one_more_guess(self):
         summary = reduce_candidate_erd([self._group("----y", 1, None, None)], 5)
         self.assertEqual(summary["state"], "complete")
         self.assertEqual(summary["erd"], 2.0)
         self.assertEqual(summary["max_remaining_depth"], 2)
 
-    def test_candidate_erd_summary_treats_erd_without_worst_case_as_pending(self):
-        # An ERD present but no proven worst-case line cannot complete the fold;
+    def test_reduce_candidate_erd_treats_erd_without_worst_case_as_pending(self):
+        # An ERD present but no proven worst-case line cannot complete the reduction;
         # it must not crash the max() and must not read as complete.
         summary = reduce_candidate_erd([self._group("-----", 8, 2.1, None)], 5)
         self.assertEqual(summary["state"], "pending")
         self.assertIsNone(summary["max_remaining_depth"])
 
-    def test_candidate_erd_summary_lone_survivor_is_infeasible_with_no_guess_left(self):
+    def test_reduce_candidate_erd_lone_survivor_is_infeasible_with_no_guess_left(self):
         # A lone survivor needs one guess to play; at group_budget 0 there is no
         # guess left, so it is a proven loss — matching evaluate_candidate's
         # budget floor, checked before its n == 1 shortcut.
@@ -948,16 +948,16 @@ class ReportModelTest(unittest.TestCase):
          "max_remaining_depth": None, "cache_state": "exact"},
     ]
 
-    def test_candidate_erd_summary_folds_the_groups_it_is_handed(self):
+    def test_reduce_candidate_erd_reduces_the_groups_it_is_handed(self):
         summary = reduce_candidate_erd(self._SALET_GROUPS, 5)
         self.assertEqual(summary["state"], "complete")
         self.assertAlmostEqual(summary["erd"], 1.75)
         self.assertEqual(summary["resolved_group_count"], 4)
         self.assertEqual(summary["response_group_count"], 4)
 
-    def test_candidate_erd_summary_holds_no_state_between_calls(self):
-        # The fold is a pure function of the groups handed to it.  Folding a
-        # candidate complete and then folding the same candidate again with one
+    def test_reduce_candidate_erd_holds_no_state_between_calls(self):
+        # The reduction is a pure function of the groups handed to it.  Reducing a
+        # candidate complete and then reducing the same candidate again with one
         # group unresolved must report the second answer, not the first: that
         # is the whole difference between deriving the value and memoising it.
         # The changed group holds two answers, so its state genuinely turns on
@@ -977,9 +977,9 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(degraded["resolved_group_count"], 1)
         self.assertEqual(degraded["response_group_count"], 2)
 
-    def test_leaderboard_refolds_every_candidate_on_every_build(self):
-        # A stored fold is a record of the last screen, never an answer.  Each
-        # row is folded from the branch results as they stand when the
+    def test_leaderboard_reduces_every_candidate_on_every_build(self):
+        # A stored reduction is a record of the last screen, never an answer.  Each
+        # row is reduced from the branch results as they stand when the
         # leaderboard is asked for, so poisoning the stored value changes
         # nothing about what the build reports.
         answers = ["crane", "slate"]
@@ -1006,8 +1006,8 @@ class ReportModelTest(unittest.TestCase):
         """Three openers that complete, and one that does not.
 
         CRANE and SLATE are answers, so each splits the pair into an all-green
-        group and a lone survivor and folds to 1.5; RAISE separates them into
-        two lone survivors and folds to 2.0.  HOWDY collides both answers into
+        group and a lone survivor and reduces to 1.5; RAISE separates them into
+        two lone survivors and reduces to 2.0.  HOWDY collides both answers into
         one group no branch result settles, so it stays pending.  CRANE and
         SLATE therefore tie on ERD and on worst-case line, which is the only
         shape that exercises the ranking's word-level tiebreak.
@@ -1043,8 +1043,8 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(standing["percentile"], 0.0)
 
     def test_a_standing_rank_is_the_position_the_ranking_puts_the_word_at(self):
-        # Rank is counted in SQL over stored folds while the ranking is sorted
-        # in Python over freshly folded ones.  Those are two orderings of the
+        # Rank is counted in SQL over stored reductions while the ranking is sorted
+        # in Python over freshly reduced ones.  Those are two orderings of the
         # same triple, and a lookup is only worth anything if they agree -- so
         # every ranked opener is looked up and checked against its own row.
         _answers, sources = self._standing_sources()
@@ -1059,8 +1059,8 @@ class ReportModelTest(unittest.TestCase):
             self.assertEqual(standing["ranked_total"], len(ranking))
             self.assertEqual(standing["erd_numerator"], row["erd_numerator"])
 
-    def test_a_standing_ignores_the_stored_fold_of_the_word_it_places(self):
-        # The looked-up opener is placed by the fold this request screened,
+    def test_a_standing_ignores_the_stored_reduction_of_the_word_it_places(self):
+        # The looked-up opener is placed by the reduction this request screened,
         # never by its own stored row, which can predate a repair.  Poison
         # that row with an ERD better than the whole field: counting it as
         # well would push RAISE past itself and report a rank past the end of
@@ -1129,7 +1129,7 @@ class ReportModelTest(unittest.TestCase):
     def test_a_standing_counts_its_rank_and_its_field_in_one_snapshot(self):
         """The four reads describe one field, so they read one version of it.
 
-        A leaderboard build stores and deletes folds against the same cache a
+        A leaderboard build stores and deletes reductions against the same cache a
         detail request is served from.  Counted in separate autocommit
         statements, a rank taken over a larger field can be reported beside a
         total taken over a smaller one -- a place past the end of the ranking
@@ -1153,7 +1153,7 @@ class ReportModelTest(unittest.TestCase):
         dropped = [row["word"] for row in ranking[:-1]][:3]
 
         class DeleteBeforeTheSecondCount:
-            """Drop folds between the rank count and the field count."""
+            """Drop reductions between the rank count and the field count."""
 
             def __init__(self, connection, on_second_count):
                 self._connection = connection
@@ -1264,7 +1264,7 @@ class ReportModelTest(unittest.TestCase):
 
     def test_an_unfinished_opener_names_its_state_and_the_field_it_is_not_in(self):
         # HOWDY is a real candidate whose tree is unfinished, which is the
-        # ordinary case while a sweep runs.  It reports the fold's own state
+        # ordinary case while a sweep runs.  It reports the reduction's own state
         # and how large the ranked field already is, so the answer is "not yet,
         # and here is how far along the sweep is" rather than a bare refusal.
         _answers, sources = self._standing_sources()
@@ -1285,7 +1285,7 @@ class ReportModelTest(unittest.TestCase):
 
     def test_a_screened_candidate_holding_a_loss_and_a_gap_is_infeasible(self):
         # GIPPY splits these answers into two groups of more than one answer.
-        # Prove one a loss and leave the other unsolved: the fold calls that
+        # Prove one a loss and leave the other unsolved: the reduction calls that
         # infeasible, because a proven loss settles the candidate whatever the
         # unsolved group later turns out to be.  A screen that stopped at the
         # first unsettled group could exit before reaching the loss and report
@@ -1330,11 +1330,11 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual([row["word"] for row in leaderboard_rows(data)],
                          ["raise"])
 
-    def test_a_rebuild_over_an_unchanged_cache_writes_no_stored_folds(self):
+    def test_a_rebuild_over_an_unchanged_cache_writes_no_stored_reductions(self):
         # The leaderboard is polled, and the cache it writes to is the one the
         # swarm is writing branch results into.  A build that rewrote every
-        # stored fold would add WAL traffic proportional to the vocabulary for
-        # a set of values none of which changed, so a fold is written only when
+        # stored reduction would add WAL traffic proportional to the vocabulary for
+        # a set of values none of which changed, so a reduction is written only when
         # it differs from the row already there.
         answers = ["crane", "slate"]
         sources = self._leaderboard_sources(answers, ["crane", "slate", "raise"])
@@ -1352,8 +1352,8 @@ class ReportModelTest(unittest.TestCase):
              for opener in call.args[2]],
             [])
 
-    def test_a_stored_fold_is_deleted_once_its_opener_stops_screening(self):
-        # The stored fold asserts that every one of an opener's groups holds a
+    def test_a_stored_reduction_is_deleted_once_its_opener_stops_screening(self):
+        # The stored reduction asserts that every one of an opener's groups holds a
         # result.  Deleting one of those results falsifies that, so the next
         # build must take the stored row with it rather than leave it naming a
         # tree that is gone.
@@ -1383,21 +1383,21 @@ class ReportModelTest(unittest.TestCase):
         self.addCleanup(cache.close)
         self.assertNotIn("howdy", cache.opener_erd_map(ERD_ALL))
 
-    def test_leaderboard_folds_only_the_candidates_its_screen_admits(self):
-        # Folding builds a state dict per response group, so a vocabulary of
-        # openers still being searched costs far more to fold than to screen.
+    def test_leaderboard_reduces_only_the_candidates_its_screen_admits(self):
+        # Reducing builds a state dict per response group, so a vocabulary of
+        # openers still being searched costs far more to reduce than to screen.
         # HOWDY is the one candidate here that a cached branch result has not
-        # settled, so the screen must keep it out of the fold entirely.
+        # settled, so the screen must keep it out of the reduction entirely.
         sources = self._leaderboard_sources(
             ["crane", "slate"], ["crane", "slate", "raise", "howdy"]
         )
         with patch(
             "report_model.reduce_candidate_erd", wraps=reduce_candidate_erd,
-        ) as folded:
+        ) as reduced:
             report = collect_report(
                 sources, ReportRequest(report_kind="leaderboard")
             )
-        self.assertEqual(folded.call_count, 3)
+        self.assertEqual(reduced.call_count, 3)
         self.assertEqual(report["data"]["counts"],
                          {"complete": 3, "pending": 1, "infeasible": 0})
 
@@ -1428,7 +1428,7 @@ class ReportModelTest(unittest.TestCase):
                       {row["word"] for row in leaderboard_rows(complete)})
 
         # Nothing names HOWDY when this row goes, and nothing needs to: the
-        # next build folds HOWDY from the group that no longer resolves.
+        # next build reduces HOWDY from the group that no longer resolves.
         cache = ScoreCache(sources.cache_path, answers,
                            checkpoint_on_close=False)
         cache.delete(collided_key, ERD_ALL)
@@ -1453,18 +1453,18 @@ class ReportModelTest(unittest.TestCase):
             "infeasible_group_count", "response_group_count",
         })
         self.assertIn(summary["state"], {"complete", "pending", "infeasible"})
-        # The fold walks every response group, not the filtered/limited view.
+        # The reduction walks every response group, not the filtered/limited view.
         self.assertEqual(
             summary["response_group_count"],
             report["data"]["response_group_counts"]["response_group_count"],
         )
 
-    def test_collect_word_report_folds_candidate_erd_below_the_root(self):
+    def test_collect_word_report_reduces_candidate_erd_below_the_root(self):
         # A one-step spine: SALET/-y--- leaves {khaki}, and CRANE is the
-        # candidate folded at guess_depth 1.  The fold measures depth from this
+        # candidate reduced at guess_depth 1.  The reduction measures depth from this
         # branch, not from the root — CRANE splits {khaki} into a lone survivor,
         # so its ERD is 2.0 (play CRANE, then khaki), not the 3.0 a
-        # depth-from-root fold would give (SALET, CRANE, khaki).
+        # depth-from-root reduction would give (SALET, CRANE, khaki).
         request = ReportRequest(
             branch_target=parse_report_branch_target("salet -y--- crane"),
         )
@@ -1925,7 +1925,7 @@ class ReportModelTest(unittest.TestCase):
     def test_response_group_summary_reflects_active_filters_not_all_groups(self):
         # The grand summary describes what's currently filtered to, like the
         # response_groups list itself — not every response group regardless of
-        # filter (that invariant belongs to erd_summary, which must fold every
+        # filter (that invariant belongs to erd_summary, which must reduce every
         # group to compute one true word ERD).
         request = ReportRequest(
             branch_target=parse_report_branch_target("salet"),
@@ -2095,7 +2095,7 @@ class ReportModelTest(unittest.TestCase):
         ))
 
     def test_response_group_is_solved_requires_a_worst_case_line(self):
-        # An ERD with no proven worst-case line cannot complete the fold, so it
+        # An ERD with no proven worst-case line cannot complete the reduction, so it
         # is not a solved group either.
         self.assertFalse(response_group_is_solved(
             {"best_erd": 2.0, "max_remaining_depth": None,
@@ -2163,7 +2163,7 @@ class ReportModelTest(unittest.TestCase):
         This is the failure #288 describes, reduced to its smallest form: no
         caller announces the deletion, and nothing above the branch is
         invalidated.  A word reads `complete` only because its groups are read
-        and folded afresh, so deleting one of them shows up on the next report
+        and reduced afresh, so deleting one of them shows up on the next report
         with no invalidation step in between to get right.
         """
         branch_keys, _ = self._solve_bebop_groups()
@@ -2186,7 +2186,7 @@ class ReportModelTest(unittest.TestCase):
     def test_a_word_goes_pending_after_a_repair_withdraws_a_child(self):
         # verify_branch_depths repairs max_depth in place.  Raising a child's
         # worst case past the budget it is read at withdraws its reuse, so the
-        # parent's fold must lose that group -- the case a memo keyed on an
+        # parent's reduction must lose that group -- the case a memo keyed on an
         # unchanged response-group count could not see at all.
         branch_keys, _ = self._solve_bebop_groups()
         cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
@@ -2206,12 +2206,12 @@ class ReportModelTest(unittest.TestCase):
         queue.close()
         self._assert_bebop_reads_pending(resolved_group_count=0)
 
-    def test_a_word_folds_a_childs_budget_specific_result_at_its_own_budget(self):
-        """A child solved at exactly this budget completes the fold; one solved
+    def test_a_word_reduces_a_childs_budget_specific_result_at_its_own_budget(self):
+        """A child solved at exactly this budget completes the reduction; one solved
         at another budget is not available to it.
 
         Both facts can be stored for one branch, and only the scope the parent
-        would actually reuse may be folded -- `report_branch_states` picks it
+        would actually reuse may be reduced -- `report_branch_states` picks it
         with the same rule `read_for_budget` applies.
         """
         target = parse_report_branch_target("bebop")
@@ -2231,7 +2231,7 @@ class ReportModelTest(unittest.TestCase):
         cache.close()
         self._assert_bebop_reads_pending(resolved_group_count=1)
 
-        # ... and completes the fold once it holds one at this budget.
+        # ... and completes the reduction once it holds one at this budget.
         cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
         cache.write(branch_keys[0], ERD_ALL, "salet", 1.5,
                     max_depth=2, solve_budget=group_budget)
@@ -2600,7 +2600,7 @@ class ReportModelTest(unittest.TestCase):
 
         It is total guesses over the answer count, so the numerator counts
         guesses and is an integer by construction.  A value that is not says
-        the fold produced something an ERD cannot be, and every other value in
+        the reduction produced something an ERD cannot be, and every other value in
         the ranking is suspect with it -- so this is a defect to surface, not a
         display case to fall back from.
         """
@@ -3768,7 +3768,7 @@ class OpenerReportTest(unittest.TestCase):
         self.assertEqual(nurdy["resolved_group_count"], 2)
         self.assertEqual(nurdy["response_group_count"], 3)
 
-        # Neither word's fold is persisted anywhere: the report's numbers came
+        # Neither word's reduction is persisted anywhere: the report's numbers came
         # from the branch tables and nothing else was written.
         cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
         self.assertEqual(

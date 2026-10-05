@@ -3,8 +3,8 @@
 A branch has two kinds of exact result and they are different facts: the
 optimum over all strategies, and the optimum among those feasible at one
 remaining-depth budget.  They live in separate tables so neither write can
-destroy the other, because an ancestor may already have folded the one being
-replaced and nothing records which it folded (issue #302).
+destroy the other, because an ancestor may already have reduced the one being
+replaced and nothing records which it reduced (issue #302).
 """
 import io
 import os
@@ -98,9 +98,9 @@ class WriteRoutingTest(_CacheTest):
         self.assertEqual(self.count(score_cache, CANONICAL), 1)
         self.assertEqual(score_cache.redundant_write_count, 1)
 
-    def test_an_equal_cost_rewrite_keeps_the_depth_ancestors_folded(self):
+    def test_an_equal_cost_rewrite_keeps_the_depth_ancestors_reduced(self):
         # Two strategies can tie on ERD and differ in worst case.  Replacing
-        # the stored one would leave every ancestor that folded its depth
+        # the stored one would leave every ancestor that reduced its depth
         # describing a subtree the cache no longer holds.
         score_cache = self.cache()
         score_cache.write(self.key, ERD_ALL, "crane", 2.0, max_depth=3)
@@ -195,7 +195,7 @@ class ReadSelectionTest(_CacheTest):
 
 
 class AncestorSurvivesBothOrdersTest(_CacheTest):
-    """A parent's fold stays true whichever of a child's results arrives later."""
+    """A parent's reduction stays true whichever of a child's results arrives later."""
 
     def child_key(self):
         return ScoreCache.encode_subset(WORDS[:2])
@@ -205,7 +205,7 @@ class AncestorSurvivesBothOrdersTest(_CacheTest):
         child = self.child_key()
         score_cache.write(child, ERD_ALL, "slate", 2.5, max_depth=3,
                           solve_budget=3)
-        # A parent at budget 4 folds that child and records its own result.
+        # A parent at budget 4 reduces that child and records its own result.
         score_cache.write(self.key, ERD_ALL, "crane", 2.8, max_depth=4,
                           solve_budget=4)
         # The child is later solved unrestricted, at a different cost.
@@ -316,7 +316,7 @@ class MigrationTest(_CacheTest):
             "SELECT name FROM sqlite_master WHERE type = 'table'")}
 
     def test_the_obsolete_candidate_erd_memo_table_is_dropped(self):
-        # It memoised a candidate's folded ERD, which is now derived on every
+        # It memoised a candidate's reduced ERD, which is now derived on every
         # read, so the table is derived data with no reader.  Its index goes
         # with it, since dropping a table drops the indexes over it.
         path = self.legacy_cache()
@@ -327,7 +327,7 @@ class MigrationTest(_CacheTest):
             score_cache._conn.execute(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' "
                 "AND name = 'idx_candidate_erd_by_policy'").fetchone()[0], 0)
-        # The branch results the memo folded are untouched by the drop.
+        # The branch results the memo reduced are untouched by the drop.
         self.assertEqual(self.count(score_cache, CANONICAL), 1)
         self.assertEqual(self.count(score_cache, BUDGETED), 2)
 
@@ -680,7 +680,7 @@ class ConcurrentWriteTest(_CacheTest):
 
     Creating the row is the check: a read followed by an insert leaves a
     window both writers pass through, and the loser's insert would then
-    displace a result an ancestor may already have folded, with neither
+    displace a result an ancestor may already have reduced, with neither
     noticing.  These drive that window directly.
     """
 
@@ -712,7 +712,7 @@ class ConcurrentWriteTest(_CacheTest):
 
     def test_a_stale_miss_with_an_agreeing_value_keeps_the_incumbent(self):
         # Equal cost, different worst case: the stored depth is the one an
-        # ancestor folded, so the loser must not replace it.
+        # ancestor reduced, so the loser must not replace it.
         for label, scope in self.SCOPES:
             with self.subTest(scope=label):
                 observer = self.cache(f'{label}-b.sqlite3')
@@ -790,7 +790,7 @@ class ConcurrentWriteTest(_CacheTest):
     def test_an_equal_cost_result_is_adopted_rather_than_kept_locally(self):
         # The incumbent stands, and write hands it back: max_depth is
         # ancestor-visible, so a solver that kept its own worst case would
-        # fold a parent the stored child does not support -- the same
+        # reduce a parent the stored child does not support -- the same
         # inconsistent ancestry, reached without any overwrite.
         for label, scope in self.SCOPES:
             with self.subTest(scope=label):
@@ -831,7 +831,7 @@ class ConcurrentWriteTest(_CacheTest):
                              None, None, None, None)
 
     def test_a_solve_returns_the_depth_the_cache_holds(self):
-        # The engine must adopt before folding, so what _solve_subset hands
+        # The engine must adopt before reducing, so what _solve_subset hands
         # its caller is what a parent reads back.  Driving that needs a
         # competing incumbent the solve does not see until it writes -- the
         # real interleaving, where another worker stored first.
@@ -904,7 +904,7 @@ class ImportConflictTest(_CacheTest):
 
     Normally it is one fact reached twice.  When the costs disagree, one of
     the caches is wrong and whichever the merge keeps displaces a result the
-    other's ancestors folded — the failure CacheWriteConflict refuses within a
+    other's ancestors reduced — the failure CacheWriteConflict refuses within a
     file, applied across files.
     """
 
@@ -968,8 +968,8 @@ class ImportConflictTest(_CacheTest):
         self.assertEqual([c[0] for c in conflicts], ['budget-specific (routed)'])
 
     def test_a_different_strategy_at_the_same_cost_and_depth_is_one_fact(self):
-        # Different guesses are harmless when both folded outputs agree: the
-        # cost and the worst case are what an ancestor folded.
+        # Different guesses are harmless when both reduced outputs agree: the
+        # cost and the worst case are what an ancestor reduced.
         a = self._cache_with("sa.sqlite3", "crane", 2.0)
         b = self._cache_with("sb.sqlite3", "slate", 2.0)
         self.assertEqual(self._conflicts(a, b), [])
@@ -978,7 +978,7 @@ class ImportConflictTest(_CacheTest):
     def test_equal_cost_with_a_different_worst_case_is_a_conflict(self):
         # max_depth is ancestor-visible, so equal cost does not make two
         # certificates interchangeable: keeping the target's child while
-        # admitting source parents folded from the source's depth makes those
+        # admitting source parents reduced from the source's depth makes those
         # parents inconsistent on arrival.
         a = self._cache_with("da.sqlite3", "crane", 2.0, max_depth=3)
         b = self._cache_with("db.sqlite3", "slate", 2.0, max_depth=4)
@@ -989,7 +989,7 @@ class ImportConflictTest(_CacheTest):
                 self.assertNotEqual(conflicts[0][4][2], conflicts[0][5][2])
 
     def test_a_source_parent_is_not_admitted_above_a_retained_child(self):
-        # End to end: the source holds a child at depth 4 and a parent folded
+        # End to end: the source holds a child at depth 4 and a parent reduced
         # from it; the target holds the same child at depth 3.  INSERT OR
         # IGNORE would keep the target's child and import the source's parent,
         # leaving that parent describing a subtree the retained child does not
@@ -1172,7 +1172,7 @@ class PreSplitReadOnlyTest(_CacheTest):
         self.addCleanup(score_cache.close)
         rows = list(iter_rows(score_cache, ERD_ALL))
         # Both results are there; each still names the scope it belongs to,
-        # which is what the fold reads them at.
+        # which is what the reduction reads them at.
         self.assertEqual(sorted(row["solve_budget"] or 0 for row in rows), [0, 3])
 
     def test_supplying_the_table_writes_nothing_to_the_file(self):

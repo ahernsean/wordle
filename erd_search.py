@@ -285,7 +285,7 @@ def invalidate_branches_for_recompute(queue, score_cache, branch_keys):
     unclaimable, so it is genuinely recomputed.
 
     Nothing above these branches needs invalidating alongside them.  A word's
-    own ERD is folded from its response groups' cached results on every read,
+    own ERD is reduced from its response groups' cached results on every read,
     so a group deleted here reports as unresolved immediately, and the word
     reads as pending until it is solved again.
 

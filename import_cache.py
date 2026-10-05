@@ -17,7 +17,7 @@ given the same answer-word universe — matching keys imply identical values
 — so INSERT OR IGNORE is exact.
 
 An older export may carry candidate_erd_by_policy, a derived memo of a
-candidate's folded ERD that no longer has a reader on either machine. It is
+candidate's reduced ERD that no longer has a reader on either machine. It is
 absent from TABLES, so such a source is merged for the tables that still
 mean something and that one is skipped by the same path any unknown table
 takes.
@@ -51,7 +51,7 @@ batch re-checks inside its own write transaction — a live worker can store a
 disagreeing result after a clean scan, and INSERT OR IGNORE would drop the
 source's row without a word.  Two exact
 results for one scope cannot both be right, and keeping either displaces
-whichever the other cache's ancestors folded.  --dry-run reports them and
+whichever the other cache's ancestors reduced.  --dry-run reports them and
 continues.
 
 Run with --dry-run first to see how many rows would be added/upgraded.  Prefer
@@ -287,12 +287,12 @@ def _conflicting_exact_results(conn, src_tables, limit=20):
     A key collision between two caches is normally one fact reached twice, and
     INSERT OR IGNORE is exact for that.  It is not safe to *assume*: two caches
     can hold different exact results for one branch at one scope, and whichever
-    the merge keeps displaces a result the other cache's ancestors folded.
+    the merge keeps displaces a result the other cache's ancestors reduced.
 
     Sameness is cache_sqlite.exact_results_agree — equal cost AND equal
     max_depth, expressed here in SQL so whole tables compare at once.  Equal
     cost alone is not enough: max_depth is ancestor-visible, so keeping the
-    target's child while admitting source-only parents folded from the source's
+    target's child while admitting source-only parents reduced from the source's
     deeper worst case makes those imported parents inconsistent on arrival.
     Within one file ScoreCache.write reconciles the same situation by handing
     the incumbent back for the caller to adopt; a merge has no such option,
@@ -359,7 +359,7 @@ def _report_conflicts(conflicts) -> None:
               file=sys.stderr)
     print("Two exact results for one scope cannot both be right, and equal "
           "cost with a different worst case is still two certificates: "
-          "whichever side the merge keeps, the other cache's ancestors folded "
+          "whichever side the merge keeps, the other cache's ancestors reduced "
           "the one it dropped.  Resolve the disagreement before importing.",
           file=sys.stderr)
 

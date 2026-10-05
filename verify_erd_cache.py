@@ -62,9 +62,9 @@ def _erd_from_cache(branch_words, candidate, rcache, sc, n, best_erd):
 
     Unlike evaluate_candidate / _solve_subset, this never recurses: it reads
     each sub-branch's unrestricted optimum directly via sc.read().  That is
-    the right value to fold here and the only one this reaches: a
+    the right value to reduce here and the only one this reaches: a
     budget-specific result is optimal against a smaller set of strategies, so
-    folding one into an unrestricted cost would understate it.  A sub-branch
+    reducing one into an unrestricted cost would understate it.  A sub-branch
     holding only such a result reads as missing and the candidate is skipped.
     Safe for verification because sub-branches were already verified in
     earlier waves.

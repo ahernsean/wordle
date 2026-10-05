@@ -2362,7 +2362,7 @@
     // At the full candidate vocabulary the ranking is the wrong front door for
     // the question a reader actually has, which is where one word stands --
     // not what fifteen thousand of them look like.  The lookup answers that in
-    // one bounded request: the server folds the named opener's own groups and
+    // one bounded request: the server reduces the named opener's own groups and
     // counts its place in the stored ranking, so nothing on this path grows
     // with the vocabulary.
     function renderOpenerLookup(state){
@@ -2439,7 +2439,7 @@
       return host;
     }
     // The endpoint is the one a card expansion already uses: both questions
-    // rest on the same fold of one opener's groups, so asking for either pays
+    // rest on the same reduction of one opener's groups, so asking for either pays
     // for it once.
     async function lookUpOpener(state,typed){
       const draw=()=>openerLookupRedraw?.();
@@ -2813,7 +2813,7 @@
       const state=normalizeState(currentState),context=contextKey(state),generation=++requestGeneration,controller=new AbortController();
       activeRequestController=controller;activeRequestStartedAt=Date.now();
       // A new context can require a slow report, especially when a source sort
-      // also folds ERD summaries.  Keep the current report visible while the
+      // also reduces ERD summaries.  Keep the current report visible while the
       // replacement is being computed, but make the work visible immediately.
       // Same-context polls keep the current data on screen and never show it.
       if(context!==lastContext)setReportStatus(pendingReportStatus(state));

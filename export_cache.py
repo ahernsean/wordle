@@ -12,7 +12,7 @@ cached ERD result for its current position still needs candidate_scores'
 entropy/max-group-size numbers to rank candidates, and that need isn't
 limited to the opening guess, so the whole table is carried, not just one
 position's rows. A candidate's own ERD is derived where it is displayed, by
-folding that candidate's response groups from the branch tables, so there is
+reducing that candidate's response groups from the branch tables, so there is
 nothing to carry for it.
 
 Safe to run while workers are active: WAL mode allows concurrent reads, so

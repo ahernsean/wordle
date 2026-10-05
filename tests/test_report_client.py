@@ -2733,7 +2733,7 @@ class ReportClientContract:
 
     def test_slow_view_switch_shows_a_computing_notice(self):
         # Delay only the leaderboard fetch on the client so the slow-request
-        # timer fires on the view switch (the fold can take several seconds).
+        # timer fires on the view switch (the reduction can take several seconds).
         # The fetch still resolves, so nothing is left pending — unlike a hung
         # route, which is cancelled at teardown and logs an asyncio error.
         self.page.evaluate(

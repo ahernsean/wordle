@@ -480,7 +480,7 @@ class TestObsoleteCandidateErdMemo(_TmpDB):
         tables = {row[0] for row in target._conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table'")}
         self.assertNotIn("candidate_erd_by_policy", tables)
-        # The branch result the memo folded did travel.
+        # The branch result the memo reduced did travel.
         self.assertEqual(
             target.read_with_depth(ScoreCache.encode_subset(WORDS), ERD_ALL),
             ("crane", 1.5, 2, None))
