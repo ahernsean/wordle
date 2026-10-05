@@ -296,6 +296,31 @@ class ReportClientStaticTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_every_browser_test_class_is_selected_by_a_ci_job(self):
+        """A class no job names is a class CI never runs.
+
+        The engine jobs name their own classes rather than running the module
+        and skipping the engine they are not, so that a skip count means an
+        actual skip.  That makes the selection an enumeration, and an
+        enumeration goes stale silently: a class added here would run in no job
+        and report nothing -- the same hole a green suite that never started a
+        browser would have.
+        """
+        with open(os.path.join(ROOT, ".github", "workflows", "tests.yml"),
+                  encoding="utf-8") as workflow_file:
+            workflow = workflow_file.read()
+        selected = set(re.findall(r"tests\.test_report_client\.(\w+)",
+                                  workflow))
+        defined = {
+            name for name, value in globals().items()
+            if isinstance(value, type)
+            and issubclass(value, unittest.TestCase)
+            and value.__module__ == __name__
+        }
+        self.assertTrue(selected, "no CI job names a class in this module")
+        self.assertEqual(defined - selected, set(),
+                         "these classes are run by no CI job")
+
 
 class LaunchWebKitTest(unittest.TestCase):
     """_launch_webkit's native-first, container-fallback dispatch, exercised
@@ -359,30 +384,57 @@ def fixture_server():
         thread.join(timeout=2)
 
 
-@unittest.skipIf(SKIP_BROWSER_TESTS, "SKIP_BROWSER_TESTS=1")
-class ReportClientBrowserTest(unittest.TestCase):
+class ReportClientContract:
+    """Every assertion about the browser client, bound to no engine.
+
+    The client is one program and the engines are peers, so the assertions
+    belong to neither of them.  This holds the whole contract and names the
+    engine only through `start_browser`; the two bindings below supply that and
+    nothing else, which is what makes a test written for one of them run on
+    both without either being the other's special case.
+
+    Deliberately not a `TestCase`, so unittest collects the bindings and never
+    this: a test body has no meaning until an engine is chosen for it.
+    """
+
+    #: Named in the message a failed launch raises, so it says which engine.
+    engine_name = None
+    #: How to run without this engine, for a machine that cannot host it.
+    opt_out_hint = None
+    #: What to try when the engine is installed but will not start.
+    launch_failure_hint = None
+
+    @classmethod
+    def start_browser(cls, playwright):
+        """Launch this engine and return its browser."""
+        raise NotImplementedError
+
+    @classmethod
+    def release_engine(cls):
+        """Release whatever `start_browser` took besides the browser."""
+
     @classmethod
     def setUpClass(cls):
         if sync_playwright is None:
             raise RuntimeError(
                 "playwright is not installed (it is in requirements-dev.txt); "
-                "install it, or set SKIP_BROWSER_TESTS=1 to run without any "
-                "browser coverage"
+                f"install it, or {cls.opt_out_hint}"
             )
         cls.server_context = fixture_server()
         cls.base_url = cls.server_context.__enter__()
         cls.playwright = sync_playwright().start()
         try:
-            cls.browser = _launch_chromium(cls.playwright)
+            cls.browser = cls.start_browser(cls.playwright)
         except Exception as error:
             cls.playwright.stop()
             cls.server_context.__exit__(None, None, None)
-            raise RuntimeError("Playwright Chromium failed to start") from error
+            raise RuntimeError(cls.launch_failure_hint) from error
 
     @classmethod
     def tearDownClass(cls):
         cls.browser.close()
         cls.playwright.stop()
+        cls.release_engine()
         cls.server_context.__exit__(None, None, None)
 
     def answer_notch(self, word):
@@ -6480,51 +6532,54 @@ class ReportClientBrowserTest(unittest.TestCase):
                     self.assertGreater(os.path.getsize(screenshot), 0)
 
 
+@unittest.skipIf(SKIP_BROWSER_TESTS, "SKIP_BROWSER_TESTS=1")
+class ChromiumReportClientTest(ReportClientContract, unittest.TestCase):
+    """The client's contract against Chromium."""
+
+    engine_name = "Chromium"
+    opt_out_hint = "set SKIP_BROWSER_TESTS=1 to run without any browser coverage"
+    launch_failure_hint = "Playwright Chromium failed to start"
+
+    @classmethod
+    def start_browser(cls, playwright):
+        return _launch_chromium(playwright)
+
+
 @unittest.skipIf(SKIP_WEBKIT_CONTAINER_TESTS,
                  "SKIP_WEBKIT_CONTAINER_TESTS=1")
-class ReportClientWebKitBrowserTest(ReportClientBrowserTest):
-    """The Chromium suite's test bodies, replayed against real WebKit.
+class WebKitReportClientTest(ReportClientContract, unittest.TestCase):
+    """The client's contract against WebKit, which is how it is mostly used.
 
-    _launch_webkit tries Playwright's bundled native build first and only
-    falls back to running the browser inside the Microsoft Playwright
-    container (see tests/webkit_container.py) when that fails -- rocky's
-    glibc can't run the native build at all, but most other environments,
-    including CI, can. Only setUpClass/tearDownClass differ from the
-    Chromium base class.
+    `_launch_webkit` tries Playwright's bundled native build first and falls
+    back to running the browser inside the Microsoft Playwright container (see
+    tests/webkit_container.py) only when that fails -- rocky's glibc cannot run
+    the native build at all, while most other environments, CI included, can.
+    Either way the browser is real and the test process stays local.
     """
 
-    @classmethod
-    def setUpClass(cls):
-        if sync_playwright is None:
-            raise RuntimeError(
-                "playwright is not installed (it is in requirements-dev.txt); "
-                "install it, or set SKIP_WEBKIT_CONTAINER_TESTS=1 to run "
-                "without WebKit coverage"
-            )
-        cls.server_context = fixture_server()
-        cls.base_url = cls.server_context.__enter__()
-        cls.playwright = sync_playwright().start()
-        try:
-            cls.browser, cls.webkit_container = _launch_webkit(cls.playwright)
-        except (WebKitContainerUnavailable, Exception) as error:
-            cls.playwright.stop()
-            cls.server_context.__exit__(None, None, None)
-            raise RuntimeError(
-                "WebKit failed to start natively and its container fallback "
-                "also failed.  Native WebKit needs `playwright install "
-                "--with-deps webkit`; the container fallback needs podman or "
-                "docker and the mcr.microsoft.com/playwright image at the "
-                "installed playwright's version.  Set "
-                "SKIP_WEBKIT_CONTAINER_TESTS=1 to run without WebKit coverage."
-            ) from error
+    engine_name = "WebKit"
+    opt_out_hint = ("set SKIP_WEBKIT_CONTAINER_TESTS=1 to run without WebKit "
+                    "coverage")
+    launch_failure_hint = (
+        "WebKit failed to start natively and its container fallback also "
+        "failed.  Native WebKit needs `playwright install --with-deps "
+        "webkit`; the container fallback needs podman or docker and the "
+        "mcr.microsoft.com/playwright image at the installed playwright's "
+        "version.  Set SKIP_WEBKIT_CONTAINER_TESTS=1 to run without WebKit "
+        "coverage."
+    )
+    #: Set when the native build could not run and the container answered.
+    container = None
 
     @classmethod
-    def tearDownClass(cls):
-        cls.browser.close()
-        cls.playwright.stop()
-        if cls.webkit_container is not None:
-            cls.webkit_container.stop()
-        cls.server_context.__exit__(None, None, None)
+    def start_browser(cls, playwright):
+        browser, cls.container = _launch_webkit(playwright)
+        return browser
+
+    @classmethod
+    def release_engine(cls):
+        if cls.container is not None:
+            cls.container.stop()
 
 
 if __name__ == "__main__":
