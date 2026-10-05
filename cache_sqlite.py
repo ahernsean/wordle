@@ -1356,17 +1356,17 @@ class ScoreCache:
         """Branch results reusable at exactly one budget, as lean maps.
 
         Returns (erd_by_key, loss_keys): a branch_key -> (best_erd,
-        max_remaining_depth) map of the results a search at `budget` would
-        reuse, and the set of keys proven a loss within it.  Both apply the
-        same gate `report_branch_states` does, decided in SQL rather than by
-        loading every row and filtering in Python.
+        max_remaining_depth, updated_at) map of the results a search at
+        `budget` would reuse, and the set of keys proven a loss within it.
+        Both apply the same gate `report_branch_states` does, decided in SQL
+        rather than by loading every row and filtering in Python.
 
         `report_branch_row_maps` is the other bulk loader, and it is the one to
         use when a caller needs a branch's *facts* — its budget-specific rows,
         update times, and which table each came from.  This one answers only
         "is this branch settled at this budget, and at what cost", which is
         everything a fold over response groups reads.  Folding a whole
-        vocabulary that way loads the qualifying keys and three columns instead
+        vocabulary that way loads the qualifying keys and four columns instead
         of every row and six, which on a production cache is several times
         less work for an identical fold.
 
@@ -1374,24 +1374,32 @@ class ScoreCache:
         budget, so the budget-specific table only fills in keys the
         unrestricted one did not settle — the precedence `_exact_row_for_budget`
         applies per branch, expressed here over whole tables.
+
+        `updated_at` travels with the value because a caller that *stores* a
+        fold over these facts has to be able to tell whether the facts have
+        moved since.  It is the update time of the row the value came from, and
+        one timestamp per key is enough: `delete` drops both of a branch's
+        exact scopes together, so the precedence above can never fall back onto
+        a surviving row older than the fold that read the one in front of it.
         """
         erd_by_key = {}
-        for branch_key, best_score, max_depth in self._conn.execute(
-            """SELECT branch_key, best_score, max_depth
+        for branch_key, best_score, max_depth, updated_at in self._conn.execute(
+            """SELECT branch_key, best_score, max_depth, updated_at
                  FROM branch_best_by_policy
                 WHERE policy = ? AND answer_list_id = ?
                   AND solve_budget IS NULL AND max_depth <= ?""",
             (policy, self.answer_list_id, budget),
         ):
-            erd_by_key[bytes(branch_key)] = (best_score, max_depth)
-        for branch_key, best_score, max_depth in self._conn.execute(
-            """SELECT branch_key, best_score, max_depth
+            erd_by_key[bytes(branch_key)] = (best_score, max_depth, updated_at)
+        for branch_key, best_score, max_depth, updated_at in self._conn.execute(
+            """SELECT branch_key, best_score, max_depth, updated_at
                  FROM branch_best_by_policy_and_budget
                 WHERE policy = ? AND answer_list_id = ?
                   AND solve_budget = ? AND max_depth IS NOT NULL""",
             (policy, self.answer_list_id, budget),
         ):
-            erd_by_key.setdefault(bytes(branch_key), (best_score, max_depth))
+            erd_by_key.setdefault(
+                bytes(branch_key), (best_score, max_depth, updated_at))
         loss_keys = {
             bytes(row[0]) for row in self._conn.execute(
                 """SELECT branch_key FROM branch_loss_by_policy
@@ -1453,12 +1461,12 @@ class ScoreCache:
         therefore get a place of their own, and the neighbours are the rows
         actually above and below.
 
-        The population is whatever the last leaderboard build screened.  A
-        stored fold is a record of that screen and is not evidence on its own
-        (`_screen_and_fold_openers` rescreens and `delete_opener_erds` prunes),
-        so this is a positional statement about that population and nothing
-        more.  The alternative is to rescreen the vocabulary, which is the cost
-        the whole lookup exists to avoid.
+        The population is whatever the last leaderboard build left: that build
+        adopts each stored fold whose groups it can show unchanged, refreshes
+        the rest, and deletes the rows whose openers no longer screen
+        complete.  So this is a positional statement about the field as of that
+        build and nothing more.  The alternative is to screen the vocabulary
+        here, which is the cost the whole lookup exists to avoid.
 
         `rank` walks the index entries that qualify, so it is linear in the
         rank and bounded by the vocabulary; the neighbour windows stop at

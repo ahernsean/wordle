@@ -481,12 +481,36 @@ class ReportingTest(_CacheTest):
                 with self.subTest(budget=budget, key=key.hex()):
                     if state["cache_state"] == "exact":
                         self.assertEqual(
-                            erd_by_key.get(key),
+                            erd_by_key.get(key)[:2],
                             (state["best_erd"], state["max_remaining_depth"]))
                     else:
                         self.assertNotIn(key, erd_by_key)
                     self.assertEqual(
                         key in loss_keys, state["cache_state"] == "loss")
+
+    def test_the_lean_facts_carry_the_update_time_of_the_winning_row(self):
+        # A caller that stores a fold over these facts invalidates it by
+        # comparing update times, so the time has to belong to the row whose
+        # value the fold actually read.  A branch carrying both scopes reports
+        # the unrestricted row's time even when the budget-specific row is
+        # newer: that row's value never reached the fold, so it cannot be what
+        # the fold is stale against.
+        score_cache = self.cache()
+        other_key = ScoreCache.encode_subset(WORDS[:2])
+        score_cache.write(self.key, ERD_ALL, "crane", 2.0, max_depth=3)
+        score_cache.write(self.key, ERD_ALL, "slate", 2.5, max_depth=3,
+                          solve_budget=3)
+        score_cache.write(other_key, ERD_ALL, "trace", 2.2, max_depth=2,
+                          solve_budget=3)
+        score_cache._conn.execute(
+            "UPDATE branch_best_by_policy SET updated_at = 1000")
+        score_cache._conn.execute(
+            "UPDATE branch_best_by_policy_and_budget SET updated_at = 5000")
+
+        erd_by_key, _loss_keys = score_cache.report_reusable_branch_facts(
+            ERD_ALL, 3)
+        self.assertEqual(erd_by_key[self.key], (2.0, 3, 1000))
+        self.assertEqual(erd_by_key[other_key], (2.2, 2, 5000))
 
     def test_the_bulk_maps_select_the_same_result_as_a_single_lookup(self):
         score_cache = self.cache()

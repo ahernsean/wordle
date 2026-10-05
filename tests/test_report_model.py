@@ -978,30 +978,151 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(degraded["resolved_group_count"], 1)
         self.assertEqual(degraded["response_group_count"], 2)
 
-    def test_leaderboard_refolds_every_candidate_on_every_build(self):
-        # A stored fold is a record of the last screen, never an answer.  Each
-        # row is folded from the branch results as they stand when the
-        # leaderboard is asked for, so poisoning the stored value changes
-        # nothing about what the build reports.
+    def _collided_opener_sources(self):
+        """HOWDY over two answers: one response group, so one branch result.
+
+        Every other opener in these fixtures splits the pair into lone
+        survivors, which hold no branch result at all and so can say nothing
+        about a fold whose inputs moved.
+        """
         answers = ["crane", "slate"]
-        sources = self._leaderboard_sources(
-            answers, ["crane", "slate", "raise", "howdy"]
-        )
-        first = collect_report(sources, ReportRequest(report_kind="leaderboard"))
+        sources = self._leaderboard_sources(answers, ["howdy"])
         cache = ScoreCache(sources.cache_path, answers,
                            checkpoint_on_close=False)
-        self.assertTrue(cache.opener_erd_map(ERD_ALL))
+        cache.write(ScoreCache.encode_subset(answers), ERD_ALL, "crane", 1.5,
+                    max_depth=2, solve_budget=None)
+        cache.close()
+        return answers, sources, ScoreCache.encode_subset(answers)
+
+    def test_a_leaderboard_reads_the_opener_erd_it_stored(self):
+        # An exact ERD per opener is what the swarm is for, and the stored row
+        # is that answer rather than a memo of how it was reached.  Poisoning
+        # the row while leaving its dependencies alone is the only way to tell
+        # a build that reads it from one that re-derives it: on an honest cache
+        # the two agree on every digit.
+        answers, sources, _key = self._collided_opener_sources()
+        collect_report(sources, ReportRequest(report_kind="leaderboard"))
+
+        cache = ScoreCache(sources.cache_path, answers,
+                           checkpoint_on_close=False)
+        stored = cache.opener_erd_map(ERD_ALL)["howdy"]
+        # The branch was solved before the fold was taken, which is the
+        # ordinary case: a fold happens when a tree finishes, and the results
+        # it reads are older than that.
+        cache._conn.execute(
+            "UPDATE branch_best_by_policy SET updated_at = ?",
+            (stored["folded_at"] - 60,))
         cache.write_opener_erds(
-            [(row["word"], row["erd"] + 99.0, 6, 4)
-             for row in leaderboard_rows(first["data"])],
-            ERD_ALL,
-        )
+            [("howdy", 9.5, 4, stored["response_group_count"])], ERD_ALL)
         cache.close()
 
-        second = collect_report(sources, ReportRequest(report_kind="leaderboard"))
-        self.assertEqual(leaderboard_rows(second["data"]),
-                         leaderboard_rows(first["data"]))
-        self.assertEqual(second["data"]["counts"], first["data"]["counts"])
+        data = collect_report(
+            sources, ReportRequest(report_kind="leaderboard"))["data"]
+        row, = leaderboard_rows(data)
+        self.assertEqual((row["word"], row["erd"]), ("howdy", 9.5))
+        self.assertEqual(row["max_remaining_depth"], 4)
+
+    def test_a_recomputed_branch_invalidates_the_fold_that_read_it(self):
+        # A branch deleted and recomputed to a *different* exact value leaves
+        # every one of the opener's groups present again, so presence alone
+        # cannot tell that the stored fold is reading a number no longer in the
+        # cache.  That is the one wrong answer that still looks plausible, and
+        # the result's update time is the only thing that catches it.
+        answers, sources, collided_key = self._collided_opener_sources()
+        first = collect_report(
+            sources, ReportRequest(report_kind="leaderboard"))["data"]
+        self.assertEqual([row["erd"] for row in leaderboard_rows(first)], [2.5])
+
+        cache = ScoreCache(sources.cache_path, answers,
+                           checkpoint_on_close=False)
+        folded_at = cache.opener_erd_map(ERD_ALL)["howdy"]["folded_at"]
+        cache.delete(collided_key, ERD_ALL)
+        cache.write(collided_key, ERD_ALL, "crane", 2.0,
+                    max_depth=3, solve_budget=None)
+        cache._conn.execute(
+            "UPDATE branch_best_by_policy SET updated_at = ?",
+            (folded_at + 1,))
+        cache.close()
+
+        data = collect_report(
+            sources, ReportRequest(report_kind="leaderboard"))["data"]
+        row, = leaderboard_rows(data)
+        self.assertEqual(row["erd"], 3.0)
+        self.assertEqual(row["max_remaining_depth"], 4)
+
+    def test_a_branch_rewritten_in_the_folds_own_second_is_not_covered(self):
+        # Update times are whole seconds, so a result written in the same
+        # second as the facts were read may or may not be in the fold that
+        # read them.  A tie therefore has to fail: the fold is re-derived
+        # rather than adopted on evidence that cannot distinguish the two.
+        answers, sources, collided_key = self._collided_opener_sources()
+        collect_report(sources, ReportRequest(report_kind="leaderboard"))
+
+        cache = ScoreCache(sources.cache_path, answers,
+                           checkpoint_on_close=False)
+        stored = cache.opener_erd_map(ERD_ALL)["howdy"]
+        cache._conn.execute(
+            "UPDATE branch_best_by_policy SET updated_at = ?",
+            (stored["folded_at"],))
+        cache.write_opener_erds(
+            [("howdy", 9.5, 4, stored["response_group_count"])],
+            ERD_ALL, folded_at=stored["folded_at"])
+        cache.close()
+
+        data = collect_report(
+            sources, ReportRequest(report_kind="leaderboard"))["data"]
+        self.assertEqual([row["erd"] for row in leaderboard_rows(data)], [2.5])
+
+    def test_a_stored_fold_over_a_different_split_is_not_adopted(self):
+        # The row records how many response groups it folded.  A count that
+        # disagrees with the opener's current split describes some other
+        # decomposition of the answer list, so it is re-derived rather than
+        # read however untouched the branch results behind it are.
+        answers, sources, _key = self._collided_opener_sources()
+        collect_report(sources, ReportRequest(report_kind="leaderboard"))
+
+        cache = ScoreCache(sources.cache_path, answers,
+                           checkpoint_on_close=False)
+        stored = cache.opener_erd_map(ERD_ALL)["howdy"]
+        cache._conn.execute(
+            "UPDATE branch_best_by_policy SET updated_at = ?",
+            (stored["folded_at"] - 60,))
+        cache.write_opener_erds(
+            [("howdy", 9.5, 4, stored["response_group_count"] + 1)], ERD_ALL)
+        cache.close()
+
+        data = collect_report(
+            sources, ReportRequest(report_kind="leaderboard"))["data"]
+        self.assertEqual([row["erd"] for row in leaderboard_rows(data)], [2.5])
+
+    def test_a_fold_the_budget_makes_infeasible_is_never_adopted(self):
+        # A lone survivor is solved by playing it, which needs a guess left.
+        # With none it is a proven loss and the candidate is infeasible, so no
+        # stored row calling it complete may be read -- and that is decided by
+        # the budget rather than by anything the groups hold, which is why the
+        # same inputs one budget higher do adopt the row.
+        answers = ["crane", "slate"]
+        sources = self._leaderboard_sources(answers, ["raise"])
+        cache = ScoreCache(sources.cache_path, answers,
+                           checkpoint_on_close=False)
+        self.addCleanup(cache.close)
+        skeletons = [("raise", [("--y--", 1, b"survivor")])]
+        stored = {"raise": {"erd": 7.0, "max_remaining_depth": 8,
+                            "response_group_count": 1, "folded_at": 10 ** 9}}
+
+        summaries, counts, derived, _folded_at = \
+            report_model._screen_and_fold_openers(
+                cache, skeletons, 0, ERD_ALL, stored)
+        self.assertEqual(counts, {"complete": 0, "pending": 0, "infeasible": 1})
+        self.assertEqual(summaries["raise"]["state"], "infeasible")
+        self.assertEqual(derived, set())
+
+        summaries, counts, derived, _folded_at = \
+            report_model._screen_and_fold_openers(
+                cache, skeletons, 1, ERD_ALL, stored)
+        self.assertEqual(counts, {"complete": 1, "pending": 0, "infeasible": 0})
+        self.assertEqual(summaries["raise"]["erd"], 7.0)
+        self.assertEqual(derived, set())
 
     def _standing_sources(self):
         """Three openers that complete, and one that does not.
@@ -1335,8 +1456,8 @@ class ReportModelTest(unittest.TestCase):
         # The leaderboard is polled, and the cache it writes to is the one the
         # swarm is writing branch results into.  A build that rewrote every
         # stored fold would add WAL traffic proportional to the vocabulary for
-        # a set of values none of which changed, so a fold is written only when
-        # it differs from the row already there.
+        # a set of values none of which changed, so a fold the screen adopted
+        # is left exactly as it stands.
         answers = ["crane", "slate"]
         sources = self._leaderboard_sources(answers, ["crane", "slate", "raise"])
         collect_report(sources, ReportRequest(report_kind="leaderboard"))
@@ -1352,6 +1473,32 @@ class ReportModelTest(unittest.TestCase):
             [opener for call in published.call_args_list
              for opener in call.args[2]],
             [])
+
+    def test_a_rebuild_over_an_unchanged_cache_derives_no_folds(self):
+        # The cost the screen was built to avoid is the per-group state dict a
+        # fold needs, and it comes back in full exactly as the sweep succeeds:
+        # screening reaches the fold only for the openers a fold can settle,
+        # and at a finished vocabulary that is all of them.  A rebuild whose
+        # branch results have not moved must therefore reach the fold for none
+        # of them -- and still report the same ranking it folded the first time.
+        answers = ["crane", "slate"]
+        sources = self._leaderboard_sources(answers, ["crane", "slate", "raise"])
+        first = collect_report(
+            sources, ReportRequest(report_kind="leaderboard"))["data"]
+        folded = []
+        real_fold = report_model._candidate_erd_summary
+
+        def recording(response_groups, group_budget):
+            folded.append(len(response_groups))
+            return real_fold(response_groups, group_budget)
+
+        with patch.object(report_model, "_candidate_erd_summary", recording):
+            second = collect_report(
+                sources, ReportRequest(report_kind="leaderboard"))["data"]
+        self.assertEqual(folded, [], "a rebuild re-derived a stored fold")
+        self.assertEqual(leaderboard_rows(second), leaderboard_rows(first))
+        self.assertEqual(second["counts"], first["counts"])
+        self.assertEqual(second["columns"], first["columns"])
 
     def test_a_stored_fold_is_deleted_once_its_opener_stops_screening(self):
         # The stored fold asserts that every one of an opener's groups holds a
@@ -2647,9 +2794,9 @@ class ReportModelTest(unittest.TestCase):
         screened = []
         real_screen = report_model._screen_and_fold_openers
 
-        def recording(cache, skeletons, group_budget, policy):
+        def recording(cache, skeletons, group_budget, policy, stored):
             screened.append(len(skeletons))
-            return real_screen(cache, skeletons, group_budget, policy)
+            return real_screen(cache, skeletons, group_budget, policy, stored)
 
         with patch.object(report_model, "_screen_and_fold_openers", recording):
             data = collect_report(sources, ReportRequest(

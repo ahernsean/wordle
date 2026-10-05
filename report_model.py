@@ -1394,11 +1394,10 @@ def _candidate_erd_summary(response_groups, group_budget):
     An *opener's* own ERD is a different case, and `opener_erd_by_policy`
     stores it: there is one row per opener rather than one per (branch,
     candidate) pair, and it depends only on that opener's own top-level
-    groups.  That dependency set is small enough to settle precisely, which is
-    what makes the stored value the authoritative answer rather than a memo of
-    a derivation.  Today `_screen_and_fold_openers` still re-derives every one
-    of them on each build and the rows go unread -- an implementation gap
-    (#384), not a property of the value.
+    groups.  That dependency set is small enough to settle precisely, so
+    `_screen_and_fold_openers` reads the stored value as the authoritative
+    answer and reaches this function only for the openers whose stored row it
+    cannot show to be current.
 
     `response_groups` carry each group's branch fact as
     `ScoreCache.report_branch_states` resolved it at `group_budget`, so a child
@@ -1473,15 +1472,55 @@ def _candidate_erd_summary(response_groups, group_budget):
     }
 
 
-def _screen_and_fold_openers(cache, skeletons, group_budget, policy):
-    """Fold every candidate opener that current branch results can settle.
+# A group whose branch holds no reusable exact result, in the shape
+# `report_reusable_branch_facts` returns the ones that do.
+_NO_BRANCH_FACT = (None, None, None)
 
-    Folding a whole vocabulary the way the word report folds one word costs a
-    per-group state dict for each of ~1.4 million response groups, almost all
-    of them belonging to openers still being searched.  Screening first reads
-    the same facts as two set lookups per group and reaches the fold only for
-    the openers a fold can finish, which on a production cache is the small
-    minority.
+
+def _adopted_opener_fold(stored_fold, response_group_count):
+    """The summary a current stored opener fold stands for.
+
+    A complete fold resolved every group it covered — the three per-group
+    tallies partition the groups, and `complete` is the state in which the
+    other two are empty — so the counts `_candidate_erd_summary` would have
+    returned follow from the group count alone.
+    """
+    return {
+        "state": "complete",
+        "erd": stored_fold["erd"],
+        "max_remaining_depth": stored_fold["max_remaining_depth"],
+        "resolved_group_count": response_group_count,
+        "infeasible_group_count": 0,
+        "response_group_count": response_group_count,
+    }
+
+
+def _screen_and_fold_openers(cache, skeletons, group_budget, policy, stored):
+    """Place every candidate opener against current branch results.
+
+    An opener's own ERD is the swarm's authoritative answer for that opener,
+    and `opener_erd_by_policy` holds it, so this reads the stored value
+    wherever the stored value is still current.  Deriving it again costs a
+    per-group state dict for every response group the build can settle --
+    1,389,596 of them once the sweep finishes -- which is the cost the screen
+    was built to avoid and the one part of it that comes back as the sweep
+    succeeds: the screen reaches the fold only for the openers a fold can
+    settle, and at completion that is all of them.
+
+    A stored fold is current when both hold, and `stored` carries the
+    `folded_at` the second test needs:
+
+    1. every one of the opener's groups still holds a reusable exact result —
+       which the screen already determines, as a lookup per group; and
+    2. none of those results has been rewritten since the fold was taken.
+
+    (1) catches a deleted branch.  (2) catches the case (1) cannot see: a
+    branch deleted and recomputed to a *different* exact value, which leaves
+    the fold reading a number that is no longer there while every group is
+    present again.  `folded_at` is stamped before the facts are read and the
+    comparison is strict, so a branch written in the same second as the read —
+    which the fold may or may not have seen — fails the test rather than
+    passing it on a tie.
 
     The screen visits every group rather than stopping at the first unsettled
     one, because a candidate holding both an unsettled group and a proven loss
@@ -1489,18 +1528,30 @@ def _screen_and_fold_openers(cache, skeletons, group_budget, policy):
     infeasibility ahead of pendency, and a screen that stopped early could
     exit before reaching the loss that decides it.
 
-    Returns (summaries, counts): one `_candidate_erd_summary` per opener the
-    fold could settle, and the three-way state tally over the whole
-    vocabulary.  An opener absent from `summaries` is pending, which is what
-    the tally counts it as.
+    Returns (summaries, counts, derived, folded_at): one summary per opener
+    the fold could settle, the three-way state tally over the whole
+    vocabulary, the openers whose complete fold was derived here rather than
+    adopted, and the stamp those folds are current as of.  An opener absent
+    from `summaries` is pending, which is what the tally counts it as.
     """
+    # Before the read, so a branch written during or after it cannot be
+    # covered by a fold that may have missed it.
+    folded_at = int(time.time())
     erd_by_key, loss_keys = cache.report_reusable_branch_facts(
         policy, group_budget)
     summaries = {}
+    derived = set()
     counts = {"complete": 0, "pending": 0, "infeasible": 0}
+    # A lone survivor is solved by playing it, which needs a guess left.  With
+    # none it is a proven loss and every candidate holding one is infeasible,
+    # so at that budget there is no complete fold to adopt at all and the
+    # question never reaches a stored row.
+    adoptable = group_budget >= 1
     for candidate, groups in skeletons:
+        stored_fold = stored.get(candidate) if adoptable else None
         settled = True
         holds_loss = False
+        latest_group_update = 0
         for _pattern, answer_count, branch_key in groups:
             # A group of fewer than two answers needs no stored result: the
             # fold solves it from the response pattern alone.
@@ -1510,17 +1561,31 @@ def _screen_and_fold_openers(cache, skeletons, group_budget, policy):
                 holds_loss = True
             elif branch_key not in erd_by_key:
                 settled = False
+            elif stored_fold is not None:
+                # Only a candidate with a row to adopt needs the update times;
+                # for the rest the screen is deciding presence and nothing
+                # else, and this is 1.4 million groups.
+                updated_at = erd_by_key[branch_key][2]
+                if updated_at > latest_group_update:
+                    latest_group_update = updated_at
         if not (settled or holds_loss):
             counts["pending"] += 1
+            continue
+        if (stored_fold is not None and settled and not holds_loss
+                and stored_fold["folded_at"] > latest_group_update
+                and stored_fold["response_group_count"] == len(groups)):
+            counts["complete"] += 1
+            summaries[candidate] = _adopted_opener_fold(
+                stored_fold, len(groups))
             continue
         summary = _candidate_erd_summary(
             [
                 {
                     "pattern": pattern,
                     "answer_count": answer_count,
-                    "best_erd": erd_by_key.get(branch_key, (None, None))[0],
+                    "best_erd": erd_by_key.get(branch_key, _NO_BRANCH_FACT)[0],
                     "max_remaining_depth":
-                        erd_by_key.get(branch_key, (None, None))[1],
+                        erd_by_key.get(branch_key, _NO_BRANCH_FACT)[1],
                     "cache_state": (
                         "exact" if branch_key in erd_by_key
                         else "loss" if branch_key in loss_keys else "missing"
@@ -1533,18 +1598,25 @@ def _screen_and_fold_openers(cache, skeletons, group_budget, policy):
         counts[summary["state"]] += 1
         if summary["state"] != "pending":
             summaries[candidate] = summary
-    return summaries, counts
+        if summary["state"] == "complete":
+            derived.add(candidate)
+    return summaries, counts, derived, folded_at
 
 
-def _store_opener_folds(cache, summaries, policy, stored=None):
+def _store_opener_folds(cache, summaries, policy, stored, derived, folded_at):
     """Bring stored opener folds into line with the folds just screened.
 
-    Writes every opener the screen settled and deletes the stored rows for
+    Writes the folds this build derived and deletes the stored rows for
     openers it no longer settles, so a branch result removed by a repair or a
-    requeue takes the folds that read it with it on the next read.  A row is
-    rewritten only when its value differs from the one stored: the build runs
-    on a poll against the cache the swarm is writing into, and rewriting an
-    unchanged vocabulary would add WAL traffic for no change in the answer.
+    requeue takes the folds that read it with it on the next read.
+
+    A fold the screen *adopted* is already the row that would be written, so
+    it is left untouched: the build runs on a poll against the cache the swarm
+    is writing into, and rewriting an unchanged vocabulary would add WAL
+    traffic for no change in the answer.  A derived fold is written even when
+    its value matches the stored one, because the row's `folded_at` is what
+    the next build's adoption test reads, and advancing it is what re-deriving
+    bought.
 
     Both halves go through one `publish_opener_erds`, so the refresh lands as
     one field rather than as stored rows that appear before the retired ones
@@ -1553,22 +1625,19 @@ def _store_opener_folds(cache, summaries, policy, stored=None):
     if cache.read_only:
         return
     complete = {
-        opener: summary for opener, summary in summaries.items()
+        opener for opener, summary in summaries.items()
         if summary["state"] == "complete"
     }
-    if stored is None:
-        stored = cache.opener_erd_map(policy)
     cache.publish_opener_erds(
         (
-            (opener, summary["erd"], summary["max_remaining_depth"],
-             summary["response_group_count"])
-            for opener, summary in complete.items()
-            if stored.get(opener, {}).get("erd") != summary["erd"]
-            or stored.get(opener, {}).get("max_remaining_depth")
-            != summary["max_remaining_depth"]
+            (opener, summaries[opener]["erd"],
+             summaries[opener]["max_remaining_depth"],
+             summaries[opener]["response_group_count"])
+            for opener in derived
         ),
-        set(stored) - set(complete),
+        set(stored) - complete,
         policy,
+        folded_at,
     )
 
 
@@ -3559,8 +3628,7 @@ def _opener_standing(cache, word, summary, answer_count, answer_set):
     stored, so the ERD is as fresh as this request and the rank as fresh as
     that build.  That asymmetry is the trade the lookup is: rescreening the
     vocabulary to place one word costs more than the ranking it would place
-    the word in.  It narrows as the stored folds become the build's own answer
-    rather than its output (#384).
+    the word in.
 
     So `ranked_total` is the size of the field as the last build left it, and
     it is reported rather than assumed: on a cache no build has screened yet
@@ -3713,17 +3781,18 @@ def _leaderboard_detail(word, summary, response_group_skeletons, answer_set):
 def collect_leaderboard_report(sources: ReportOpeners, request: ReportRequest) -> dict:
     """Rank every candidate opener by its own ERD.
 
-    Each candidate's ERD is folded exactly as the word report folds it
-    (`_candidate_erd_summary`), over branch states read through the cache's own
+    Each candidate's ERD is the value `_candidate_erd_summary` folds from its
+    response groups, over branch states read through the cache's own
     reusability gate, so the numbers agree with `view WORD`.  Only openers
     whose whole tree is solved have a finite ERD and appear ranked; the rest
     are summarized as pending or infeasible.
 
-    Every candidate is rescreened against current cache state on every build,
-    and `_screen_and_fold_openers` reaches the fold only for the openers a
-    fold can settle.  `_store_opener_folds` then records those folds, so the
-    ranking is a description of the cache as it stands rather than a reading
-    of what an earlier build stored.
+    Every candidate is screened against current cache state on every build.
+    An opener whose groups are all present and none of them rewritten since
+    its stored fold was taken is read from `opener_erd_by_policy`; every other
+    opener is folded here and its row refreshed.  So the ranking still
+    describes the cache as it stands, and the cost of saying so stops growing
+    with the share of the vocabulary that is finished.
     """
     generated_at = int(time.time())
     all_answers = load_word_list(sources.answer_list_path)
@@ -3763,10 +3832,12 @@ def collect_leaderboard_report(sources: ReportOpeners, request: ReportRequest) -
             (len(groups) for _, groups in skeletons),
             default=0,
         )
-        summaries, counts = _screen_and_fold_openers(
-            cache, skeletons, group_budget, ERD_ALL
+        stored = cache.opener_erd_map(ERD_ALL)
+        summaries, counts, derived, folded_at = _screen_and_fold_openers(
+            cache, skeletons, group_budget, ERD_ALL, stored
         )
-        _store_opener_folds(cache, summaries, ERD_ALL)
+        _store_opener_folds(
+            cache, summaries, ERD_ALL, stored, derived, folded_at)
         groups_by_candidate = dict(skeletons)
         ranked = sorted(
             (

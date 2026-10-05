@@ -459,25 +459,83 @@ as `missing`, and the candidate reads `pending` — never folded in.
 Do not reintroduce a durable memo keyed by branch, and do not add one to
 `EXPORT_TABLES`/`TABLES`.
 
-**One fold is stored, and only because it can be rechecked for less than it
-costs to keep honest.**  `opener_erd_by_policy` holds each completed opener's
-own ERD: one row per candidate word, bounded at the vocabulary rather than at
-every (branch, candidate) pair the dropped `candidate_erd_by_policy` was keyed
-by.  That bound is what makes the difference.  A reader does not trust a stored
-row — `_screen_and_fold_openers` rescreens every opener's groups against
-current branch results on every build, and `_store_opener_folds` deletes the
-rows whose openers no longer screen complete.  So a repair or a requeue that
-removes a branch result removes the folds that read it at the next read, which
-is the guarantee a branch-keyed memo could not give.
+**One fold is stored, and it is the authoritative answer for its opener.**
+`opener_erd_by_policy` holds each completed opener's own ERD: one row per
+candidate word, bounded at the vocabulary rather than at every (branch,
+candidate) pair the dropped `candidate_erd_by_policy` was keyed by.  That bound
+is what makes the difference — an opener depends only on its own top-level
+groups, a dependency set the screen already walks on every build, so a stored
+row can be *shown* current for less than it costs to derive again.  That is the
+thing a branch-keyed memo could never do, and it is why this one is kept.
 
-The screen is what makes rescreening affordable.  Folding a whole vocabulary
-builds a state dict per response group — about 1.4 million of them, nearly all
-belonging to openers still being searched.  The screen reads the same facts as
-two set lookups per group through `ScoreCache.report_reusable_branch_facts`,
-which decides the reusability gate in SQL and loads three columns of the
-qualifying rows instead of six columns of every row.  Measured on the
-production cache at 872 completed openers, a full leaderboard build went from
-25.3s to 3.0s, returning byte-identical rows.
+**A stored fold is current exactly when both of these hold, and
+`_screen_and_fold_openers` checks both on every build:**
+
+1. every one of the opener's groups still holds a reusable exact result; and
+2. none of those results has been rewritten since the fold was taken —
+   `max(group.updated_at) < folded_at`.
+
+(1) is what a repair or a requeue trips: the branch result is gone, the opener
+no longer screens complete, and `_store_opener_folds` deletes its row.  (2) is
+for the case (1) cannot see — a branch deleted and recomputed to a *different*
+exact value, which leaves every group present again while the stored number is
+no longer anywhere in the cache.  That is the one wrong answer that still looks
+plausible, and `test_a_recomputed_branch_invalidates_the_fold_that_read_it` is
+what pins it.  `test_a_leaderboard_reads_the_opener_erd_it_stored` pins the
+other direction, by poisoning a current row and watching the ranking report
+it: on an honest cache a build that reads the row and a build that re-derives
+it agree on every digit, so nothing short of a poisoned row can tell them
+apart.
+
+**`folded_at` is stamped before the facts are read, and the comparison is
+strict.**  `updated_at` is whole seconds, so a result written in the same
+second as the read may or may not be in the fold that read them — a tie has to
+fail rather than pass (`test_a_branch_rewritten_in_the_folds_own_second_is_not_covered`).
+One timestamp per group is enough because `ScoreCache.delete` drops both of a
+branch's exact scopes together, so the budget precedence can never fall back
+onto a surviving row older than the fold that read the one in front of it.
+
+**`_store_opener_folds` writes every fold the build derived, and leaves every
+fold it adopted alone.**  A derived row is rewritten even when its value is
+unchanged, because the row's `folded_at` is what the next build's adoption
+test reads and advancing it is what re-deriving bought — which is also how a
+same-second tie settles itself. An adopted row is already what would be
+written, and rewriting an unchanged vocabulary on a two-second poll would add
+WAL traffic for no change in the answer.
+
+The screen is what makes both the check and the fallback affordable.  Folding a
+whole vocabulary builds a state dict per response group — about 1.4 million of
+them at 872 completed openers, nearly all belonging to openers still being
+searched.  The screen reads the same facts as a lookup per group through
+`ScoreCache.report_reusable_branch_facts`, which decides the reusability gate
+in SQL and loads four columns of the qualifying rows instead of six columns of
+every row.  Measured on the production cache at 872 completed openers, a full
+leaderboard build went from 25.3s to 3.0s, returning byte-identical rows.
+
+**The screen's saving is the fold it skips, and that saving runs out as the
+sweep succeeds; adoption's does not.**  The screen reaches the fold only for
+the openers a fold can settle, which was 7% of the vocabulary at 1,058
+completed openers, so at a finished vocabulary nothing is skipped and all
+1,389,596 response groups are folded on every rebuild.  Adoption keeps the
+walk over the groups — that is what decides (1) and (2) — and drops the
+per-group state dict.
+
+Measured read-only on the production cache at 1,058 completed openers, both
+paths over the same skeletons: deriving every fold 2.81s, adopting 1,052 of
+them 2.74s, and 0 of the 1,058 summaries differing between the two.  The
+marginal fold is 1.56 µs per group, so the screen phase projects to 4.9s
+deriving against 2.7s adopting at full completion.
+
+**That is a smaller number than the 25.3s above suggests, and the two are not
+comparable.**  25.3s was the pre-screen build, which read whole branch rows
+through `report_branch_states` once per group; the screen replaced the fact
+loading *and* made the fold itself several times cheaper, so deriving after
+screening does not return there.  What adoption removes is the part of the
+build that is proportional to the finished share of the vocabulary — about
+2.2s of it — on top of making the stored ERD the answer rather than a
+by-product.  Do not quote it as a twenty-second saving.  The build's dominant
+term at either completion is `_candidate_group_skeletons` (#381), which
+adoption does not touch, because deciding (1) and (2) needs the groups.
 
 **The screen visits every group; it must not stop at the first unsettled one.**
 A candidate holding both an unsettled group and a proven loss is `infeasible`,
@@ -510,17 +568,13 @@ counted in rather than implying one.  Rescreening the vocabulary to place one
 word costs more than the ranking it would place the word in, which is the whole
 reason the lookup exists.
 
-**An opener's stored ERD is meant to be the authoritative answer, and the rule
-above is about a different table.**  What #288 dropped was
-`candidate_erd_by_policy`, a fold keyed by (branch, candidate): an unbounded
-set whose dependencies could not be enumerated, so a deleted branch row
-falsified folds nobody could name.  `opener_erd_by_policy` holds one row per
-opener and depends only on that opener's own top-level groups -- a dependency
-set the screen already walks on every build.  Do not read "a fold cannot
-defend itself" as covering it.  That the leaderboard still re-derives all of
-them on every build, and never reads the rows it writes, is an implementation
-gap tracked in #384, not a property of the value: computing an exact ERD for
-every opener is what the swarm is for.
+**"A fold cannot defend itself" is about a different table.**  What #288
+dropped was `candidate_erd_by_policy`, a fold keyed by (branch, candidate): an
+unbounded set whose dependencies could not be enumerated, so a deleted branch
+row falsified folds nobody could name.  `opener_erd_by_policy` holds one row
+per opener and depends only on that opener's own top-level groups.  Do not read
+the rule as covering it: computing an exact ERD for every opener is what the
+swarm is for, and that number is the output, not a cache of one.
 
 `opener_erd_by_policy` is local to each machine and travels in neither
 `EXPORT_TABLES` nor `TABLES`: it is derived from branch results the export
