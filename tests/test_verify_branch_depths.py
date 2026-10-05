@@ -21,7 +21,7 @@ import verify_branch_depths
 from cache_sqlite import ScoreCache, branch_reference
 from erd_queue import decode_subset
 from runtime_paths import DEFAULT_ANSWER_LIST_PATH
-from verify_branch_depths import DepthAudit, fold_branch, iter_rows
+from verify_branch_depths import DepthAudit, reduce_branch, iter_rows
 from wordle_engine import (
     ERD_ALL,
     ResponseCache,
@@ -49,13 +49,13 @@ class _StubResponses:
 
 
 class FoldBranchTest(unittest.TestCase):
-    """fold_branch reproduces evaluate_candidate's max_depth recurrence."""
+    """reduce_branch reproduces evaluate_candidate's max_depth recurrence."""
 
     def test_self_group_is_free_and_a_singleton_costs_one_more_guess(self):
         # CRANE is the guess and one of the branch words: its own group is
         # finished by playing it, while the other single word needs one more.
         responses = _StubResponses({0: ['crane'], 1: ['sound']})
-        fold = fold_branch(['crane', 'sound'], 'crane', responses,
+        fold = reduce_branch(['crane', 'sound'], 'crane', responses,
                            lambda key: self.fail('no group needs a lookup'))
         self.assertEqual(fold.depth, 2)
         self.assertEqual(fold.erd, 1.5)
@@ -63,7 +63,7 @@ class FoldBranchTest(unittest.TestCase):
     def test_a_stored_group_costs_one_more_than_its_own_worst_case(self):
         group = ['sound', 'spend', 'stand']
         responses = _StubResponses({0: ['crane'], 1: group})
-        fold = fold_branch(['crane'] + group, 'crane', responses,
+        fold = reduce_branch(['crane'] + group, 'crane', responses,
                            lambda key: (3, 2.0))
         self.assertEqual(fold.depth, 4)
         self.assertAlmostEqual(fold.erd, 1.0 + 0.75 * 2.0)
@@ -71,21 +71,21 @@ class FoldBranchTest(unittest.TestCase):
     def test_a_group_with_no_stored_row_leaves_the_fold_incomplete(self):
         group = ['sound', 'spend']
         responses = _StubResponses({0: ['crane'], 1: group})
-        fold = fold_branch(['crane'] + group, 'crane', responses, lambda key: None)
+        fold = reduce_branch(['crane'] + group, 'crane', responses, lambda key: None)
         self.assertFalse(fold.complete)
         self.assertEqual(fold.missing, (ScoreCache.encode_subset(group),))
 
     def test_a_row_whose_max_depth_is_missing_reads_as_incomplete(self):
         group = ['sound', 'spend']
         responses = _StubResponses({0: ['crane'], 1: group})
-        fold = fold_branch(['crane'] + group, 'crane', responses,
+        fold = reduce_branch(['crane'] + group, 'crane', responses,
                            lambda key: (None, 2.0))
         self.assertFalse(fold.complete)
 
     def test_a_guess_that_separates_nothing_is_degenerate(self):
         branch = ['sound', 'spend']
         responses = _StubResponses({0: branch})
-        fold = fold_branch(branch, 'crane', responses,
+        fold = reduce_branch(branch, 'crane', responses,
                            lambda key: self.fail('degenerate rows are not folded'))
         self.assertTrue(fold.degenerate)
         self.assertFalse(fold.complete)
@@ -310,7 +310,7 @@ class CleanRebuildTest(_CacheFixture):
         for row in iter_rows(score_cache, ERD_ALL):
             branch_key = bytes(row['branch_key'])
             scope = row['solve_budget']
-            fold = fold_branch(
+            fold = reduce_branch(
                 decode_subset(branch_key), row['best_guess'], responses,
                 _known_lookup(known, scope))
             self.assertTrue(fold.complete)
@@ -363,7 +363,7 @@ class AliasedOverwriteTest(_CacheFixture):
                   for key, scope, _guess, max_depth in rows}
         flagged = set()
         for branch_key, scope, best_guess, max_depth in rows:
-            fold = fold_branch(decode_subset(branch_key), best_guess, responses,
+            fold = reduce_branch(decode_subset(branch_key), best_guess, responses,
                                _known_lookup(stored, scope))
             if fold.complete and fold.depth != max_depth:
                 flagged.add((branch_reference(branch_key), scope))
@@ -380,7 +380,7 @@ class AliasedOverwriteTest(_CacheFixture):
         self.assertIn(_fact_reference(parent), flagged)
         finding = flagged[_fact_reference(parent)]
         self.assertEqual(finding['stored_max_depth'], true_depth - 1)
-        self.assertEqual(finding['folded_max_depth'], true_depth)
+        self.assertEqual(finding['reduced_max_depth'], true_depth)
         self.assertEqual(audit.depth_deltas[(true_depth - 1, true_depth)], 1)
         self.assertEqual(audit.mismatch_sizes[len(decode_subset(parent[0]))], 1)
 

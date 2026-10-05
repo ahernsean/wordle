@@ -92,7 +92,7 @@ SINGLETON_MAX_REMAINING_DEPTH = 1
 SCORE_TOLERANCE = 1e-9
 
 
-class DepthFold:
+class BranchReduction:
     """One row's max_depth and ERD as its own stored strategy determines them.
 
     `depth` and `erd` are None when `missing` or `degenerate` is set — the fold
@@ -113,7 +113,7 @@ class DepthFold:
         return self.depth is not None
 
 
-def fold_branch(branch_words, best_guess, response_cache, child_lookup):
+def reduce_branch(branch_words, best_guess, response_cache, child_lookup):
     """Fold one branch's max_depth and ERD from best_guess's response groups.
 
     Mirrors evaluate_candidate's recurrence: the guess itself is one guess; the
@@ -139,7 +139,7 @@ def fold_branch(branch_words, best_guess, response_cache, child_lookup):
         k = len(group)
         if k >= n:
             # The guess separates nothing: this row's own branch back again.
-            return DepthFold(degenerate=True)
+            return BranchReduction(degenerate=True)
         if k == 1:
             if group[0] == best_guess:
                 continue
@@ -153,8 +153,8 @@ def fold_branch(branch_words, best_guess, response_cache, child_lookup):
         depth = max(depth, 1 + child_depth)
         erd += (k / n) * child_erd
     if missing:
-        return DepthFold(missing=missing)
-    return DepthFold(depth=depth, erd=erd)
+        return BranchReduction(missing=missing)
+    return BranchReduction(depth=depth, erd=erd)
 
 
 class DepthAudit:
@@ -235,7 +235,7 @@ class DepthAudit:
             return
 
         branch_words = decode_subset(branch_key)
-        fold = fold_branch(branch_words, best_guess, self._responses,
+        fold = reduce_branch(branch_words, best_guess, self._responses,
                            self._child_lookup(scope))
         if fold.degenerate:
             self.degenerate += 1
@@ -271,7 +271,7 @@ class DepthAudit:
                 'branch_size': len(branch_words),
                 'best_guess': best_guess,
                 'stored_max_depth': stored_depth,
-                'folded_max_depth': fold.depth,
+                'reduced_max_depth': fold.depth,
                 'solve_budget': solve_budget,
             })
         if not self._repair:
@@ -395,7 +395,7 @@ def render_report(summary, elapsed, repair):
         lines.append(
             f"    {finding['branch_reference']}  n={finding['branch_size']:,}  "
             f"{finding['best_guess']}  stored {finding['stored_max_depth']} "
-            f"-> folded {finding['folded_max_depth']}  "
+            f"-> folded {finding['reduced_max_depth']}  "
             f"solve_budget={finding['solve_budget']}")
     return '\n'.join(lines)
 

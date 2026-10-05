@@ -27,10 +27,10 @@ def exact_results_agree(stored_score, stored_max_depth,
                         incoming_score, incoming_max_depth) -> bool:
     """Whether two exact results for one scope are the same certificate.
 
-    Equal cost is not enough.  max_depth is ancestor-visible — a parent folds
-    a child's worst case into its own — so two equal-cost strategies with
-    different worst cases are different certificates, and a parent folded from
-    one does not describe a subtree the other supports.
+    Equal cost is not enough.  max_depth is ancestor-visible — a parent
+    reduces a child's worst case into its own — so two equal-cost strategies
+    with different worst cases are different certificates, and a parent reduced
+    from one does not describe a subtree the other supports.
 
     import_cache expresses this same rule in SQL, over whole tables at once;
     test_the_sql_equivalence_rule_matches_the_python_one keeps the two in step.
@@ -122,7 +122,7 @@ class CacheWriteConflict(Exception):
 
     Within a scope the optimum is a single number, so a second exact write
     naming a different one means the two searches cannot both be right.
-    Recording either would invalidate whichever ancestors folded the other,
+    Recording either would invalidate whichever ancestors reduced the other,
     which is the failure this schema exists to prevent — so the write is
     refused instead.
     """
@@ -450,8 +450,8 @@ class ScoreCache:
         # at one remaining-depth budget.  Both can be right and differ.  They
         # live in separate tables because one row cannot hold both: a shared
         # key makes either write destroy the other, after ancestors may already
-        # have folded the value it displaced, and nothing records which one
-        # they folded.
+        # have reduced the value it displaced, and nothing records which one
+        # they reduced.
         #
         # branch_best_by_policy holds only the unrestricted optima, so its
         # solve_budget column is NULL on every row it now accepts.  The column
@@ -528,18 +528,18 @@ class ScoreCache:
             self._conn.execute(
                 "ALTER TABLE completed_opener_summaries "
                 "ADD COLUMN telemetry_epochs TEXT NOT NULL DEFAULT ''")
-        # An opener's own ERD, folded over its top-level response groups once
+        # An opener's own ERD, reduced over its top-level response groups once
         # every one of them holds a reusable exact result.  Unlike a candidate's
         # ERD at an arbitrary branch, this is bounded at one row per candidate
         # word and is revalidated on every read: the reader rescreens each
         # opener's groups against current branch results and deletes the rows
         # whose openers no longer screen complete, so a repair or requeue that
-        # removes a branch result removes the folds that read it on the next
-        # read rather than leaving them asserting a tree that is gone.
+        # removes a branch result removes the reductions that read it on the
+        # next read rather than leaving them asserting a tree that is gone.
         #
-        # response_group_count is how many response groups the fold covered,
-        # which is the opener's split against the answer list it was folded
-        # over.
+        # response_group_count is how many response groups the reduction
+        # covered, which is the opener's split against the answer list it was
+        # reduced over.
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS opener_erd_by_policy (
                 opener TEXT NOT NULL, policy TEXT NOT NULL,
@@ -551,7 +551,8 @@ class ScoreCache:
             )
         """)
         # The ranking's own sort key, so a question about one opener's place in
-        # it is a seek rather than a read of every fold.  The primary key is on
+        # it is a seek rather than a read of every reduction.  The primary key
+        # is on
         # the opener, which answers "what is SALET's ERD" and nothing about
         # order; this index answers "how many openers beat it" and "which ones
         # sit either side of it".  Covering, so neither query reaches the table.
@@ -611,8 +612,8 @@ class ScoreCache:
                     f"ALTER TABLE {tbl} ADD COLUMN solve_budget INTEGER")
         # ERD policy names were renamed so both axes of the (guess-universe x
         # compliance-filter) selection are spelled out in the namespace
-        # itself — 'erd_all' named only the universe, 'erd_answers' folded
-        # both axes into one word, and 'erd_constrained' named neither
+        # itself — 'erd_all' named only the universe, 'erd_answers' named
+        # both axes with one word, and 'erd_constrained' named neither
         # explicitly. The new names are uniform: erd_<universe>_<compliance>.
         #   erd_all     -> erd_words_unfiltered   (all words,   no clue filter)
         #   erd_answers -> erd_answers_compliant  (answer list, clue-compliant)
@@ -786,11 +787,12 @@ class ScoreCache:
             self._conn.execute(
                 "DELETE FROM branch_best_by_policy WHERE solve_budget IS NOT NULL")
             self._mark_migration_done('split_budget_specific_branch_results')
-        # candidate_erd_by_policy memoised a candidate's folded ERD at a
+        # candidate_erd_by_policy memoised a candidate's reduced ERD at a
         # branch, keyed by a hash of the branch's word set.  Given a branch
-        # result there was no way to ask which folds had read it, so deleting
-        # one — a repair, a reverification, a requeue — left every fold over it
-        # asserting a candidate complete whose groups were gone.  A candidate's
+        # result there was no way to ask which reductions had read it, so
+        # deleting one — a repair, a reverification, a requeue — left every
+        # reduction over it asserting a candidate complete whose groups were
+        # gone.  A candidate's
         # ERD at an arbitrary branch is derived on each read instead, so the
         # table has no reader and must not exist.
         #
@@ -1007,10 +1009,10 @@ class ScoreCache:
 
         A result already stored for the same branch at the same scope is kept
         rather than replaced, and **returned**: the caller must adopt it before
-        folding anything, because what a solver hands its parent has to be what
-        the cache durably holds.  Equal-cost strategies can differ in
+        reducing anything, because what a solver hands its parent has to be
+        what the cache durably holds.  Equal-cost strategies can differ in
         max_depth, which is ancestor-visible, so a caller that kept its own
-        worst case would fold a parent the stored child does not support —
+        worst case would reduce a parent the stored child does not support —
         the inconsistent ancestry this schema exists to prevent, reached
         without any overwrite.
 
@@ -1041,7 +1043,7 @@ class ScoreCache:
             # Creating the row IS the check.  A read followed by an insert
             # leaves a window two workers both pass through, and the second
             # insert would then displace a result an ancestor may already have
-            # folded -- with neither writer noticing.  DO NOTHING makes the
+            # reduced -- with neither writer noticing.  DO NOTHING makes the
             # uniqueness constraint decide it: exactly one writer creates the
             # row, and every other reconciles against what that one stored.
             before = self._conn.total_changes
@@ -1077,7 +1079,7 @@ class ScoreCache:
                         f"budget={solve_budget}: stored {stored[1]!r}, "
                         f"incoming {best_score!r}")
                 # The same optimum, reached again.  The stored row stands and
-                # the caller adopts it: an ancestor may already have folded its
+                # the caller adopts it: an ancestor may already have reduced its
                 # max_depth, and equal cost does not make two worst cases
                 # interchangeable.
                 self.redundant_write_count += 1
@@ -1198,7 +1200,7 @@ class ScoreCache:
 
         max_depth is fully determined by best_guess and the max_depth of that
         guess's response groups, so a row whose stored value disagrees with
-        that fold can be set to the folded value without re-searching: the
+        that reduction can be set to the reduced value without re-searching: the
         strategy is unchanged, only the worst-case line length it was
         recorded with.  best_guess, best_score and solve_budget are left as
         they are.
@@ -1365,10 +1367,10 @@ class ScoreCache:
         use when a caller needs a branch's *facts* — its budget-specific rows,
         update times, and which table each came from.  This one answers only
         "is this branch settled at this budget, and at what cost", which is
-        everything a fold over response groups reads.  Folding a whole
+        everything a reduction over response groups reads.  Reducing a whole
         vocabulary that way loads the qualifying keys and three columns instead
         of every row and six, which on a production cache is several times
-        less work for an identical fold.
+        less work for an identical reduction.
 
         An unrestricted result wins whenever its own worst case fits the
         budget, so the budget-specific table only fills in keys the
@@ -1403,7 +1405,7 @@ class ScoreCache:
         return erd_by_key, loss_keys
 
     def opener_erd_map(self, policy):
-        """Stored opener folds for this answer list, keyed by opener word."""
+        """Stored opener reductions for this answer list, keyed by opener."""
         return {
             row["opener"]: {
                 "erd": row["erd"],
@@ -1421,10 +1423,11 @@ class ScoreCache:
         }
 
     def ranked_opener_count(self, policy, excluding):
-        """How many openers other than `excluding` hold a stored fold.
+        """How many openers other than `excluding` hold a stored reduction.
 
         The named opener is left out because the caller is asking about it, and
-        its own row can outlive the fold that wrote it: an opener that a repair
+        its own row can outlive the reduction that wrote it: an opener that a
+        repair
         or a requeue has made unfinished still has the row the last screen
         stored, and counting that would report a field one larger than the one
         the opener is actually outside.
@@ -1439,9 +1442,10 @@ class ScoreCache:
                         neighbour_count):
         """Where one opener sits in the stored ranking, without loading it.
 
-        `erd` and `max_remaining_depth` are the caller's own fold of this
+        `erd` and `max_remaining_depth` are the caller's own reduction of this
         opener, and they are the only live facts in the answer.  The opener's
-        stored row is excluded from every query here, so a fold that disagrees
+        stored row is excluded from every query here, so a reduction that
+        disagrees
         with it -- an opener that completed since the last screen, or one whose
         tree was repaired -- is placed by what it is now rather than by what
         was recorded.  Counting its stale row as well would move it past
@@ -1454,8 +1458,9 @@ class ScoreCache:
         actually above and below.
 
         The population is whatever the last leaderboard build screened.  A
-        stored fold is a record of that screen and is not evidence on its own
-        (`_screen_and_fold_openers` rescreens and `delete_opener_erds` prunes),
+        stored reduction is a record of that screen and is not evidence on its
+        own
+        (`_screen_and_reduce_openers` rescreens and `delete_opener_erds` prunes),
         so this is a positional statement about that population and nothing
         more.  The alternative is to rescreen the vocabulary, which is the cost
         the whole lookup exists to avoid.
@@ -1465,7 +1470,8 @@ class ScoreCache:
         `neighbour_count` and are seeks.
 
         All four read one snapshot.  A leaderboard build stores and deletes
-        folds, and it runs against the same cache a detail request is being
+        reductions, and it runs against the same cache a detail request is
+        being
         served from, so between two autocommit statements the field can change
         underneath them -- and the four answers are one statement about one
         field.  Counted separately they can disagree: a rank from a larger
@@ -1579,11 +1585,11 @@ class ScoreCache:
                 len(rows), len(retired_openers), policy, exc)
 
     def write_opener_erds(self, rows, policy, folded_at=None):
-        """Store folds for openers whose whole tree is solved."""
+        """Store reductions for openers whose whole tree is solved."""
         self.publish_opener_erds(rows, (), policy, folded_at)
 
     def delete_opener_erds(self, openers, policy):
-        """Drop stored folds for openers that no longer screen complete."""
+        """Drop stored reductions for openers that no longer screen complete."""
         self.publish_opener_erds((), openers, policy)
 
     def completed_opener_summary_map(self, policy):
@@ -1831,7 +1837,7 @@ class ScoreCache:
     def report_branch_row_maps(self, policy):
         """Bulk-load every exact and loss row for a policy, keyed by branch_key.
 
-        Folding a whole candidate vocabulary at once would otherwise need one
+        Reducing a whole candidate vocabulary at once would otherwise need one
         `IN (...)` query per candidate; loading the full maps once and looking
         up in memory keeps the leaderboard a single pass over the cache.  The
         rows carry the same columns `_report_cache_state_from_rows` reads, so
@@ -1867,7 +1873,7 @@ class ScoreCache:
 
         `report_branch_row_maps` loads every exact/loss row for a policy once;
         this applies the same reusability gate `report_branch_states` uses
-        without a per-key query, so a whole candidate vocabulary folds in one
+        without a per-key query, so a whole candidate vocabulary reduces in one
         pass.  The maps must carry the columns the gate reads, which is exactly
         what `report_branch_row_maps` returns.
         """

@@ -434,7 +434,7 @@ results at three budgets is one branch.
 
 A branch result is a certificate; a **candidate's** ERD at a branch is a *fold*
 over the results of that candidate's response groups, and the two are not
-alike.  `report_model._candidate_erd_summary` is the only thing that produces
+alike.  `report_model.reduce_candidate_erd` is the only thing that produces
 one, and it produces it on every read from the group facts the caller has
 already materialized.
 
@@ -464,8 +464,8 @@ costs to keep honest.**  `opener_erd_by_policy` holds each completed opener's
 own ERD: one row per candidate word, bounded at the vocabulary rather than at
 every (branch, candidate) pair the dropped `candidate_erd_by_policy` was keyed
 by.  That bound is what makes the difference.  A reader does not trust a stored
-row — `_screen_and_fold_openers` rescreens every opener's groups against
-current branch results on every build, and `_store_opener_folds` deletes the
+row — `_screen_and_reduce_openers` rescreens every opener's groups against
+current branch results on every build, and `_store_opener_reductions` deletes the
 rows whose openers no longer screen complete.  So a repair or a requeue that
 removes a branch result removes the folds that read it at the next read, which
 is the guarantee a branch-keyed memo could not give.
@@ -481,7 +481,7 @@ production cache at 872 completed openers, a full leaderboard build went from
 
 **The screen visits every group; it must not stop at the first unsettled one.**
 A candidate holding both an unsettled group and a proven loss is `infeasible`,
-because `_candidate_erd_summary` decides infeasibility ahead of pendency — and
+because `reduce_candidate_erd` decides infeasibility ahead of pendency — and
 an early exit can return before reaching the loss that decides it.  That is the
 one wrong answer that still looks plausible, so
 `test_a_screened_candidate_holding_a_loss_and_a_gap_is_infeasible` pins it

@@ -32,11 +32,9 @@ from report_model import (
     WORK_DISTRIBUTION_BAND_EDGE_SECONDS,
     collect_work_distribution_report,
     work_distribution_band_labels,
-    _candidate_erd_summary,
     _candidate_eta,
     _opener_group_key,
     _grouped_response_groups,
-    _response_group_is_solved,
     _response_group_key,
     _response_group_rollup,
     _root_progress_estimate,
@@ -51,6 +49,7 @@ from report_model import (
     parse_report_branch_target,
     resolve_branch_reference,
 )
+from erd_reduction import reduce_candidate_erd, response_group_is_solved
 from wordle_engine import ERD_ALL, GAME_GUESSES, ResponseCache
 from wordle_ui import fmt_pattern, parse_pattern
 
@@ -871,7 +870,7 @@ class ReportModelTest(unittest.TestCase):
         }
 
     def test_candidate_erd_summary_folds_solved_groups_with_the_candidate_guess(self):
-        summary = _candidate_erd_summary([
+        summary = reduce_candidate_erd([
             self._group("-----", 8, 2.1, 3),
             self._group("----g", 2, 1.5, 2),
             self._group("ggggg", 1, None, None),
@@ -885,7 +884,7 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(summary["response_group_count"], 3)
 
     def test_candidate_erd_summary_is_pending_while_a_group_is_unsolved(self):
-        summary = _candidate_erd_summary([
+        summary = reduce_candidate_erd([
             self._group("-----", 8, 2.1, 3),
             self._group("y----", 5, None, None, cache_state="missing"),
             self._group("ggggg", 1, None, None),
@@ -898,7 +897,7 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(summary["response_group_count"], 3)
 
     def test_candidate_erd_summary_is_infeasible_when_a_group_is_a_proven_loss(self):
-        summary = _candidate_erd_summary([
+        summary = reduce_candidate_erd([
             self._group("-----", 8, 2.1, 3),
             self._group("yy---", 5, None, None, cache_state="loss"),
             self._group("-y---", 3, None, None, cache_state="missing"),
@@ -911,7 +910,7 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(summary["infeasible_group_count"], 1)
 
     def test_candidate_erd_summary_solves_a_lone_survivor_in_one_more_guess(self):
-        summary = _candidate_erd_summary([self._group("----y", 1, None, None)], 5)
+        summary = reduce_candidate_erd([self._group("----y", 1, None, None)], 5)
         self.assertEqual(summary["state"], "complete")
         self.assertEqual(summary["erd"], 2.0)
         self.assertEqual(summary["max_remaining_depth"], 2)
@@ -919,7 +918,7 @@ class ReportModelTest(unittest.TestCase):
     def test_candidate_erd_summary_treats_erd_without_worst_case_as_pending(self):
         # An ERD present but no proven worst-case line cannot complete the fold;
         # it must not crash the max() and must not read as complete.
-        summary = _candidate_erd_summary([self._group("-----", 8, 2.1, None)], 5)
+        summary = reduce_candidate_erd([self._group("-----", 8, 2.1, None)], 5)
         self.assertEqual(summary["state"], "pending")
         self.assertIsNone(summary["max_remaining_depth"])
 
@@ -927,12 +926,12 @@ class ReportModelTest(unittest.TestCase):
         # A lone survivor needs one guess to play; at group_budget 0 there is no
         # guess left, so it is a proven loss — matching evaluate_candidate's
         # budget floor, checked before its n == 1 shortcut.
-        summary = _candidate_erd_summary([self._group("----y", 1, None, None)], 0)
+        summary = reduce_candidate_erd([self._group("----y", 1, None, None)], 0)
         self.assertEqual(summary["state"], "infeasible")
         self.assertEqual(summary["infeasible_group_count"], 1)
         # The all-green group was already solved by the guess that reached it,
         # so it stays complete even with no budget.
-        solved = _candidate_erd_summary([self._group("ggggg", 1, None, None)], 0)
+        solved = reduce_candidate_erd([self._group("ggggg", 1, None, None)], 0)
         self.assertEqual(solved["state"], "complete")
         self.assertEqual(solved["erd"], 1.0)
 
@@ -950,7 +949,7 @@ class ReportModelTest(unittest.TestCase):
     ]
 
     def test_candidate_erd_summary_folds_the_groups_it_is_handed(self):
-        summary = _candidate_erd_summary(self._SALET_GROUPS, 5)
+        summary = reduce_candidate_erd(self._SALET_GROUPS, 5)
         self.assertEqual(summary["state"], "complete")
         self.assertAlmostEqual(summary["erd"], 1.75)
         self.assertEqual(summary["resolved_group_count"], 4)
@@ -965,10 +964,10 @@ class ReportModelTest(unittest.TestCase):
         # a cached branch result rather than on playing a lone survivor.
         groups = [self._group("ggggg", 1, None, None),
                   self._group("-----", 2, 1.5, 2)]
-        complete = _candidate_erd_summary(groups, 5)
+        complete = reduce_candidate_erd(groups, 5)
         self.assertEqual(complete["state"], "complete")
         self.assertAlmostEqual(complete["erd"], 2.0)
-        degraded = _candidate_erd_summary(
+        degraded = reduce_candidate_erd(
             [groups[0],
              self._group("-----", 2, None, None, cache_state="missing")],
             5,
@@ -1393,7 +1392,7 @@ class ReportModelTest(unittest.TestCase):
             ["crane", "slate"], ["crane", "slate", "raise", "howdy"]
         )
         with patch(
-            "report_model._candidate_erd_summary", wraps=_candidate_erd_summary,
+            "report_model.reduce_candidate_erd", wraps=reduce_candidate_erd,
         ) as folded:
             report = collect_report(
                 sources, ReportRequest(report_kind="leaderboard")
@@ -2084,12 +2083,12 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(
             sum(solved.values()), data["erd_summary"]["resolved_group_count"]
         )
-        self.assertFalse(_response_group_is_solved(
+        self.assertFalse(response_group_is_solved(
             {"best_erd": None, "max_remaining_depth": None,
              "answer_count": 1, "pattern": "-----"},
             0,
         ))
-        self.assertTrue(_response_group_is_solved(
+        self.assertTrue(response_group_is_solved(
             {"best_erd": None, "max_remaining_depth": None,
              "answer_count": 1, "pattern": "ggggg"},
             0,
@@ -2098,12 +2097,12 @@ class ReportModelTest(unittest.TestCase):
     def test_response_group_is_solved_requires_a_worst_case_line(self):
         # An ERD with no proven worst-case line cannot complete the fold, so it
         # is not a solved group either.
-        self.assertFalse(_response_group_is_solved(
+        self.assertFalse(response_group_is_solved(
             {"best_erd": 2.0, "max_remaining_depth": None,
              "answer_count": 9, "pattern": "-----"},
             5,
         ))
-        self.assertTrue(_response_group_is_solved(
+        self.assertTrue(response_group_is_solved(
             {"best_erd": 2.0, "max_remaining_depth": 3,
              "answer_count": 9, "pattern": "-----"},
             5,
@@ -2645,13 +2644,13 @@ class ReportModelTest(unittest.TestCase):
             ["crane", "slate"], ["crane", "slate", "raise", "howdy"]
         )
         screened = []
-        real_screen = report_model._screen_and_fold_openers
+        real_screen = report_model._screen_and_reduce_openers
 
         def recording(cache, skeletons, group_budget, policy):
             screened.append(len(skeletons))
             return real_screen(cache, skeletons, group_budget, policy)
 
-        with patch.object(report_model, "_screen_and_fold_openers", recording):
+        with patch.object(report_model, "_screen_and_reduce_openers", recording):
             data = collect_report(sources, ReportRequest(
                 report_kind="leaderboard",
                 branch_target=parse_report_branch_target("crane")))["data"]
