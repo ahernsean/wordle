@@ -29,7 +29,8 @@ SWARM.md for the stopped-swarm procedure required to change it.
 Queue mutations remain grouped under `erd_search.py queue`: `add`, `remove`,
 `clear`, `priority`, `opener-priority`, `reset-stale`, and
 `reconcile-orphaned-ownership`. The `queue` group has no read-only dashboard
-commands.
+commands.  `erd_search.py reconcile-opener-erds` is top-level because it writes
+the cache as well as reading the queue.
 
 ### Numba is optional, and only one function uses it
 
@@ -333,7 +334,7 @@ reached by a second spine of a different length — so any caller holding an
 `active_branches` row read earlier may be describing a branch that no longer
 exists. Ownership and priority both survive that re-creation and so catch
 nothing; without this check the claim succeeds and the candidates are evaluated
-at the old budget while being folded into the new branch. A row whose stored
+at the old budget while being reduced into the new branch. A row whose stored
 budget is NULL predates the column and is admitted, matching how callers derive
 a budget from the spine for those.
 
@@ -404,7 +405,7 @@ apply.  `wordle_engine._cache_reuse` stays the single statement of the rule;
 keyed by scope for the same reason the tables are.
 
 **A second exact result at a scope already stored does not replace it** — it
-is returned, and the caller adopts it before folding anything.  `max_depth` is
+is returned, and the caller adopts it before reducing anything.  `max_depth` is
 ancestor-visible, so a solver that kept its own worst case would hand its
 parent a value the stored child does not support: the same inconsistent
 ancestry, reached without an overwrite.  `_solve_subset` therefore takes
@@ -414,13 +415,13 @@ disagrees on *cost* cannot be reconciled by adoption and raises
 
 **Sameness is `exact_results_agree`: equal cost AND equal `max_depth`.**
 `import_cache` states the same rule in SQL to compare whole tables; a merge
-cannot adopt, because the incoming ancestors are already folded, so it refuses
+cannot adopt, because the incoming ancestors are already reduced, so it refuses
 instead.
 
 **Creating the row is the check.**  `write` inserts with `ON CONFLICT DO
 NOTHING` and reconciles only when the insert finds the scope taken; a read
 followed by an insert leaves a window two workers both pass through, and the
-loser's write would displace a result an ancestor had folded with neither
+loser's write would displace a result an ancestor had reduced with neither
 noticing.  The reconciliation reads through `_read_stored_row`, never the
 session mirror, which can predate the other writer.  Anything else that
 invalidates a branch clears the mirror by matching the branch, not by the
@@ -430,101 +431,100 @@ Only `branch_best_by_policy` is the "one row per branch" table.  Any count,
 report, or query that means branches must not union the two: a branch with
 results at three budgets is one branch.
 
-### A candidate's own ERD is derived; an opener's is stored and rescreened
+### A candidate's own ERD is derived; an opener's is stored
 
-A branch result is a certificate; a **candidate's** ERD at a branch is a *fold*
+A branch result is a certificate; a **candidate's** ERD at a branch is an *ERD reduction*
 over the results of that candidate's response groups, and the two are not
-alike.  `report_model._candidate_erd_summary` is the only thing that produces
+alike.  `report_model.reduce_candidate_erd` is the only thing that produces
 one, and it produces it on every read from the group facts the caller has
 already materialized.
 
-The reason is that a fold has no way to defend itself.  It asserts "every one
+The reason is that a reduction has no way to defend itself.  It asserts "every one
 of my response groups is an exact result", and every path that deletes a branch
 result — a repair, a reverification, a `queue add --delete-erd-cache` — would
-falsify that assertion silently.  A stored fold is keyed by the *parent*
-branch, so given a deleted child there is no way to ask which folds read it; a
-reverse index would cost up to 243 rows per fold, and a generation counter
+falsify that assertion silently.  A stored reduction is keyed by the *parent*
+branch, so given a deleted child there is no way to ask which reductions read it; a
+reverse index would cost up to 243 rows per reduction, and a generation counter
 would invalidate everything on each deletion anyway.  Deriving costs less than
-either: the callers already hold the rows, so a fold is arithmetic over memory
+either: the callers already hold the rows, so a reduction is arithmetic over memory
 (measured at ~40 µs per candidate across the whole vocabulary), and the report
 then describes the cache as it actually stands.
 
-**A fold must select each child at the budget the parent would use.**  Callers
-read group facts through `report_branch_states` or
-`report_branch_states_from_maps` at the branch's own `group_budget`, which
-applies `_exact_row_for_budget` and the same reusability gate `read_for_budget`
+**A reduction must select each child at the budget the parent would use.**  Callers
+read group facts through `report_branch_states` at the branch's own
+`group_budget`, which applies `_exact_row_for_budget` and the same reusability gate `read_for_budget`
 does.  A child whose only exact result was solved at some other budget arrives
-as `missing`, and the candidate reads `pending` — never folded in.
+as `missing`, and the candidate reads `pending` — never reduced in.
 
 Do not reintroduce a durable memo keyed by branch, and do not add one to
 `EXPORT_TABLES`/`TABLES`.
 
-**One fold is stored, and only because it can be rechecked for less than it
-costs to keep honest.**  `opener_erd_by_policy` holds each completed opener's
-own ERD: one row per candidate word, bounded at the vocabulary rather than at
-every (branch, candidate) pair the dropped `candidate_erd_by_policy` was keyed
-by.  That bound is what makes the difference.  A reader does not trust a stored
-row — `_screen_and_fold_openers` rescreens every opener's groups against
-current branch results on every build, and `_store_opener_folds` deletes the
-rows whose openers no longer screen complete.  So a repair or a requeue that
-removes a branch result removes the folds that read it at the next read, which
-is the guarantee a branch-keyed memo could not give.
+**An opener's reduction is stored, by the worker that finishes the opener.**
+`opener_erd_by_policy` holds each finished opener's own ERD: one row per
+candidate word, bounded at the vocabulary rather than at every (branch,
+candidate) pair the dropped `candidate_erd_by_policy` was keyed by.  The worker
+whose branch finalize resolves an opener's last branch reduces its response
+groups, stores the row, records the completion timing, and only then marks the
+opener done (`_BranchWorker._complete_openers`).  That order is forced: the
+queue and the cache are separate databases with no shared transaction, so
+flipping first would leave a window in which an opener is done with no ERD.
+A failure before the flip leaves the opener not done, which is true, and
+`ERDQueue.openers_ready_to_complete` offers it again at the next finalize
+anywhere.  `ScoreCache.write_opener_erd` raises on a failed write, disk errors
+included, because the flip is conditioned on the row existing.
 
-The screen is what makes rescreening affordable.  Folding a whole vocabulary
-builds a state dict per response group — about 1.4 million of them, nearly all
-belonging to openers still being searched.  The screen reads the same facts as
-two set lookups per group through `ScoreCache.report_reusable_branch_facts`,
-which decides the reusability gate in SQL and loads three columns of the
-qualifying rows instead of six columns of every row.  Measured on the
-production cache at 872 completed openers, a full leaderboard build went from
-25.3s to 3.0s, returning byte-identical rows.
+An opener is done when no further computation is needed on it, which in
+practice means its ERD is stored.  Two workers finishing an opener's last two
+branches together can both reduce it; the reduction is a pure function of cached
+results and the row is replaced with identical values, so the repeat is
+harmless and is deliberately not locked against.
 
-**The screen visits every group; it must not stop at the first unsettled one.**
-A candidate holding both an unsettled group and a proven loss is `infeasible`,
-because `_candidate_erd_summary` decides infeasibility ahead of pendency — and
-an early exit can return before reaching the loss that decides it.  That is the
-one wrong answer that still looks plausible, so
-`test_a_screened_candidate_holding_a_loss_and_a_gap_is_infeasible` pins it
-against its pending-only twin: a screen cannot pass both by calling every
-unsettled candidate one thing or the other.
+A repair, a reverification or a `queue add --delete-erd-cache` is an
+exceptional event and owns its own surgery on the rows it falsifies; nothing
+on the normal path is shaped around it.  `erd_search.py reconcile-opener-erds`
+stores the ERD of any done opener that has none, which is also how openers
+finished before this was so are brought in.
 
-Groups of fewer than two answers hold no branch result and never will — the
-fold solves them from the response pattern — so the screen must skip them
-rather than ask the cache about them.
+**The leaderboard is an ordered read of those rows.**  `idx_opener_erd_rank`
+covers the ranking's own sort key, `(erd, max_remaining_depth, opener)`, so the
+ranking is a walk of the index and a `limit` stops it early.  Measured: 4.0 ms
+at 1,052 rows, and 41.9 ms at a synthetic 14,855 (13.6 ms with a limit of 200).
+The build it replaced reduced every opener's response groups on every request
+-- about 1.4 million of them, ~14 s on the production cache, and a quarter of a
+gigabyte of strings held between builds -- to answer a question the swarm had
+already answered once per opener.  Candidates with no stored ERD are counted as
+pending; the leaderboard has no `infeasible` count, since no opener has ever
+been infeasible and one would be done with no row, which a display can show
+when it first happens.
 
-**The stored folds are also read for an opener's *position*, and that is not
-reading a fold in place of folding.**  `ScoreCache.opener_standing` answers
-"where does TARSE stand" from two counts and two bounded seeks over
-`opener_erd_by_policy` (`idx_opener_erd_rank` covers the ranking's own sort
-key, `(erd, max_remaining_depth, opener)`, so the neighbour windows are seeks
-rather than a scan -- measured 0.018 ms against 2.3 ms at 14,855 openers).  The
-looked-up opener's own ERD still comes from a live fold of its groups; what the
-table supplies is the *field*, which is the one thing folding a single opener
-cannot.  Its own stored row is excluded from every one of those queries, so a
-fold that disagrees with it is placed by what it is now and cannot be counted
-past itself.
+**An opener's position is read the same way.**  `ScoreCache.opener_standing`
+answers "where does TARSE stand" from two counts and two bounded seeks over the
+same index (0.018 ms against 2.3 ms at 14,855 openers).  The opener's own row
+is excluded from every one of those queries, so it is placed among the others
+and cannot be counted past itself, and all four reads share one snapshot
+because the swarm stores a row whenever it finishes an opener.  A named
+opener's card reads its one row and partitions the answer list for its
+response-group breakdown; it never reads the ranking.
 
-So a standing is as fresh as this request in its ERD and as fresh as the last
-leaderboard build in its rank, and `ranked_total` reports the field it was
-counted in rather than implying one.  Rescreening the vocabulary to place one
-word costs more than the ranking it would place the word in, which is the whole
-reason the lookup exists.
+**An opener's stored ERD is the authoritative answer, and the rule above is
+about a different table.**  What #288 dropped was `candidate_erd_by_policy`, a
+reduction keyed by (branch, candidate): an unbounded set whose dependencies
+could not be enumerated, so a deleted branch row falsified reductions nobody
+could name.  `opener_erd_by_policy` holds one row per opener and depends only
+on that opener's own top-level groups.  Do not read "a reduction cannot defend
+itself" as covering it: computing an exact ERD for every opener is what the
+swarm is for, and the exceptional operation that deletes those groups deletes
+the row with them.
 
-**An opener's stored ERD is meant to be the authoritative answer, and the rule
-above is about a different table.**  What #288 dropped was
-`candidate_erd_by_policy`, a fold keyed by (branch, candidate): an unbounded
-set whose dependencies could not be enumerated, so a deleted branch row
-falsified folds nobody could name.  `opener_erd_by_policy` holds one row per
-opener and depends only on that opener's own top-level groups -- a dependency
-set the screen already walks on every build.  Do not read "a fold cannot
-defend itself" as covering it.  That the leaderboard still re-derives all of
-them on every build, and never reads the rows it writes, is an implementation
-gap tracked in #384, not a property of the value: computing an exact ERD for
-every opener is what the swarm is for.
+Its rows are keyed by answer list and carry no candidate-list identity, because
+the candidate list is the fixed vocabulary every queued opener is drawn from.
+Changing that vocabulary is an exceptional operation, and it clears the table
+(`ScoreCache.delete_all_opener_erds`) and runs `reconcile-opener-erds` itself;
+the leaderboard does not filter against the list on every read.
 
 `opener_erd_by_policy` is local to each machine and travels in neither
 `EXPORT_TABLES` nor `TABLES`: it is derived from branch results the export
-already carries, and the other side rescreens against its own cache.
+already carries, and each machine's swarm stores its own.
 
 **The obsolete `candidate_erd_by_policy` is dropped on every writable open, not
 once behind a migration flag.**  A process running code from before the table
@@ -534,13 +534,39 @@ production cache, where the table reappeared after its migration was marked
 complete.  The check is a `sqlite_master` lookup, so carrying it permanently
 costs one indexed read per open.
 
+### The report server writes no table
+
+A report server reads. If a value needs computing and persisting, something
+upstream computes it -- the swarm, at the moment its inputs are complete -- and
+the report server reads the result. Enforce this structurally rather than by
+classifying values: the report server opens the cache read-only, so a write it
+attempts has nowhere to land.
+
+"Is this a record or a memo?" is not a usable test. An opener's ERD is a derived
+quantity like any other; computing it discovers a value that already exists. The
+rule is about *who does the work*, not what kind of value it is: a report that
+computes and stores on the way to answering makes its latency depend on the
+store being cold, and makes a poll-driven page the thing that keeps the data
+current.
+
+Every `ScoreCache` a report opens goes through `report_model._open_report_cache`,
+which states the rule once. A read-only cache refuses a write, and
+`write_decomposition` returns without storing: a guess's partition of the
+answers is a pure function of its key, so a reader that finds it missing
+recomputes it in memory and leaves the file to a writer. A read-only open also
+refuses to create the file, so a mistyped path reports a cache error instead of
+an empty cache.
+
+Exceptions are possible, and they are to be discussed and chosen, not drifted
+into.
+
 ### A hint cache names a word and nothing else
 
 `--hint-cache` opens a quarantined historical cache alongside the live one.
 Its rows were produced by earlier solver versions, so they are descriptive
 history, not certificates: a historical row may put its word first in a
 branch's candidate order, and may do nothing else.  It is never an exact hit,
-never a fold input, never a ceiling, never a loss, never a queue-admission
+never a reduction input, never a ceiling, never a loss, never a queue-admission
 answer, and never an export source.
 
 `HintCache` is the whole interface, and the guarantee is structural rather
@@ -587,10 +613,12 @@ several workers each contributed placements to.
 
 ### An expensive report is rebuilt on its own event, not on the poll
 
-`report_client.html` polls every two seconds. A leaderboard build rescreens the
-whole opener vocabulary, so serving one per poll means the server is never idle
-and requests queue behind each other — which is what
-`report_server.collect_report_once`'s shared-collection lock was papering over.
+`report_client.html` polls every two seconds. A report whose answer changes
+only when something upstream finishes should be served from a cache that
+revalidates rather than rebuilt per poll: the leaderboard is an ordered read of
+stored rows, but its encoded body is hundreds of kilobytes at full vocabulary,
+and re-encoding it for every client every two seconds is work with no new
+answer in it.
 
 `REVALIDATED_REPORT_KINDS` names the reports served from a cache that
 revalidates instead of rebuilding. A kind belongs there only if its answer is a
@@ -601,7 +629,9 @@ no longer has. Caching them would be cheap and wrong.
 
 `report_model.opener_completion_signal` is the signal: two indexed counts over
 `opener_work` where `state = 'complete'`, about 0.14 ms. It moves exactly when
-an opener's tree finishes, which is what grows the leaderboard's answer.
+an opener finishes, which is what grows the leaderboard's answer. A worker
+stores an opener's ERD before it marks the opener done, so by the time the
+signal moves the row it announces is already there.
 
 **The obvious signal is a branch-result watermark, and it does not work.**
 `MAX(updated_at)` over the branch tables is the conservative choice — it cannot
@@ -613,20 +643,18 @@ nothing. Do not reach for the watermark again without re-measuring that ratio;
 a 90-second sample taken during a quiet stretch shows zero changes and reads as
 a green light.
 
-The signal is a hint and never an answer: the build still rescreens every
-opener against the cache, so a stale signal costs freshness and never
-correctness. It is also not exhaustive — a repair, a reverification or an
-import changes the cache without completing any queue work — so
+The signal is a hint and never an answer: a rebuild reads the stored rows, so
+a stale signal costs freshness and never correctness. It is also not
+exhaustive — a repair, a reverification or an import changes the cache without
+completing any queue work — so
 `REPORT_CACHE_MAX_AGE_SECONDS` bounds how long such a change can go unnoticed.
 That age is a backstop for the rare case, not the mechanism. A signal that
 cannot be read at all returns `None`, which must be treated as "assume
 changed": serving a cached report on no information asserts a freshness the
 server cannot support.
 
-The encoded body is cached alongside the report, because re-encoding a
-multi-megabyte ranking on every poll is its own cost once the build is gone.
-Measured end to end on the production cache: a repeat leaderboard request went
-from 18.4 s to 0.005 s, serving identical bytes.
+The encoded body is cached alongside the report, because re-encoding the
+ranking on every poll is its own cost once the read is cheap.
 
 ### Completed work has two records, and they can disagree
 
@@ -686,6 +714,10 @@ word the swarm sweeps is queued as an opener. |
 priority, and the ownership every branch in that tree inherits. Keyed by
 (opener, priority), so one opener may own several. It answers "who asked for
 this branch?", never "where is it?" — position is the spine's job. |
+| **ERD reduction** | Combining the exact results of a node's response groups
+into that node's own ERD: one level of the recurrence evaluated over cached
+results rather than by searching. As a verb, to *reduce* an ERD. Never "fold",
+which this codebase uses only for running aggregates and checkpoints. |
 
 **An opener is an opener by construction, not by convention.** `queue add` is
 the only path that creates a top-level request, and it hardcodes `branch_budget

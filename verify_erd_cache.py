@@ -18,6 +18,10 @@ IMPORTANT: stop all swarm workers before running this script.  Active workers
 modifying the cache while entries are being deleted and re-written can corrupt
 results.
 
+A correction changes a branch result that an opener's stored ERD may have been
+reduced from, so the first correction drops every stored opener ERD; run
+`erd_search.py reconcile-opener-erds` afterwards to store them again.
+
 Usage:
     python3.13 verify_erd_cache.py [--workers N] [--cache PATH] [--log PATH]
     python3.13 verify_erd_cache.py --start-size 15   # resume from wave 15
@@ -62,9 +66,9 @@ def _erd_from_cache(branch_words, candidate, rcache, sc, n, best_erd):
 
     Unlike evaluate_candidate / _solve_subset, this never recurses: it reads
     each sub-branch's unrestricted optimum directly via sc.read().  That is
-    the right value to fold here and the only one this reaches: a
+    the right value to reduce here and the only one this reaches: a
     budget-specific result is optimal against a smaller set of strategies, so
-    folding one into an unrestricted cost would understate it.  A sub-branch
+    reducing one into an unrestricted cost would understate it.  A sub-branch
     holding only such a result reads as missing and the candidate is skipped.
     Safe for verification because sub-branches were already verified in
     earlier waves.
@@ -102,6 +106,20 @@ def _erd_from_cache(branch_words, candidate, rcache, sc, n, best_erd):
             return None  # alpha-beta: partial cost already too high
 
     return cost
+
+
+def _drop_stored_opener_erds(cache_path, answer_file):
+    """Drop every stored opener ERD: a correction may have falsified any of them.
+
+    An opener's stored ERD is not re-derived from branch results on read, so a
+    reverification that rewrites a branch result clears the rows itself.
+    """
+    sc = ScoreCache(cache_path, load_word_list(answer_file),
+                    checkpoint_on_close=False)
+    try:
+        sc.delete_all_opener_erds(ERD_ALL)
+    finally:
+        sc.close()
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +309,7 @@ def main():
     t0 = time.time()
     n_checked = 0
     n_score_corrected = 0
+    opener_erds_dropped = False
 
     log_mode = 'a' if args.start_size > 2 else 'w'
     with open(args.log, log_mode) as logf:
@@ -366,6 +385,9 @@ def main():
                         if status == 'SCORE_CORRECTED':
                             n_score_corrected += 1
                             wave_corrected += 1
+                            if not opener_erds_dropped:
+                                _drop_stored_opener_erds(args.cache, ANSWER_FILE)
+                                opener_erds_dropped = True
 
                     now = time.time()
                     is_last = chunks_done == n_chunks
@@ -404,6 +426,9 @@ def main():
     print(f'  Checked         : {n_checked:,}')
     print(f'  Confirmed       : {n_confirmed:,}')
     print(f'  Score corrected : {n_score_corrected:,}  (old ERD was too high)')
+    if opener_erds_dropped:
+        print('  Stored opener ERDs dropped; run `erd_search.py '
+              'reconcile-opener-erds` to store them again.')
     print(f'  Log             : {os.path.abspath(args.log)}')
 
 

@@ -27,10 +27,10 @@ def exact_results_agree(stored_score, stored_max_depth,
                         incoming_score, incoming_max_depth) -> bool:
     """Whether two exact results for one scope are the same certificate.
 
-    Equal cost is not enough.  max_depth is ancestor-visible — a parent folds
-    a child's worst case into its own — so two equal-cost strategies with
-    different worst cases are different certificates, and a parent folded from
-    one does not describe a subtree the other supports.
+    Equal cost is not enough.  max_depth is ancestor-visible — a parent
+    reduces a child's worst case into its own — so two equal-cost strategies
+    with different worst cases are different certificates, and a parent reduced
+    from one does not describe a subtree the other supports.
 
     import_cache expresses this same rule in SQL, over whole tables at once;
     test_the_sql_equivalence_rule_matches_the_python_one keeps the two in step.
@@ -122,7 +122,7 @@ class CacheWriteConflict(Exception):
 
     Within a scope the optimum is a single number, so a second exact write
     naming a different one means the two searches cannot both be right.
-    Recording either would invalidate whichever ancestors folded the other,
+    Recording either would invalidate whichever ancestors reduced the other,
     which is the failure this schema exists to prevent — so the write is
     refused instead.
     """
@@ -450,8 +450,8 @@ class ScoreCache:
         # at one remaining-depth budget.  Both can be right and differ.  They
         # live in separate tables because one row cannot hold both: a shared
         # key makes either write destroy the other, after ancestors may already
-        # have folded the value it displaced, and nothing records which one
-        # they folded.
+        # have reduced the value it displaced, and nothing records which one
+        # they reduced.
         #
         # branch_best_by_policy holds only the unrestricted optima, so its
         # solve_budget column is NULL on every row it now accepts.  The column
@@ -528,18 +528,18 @@ class ScoreCache:
             self._conn.execute(
                 "ALTER TABLE completed_opener_summaries "
                 "ADD COLUMN telemetry_epochs TEXT NOT NULL DEFAULT ''")
-        # An opener's own ERD, folded over its top-level response groups once
+        # An opener's own ERD, reduced over its top-level response groups once
         # every one of them holds a reusable exact result.  Unlike a candidate's
         # ERD at an arbitrary branch, this is bounded at one row per candidate
         # word and is revalidated on every read: the reader rescreens each
         # opener's groups against current branch results and deletes the rows
         # whose openers no longer screen complete, so a repair or requeue that
-        # removes a branch result removes the folds that read it on the next
-        # read rather than leaving them asserting a tree that is gone.
+        # removes a branch result removes the reductions that read it on the
+        # next read rather than leaving them asserting a tree that is gone.
         #
-        # response_group_count is how many response groups the fold covered,
-        # which is the opener's split against the answer list it was folded
-        # over.
+        # response_group_count is how many response groups the reduction
+        # covered, which is the opener's split against the answer list it was
+        # reduced over.
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS opener_erd_by_policy (
                 opener TEXT NOT NULL, policy TEXT NOT NULL,
@@ -551,7 +551,8 @@ class ScoreCache:
             )
         """)
         # The ranking's own sort key, so a question about one opener's place in
-        # it is a seek rather than a read of every fold.  The primary key is on
+        # it is a seek rather than a read of every reduction.  The primary key
+        # is on
         # the opener, which answers "what is SALET's ERD" and nothing about
         # order; this index answers "how many openers beat it" and "which ones
         # sit either side of it".  Covering, so neither query reaches the table.
@@ -611,8 +612,8 @@ class ScoreCache:
                     f"ALTER TABLE {tbl} ADD COLUMN solve_budget INTEGER")
         # ERD policy names were renamed so both axes of the (guess-universe x
         # compliance-filter) selection are spelled out in the namespace
-        # itself — 'erd_all' named only the universe, 'erd_answers' folded
-        # both axes into one word, and 'erd_constrained' named neither
+        # itself — 'erd_all' named only the universe, 'erd_answers' named
+        # both axes with one word, and 'erd_constrained' named neither
         # explicitly. The new names are uniform: erd_<universe>_<compliance>.
         #   erd_all     -> erd_words_unfiltered   (all words,   no clue filter)
         #   erd_answers -> erd_answers_compliant  (answer list, clue-compliant)
@@ -786,11 +787,12 @@ class ScoreCache:
             self._conn.execute(
                 "DELETE FROM branch_best_by_policy WHERE solve_budget IS NOT NULL")
             self._mark_migration_done('split_budget_specific_branch_results')
-        # candidate_erd_by_policy memoised a candidate's folded ERD at a
+        # candidate_erd_by_policy memoised a candidate's reduced ERD at a
         # branch, keyed by a hash of the branch's word set.  Given a branch
-        # result there was no way to ask which folds had read it, so deleting
-        # one — a repair, a reverification, a requeue — left every fold over it
-        # asserting a candidate complete whose groups were gone.  A candidate's
+        # result there was no way to ask which reductions had read it, so
+        # deleting one — a repair, a reverification, a requeue — left every
+        # reduction over it asserting a candidate complete whose groups were
+        # gone.  A candidate's
         # ERD at an arbitrary branch is derived on each read instead, so the
         # table has no reader and must not exist.
         #
@@ -1007,10 +1009,10 @@ class ScoreCache:
 
         A result already stored for the same branch at the same scope is kept
         rather than replaced, and **returned**: the caller must adopt it before
-        folding anything, because what a solver hands its parent has to be what
-        the cache durably holds.  Equal-cost strategies can differ in
+        reducing anything, because what a solver hands its parent has to be
+        what the cache durably holds.  Equal-cost strategies can differ in
         max_depth, which is ancestor-visible, so a caller that kept its own
-        worst case would fold a parent the stored child does not support —
+        worst case would reduce a parent the stored child does not support —
         the inconsistent ancestry this schema exists to prevent, reached
         without any overwrite.
 
@@ -1041,7 +1043,7 @@ class ScoreCache:
             # Creating the row IS the check.  A read followed by an insert
             # leaves a window two workers both pass through, and the second
             # insert would then displace a result an ancestor may already have
-            # folded -- with neither writer noticing.  DO NOTHING makes the
+            # reduced -- with neither writer noticing.  DO NOTHING makes the
             # uniqueness constraint decide it: exactly one writer creates the
             # row, and every other reconciles against what that one stored.
             before = self._conn.total_changes
@@ -1077,7 +1079,7 @@ class ScoreCache:
                         f"budget={solve_budget}: stored {stored[1]!r}, "
                         f"incoming {best_score!r}")
                 # The same optimum, reached again.  The stored row stands and
-                # the caller adopts it: an ancestor may already have folded its
+                # the caller adopts it: an ancestor may already have reduced its
                 # max_depth, and equal cost does not make two worst cases
                 # interchangeable.
                 self.redundant_write_count += 1
@@ -1198,7 +1200,7 @@ class ScoreCache:
 
         max_depth is fully determined by best_guess and the max_depth of that
         guess's response groups, so a row whose stored value disagrees with
-        that fold can be set to the folded value without re-searching: the
+        that reduction can be set to the reduced value without re-searching: the
         strategy is unchanged, only the worst-case line length it was
         recorded with.  best_guess, best_score and solve_budget are left as
         they are.
@@ -1281,7 +1283,13 @@ class ScoreCache:
         see its docstring. ResponseCache._ensure caches the blob in memory
         regardless, so this run proceeds unaffected; only the on-disk copy
         is missing until a later run repersists it.
+
+        A read-only cache stores nothing: the decomposition is a pure function
+        of its key, so a reader that finds it missing recomputes it in memory
+        and leaves the file to a writer.
         """
+        if self.read_only:
+            return
         now = int(time.time())
         try:
             self._conn.execute("""
@@ -1352,100 +1360,71 @@ class ScoreCache:
             self._conn.execute("ROLLBACK")
             raise
 
-    def report_reusable_branch_facts(self, policy, budget):
-        """Branch results reusable at exactly one budget, as lean maps.
+    def opener_erd(self, policy, opener):
+        """One opener's stored (erd, max_remaining_depth), or None."""
+        row = self._conn.execute(
+            """SELECT erd, max_remaining_depth FROM opener_erd_by_policy
+                WHERE opener = ? AND policy = ? AND answer_list_id = ?""",
+            (opener.lower(), policy, self.answer_list_id)).fetchone()
+        return None if row is None else (row["erd"], row["max_remaining_depth"])
 
-        Returns (erd_by_key, loss_keys): a branch_key -> (best_erd,
-        max_remaining_depth) map of the results a search at `budget` would
-        reuse, and the set of keys proven a loss within it.  Both apply the
-        same gate `report_branch_states` does, decided in SQL rather than by
-        loading every row and filtering in Python.
+    def ranked_openers(self, policy, limit=None):
+        """Stored openers in ranking order: (erd, max_remaining_depth, opener).
 
-        `report_branch_row_maps` is the other bulk loader, and it is the one to
-        use when a caller needs a branch's *facts* — its budget-specific rows,
-        update times, and which table each came from.  This one answers only
-        "is this branch settled at this budget, and at what cost", which is
-        everything a fold over response groups reads.  Folding a whole
-        vocabulary that way loads the qualifying keys and three columns instead
-        of every row and six, which on a production cache is several times
-        less work for an identical fold.
-
-        An unrestricted result wins whenever its own worst case fits the
-        budget, so the budget-specific table only fills in keys the
-        unrestricted one did not settle — the precedence `_exact_row_for_budget`
-        applies per branch, expressed here over whole tables.
+        The sort key is the ranking's own, and `idx_opener_erd_rank` covers it,
+        so this is an ordered walk of the index and a `limit` stops it early.
         """
-        erd_by_key = {}
-        for branch_key, best_score, max_depth in self._conn.execute(
-            """SELECT branch_key, best_score, max_depth
-                 FROM branch_best_by_policy
+        return [tuple(row) for row in self._conn.execute(
+            """SELECT erd, max_remaining_depth, opener
+                 FROM opener_erd_by_policy
                 WHERE policy = ? AND answer_list_id = ?
-                  AND solve_budget IS NULL AND max_depth <= ?""",
-            (policy, self.answer_list_id, budget),
-        ):
-            erd_by_key[bytes(branch_key)] = (best_score, max_depth)
-        for branch_key, best_score, max_depth in self._conn.execute(
-            """SELECT branch_key, best_score, max_depth
-                 FROM branch_best_by_policy_and_budget
-                WHERE policy = ? AND answer_list_id = ?
-                  AND solve_budget = ? AND max_depth IS NOT NULL""",
-            (policy, self.answer_list_id, budget),
-        ):
-            erd_by_key.setdefault(bytes(branch_key), (best_score, max_depth))
-        loss_keys = {
-            bytes(row[0]) for row in self._conn.execute(
-                """SELECT branch_key FROM branch_loss_by_policy
-                    WHERE policy = ? AND answer_list_id = ?
-                      AND loss_budget >= ?""",
-                (policy, self.answer_list_id, budget),
-            )
-        }
-        return erd_by_key, loss_keys
+                ORDER BY erd, max_remaining_depth, opener
+                LIMIT ?""",
+            (policy, self.answer_list_id, -1 if limit is None else limit))]
 
-    def opener_erd_map(self, policy):
-        """Stored opener folds for this answer list, keyed by opener word."""
-        return {
-            row["opener"]: {
-                "erd": row["erd"],
-                "max_remaining_depth": row["max_remaining_depth"],
-                "response_group_count": row["response_group_count"],
-                "folded_at": row["folded_at"],
-            }
-            for row in self._conn.execute(
-                """SELECT opener, erd, max_remaining_depth,
-                          response_group_count, folded_at
-                     FROM opener_erd_by_policy
-                    WHERE policy = ? AND answer_list_id = ?""",
-                (policy, self.answer_list_id),
-            )
-        }
-
-    def ranked_opener_count(self, policy, excluding):
-        """How many openers other than `excluding` hold a stored fold.
-
-        The named opener is left out because the caller is asking about it, and
-        its own row can outlive the fold that wrote it: an opener that a repair
-        or a requeue has made unfinished still has the row the last screen
-        stored, and counting that would report a field one larger than the one
-        the opener is actually outside.
-        """
+    def ranked_opener_count(self, policy):
+        """How many openers hold a stored ERD."""
         return self._conn.execute(
             """SELECT COUNT(*) FROM opener_erd_by_policy
-                WHERE policy = ? AND answer_list_id = ? AND opener <> ?""",
-            (policy, self.answer_list_id, excluding.lower()),
-        ).fetchone()[0]
+                WHERE policy = ? AND answer_list_id = ?""",
+            (policy, self.answer_list_id)).fetchone()[0]
+
+    def maximum_opener_response_group_count(self, policy):
+        """The most response groups any stored opener has, or None if none."""
+        return self._conn.execute(
+            """SELECT MAX(response_group_count) FROM opener_erd_by_policy
+                WHERE policy = ? AND answer_list_id = ?""",
+            (policy, self.answer_list_id)).fetchone()[0]
+
+    def opener_ranking(self, policy, limit=None):
+        """The ranking, and the facts that describe it, from one snapshot.
+
+        The swarm stores a row whenever it finishes an opener, so reads taken
+        in separate autocommit statements can describe different fields: a
+        count that includes a row the rows do not, or a response-group scale
+        taken over another population again.  One read transaction holds the
+        version they share.
+        """
+        self._conn.execute("BEGIN")
+        try:
+            return {
+                "rows": self.ranked_openers(policy, limit),
+                "count": self.ranked_opener_count(policy),
+                "maximum_response_group_count":
+                    self.maximum_opener_response_group_count(policy),
+            }
+        finally:
+            # A read transaction holds a snapshot and nothing else, so it ends
+            # the same way whether or not the reads raised.
+            self._conn.execute("ROLLBACK")
 
     def opener_standing(self, policy, opener, erd, max_remaining_depth,
                         neighbour_count):
         """Where one opener sits in the stored ranking, without loading it.
 
-        `erd` and `max_remaining_depth` are the caller's own fold of this
-        opener, and they are the only live facts in the answer.  The opener's
-        stored row is excluded from every query here, so a fold that disagrees
-        with it -- an opener that completed since the last screen, or one whose
-        tree was repaired -- is placed by what it is now rather than by what
-        was recorded.  Counting its stale row as well would move it past
-        itself.
+        `erd` and `max_remaining_depth` are the opener's own stored values.
+        Its row is excluded from every query here, so it is placed among the
+        others and cannot be counted past itself.
 
         The sort key is the ranking's own, `(erd, max_remaining_depth,
         opener)`, so `rank` is a position in the ranking as it is displayed
@@ -1453,22 +1432,15 @@ class ScoreCache:
         therefore get a place of their own, and the neighbours are the rows
         actually above and below.
 
-        The population is whatever the last leaderboard build screened.  A
-        stored fold is a record of that screen and is not evidence on its own
-        (`_screen_and_fold_openers` rescreens and `delete_opener_erds` prunes),
-        so this is a positional statement about that population and nothing
-        more.  The alternative is to rescreen the vocabulary, which is the cost
-        the whole lookup exists to avoid.
-
         `rank` walks the index entries that qualify, so it is linear in the
         rank and bounded by the vocabulary; the neighbour windows stop at
-        `neighbour_count` and are seeks.
+        `neighbour_count` and are seeks (`idx_opener_erd_rank` covers the sort
+        key).
 
-        All four read one snapshot.  A leaderboard build stores and deletes
-        folds, and it runs against the same cache a detail request is being
-        served from, so between two autocommit statements the field can change
-        underneath them -- and the four answers are one statement about one
-        field.  Counted separately they can disagree: a rank from a larger
+        All four reads share one snapshot.  The swarm stores a row whenever an
+        opener finishes, so between two autocommit statements the field can
+        change underneath them -- and the four answers are one statement about
+        one field.  Counted separately they can disagree: a rank from a larger
         field beside a total from a smaller one is a rank past the end of the
         ranking it claims to be in, and neighbours that are not the rows
         either side of it.
@@ -1522,69 +1494,50 @@ class ScoreCache:
             "below": [tuple(row) for row in below],
         }
 
-    def publish_opener_erds(self, rows, retired_openers, policy,
-                            folded_at=None):
-        """Replace the stored ranking in one step, or not at all.
+    def delete_opener_erd(self, opener, policy):
+        """Drop one opener's stored ERD.
 
-        `rows` is an iterable of (opener, erd, max_remaining_depth,
-        response_group_count) for the openers a screen settled, and
-        `retired_openers` names the ones it no longer settles.  A stored row is
-        replaced rather than reconciled, because the caller has just rescreened
-        it against current branch results and its value is the newer of the
-        two.
-
-        The two halves are one statement about the field and commit together.
-        On an autocommit connection each row of an `executemany` is its own
-        transaction and visible the moment it lands, so a reader could see the
-        openers this screen settled alongside the stale rows it was about to
-        retire -- a field no build ever produced.  A reader holding a snapshot
-        is no help against that: the snapshot would be of the hybrid.
+        For an operation that is about to falsify it -- recomputing the
+        opener's response groups -- to call itself.  Nothing on the normal
+        path reads or repairs a stored ERD against current branch results.
         """
-        rows = list(rows)
-        retired_openers = list(retired_openers)
-        if not rows and not retired_openers:
-            return
-        now = int(time.time()) if folded_at is None else folded_at
-        try:
-            self._conn.execute("BEGIN IMMEDIATE")
-            if rows:
-                self._conn.executemany(
-                    """INSERT OR REPLACE INTO opener_erd_by_policy
-                           (opener, policy, answer_list_id, erd,
-                            max_remaining_depth, response_group_count,
-                            folded_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    [(opener.lower(), policy, self.answer_list_id, erd,
-                      max_remaining_depth, response_group_count, now)
-                     for opener, erd, max_remaining_depth, response_group_count
-                     in rows],
-                )
-            if retired_openers:
-                self._conn.executemany(
-                    """DELETE FROM opener_erd_by_policy
-                        WHERE opener = ? AND policy = ? AND answer_list_id = ?""",
-                    [(opener.lower(), policy, self.answer_list_id)
-                     for opener in retired_openers],
-                )
-            self._conn.execute("COMMIT")
-        except sqlite3.OperationalError as exc:
-            try:
-                self._conn.execute("ROLLBACK")
-            except sqlite3.OperationalError:
-                pass
-            if not _is_disk_io_error(exc):
-                raise
-            logger.warning(
-                "publish_opener_erds(%d stored, %d retired, %s) failed: %s",
-                len(rows), len(retired_openers), policy, exc)
+        self._conn.execute(
+            "DELETE FROM opener_erd_by_policy "
+            "WHERE opener = ? AND policy = ? AND answer_list_id = ?",
+            (opener.lower(), policy, self.answer_list_id))
 
-    def write_opener_erds(self, rows, policy, folded_at=None):
-        """Store folds for openers whose whole tree is solved."""
-        self.publish_opener_erds(rows, (), policy, folded_at)
+    def delete_all_opener_erds(self, policy):
+        """Drop every stored opener ERD for this answer list and policy."""
+        self._conn.execute(
+            "DELETE FROM opener_erd_by_policy "
+            "WHERE policy = ? AND answer_list_id = ?",
+            (policy, self.answer_list_id))
 
-    def delete_opener_erds(self, openers, policy):
-        """Drop stored folds for openers that no longer screen complete."""
-        self.publish_opener_erds((), openers, policy)
+    def opener_names_with_erd(self, policy):
+        """The openers whose ERD is stored for this answer list."""
+        return {row["opener"] for row in self._conn.execute(
+            "SELECT opener FROM opener_erd_by_policy "
+            "WHERE policy = ? AND answer_list_id = ?",
+            (policy, self.answer_list_id))}
+
+    def write_opener_erd(self, opener, policy, erd, max_remaining_depth,
+                         response_group_count):
+        """Store one opener's reduced ERD.
+
+        Unlike `write` and `write_decomposition`, a failed write raises, disk
+        errors included.  Those swallow because a missing row only costs a
+        recomputation; here the caller marks the opener done on the strength of
+        this row existing, so continuing past a failed write would record an
+        opener done with no ERD.  The same opener and values replace
+        themselves, which is what makes a repeated reduction harmless.
+        """
+        self._conn.execute(
+            """INSERT OR REPLACE INTO opener_erd_by_policy
+                   (opener, policy, answer_list_id, erd, max_remaining_depth,
+                    response_group_count, folded_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (opener.lower(), policy, self.answer_list_id, erd,
+             max_remaining_depth, response_group_count, int(time.time())))
 
     def completed_opener_summary_map(self, policy):
         return {row["opener"].lower(): dict(row) for row in self._conn.execute("""
@@ -1597,20 +1550,21 @@ class ScoreCache:
     def write_completed_opener_summary(self, opener, policy, completed_at,
                                        elapsed_millis, worker_millis,
                                        telemetry_epochs=()):
-        try:
-            self._conn.execute("""
-                INSERT OR REPLACE INTO completed_opener_summaries
-                    (opener, policy, answer_list_id, completed_at,
-                     elapsed_millis, worker_millis, telemetry_epochs)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (opener.lower(), policy, self.answer_list_id, completed_at,
-                  elapsed_millis, worker_millis,
-                  ",".join(str(epoch) for epoch in sorted(set(telemetry_epochs)))))
-        except sqlite3.OperationalError as exc:
-            if not _is_disk_io_error(exc):
-                raise
-            logger.warning("write_completed_opener_summary(%s, %s) failed: %s",
-                           opener, policy, exc)
+        """Record when an opener finished and what it cost.
+
+        A failed write raises, disk errors included.  The swarm records this
+        as part of finishing an opener and marks the opener done only after
+        it returns; nothing else writes it afterwards, so a write that failed
+        quietly would lose the timing for good.
+        """
+        self._conn.execute("""
+            INSERT OR REPLACE INTO completed_opener_summaries
+                (opener, policy, answer_list_id, completed_at,
+                 elapsed_millis, worker_millis, telemetry_epochs)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (opener.lower(), policy, self.answer_list_id, completed_at,
+              elapsed_millis, worker_millis,
+              ",".join(str(epoch) for epoch in sorted(set(telemetry_epochs)))))
 
     def add_opener_response_group_summary(self, opener, response_pattern,
                                           policy, nodes, worker_millis,
@@ -1826,60 +1780,6 @@ class ScoreCache:
                 loss_by_key.get(key), budget
             )
             for key in keys
-        }
-
-    def report_branch_row_maps(self, policy):
-        """Bulk-load every exact and loss row for a policy, keyed by branch_key.
-
-        Folding a whole candidate vocabulary at once would otherwise need one
-        `IN (...)` query per candidate; loading the full maps once and looking
-        up in memory keeps the leaderboard a single pass over the cache.  The
-        rows carry the same columns `_report_cache_state_from_rows` reads, so
-        the caller reuses that reusability gate unchanged.
-        """
-        exact_by_key = _branch_facts_by_key(self._conn.execute(
-            """SELECT branch_key, best_guess, best_score, updated_at,
-                      max_depth, solve_budget
-               FROM branch_best_by_policy
-               WHERE policy = ? AND answer_list_id = ?
-               UNION ALL
-               SELECT branch_key, best_guess, best_score, updated_at,
-                      max_depth, solve_budget
-               FROM branch_best_by_policy_and_budget
-               WHERE policy = ? AND answer_list_id = ?""",
-            (policy, self.answer_list_id, policy, self.answer_list_id),
-        ))
-        loss_by_key = {
-            bytes(row["branch_key"]): row
-            for row in self._conn.execute(
-                """SELECT branch_key, loss_budget, updated_at
-                   FROM branch_loss_by_policy
-                   WHERE policy = ? AND answer_list_id = ?""",
-                (policy, self.answer_list_id),
-            )
-        }
-        return exact_by_key, loss_by_key
-
-    def report_branch_states_from_maps(
-        self, branch_keys, exact_by_key, loss_by_key, budget=None
-    ) -> dict:
-        """Reusable cache states for keys, from pre-loaded row maps.
-
-        `report_branch_row_maps` loads every exact/loss row for a policy once;
-        this applies the same reusability gate `report_branch_states` uses
-        without a per-key query, so a whole candidate vocabulary folds in one
-        pass.  The maps must carry the columns the gate reads, which is exactly
-        what `report_branch_row_maps` returns.
-        """
-        return {
-            bytes(branch_key): self._report_cache_state_from_rows(
-                bytes(branch_key),
-                self._exact_row_for_budget(
-                    exact_by_key.get(bytes(branch_key)), budget),
-                loss_by_key.get(bytes(branch_key)),
-                budget,
-            )
-            for branch_key in branch_keys
         }
 
     def report_recent_rows(self, policy, since, limit) -> list[dict]:

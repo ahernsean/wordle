@@ -113,7 +113,8 @@ class TestQueueReconcileOrphanedOwnership(unittest.TestCase):
             opener_pattern=crane['opener_pattern'],
             opener_work_id=crane['opener_work_id'])
         queue.mark_done(root_key)
-        queue.delete_branch(root_key)  # the request completes here
+        queue.delete_branch(root_key)  # every branch has resolved
+        queue.mark_openers_complete(queue.openers_ready_to_complete())
         self.assertEqual(queue._conn.execute(
             "SELECT state FROM opener_work WHERE opener_work_id = ?",
             (crane['opener_work_id'],)).fetchone()[0], 'complete')

@@ -1964,7 +1964,7 @@ def _solve_subset(branch_words, cache, score_cache, budget, deadline, guesses,
         solve_budget = None if (budget is None or not node_floor) else budget
         # Adopt whatever the cache durably holds for this scope.  Another
         # solver may already own it with an equal-cost strategy of a different
-        # worst case, and returning our own max_depth would fold a parent the
+        # worst case, and returning our own max_depth would reduce a parent the
         # stored child does not support.
         durable = score_cache.write(
             branch_key, policy, best_guess, best_erd,

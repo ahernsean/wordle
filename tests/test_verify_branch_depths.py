@@ -1,15 +1,16 @@
-"""Tests for verify_branch_depths.py — the max_depth fold audit.
+"""Tests for verify_branch_depths.py — the max_depth reduction audit.
 
 The fixture is a real depth-limited solve over a sampled vocabulary, so the
 rows carry the max_depth and solve_budget values the solver itself writes.
 Two properties anchor everything else: a cache the solver just built agrees
-with the fold on every row, and a cache where one branch's value has been
+with the reduction on every row, and a cache where one branch's value has been
 replaced — the tainted/untainted overwrite of issue #302 — disagrees at every
-ancestor that folded the value it replaced.
+ancestor that reduced the value it replaced.
 """
 import io
 import json
 import sqlite3
+import contextlib
 import os
 import random
 import shutil
@@ -21,7 +22,7 @@ import verify_branch_depths
 from cache_sqlite import ScoreCache, branch_reference
 from erd_queue import decode_subset
 from runtime_paths import DEFAULT_ANSWER_LIST_PATH
-from verify_branch_depths import DepthAudit, fold_branch, iter_rows
+from verify_branch_depths import DepthAudit, reduce_branch, iter_rows
 from wordle_engine import (
     ERD_ALL,
     ResponseCache,
@@ -48,47 +49,47 @@ class _StubResponses:
         return self._groups
 
 
-class FoldBranchTest(unittest.TestCase):
-    """fold_branch reproduces evaluate_candidate's max_depth recurrence."""
+class ReduceBranchTest(unittest.TestCase):
+    """reduce_branch reproduces evaluate_candidate's max_depth recurrence."""
 
     def test_self_group_is_free_and_a_singleton_costs_one_more_guess(self):
         # CRANE is the guess and one of the branch words: its own group is
         # finished by playing it, while the other single word needs one more.
         responses = _StubResponses({0: ['crane'], 1: ['sound']})
-        fold = fold_branch(['crane', 'sound'], 'crane', responses,
+        reduction = reduce_branch(['crane', 'sound'], 'crane', responses,
                            lambda key: self.fail('no group needs a lookup'))
-        self.assertEqual(fold.depth, 2)
-        self.assertEqual(fold.erd, 1.5)
+        self.assertEqual(reduction.depth, 2)
+        self.assertEqual(reduction.erd, 1.5)
 
     def test_a_stored_group_costs_one_more_than_its_own_worst_case(self):
         group = ['sound', 'spend', 'stand']
         responses = _StubResponses({0: ['crane'], 1: group})
-        fold = fold_branch(['crane'] + group, 'crane', responses,
+        reduction = reduce_branch(['crane'] + group, 'crane', responses,
                            lambda key: (3, 2.0))
-        self.assertEqual(fold.depth, 4)
-        self.assertAlmostEqual(fold.erd, 1.0 + 0.75 * 2.0)
+        self.assertEqual(reduction.depth, 4)
+        self.assertAlmostEqual(reduction.erd, 1.0 + 0.75 * 2.0)
 
-    def test_a_group_with_no_stored_row_leaves_the_fold_incomplete(self):
+    def test_a_group_with_no_stored_row_leaves_the_reduction_incomplete(self):
         group = ['sound', 'spend']
         responses = _StubResponses({0: ['crane'], 1: group})
-        fold = fold_branch(['crane'] + group, 'crane', responses, lambda key: None)
-        self.assertFalse(fold.complete)
-        self.assertEqual(fold.missing, (ScoreCache.encode_subset(group),))
+        reduction = reduce_branch(['crane'] + group, 'crane', responses, lambda key: None)
+        self.assertFalse(reduction.complete)
+        self.assertEqual(reduction.missing, (ScoreCache.encode_subset(group),))
 
     def test_a_row_whose_max_depth_is_missing_reads_as_incomplete(self):
         group = ['sound', 'spend']
         responses = _StubResponses({0: ['crane'], 1: group})
-        fold = fold_branch(['crane'] + group, 'crane', responses,
+        reduction = reduce_branch(['crane'] + group, 'crane', responses,
                            lambda key: (None, 2.0))
-        self.assertFalse(fold.complete)
+        self.assertFalse(reduction.complete)
 
     def test_a_guess_that_separates_nothing_is_degenerate(self):
         branch = ['sound', 'spend']
         responses = _StubResponses({0: branch})
-        fold = fold_branch(branch, 'crane', responses,
-                           lambda key: self.fail('degenerate rows are not folded'))
-        self.assertTrue(fold.degenerate)
-        self.assertFalse(fold.complete)
+        reduction = reduce_branch(branch, 'crane', responses,
+                           lambda key: self.fail('degenerate rows are not reduced'))
+        self.assertTrue(reduction.degenerate)
+        self.assertFalse(reduction.complete)
 
 
 class _CacheFixture(unittest.TestCase):
@@ -167,7 +168,7 @@ class _CacheFixture(unittest.TestCase):
 
         Each element is (branch_key, solve_budget): a branch can hold an
         unrestricted result and one per budget, and only the fact a parent
-        actually folded is on its chain.  Descending picks the group achieving
+        actually reduced is on its chain.  Descending picks the group achieving
         `1 + child_depth == parent_depth` in the scope that parent read — one
         budget down, unrestricted first — so a change to the last link
         propagates all the way back up.
@@ -248,7 +249,7 @@ def _fact_reference(fact):
 
 class CleanRebuildTest(_CacheFixture):
 
-    def test_the_solver_s_own_rows_agree_with_the_fold_on_every_one(self):
+    def test_the_solver_s_own_rows_agree_with_the_reduction_on_every_one(self):
         audit = self.audit()
         self.assertGreater(audit.checked, 20)
         self.assertEqual(audit.incomplete, 0)
@@ -259,7 +260,7 @@ class CleanRebuildTest(_CacheFixture):
         self.assertEqual(audit.score_stale, 0)
 
     def test_the_fixture_reaches_the_states_the_audit_is_about(self):
-        # A fold over rows that were all shallow, or all of one scope, would
+        # A reduction over rows that were all shallow, or all of one scope, would
         # assert nothing about either.
         score_cache = self.open_cache()
         canonical = score_cache._conn.execute(
@@ -293,13 +294,13 @@ class CleanRebuildTest(_CacheFixture):
             (branch_key, ERD_ALL, score_cache.answer_list_id))
         audit = self.audit()
         self.assertEqual(audit.legacy, 1)
-        # Its parent folds it as an unresolved group rather than as depth 0.
+        # Its parent reduces it as an unresolved group rather than as depth 0.
         self.assertEqual(audit.depth_too_low, 0)
         self.assertEqual(audit.depth_too_high, 0)
         self.assertGreaterEqual(audit.incomplete, 1)
         self.assertGreaterEqual(audit.unresolved_groups, audit.incomplete)
 
-    def test_the_erd_fold_reproduces_each_stored_score_bit_for_bit(self):
+    def test_the_erd_reduction_reproduces_each_stored_score_bit_for_bit(self):
         # Summing the response groups in evaluate_candidate's own order is
         # what makes this exact rather than merely close; a tolerance would
         # hide a genuinely stale score that happens to be near enough.
@@ -310,18 +311,18 @@ class CleanRebuildTest(_CacheFixture):
         for row in iter_rows(score_cache, ERD_ALL):
             branch_key = bytes(row['branch_key'])
             scope = row['solve_budget']
-            fold = fold_branch(
+            reduction = reduce_branch(
                 decode_subset(branch_key), row['best_guess'], responses,
                 _known_lookup(known, scope))
-            self.assertTrue(fold.complete)
-            self.assertEqual(fold.erd, row['best_score'])
+            self.assertTrue(reduction.complete)
+            self.assertEqual(reduction.erd, row['best_score'])
             known[(branch_key, scope)] = (row['max_depth'], row['best_score'])
             checked += 1
         self.assertGreater(checked, 20)
 
 
 def _known_lookup(known, parent_scope):
-    """A fold lookup over a plain dict, scoped as DepthAudit scopes its own."""
+    """A reduction lookup over a plain dict, scoped as DepthAudit scopes its own."""
     if parent_scope is None:
         return lambda key: known.get((key, None))
     child_budget = parent_scope - 1
@@ -344,7 +345,7 @@ class AliasedOverwriteTest(_CacheFixture):
 
         The deepest one's own strategy still needs the depth it always needed,
         so correcting it re-opens the gap at its parent, and so on to the root
-        — the ancestry the issue's global fold cannot count because it reads
+        — the ancestry the issue's global reduction cannot count because it reads
         back the same understated children.
         """
         chain = self.deepest_chain()
@@ -353,7 +354,7 @@ class AliasedOverwriteTest(_CacheFixture):
         return chain
 
     def naive_flagged(self):
-        """What a fold that reads each child's stored depth would flag."""
+        """What a reduction that reads each child's stored depth would flag."""
         score_cache = self.open_cache()
         responses = ResponseCache(self.answer_words, score_cache=score_cache)
         rows = [(bytes(row['branch_key']), row['solve_budget'],
@@ -363,9 +364,9 @@ class AliasedOverwriteTest(_CacheFixture):
                   for key, scope, _guess, max_depth in rows}
         flagged = set()
         for branch_key, scope, best_guess, max_depth in rows:
-            fold = fold_branch(decode_subset(branch_key), best_guess, responses,
+            reduction = reduce_branch(decode_subset(branch_key), best_guess, responses,
                                _known_lookup(stored, scope))
-            if fold.complete and fold.depth != max_depth:
+            if reduction.complete and reduction.depth != max_depth:
                 flagged.add((branch_reference(branch_key), scope))
         return flagged
 
@@ -397,8 +398,8 @@ class AliasedOverwriteTest(_CacheFixture):
         self.assertEqual(audit.depth_too_high, 0)
 
     def test_reading_stored_children_misses_part_of_the_ancestry(self):
-        # The bottom-up pass is what finds the whole ancestry.  A fold that
-        # re-reads each child's stored depth agrees with a parent that folded
+        # The bottom-up pass is what finds the whole ancestry.  A reduction that
+        # re-reads each child's stored depth agrees with a parent that reduced
         # the same understated value and moves on, so its count is a floor on
         # the real one rather than a measurement of it.
         chain = self.understate_chain()
@@ -489,6 +490,63 @@ class RepairTest(_CacheFixture):
             original[2] + 1)
 
 
+class RepairClearsOpenerERDsTest(_CacheFixture):
+    """A repaired row may be an opener's own response group, so a repair that
+    changes anything drops the stored opener ERDs it may have falsified."""
+
+    def _damage(self):
+        chain = self.deepest_chain()
+        for fact in chain:
+            self.understate(fact)
+        return chain
+
+    def _store_opener(self):
+        cache = self.open_cache()
+        cache.write_opener_erd("crane", ERD_ALL, 3.5, 6, 100)
+        return cache
+
+    def _stored(self):
+        cache = ScoreCache(self.cache_path, self.answer_words,
+                           checkpoint_on_close=False)
+        try:
+            return cache.opener_names_with_erd(ERD_ALL)
+        finally:
+            cache.close()
+
+    def _main(self, *flags):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            verify_branch_depths.main(
+                ['--cache', self.cache_path, '--answers', self.answers_path,
+                 *flags])
+        return output.getvalue()
+
+    def test_a_repair_that_changed_a_row_drops_the_stored_opener_erds(self):
+        chain = self._damage()
+        self.assertTrue(chain)
+        self._store_opener()
+
+        output = self._main('--repair')
+
+        self.assertEqual(self._stored(), set())
+        self.assertIn("reconcile-opener-erds", output)
+
+    def test_a_repair_that_changed_nothing_leaves_them(self):
+        self._store_opener()
+
+        self._main('--repair')
+
+        self.assertEqual(self._stored(), {"crane"})
+
+    def test_an_audit_alone_leaves_them(self):
+        self._damage()
+        self._store_opener()
+
+        self._main()
+
+        self.assertEqual(self._stored(), {"crane"})
+
+
 class RepairSafetyTest(_CacheFixture):
     """Which direction of disagreement --repair is willing to act on."""
 
@@ -508,7 +566,7 @@ class RepairSafetyTest(_CacheFixture):
         self.restate(parent, max_depth=before['max_depth'] + 1,
                      best_score=before['best_score'] + 0.5)
         audit = self.audit(repair=True)
-        # The replaced score also disagrees at whoever folded it, so the stale
+        # The replaced score also disagrees at whoever reduced it, so the stale
         # count is the parent plus its own ancestry.
         self.assertGreaterEqual(audit.score_stale, 1)
         self.assertEqual(audit.depth_too_high, 1)
@@ -557,7 +615,7 @@ class RepairSideEffectsTest(_CacheFixture):
     def test_a_repair_touches_only_the_row_it_repairs(self):
         """A repair has nothing to invalidate above it.
 
-        A candidate's own ERD is folded from its response groups' rows on
+        A candidate's own ERD is reduced from its response groups' rows on
         every read, so the repaired depth reaches the next report without an
         invalidation step.  What the pass must not do is write anything beyond
         the branch results it is auditing.
@@ -675,12 +733,14 @@ class CommandLineTest(_CacheFixture):
              'unresolved_groups': 0,
              'depth_too_low': 1070, 'depth_too_high': 36, 'score_stale': 2500,
              'repaired': 1106, 'repair_withheld': 30,
+             'opener_erds_cleared': True,
              'depth_deltas': {'3 -> 4': 1065, '4 -> 5': 5},
              'tainted_split': {'tainted': 1070},
              'mismatch_sizes': {16: 500, 25: 570},
              'findings': []},
             30.0, repair=True)
         self.assertIn('checked 739,662', report)
+        self.assertIn('reconcile-opener-erds', report)
         self.assertIn('3 -> 4: 1,065', report)
         self.assertIn('unsound reuse): 1,070', report)
         self.assertIn('n=16-25', report)

@@ -1908,7 +1908,6 @@ def _render_leaderboard_sections(report, width):
         _fit(
             f"  complete {counts['complete']}  "
             f"pending {counts['pending']}  "
-            f"infeasible {counts['infeasible']}  "
             f"(showing {len(leaderboard_rows(data))} of {data['total_rows']})",
             width,
         ),

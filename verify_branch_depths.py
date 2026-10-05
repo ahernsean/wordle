@@ -4,37 +4,37 @@
 A branch row's `max_depth` is not an independent measurement: it is fully
 determined by the row's own `best_guess` and the `max_depth` of each response
 group that guess produces.  Any disagreement between the stored value and that
-fold is therefore a genuine inconsistency, not a difference of opinion between
+reduction is therefore a genuine inconsistency, not a difference of opinion between
 two searches.
 
 A branch holds up to two kinds of exact result — the unrestricted optimum in
 `branch_best_by_policy`, and one per budget in
-`branch_best_by_policy_and_budget` — and the fold has to read the one its
+`branch_best_by_policy_and_budget` — and the reduction has to read the one its
 parent actually used.  An unrestricted parent's subtrees were solved
 unrestricted; a parent solved under budget b spent one guess reaching each
 child, so it read them at b-1: the unrestricted child when its own worst case
 fits there, and otherwise the child solved at exactly b-1.
 
 Both facts once shared one row, and the last write won.  Nothing records which
-of a child's values a parent folded, so a parent left holding the other one
-cannot be found by query — only by redoing the fold.  That is what this audit
+of a child's values a parent reduced, so a parent left holding the other one
+cannot be found by query — only by redoing the reduction.  That is what this audit
 does, and it stays worth doing after the split: it is what says whether a cache
 carries damage from before it.
 
 Two directions of disagreement, with very different consequences:
 
-  stored below the fold — unsound.  `_cache_reuse` gates an untainted entry on
+  stored below the reduction — unsound.  `_cache_reuse` gates an untainted entry on
     `max_depth <= budget`, so an understated depth offers a strategy at a
     budget that strategy cannot actually meet.
-  stored above the fold — conservative.  Reuse is refused where it was
+  stored above the reduction — conservative.  Reuse is refused where it was
     available; results stay correct.
 
 The pass runs bottom-up (ascending branch size), so a child corrected in this
-run is what its parents are folded against.  A naive fold that reads only
+run is what its parents are reduced against.  A naive reduction that reads only
 stored values undercounts: an understated child understates its ancestors, and
 reading that same child back agrees with them.
 
-`--repair` writes each folded value back, and rewrites `max_depth` only.  A
+`--repair` writes each reduced value back, and rewrites `max_depth` only.  A
 stale `best_score` is reported but never rewritten: a wrong ERD may mean
 `best_guess` is no longer the argmin, which only a re-search
 (verify_erd_cache.py) can settle.
@@ -43,12 +43,13 @@ The two directions are not equally safe to repair, so they are not repaired
 alike.  Raising a depth only ever withdraws reuse, and is always applied.
 Lowering one widens the budget range the row is offered at, which is a claim
 about a strategy — so it is applied only when the row's `best_score` agrees
-with its own fold, and withheld otherwise rather than extending the reach of a
+with its own reduction, and withheld otherwise rather than extending the reach of a
 score this pass has just contradicted.
 
-A repaired row needs nothing invalidated above it.  A candidate's own ERD is
-folded from its response groups' rows on every read, so the next report sees
-the repaired depth.
+A repaired row needs nothing invalidated above it for a candidate's ERD at a
+branch, which is reduced from its response groups' rows on every read.  An
+opener's stored ERD is not, so a repair that changes any row drops them all and
+`erd_search.py reconcile-opener-erds` stores them again.
 
 An audit-only run opens the cache read-only, so it can be run against a live
 one.  Stop the swarm before running with --repair.
@@ -60,7 +61,7 @@ Usage:
     python3.13 verify_branch_depths.py --json
 
 Exits 1 when an audit-only run finds rows whose stored depth is below the
-fold, so a scheduled run reports the unsound ones without being read.
+reduction, so a scheduled run reports the unsound ones without being read.
 """
 
 from __future__ import annotations
@@ -86,16 +87,16 @@ from runtime_paths import (
 # with a max_remaining_depth of 1, before it ever reads the cache.
 SINGLETON_MAX_REMAINING_DEPTH = 1
 
-# The ERD fold sums its groups in evaluate_candidate's own order, so a row the
+# The ERD reduction sums its groups in evaluate_candidate's own order, so a row the
 # solver wrote reproduces bit-exactly.  The tolerance only absorbs rows written
 # by some other path.
 SCORE_TOLERANCE = 1e-9
 
 
-class DepthFold:
+class BranchReduction:
     """One row's max_depth and ERD as its own stored strategy determines them.
 
-    `depth` and `erd` are None when `missing` or `degenerate` is set — the fold
+    `depth` and `erd` are None when `missing` or `degenerate` is set — the reduction
     could not be completed, so the stored values are neither confirmed nor
     contradicted.
     """
@@ -113,15 +114,15 @@ class DepthFold:
         return self.depth is not None
 
 
-def fold_branch(branch_words, best_guess, response_cache, child_lookup):
-    """Fold one branch's max_depth and ERD from best_guess's response groups.
+def reduce_branch(branch_words, best_guess, response_cache, child_lookup):
+    """Reduce one branch's max_depth and ERD from best_guess's response groups.
 
     Mirrors evaluate_candidate's recurrence: the guess itself is one guess; the
     group holding only the guess is finished by playing it; every other group
     costs one guess more than its own subtree.
 
     child_lookup(branch_key) returns (max_depth, erd) for a stored group, or
-    None when no row holds it.  It carries the scope: a fold is only sound
+    None when no row holds it.  It carries the scope: a reduction is only sound
     against the results its own search would have read, so the caller supplies
     a lookup already bound to the parent's budget.  Groups of one word are
     answered here rather than looked up, matching _solve_subset's own n == 1
@@ -133,13 +134,13 @@ def fold_branch(branch_words, best_guess, response_cache, child_lookup):
     erd = 1.0
     missing = []
     # Largest group first, as evaluate_candidate accumulates them: floating
-    # point addition is not associative, so the ERD fold only reproduces a
+    # point addition is not associative, so the ERD reduction only reproduces a
     # stored best_score exactly when it adds the same terms in the same order.
     for group in sorted(groups.values(), key=len, reverse=True):
         k = len(group)
         if k >= n:
             # The guess separates nothing: this row's own branch back again.
-            return DepthFold(degenerate=True)
+            return BranchReduction(degenerate=True)
         if k == 1:
             if group[0] == best_guess:
                 continue
@@ -153,15 +154,15 @@ def fold_branch(branch_words, best_guess, response_cache, child_lookup):
         depth = max(depth, 1 + child_depth)
         erd += (k / n) * child_erd
     if missing:
-        return DepthFold(missing=missing)
-    return DepthFold(depth=depth, erd=erd)
+        return BranchReduction(missing=missing)
+    return BranchReduction(depth=depth, erd=erd)
 
 
 class DepthAudit:
-    """Bottom-up fold of every stored branch row, with optional repair.
+    """Bottom-up reduction of every stored branch row, with optional repair.
 
     Rows must arrive in ascending branch size so each row's response groups —
-    always strictly smaller than the row itself — are already folded, in both
+    always strictly smaller than the row itself — are already reduced, in both
     scopes.
     """
 
@@ -171,7 +172,7 @@ class DepthAudit:
         self._responses = response_cache
         self._repair = repair
         # (branch_key, solve_budget) -> (max_depth, best_score) as the audit
-        # now believes them: the folded depth where the fold completed, the
+        # now believes them: the reduced depth where the reduction completed, the
         # stored depth otherwise.  solve_budget None is the unrestricted result.
         self._known = {}
         self.checked = 0
@@ -184,6 +185,7 @@ class DepthAudit:
         self.score_stale = 0
         self.repaired = 0
         self.repair_withheld = 0
+        self.opener_erds_cleared = False
         self.depth_deltas = Counter()
         self.tainted_split = Counter()
         self.mismatch_sizes = Counter()
@@ -235,24 +237,24 @@ class DepthAudit:
             return
 
         branch_words = decode_subset(branch_key)
-        fold = fold_branch(branch_words, best_guess, self._responses,
+        reduction = reduce_branch(branch_words, best_guess, self._responses,
                            self._child_lookup(scope))
-        if fold.degenerate:
+        if reduction.degenerate:
             self.degenerate += 1
             return
-        if not fold.complete:
+        if not reduction.complete:
             self.incomplete += 1
-            self.unresolved_groups += len(fold.missing)
+            self.unresolved_groups += len(reduction.missing)
             return
 
-        self._known[(branch_key, scope)] = (fold.depth, stored_score)
-        score_agrees = abs(fold.erd - stored_score) <= SCORE_TOLERANCE
+        self._known[(branch_key, scope)] = (reduction.depth, stored_score)
+        score_agrees = abs(reduction.erd - stored_score) <= SCORE_TOLERANCE
         if not score_agrees:
             self.score_stale += 1
-        if fold.depth == stored_depth:
+        if reduction.depth == stored_depth:
             return
 
-        if fold.depth > stored_depth:
+        if reduction.depth > stored_depth:
             # Raising a depth only withdraws reuse; safe whatever the score is.
             self.depth_too_low += 1
             safe_to_repair = True
@@ -262,7 +264,7 @@ class DepthAudit:
             # pass has confirmed rather than one it has just contradicted.
             self.depth_too_high += 1
             safe_to_repair = score_agrees
-        self.depth_deltas[(stored_depth, fold.depth)] += 1
+        self.depth_deltas[(stored_depth, reduction.depth)] += 1
         self.tainted_split['tainted' if solve_budget is not None else 'untainted'] += 1
         self.mismatch_sizes[len(branch_words)] += 1
         if len(self.findings) < list_limit:
@@ -271,7 +273,8 @@ class DepthAudit:
                 'branch_size': len(branch_words),
                 'best_guess': best_guess,
                 'stored_max_depth': stored_depth,
-                'folded_max_depth': fold.depth,
+                # The JSON key keeps the name consumers of --json read.
+                'folded_max_depth': reduction.depth,
                 'solve_budget': solve_budget,
             })
         if not self._repair:
@@ -279,7 +282,7 @@ class DepthAudit:
         if not safe_to_repair:
             self.repair_withheld += 1
             return
-        if self._cache.repair_max_depth(branch_key, self._policy, fold.depth,
+        if self._cache.repair_max_depth(branch_key, self._policy, reduction.depth,
                                         solve_budget=scope):
             self.repaired += 1
 
@@ -295,6 +298,7 @@ class DepthAudit:
             'score_stale': self.score_stale,
             'repaired': self.repaired,
             'repair_withheld': self.repair_withheld,
+            'opener_erds_cleared': self.opener_erds_cleared,
             'depth_deltas': {f'{was} -> {now}': count
                              for (was, now), count in sorted(self.depth_deltas.items())},
             'tainted_split': dict(sorted(self.tainted_split.items())),
@@ -326,7 +330,7 @@ def iter_rows(score_cache, policy):
 
     Spans both branch tables, so a branch with an unrestricted result and two
     budget-specific ones yields three rows — each is a separate fact with its
-    own fold.  Yielded one branch size at a time, each wave read to completion
+    own reduction.  Yielded one branch size at a time, each wave read to completion
     before it is handed out: --repair updates the same tables the rows come
     from, and a cursor still open over one would be reading a moving target.
     """
@@ -344,7 +348,7 @@ def iter_rows(score_cache, policy):
     """, (policy, answer_list_id, policy, answer_list_id)).fetchall()]
     for size in sizes:
         # Both scopes of one branch size together: a parent is strictly larger
-        # than every group it folds, so anything a fold needs is already done.
+        # than every group it reduces, so anything a reduction needs is already done.
         yield from conn.execute("""
             SELECT branch_key, best_guess, best_score, max_depth, solve_budget
             FROM branch_best_by_policy
@@ -385,24 +389,28 @@ def render_report(summary, elapsed, repair):
         lines.append(f'  tainted split: {{{split}}}')
         lines.append(f"  sizes: {_size_span(summary['mismatch_sizes'])}")
     lines.append(
-        f"  stored best_score disagrees with its own fold: {summary['score_stale']:,}")
+        f"  stored best_score disagrees with its own reduction: {summary['score_stale']:,}")
     if repair:
         lines.append(f"  max_depth rows repaired: {summary['repaired']:,}")
         lines.append(
             f"  repairs withheld (would widen reuse for a stale score): "
             f"{summary['repair_withheld']:,}")
+        if summary['opener_erds_cleared']:
+            lines.append(
+                "  stored opener ERDs dropped; run `erd_search.py "
+                "reconcile-opener-erds` to store them again")
     for finding in summary['findings']:
         lines.append(
             f"    {finding['branch_reference']}  n={finding['branch_size']:,}  "
             f"{finding['best_guess']}  stored {finding['stored_max_depth']} "
-            f"-> folded {finding['folded_max_depth']}  "
+            f"-> reduced {finding['folded_max_depth']}  "
             f"solve_budget={finding['solve_budget']}")
     return '\n'.join(lines)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description='Audit branch_best_by_policy max_depth against the fold '
+        description='Audit branch_best_by_policy max_depth against the reduction '
                     'its own best_guess and response groups determine.')
     parser.add_argument('--cache', default=DEFAULT_CACHE_PATH, metavar='PATH',
                         help='Cache database to audit (default: %(default)s)')
@@ -411,7 +419,7 @@ def main(argv=None):
     parser.add_argument('--policy', default=ERD_ALL, choices=sorted(VALID_ERD_POLICIES),
                         help='Search policy to audit (default: %(default)s)')
     parser.add_argument('--repair', action='store_true',
-                        help='Write each folded max_depth back.  Stop the '
+                        help='Write each reduced max_depth back.  Stop the '
                              'swarm first: a worker holding a branch open '
                              'will overwrite the repair with its own value.')
     parser.add_argument('--list', type=int, default=0, metavar='N',
@@ -427,7 +435,7 @@ def main(argv=None):
     answer_words = load_word_list(args.answers)
     score_cache = ScoreCache(args.cache, answer_words, checkpoint_on_close=False,
                              read_only=not args.repair)
-    # The fold reads response_decomposition rows the solver already wrote
+    # The reduction reads response_decomposition rows the solver already wrote
     # rather than recomputing every guess's patterns.  It never writes one
     # back: a guess the cache has not decomposed stays decomposed in memory
     # for this run, so an audit adds nothing to the file it is auditing.
@@ -443,6 +451,12 @@ def main(argv=None):
     audit = DepthAudit(score_cache, args.policy, responses, repair=args.repair)
     try:
         audit.run(iter_rows(score_cache, args.policy), list_limit=args.list)
+        if args.repair and audit.repaired:
+            # A repaired row can be one of an opener's own response groups,
+            # and a stored opener ERD does not follow it.  Drop them all;
+            # `erd_search.py reconcile-opener-erds` stores them again.
+            score_cache.delete_all_opener_erds(args.policy)
+            audit.opener_erds_cleared = True
     finally:
         score_cache.close()
     summary = audit.summary()

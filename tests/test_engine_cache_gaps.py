@@ -125,26 +125,14 @@ class TestCacheSQLiteDiskIOSwallow(unittest.TestCase):
             sc.write(key, "full", "heart", 2.5)
 
     # ---- write_completed_opener_summary() ----
-    def test_completed_opener_summary_swallows_disk_io_error(self):
+    def test_completed_opener_summary_propagates_a_disk_io_error(self):
+        # The opener is marked done after this write, and nothing writes the
+        # timing again, so a failure must reach the caller.
         sc = ScoreCache(self.db, ANSWERS)
         self.addCleanup(sc.close)
 
         def boom(*args, **kwargs):
             raise sqlite3.OperationalError("disk I/O error")
-
-        sc._conn = _ConnProxy(sc._conn, execute=boom)
-        with self.assertLogs("wordle", level="WARNING") as logs:
-            sc.write_completed_opener_summary(
-                "salet", ERD_ANSWERS, 160, 60_000, 2_000)
-        self.assertTrue(any("write_completed_opener_summary" in message
-                            for message in logs.output))
-
-    def test_completed_opener_summary_reraises_non_disk_io_error(self):
-        sc = ScoreCache(self.db, ANSWERS)
-        self.addCleanup(sc.close)
-
-        def boom(*args, **kwargs):
-            raise sqlite3.OperationalError("database is locked")
 
         sc._conn = _ConnProxy(sc._conn, execute=boom)
         with self.assertRaises(sqlite3.OperationalError):

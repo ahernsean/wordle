@@ -168,7 +168,7 @@ class HistoricalValuesAreNotFactsTest(_HintCacheTest):
         """A sub-branch the live cache has never seen is solved from scratch.
 
         The historical row for it is deliberately both wrong and cheap: if any
-        part of it were reused, the parent's fold would carry the lie upward
+        part of it were reused, the parent's reduction would carry the lie upward
         and the root ERD would move.
         """
         live = self.live()

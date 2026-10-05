@@ -272,6 +272,7 @@ class TestQueueOpenerPriority(unittest.TestCase):
         opener_work_id = queue.opener_work_rows()[0]['opener_work_id']
         queue.claim_next('worker-0', opener_work_id)
         queue.mark_done(key)
+        queue.mark_openers_complete(queue.openers_ready_to_complete())
         queue.close()
 
         output = self._run(_make_args(self.queue_path, priority=2,

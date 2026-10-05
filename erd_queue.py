@@ -2418,37 +2418,73 @@ class ERDQueue:
             self._conn.execute("ROLLBACK")
             raise
 
-    def _complete_finished_opener_work(self):
-        """Mark opener requests terminal once every owned branch is complete."""
-        completion_predicate = """
-            state != 'complete'
-              AND NOT EXISTS (
-                  SELECT 1 FROM branch_opener_work m
-                  LEFT JOIN pending_branches p ON p.branch_id = m.branch_id
-                  LEFT JOIN active_branches a ON a.branch_id = m.branch_id
-                  WHERE m.opener_work_id = s.opener_work_id
-                    AND m.resolved_at IS NULL
-                    AND (p.status IN ('pending', 'in_progress') OR a.status = 'open')
-              )
+    _FINISHED_OPENER_WORK_PREDICATE = """
+        state != 'complete'
+          AND NOT EXISTS (
+              SELECT 1 FROM branch_opener_work m
+              LEFT JOIN pending_branches p ON p.branch_id = m.branch_id
+              LEFT JOIN active_branches a ON a.branch_id = m.branch_id
+              WHERE m.opener_work_id = s.opener_work_id
+                AND m.resolved_at IS NULL
+                AND (p.status IN ('pending', 'in_progress') OR a.status = 'open')
+          )
+    """
+
+    def openers_ready_to_complete(self):
+        """Openers whose every owned branch has resolved but are not yet done.
+
+        An opener is done when no further computation is needed on it, and
+        resolving its last branch leaves one computation owed: reducing its
+        response groups to its own ERD.  This is the list of openers owing
+        that reduction.  It is a query over durable state rather than a stored
+        obligation, so an opener whose reducing worker died before finishing
+        simply appears again at the next finalize anywhere.
+
+        Two workers resolving an opener's last two branches near-
+        simultaneously can both see it here and both reduce it.  The
+        reduction is a pure function of cached results and its stored row is
+        replaced with identical values, so the repeat costs a few
+        milliseconds and changes nothing.
         """
-        completed_rows = self._conn.execute(
+        return sorted({row["opener"] for row in self._conn.execute(
             "SELECT opener FROM opener_work AS s WHERE "
-            + completion_predicate
-        ).fetchall()
-        if not completed_rows:
-            return []
+            + self._FINISHED_OPENER_WORK_PREDICATE)})
+
+    def completed_opener_names(self):
+        """Every opener with a request that is done."""
+        return sorted({row["opener"] for row in self._conn.execute(
+            "SELECT opener FROM opener_work WHERE state = 'complete'")})
+
+    def mark_openers_complete(self, openers):
+        """Mark openers done, once their ERD is stored.
+
+        The caller reduces and stores the ERD *first*: the queue and the
+        cache are separate databases with no shared transaction, so this flip
+        is the last step and a failure before it leaves the opener not done,
+        which is true.  An opener that has regained unresolved work since the
+        caller looked is left alone.
+        """
+        openers = list(openers)
+        if not openers:
+            return
+        placeholders = ",".join("?" for _ in openers)
         self._conn.execute(
-            "UPDATE opener_work AS s SET state = 'complete' WHERE "
-            + completion_predicate
-        )
-        return list({row["opener"] for row in completed_rows})
+            "UPDATE opener_work AS s SET state = 'complete' WHERE opener IN ("
+            + placeholders + ") AND " + self._FINISHED_OPENER_WORK_PREDICATE,
+            openers)
 
     def _resolve_branch_memberships(self, branch_id: int = None,
                                     withdraw: bool = False):
         """Make branch ownership unschedulable and update request lifecycle."""
         branch_condition = "" if branch_id is None else " AND branch_id = ?"
         parameters = () if branch_id is None else (branch_id,)
+        withdrawn_request_ids = set()
         if withdraw:
+            withdrawn_request_ids = {
+                row["opener_work_id"] for row in self._conn.execute(
+                    "SELECT DISTINCT opener_work_id FROM branch_opener_work "
+                    "WHERE resolved_at IS NULL" + branch_condition,
+                    parameters)}
             if branch_id is None:
                 self._conn.execute("DELETE FROM branch_opener_work")
             else:
@@ -2460,9 +2496,31 @@ class ERDQueue:
                 "UPDATE branch_opener_work SET resolved_at = ? "
                 "WHERE resolved_at IS NULL" + branch_condition,
                 (int(time.time()), *parameters))
-        completed_words = self._complete_finished_opener_work()
+        completed_words = self.openers_ready_to_complete()
+        if withdraw:
+            # Withdrawal is an operator removing work, not an opener finishing:
+            # the requests it took work from, and left with nothing owed, are
+            # terminal and have no ERD to reduce.  A request that finished on
+            # its own and is waiting on its reduction is not this withdrawal's
+            # to complete.
+            self._finish_opener_work_ids(
+                withdrawn_request_ids & self._ready_opener_work_ids())
         self._demote_orphaned_owned_branches()
         return completed_words
+
+    def _ready_opener_work_ids(self):
+        return {row["opener_work_id"] for row in self._conn.execute(
+            "SELECT opener_work_id FROM opener_work AS s WHERE "
+            + self._FINISHED_OPENER_WORK_PREDICATE)}
+
+    def _finish_opener_work_ids(self, opener_work_ids):
+        opener_work_ids = sorted(opener_work_ids)
+        if opener_work_ids:
+            self._conn.execute(
+                "UPDATE opener_work SET state = 'complete' "
+                "WHERE opener_work_id IN ("
+                + ",".join("?" for _ in opener_work_ids) + ")",
+                opener_work_ids)
 
     def _retire_exact_direct_response_groups(self, branch_id: int) -> list[str]:
         """Retire work below direct response groups whose exact result is done.
@@ -2540,7 +2598,7 @@ class ERDQueue:
                     f"DELETE FROM active_branches WHERE branch_id IN ({active_placeholders})",
                     active_ids)
 
-        return self._complete_finished_opener_work()
+        return self.openers_ready_to_complete()
 
     def completed_opener_timing(self, opener):
         """Return durable-opener timing from every telemetry epoch.
@@ -6399,8 +6457,9 @@ class ERDQueue:
                 )
             elif not is_complete and not has_live_membership:
                 violations.append(
-                    f"unfinished opener_work_id {row['opener_work_id']} has no "
-                    "live membership"
+                    f"unfinished opener_work_id {row['opener_work_id']} has "
+                    "resolved every branch but is not done; its ERD reduction "
+                    "has not been stored"
                 )
 
         owners_without_membership = self._conn.execute("""

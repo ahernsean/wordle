@@ -8,7 +8,7 @@ versions and are therefore descriptive history, not certificates.
 This module is the whole of the second one's interface.  HintCache answers
 exactly one question — "which word did the historical search pick for this
 branch?" — and its queries select `best_guess` alone.  A stored ERD, worst
-case, solve budget, or loss row cannot leave this module, so no caller can fold
+case, solve budget, or loss row cannot leave this module, so no caller can reduce
 an unverified value into a new parent or use one as an alpha-beta ceiling.  The
 hinted word is re-evaluated in full against the live cache before it can become
 an incumbent; a wrong hint costs evaluation order and nothing else.

@@ -566,7 +566,7 @@ class OverviewRendererTest(unittest.TestCase):
 
     def test_leaderboard_standing_for_an_unfinished_opener_sizes_the_field(self):
         # The ordinary case while a sweep runs: a real candidate whose tree is
-        # not finished.  It says so, names the fold's own state, and says how
+        # not finished.  It says so, names the reduction's own state, and says how
         # large the ranked field already is, rather than refusing the question.
         report = self._standing_report({
             "word": "howdy", "available": False, "state": "pending",

@@ -119,7 +119,7 @@ class TestExportCandidateScores(unittest.TestCase):
         conn.execute(
             "INSERT INTO candidate_erd_by_policy VALUES "
             "('h', 'crane', 'erd_all', 'x', 3.5, 5, 120, 100)")
-        # An opener's stored fold is derived from branch results the export
+        # An opener's stored reduction is derived from branch results the export
         # already carries, and each machine rescreens it against its own cache,
         # so it is rebuilt there rather than shipped.
         conn.execute(

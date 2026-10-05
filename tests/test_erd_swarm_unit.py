@@ -72,6 +72,7 @@ def _bare_worker():
     w._stop_requested = False
     w.root_budget = ROOT_BUDGET
     w.all_words = CANDIDATES
+    w.all_answers = BRANCH
     w.n_candidates = len(CANDIDATES)
     w.claims_done = 0
     w.n_ok = w.n_cutoff = w.n_pruned = w.n_useless = 0
@@ -4208,48 +4209,122 @@ class TestFinalizeTelemetryFailureIsolation(unittest.TestCase):
         w = self._finalizing_worker()
         key = b"branch-key"
         w.queue.delete_branch.return_value = ["salet"]
-        w._snapshot_completed_openers = mock.MagicMock()
+        w._complete_openers = mock.MagicMock()
         with mock.patch.object(erd_swarm, "cache_all_scores"):
             w.maybe_finalize(key, BRANCH, len(BRANCH))
-        w._snapshot_completed_openers.assert_called_once_with(["salet"])
+        w._complete_openers.assert_called_once_with(["salet"])
 
 
-class TestCompletedOpenerSnapshots(unittest.TestCase):
-    def test_snapshot_skips_empty_completion_lists_without_queue_aggregation(self):
+_TIMING = {"first_created_at": 100, "completed_at": 160,
+           "worker_millis": 2_000, "telemetry_epochs": "3"}
+
+
+def _reduction(state, **overrides):
+    return {"state": state, "erd": 3.5 if state == "complete" else None,
+            "max_remaining_depth": 6 if state == "complete" else None,
+            "resolved_group_count": 2, "infeasible_group_count": 0,
+            "response_group_count": 2, **overrides}
+
+
+class TestCompletingOpeners(unittest.TestCase):
+    """An opener is done when its ERD is stored: reduce, store, then flip."""
+
+    def _worker(self, reduction):
         worker = _bare_worker()
+        worker.name = "worker-0"
+        worker.queue.completed_opener_timing.return_value = dict(_TIMING)
+        patcher = mock.patch.object(
+            erd_swarm, "reduce_opener", return_value=reduction)
+        self.reduce_opener = patcher.start()
+        self.addCleanup(patcher.stop)
+        return worker
 
-        worker._snapshot_completed_openers(None)
+    def test_an_empty_completion_list_does_nothing(self):
+        worker = self._worker(_reduction("complete"))
 
-        worker.queue.completed_opener_timing.assert_not_called()
-        worker.queue.opener_rows.assert_not_called()
+        worker._complete_openers(None)
 
-    def test_snapshot_persists_the_completed_opener_timing(self):
-        worker = _bare_worker()
-        worker.queue.completed_opener_timing.return_value = {
-            "first_created_at": 100,
-            "completed_at": 160,
-            "worker_millis": 2_000,
-            "telemetry_epochs": "3",
-        }
+        self.reduce_opener.assert_not_called()
+        worker.queue.mark_openers_complete.assert_not_called()
 
-        worker._snapshot_completed_openers(["SALET"])
+    def test_a_complete_opener_is_stored_then_timed_then_marked_done(self):
+        worker = self._worker(_reduction("complete"))
+        order = mock.Mock()
+        order.attach_mock(worker.score_cache.write_opener_erd, "store")
+        order.attach_mock(
+            worker.score_cache.write_completed_opener_summary, "timing")
+        order.attach_mock(worker.queue.mark_openers_complete, "flip")
 
+        worker._complete_openers(["salet"])
+
+        self.assertEqual([call[0] for call in order.mock_calls],
+                         ["store", "timing", "flip"])
+        worker.score_cache.write_opener_erd.assert_called_once_with(
+            "salet", erd_swarm.ERD_ALL, 3.5, 6, 2)
         worker.score_cache.write_completed_opener_summary.assert_called_once_with(
-            "SALET", erd_swarm.ERD_ALL, 160, 60_000, 2_000, (3,))
+            "salet", erd_swarm.ERD_ALL, 160, 60_000, 2_000, (3,))
+        worker.queue.mark_openers_complete.assert_called_once_with(["salet"])
 
-    def test_snapshot_failure_does_not_abort_the_worker(self):
-        worker = _bare_worker()
-        worker.queue.completed_opener_timing.side_effect = [
-            RuntimeError("locked"),
-            {"first_created_at": 100, "completed_at": 160,
-             "worker_millis": 2_000, "telemetry_epochs": "3"},
-        ]
+    def test_a_failed_store_leaves_the_opener_not_done(self):
+        worker = self._worker(_reduction("complete"))
+        worker.score_cache.write_opener_erd.side_effect = sqlite3.OperationalError(
+            "disk I/O error")
 
         with self.assertLogs("wordle", level="ERROR"):
-            worker._snapshot_completed_openers(["salet", "crane"])
+            worker._complete_openers(["salet"])
 
-        worker.score_cache.write_completed_opener_summary.assert_called_once_with(
-            "crane", erd_swarm.ERD_ALL, 160, 60_000, 2_000, (3,))
+        worker.queue.mark_openers_complete.assert_not_called()
+
+    def test_a_failed_timing_write_leaves_the_opener_not_done(self):
+        worker = self._worker(_reduction("complete"))
+        worker.score_cache.write_completed_opener_summary.side_effect = (
+            sqlite3.OperationalError("disk I/O error"))
+
+        with self.assertLogs("wordle", level="ERROR"):
+            worker._complete_openers(["salet"])
+
+        worker.queue.mark_openers_complete.assert_not_called()
+
+    def test_one_openers_failure_does_not_stop_the_next(self):
+        worker = self._worker(_reduction("complete"))
+        worker.score_cache.write_opener_erd.side_effect = [
+            RuntimeError("locked"), None]
+
+        with self.assertLogs("wordle", level="ERROR"):
+            worker._complete_openers(["salet", "crane"])
+
+        worker.queue.mark_openers_complete.assert_called_once_with(["crane"])
+
+    def test_an_opener_with_unsettled_groups_is_not_done(self):
+        worker = self._worker(_reduction("pending", resolved_group_count=1))
+
+        with self.assertLogs("wordle", level="ERROR") as logged:
+            worker._complete_openers(["salet"])
+
+        self.assertIn("1 of 2 response groups", logged.output[0])
+        worker.score_cache.write_opener_erd.assert_not_called()
+        worker.queue.mark_openers_complete.assert_not_called()
+
+    def test_an_infeasible_opener_is_done_with_no_erd(self):
+        worker = self._worker(
+            _reduction("infeasible", infeasible_group_count=1))
+
+        with self.assertLogs("wordle", level="ERROR") as logged:
+            worker._complete_openers(["salet"])
+
+        self.assertIn("infeasible", logged.output[0])
+        worker.score_cache.write_opener_erd.assert_not_called()
+        worker.queue.mark_openers_complete.assert_called_once_with(["salet"])
+
+    def test_an_opener_with_no_recorded_completion_time_is_still_done(self):
+        worker = self._worker(_reduction("complete"))
+        worker.queue.completed_opener_timing.return_value = {
+            **_TIMING, "completed_at": None}
+
+        worker._complete_openers(["salet"])
+
+        worker.score_cache.write_completed_opener_summary.assert_not_called()
+        worker.queue.mark_openers_complete.assert_called_once_with(["salet"])
 
 
 class TestSubbranchSolverForwardsCeiling(unittest.TestCase):
@@ -4588,12 +4663,12 @@ class TestMaybeFinalizeTriage(unittest.TestCase):
         w = self._worker(("crane", 1.8, 2, False, 4, None, False))
         w.queue.mark_done.return_value = ["salet"]
         w.queue.delete_branch.return_value = []
-        w._snapshot_completed_openers = mock.MagicMock()
+        w._complete_openers = mock.MagicMock()
 
         with mock.patch.object(erd_swarm, "cache_all_scores"):
             w.maybe_finalize(key, BRANCH, len(CANDIDATES))
 
-        w._snapshot_completed_openers.assert_called_once_with(["salet"])
+        w._complete_openers.assert_called_once_with(["salet"])
 
 
 class TestMidLoopPublisherCeiling(unittest.TestCase):
