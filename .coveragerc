@@ -16,6 +16,7 @@ source =
     wordle_engine
     pattern_matrix
     erd_lattice
+    opener_erd
     cache_sqlite
     hint_cache
     erd_swarm

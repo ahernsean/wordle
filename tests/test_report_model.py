@@ -14,6 +14,11 @@ from pattern_matrix import PatternMatrix
 from erd_queue import ERDQueue
 import erd_search
 import report_model
+from opener_erd import (
+    fold_response_groups,
+    opener_response_groups,
+    store_opener_verdict,
+)
 from report_model import (
     leaderboard_rows,
     LEADERBOARD_NEIGHBOUR_COUNT,
@@ -32,7 +37,6 @@ from report_model import (
     WORK_DISTRIBUTION_BAND_EDGE_SECONDS,
     collect_work_distribution_report,
     work_distribution_band_labels,
-    _candidate_erd_summary,
     _candidate_eta,
     _opener_group_key,
     _grouped_response_groups,
@@ -870,8 +874,8 @@ class ReportModelTest(unittest.TestCase):
             "cache_state": cache_state,
         }
 
-    def test_candidate_erd_summary_folds_solved_groups_with_the_candidate_guess(self):
-        summary = _candidate_erd_summary([
+    def testfold_response_groups_folds_solved_groups_with_the_candidate_guess(self):
+        summary = fold_response_groups([
             self._group("-----", 8, 2.1, 3),
             self._group("----g", 2, 1.5, 2),
             self._group("ggggg", 1, None, None),
@@ -884,8 +888,8 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(summary["resolved_group_count"], 3)
         self.assertEqual(summary["response_group_count"], 3)
 
-    def test_candidate_erd_summary_is_pending_while_a_group_is_unsolved(self):
-        summary = _candidate_erd_summary([
+    def testfold_response_groups_is_pending_while_a_group_is_unsolved(self):
+        summary = fold_response_groups([
             self._group("-----", 8, 2.1, 3),
             self._group("y----", 5, None, None, cache_state="missing"),
             self._group("ggggg", 1, None, None),
@@ -897,8 +901,8 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(summary["infeasible_group_count"], 0)
         self.assertEqual(summary["response_group_count"], 3)
 
-    def test_candidate_erd_summary_is_infeasible_when_a_group_is_a_proven_loss(self):
-        summary = _candidate_erd_summary([
+    def testfold_response_groups_is_infeasible_when_a_group_is_a_proven_loss(self):
+        summary = fold_response_groups([
             self._group("-----", 8, 2.1, 3),
             self._group("yy---", 5, None, None, cache_state="loss"),
             self._group("-y---", 3, None, None, cache_state="missing"),
@@ -910,29 +914,29 @@ class ReportModelTest(unittest.TestCase):
         self.assertIsNone(summary["max_remaining_depth"])
         self.assertEqual(summary["infeasible_group_count"], 1)
 
-    def test_candidate_erd_summary_solves_a_lone_survivor_in_one_more_guess(self):
-        summary = _candidate_erd_summary([self._group("----y", 1, None, None)], 5)
+    def testfold_response_groups_solves_a_lone_survivor_in_one_more_guess(self):
+        summary = fold_response_groups([self._group("----y", 1, None, None)], 5)
         self.assertEqual(summary["state"], "complete")
         self.assertEqual(summary["erd"], 2.0)
         self.assertEqual(summary["max_remaining_depth"], 2)
 
-    def test_candidate_erd_summary_treats_erd_without_worst_case_as_pending(self):
+    def testfold_response_groups_treats_erd_without_worst_case_as_pending(self):
         # An ERD present but no proven worst-case line cannot complete the fold;
         # it must not crash the max() and must not read as complete.
-        summary = _candidate_erd_summary([self._group("-----", 8, 2.1, None)], 5)
+        summary = fold_response_groups([self._group("-----", 8, 2.1, None)], 5)
         self.assertEqual(summary["state"], "pending")
         self.assertIsNone(summary["max_remaining_depth"])
 
-    def test_candidate_erd_summary_lone_survivor_is_infeasible_with_no_guess_left(self):
+    def testfold_response_groups_lone_survivor_is_infeasible_with_no_guess_left(self):
         # A lone survivor needs one guess to play; at group_budget 0 there is no
         # guess left, so it is a proven loss — matching evaluate_candidate's
         # budget floor, checked before its n == 1 shortcut.
-        summary = _candidate_erd_summary([self._group("----y", 1, None, None)], 0)
+        summary = fold_response_groups([self._group("----y", 1, None, None)], 0)
         self.assertEqual(summary["state"], "infeasible")
         self.assertEqual(summary["infeasible_group_count"], 1)
         # The all-green group was already solved by the guess that reached it,
         # so it stays complete even with no budget.
-        solved = _candidate_erd_summary([self._group("ggggg", 1, None, None)], 0)
+        solved = fold_response_groups([self._group("ggggg", 1, None, None)], 0)
         self.assertEqual(solved["state"], "complete")
         self.assertEqual(solved["erd"], 1.0)
 
@@ -949,14 +953,14 @@ class ReportModelTest(unittest.TestCase):
          "max_remaining_depth": None, "cache_state": "exact"},
     ]
 
-    def test_candidate_erd_summary_folds_the_groups_it_is_handed(self):
-        summary = _candidate_erd_summary(self._SALET_GROUPS, 5)
+    def testfold_response_groups_folds_the_groups_it_is_handed(self):
+        summary = fold_response_groups(self._SALET_GROUPS, 5)
         self.assertEqual(summary["state"], "complete")
         self.assertAlmostEqual(summary["erd"], 1.75)
         self.assertEqual(summary["resolved_group_count"], 4)
         self.assertEqual(summary["response_group_count"], 4)
 
-    def test_candidate_erd_summary_holds_no_state_between_calls(self):
+    def testfold_response_groups_holds_no_state_between_calls(self):
         # The fold is a pure function of the groups handed to it.  Folding a
         # candidate complete and then folding the same candidate again with one
         # group unresolved must report the second answer, not the first: that
@@ -965,10 +969,10 @@ class ReportModelTest(unittest.TestCase):
         # a cached branch result rather than on playing a lone survivor.
         groups = [self._group("ggggg", 1, None, None),
                   self._group("-----", 2, 1.5, 2)]
-        complete = _candidate_erd_summary(groups, 5)
+        complete = fold_response_groups(groups, 5)
         self.assertEqual(complete["state"], "complete")
         self.assertAlmostEqual(complete["erd"], 2.0)
-        degraded = _candidate_erd_summary(
+        degraded = fold_response_groups(
             [groups[0],
              self._group("-----", 2, None, None, cache_state="missing")],
             5,
@@ -977,31 +981,6 @@ class ReportModelTest(unittest.TestCase):
         self.assertIsNone(degraded["erd"])
         self.assertEqual(degraded["resolved_group_count"], 1)
         self.assertEqual(degraded["response_group_count"], 2)
-
-    def test_leaderboard_refolds_every_candidate_on_every_build(self):
-        # A stored fold is a record of the last screen, never an answer.  Each
-        # row is folded from the branch results as they stand when the
-        # leaderboard is asked for, so poisoning the stored value changes
-        # nothing about what the build reports.
-        answers = ["crane", "slate"]
-        sources = self._leaderboard_sources(
-            answers, ["crane", "slate", "raise", "howdy"]
-        )
-        first = collect_report(sources, ReportRequest(report_kind="leaderboard"))
-        cache = ScoreCache(sources.cache_path, answers,
-                           checkpoint_on_close=False)
-        self.assertTrue(cache.opener_erd_map(ERD_ALL))
-        cache.write_opener_erds(
-            [(row["word"], row["erd"] + 99.0, 6, 4)
-             for row in leaderboard_rows(first["data"])],
-            ERD_ALL,
-        )
-        cache.close()
-
-        second = collect_report(sources, ReportRequest(report_kind="leaderboard"))
-        self.assertEqual(leaderboard_rows(second["data"]),
-                         leaderboard_rows(first["data"]))
-        self.assertEqual(second["data"]["counts"], first["data"]["counts"])
 
     def _standing_sources(self):
         """Three openers that complete, and one that does not.
@@ -1028,7 +1007,8 @@ class ReportModelTest(unittest.TestCase):
         # without the ranking being built, so the response holds no columns
         # for the vocabulary and the ERD arrives exactly.
         answers, sources = self._standing_sources()
-        collect_report(sources, ReportRequest(report_kind="leaderboard"))
+        self._record_opener_verdicts(
+            sources, answers, ["crane", "slate", "raise", "howdy"])
         data = collect_report(sources, ReportRequest(
             report_kind="leaderboard",
             branch_target=parse_report_branch_target("raise"),
@@ -1048,7 +1028,9 @@ class ReportModelTest(unittest.TestCase):
         # in Python over freshly folded ones.  Those are two orderings of the
         # same triple, and a lookup is only worth anything if they agree -- so
         # every ranked opener is looked up and checked against its own row.
-        _answers, sources = self._standing_sources()
+        answers, sources = self._standing_sources()
+        self._record_opener_verdicts(
+            sources, answers, ["crane", "slate", "raise", "howdy"])
         data = collect_report(
             sources, ReportRequest(report_kind="leaderboard"))["data"]
         ranking = leaderboard_rows(data)
@@ -1067,10 +1049,11 @@ class ReportModelTest(unittest.TestCase):
         # well would push RAISE past itself and report a rank past the end of
         # the ranking it is in.
         answers, sources = self._standing_sources()
-        collect_report(sources, ReportRequest(report_kind="leaderboard"))
+        self._record_opener_verdicts(
+            sources, answers, ["crane", "slate", "raise", "howdy"])
         cache = ScoreCache(sources.cache_path, answers,
                            checkpoint_on_close=False)
-        cache.write_opener_erds([("raise", 0.5, 1, 2)], ERD_ALL)
+        cache.write_opener_erd("raise", ERD_ALL, "complete", 0.5, 1, 2)
         cache.close()
 
         standing = self._standing_for(sources, "raise")
@@ -1094,7 +1077,9 @@ class ReportModelTest(unittest.TestCase):
         # and the marker but not the offset -- a reader numbering every window
         # from 1 still passes here.  The bounded-window test is what catches
         # that, because its window starts partway down.
-        _answers, sources = self._standing_sources()
+        answers, sources = self._standing_sources()
+        self._record_opener_verdicts(
+            sources, answers, ["crane", "slate", "raise", "howdy"])
         collect_report(sources, ReportRequest(report_kind="leaderboard"))
         for word, position in (("crane", 0), ("slate", 1), ("raise", 2)):
             standing = self._standing_for(sources, word)
@@ -1115,6 +1100,7 @@ class ReportModelTest(unittest.TestCase):
         candidates = ["crane", "slate", "raise", "aisle", "ariel", "irate",
                       "retia", "terai", "arise", "serai", "easel", "aesir"]
         sources = self._leaderboard_sources(answers, candidates)
+        self._record_opener_verdicts(sources, answers, candidates)
         data = collect_report(
             sources, ReportRequest(report_kind="leaderboard"))["data"]
         ranking = leaderboard_rows(data)
@@ -1130,8 +1116,8 @@ class ReportModelTest(unittest.TestCase):
     def test_a_standing_counts_its_rank_and_its_field_in_one_snapshot(self):
         """The four reads describe one field, so they read one version of it.
 
-        A leaderboard build stores and deletes folds against the same cache a
-        detail request is served from.  Counted in separate autocommit
+        Workers store verdicts and a repair deletes them, against the same
+        cache a detail request is served from.  Counted in separate autocommit
         statements, a rank taken over a larger field can be reported beside a
         total taken over a smaller one -- a place past the end of the ranking
         it claims to be in.
@@ -1140,6 +1126,7 @@ class ReportModelTest(unittest.TestCase):
         candidates = ["crane", "slate", "raise", "aisle", "ariel", "irate",
                       "retia", "terai", "arise", "serai"]
         sources = self._leaderboard_sources(answers, candidates)
+        self._record_opener_verdicts(sources, answers, candidates)
         ranking = leaderboard_rows(collect_report(
             sources, ReportRequest(report_kind="leaderboard"))["data"])
         self.assertGreater(len(ranking), 4)
@@ -1189,21 +1176,23 @@ class ReportModelTest(unittest.TestCase):
     def test_an_unfinished_openers_field_leaves_out_its_own_stale_row(self):
         """The field an unfinished opener is outside does not contain it.
 
-        An opener the last screen settled keeps its stored row until the next
-        build retires it, so one that a repair or a requeue has just made
-        pending is still in the table.  Counting that row reports a field one
-        larger than the one the opener is actually outside -- and the completed
-        branch already excludes it, so the two would disagree about what
+        A stored verdict outlives the results it was folded over: a repair
+        removes a branch result and the row stays until the repair deletes it.
+        An opener in that state is pending, and counting its own row would
+        report a field one larger than the one it is outside -- and the live
+        fold already excludes it, so the two would disagree about what
         `ranked_total` means.
         """
         answers = ["crane", "slate"]
         sources = self._leaderboard_sources(
             answers, ["crane", "slate", "raise", "howdy"])
-        collect_report(sources, ReportRequest(report_kind="leaderboard"))
+        self._record_opener_verdicts(
+            sources, answers, ["crane", "slate", "raise", "howdy"])
         cache = ScoreCache(sources.cache_path, answers,
                            checkpoint_on_close=False)
-        # The row HOWDY would have been left holding by an earlier screen.
-        cache.write_opener_erds([("howdy", 1.5, 2, 2)], ERD_ALL)
+        # The row HOWDY would be left holding by a repair that has removed the
+        # branch result its verdict read.
+        cache.write_opener_erd("howdy", ERD_ALL, "complete", 1.5, 2, 2)
         self.assertEqual(cache.ranked_opener_count(ERD_ALL, "zzzzz"), 4)
         cache.close()
 
@@ -1211,53 +1200,13 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(standing["state"], "pending")
         self.assertEqual(standing["ranked_total"], 3)
 
-    def test_a_published_ranking_is_never_read_as_half_of_itself(self):
-        """The refresh lands as one field, not row by row.
-
-        Every row of an `executemany` on an autocommit connection is its own
-        transaction and visible the moment it lands, so without one surrounding
-        transaction a reader sees the openers this screen settled alongside the
-        stale rows it is about to retire -- a field no build produced.  A reader
-        holding a snapshot is no defence, because the snapshot is of the hybrid.
-        """
-        answers = ["crane", "slate"]
-        sources = self._leaderboard_sources(answers, ["crane"])
-        cache = ScoreCache(sources.cache_path, answers,
-                           checkpoint_on_close=False)
-        self.addCleanup(cache.close)
-        reader = ScoreCache(sources.cache_path, answers,
-                            checkpoint_on_close=False)
-        self.addCleanup(reader.close)
-
-        retired = [(f"aa{index:03d}", 3.5, 5, 2) for index in range(300)]
-        cache.publish_opener_erds(retired, (), ERD_ALL)
-        self.assertEqual(cache.ranked_opener_count(ERD_ALL, "zzzzz"), 300)
-        # Different sizes, so a count taken mid-publish cannot coincide with
-        # either end of it.
-        stored = [(f"bb{index:03d}", 3.4, 5, 2) for index in range(200)]
-
-        seen = set()
-
-        def peek():
-            seen.add(reader.ranked_opener_count(ERD_ALL, "zzzzz"))
-            return 0
-
-        cache._conn.set_progress_handler(peek, 20)
-        try:
-            cache.publish_opener_erds(
-                stored, [opener for opener, *_rest in retired], ERD_ALL)
-        finally:
-            cache._conn.set_progress_handler(None, 0)
-
-        self.assertTrue(seen, "the progress handler never ran")
-        self.assertEqual(reader.ranked_opener_count(ERD_ALL, "zzzzz"), 200)
-        self.assertEqual(seen - {300, 200}, set())
-
     def test_a_word_outside_the_vocabulary_is_absent_not_unfinished(self):
         # "No such candidate" and "still being solved" are different answers,
         # and a lookup that gave both the same one would have a reader waiting
         # for a sweep to reach a word it will never reach.
-        _answers, sources = self._standing_sources()
+        answers, sources = self._standing_sources()
+        self._record_opener_verdicts(
+            sources, answers, ["crane", "slate", "raise", "howdy"])
         standing = self._standing_for(sources, "zzzzz")
         self.assertFalse(standing["available"])
         self.assertEqual(standing["state"], "absent")
@@ -1268,17 +1217,21 @@ class ReportModelTest(unittest.TestCase):
         # ordinary case while a sweep runs.  It reports the fold's own state
         # and how large the ranked field already is, so the answer is "not yet,
         # and here is how far along the sweep is" rather than a bare refusal.
-        _answers, sources = self._standing_sources()
+        answers, sources = self._standing_sources()
+        self._record_opener_verdicts(
+            sources, answers, ["crane", "slate", "raise", "howdy"])
         collect_report(sources, ReportRequest(report_kind="leaderboard"))
         standing = self._standing_for(sources, "howdy")
         self.assertFalse(standing["available"])
         self.assertEqual(standing["state"], "pending")
         self.assertEqual(standing["ranked_total"], 3)
 
-    def test_a_standing_on_a_cache_no_build_has_screened_reports_an_empty_field(self):
-        # The field is whatever the last build stored, so before any build it
-        # is empty and the honest answer is "rank 1 of 1" -- which says the
-        # field holds nothing else rather than implying a place in one.
+    def test_a_standing_before_any_opener_has_finished_reports_an_empty_field(self):
+        # The field is the openers the swarm has finished, so before any of
+        # them has the field is empty and the honest answer is "rank 1 of 1" --
+        # which says the field holds nothing else rather than implying a place
+        # in one.  The word's own ERD still arrives, because that is folded for
+        # this request rather than read.
         _answers, sources = self._standing_sources()
         standing = self._standing_for(sources, "raise")
         self.assertEqual(standing["rank"], 1)
@@ -1299,6 +1252,7 @@ class ReportModelTest(unittest.TestCase):
         cache.write_loss(
             ScoreCache.encode_subset(["brine", "swine"]), ERD_ALL, 5)
         cache.close()
+        self._record_opener_verdicts(sources, answers, ["gippy"])
 
         data = collect_report(
             sources, ReportRequest(report_kind="leaderboard"))["data"]
@@ -1312,6 +1266,9 @@ class ReportModelTest(unittest.TestCase):
         # unsettled candidate one thing or the other.
         answers = ["crane", "slate", "shale", "stale", "brine", "swine"]
         sources = self._leaderboard_sources(answers, ["gippy"])
+        self.assertEqual(
+            self._record_opener_verdicts(sources, answers, ["gippy"])
+            ["gippy"]["state"], "pending")
         data = collect_report(
             sources, ReportRequest(report_kind="leaderboard"))["data"]
         self.assertEqual(data["counts"],
@@ -1324,6 +1281,7 @@ class ReportModelTest(unittest.TestCase):
         # but lone survivors.
         answers = ["crane", "slate"]
         sources = self._leaderboard_sources(answers, ["raise"])
+        self._record_opener_verdicts(sources, answers, ["raise"])
         data = collect_report(
             sources, ReportRequest(report_kind="leaderboard"))["data"]
         self.assertEqual(data["counts"],
@@ -1331,119 +1289,7 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual([row["word"] for row in leaderboard_rows(data)],
                          ["raise"])
 
-    def test_a_rebuild_over_an_unchanged_cache_writes_no_stored_folds(self):
-        # The leaderboard is polled, and the cache it writes to is the one the
-        # swarm is writing branch results into.  A build that rewrote every
-        # stored fold would add WAL traffic proportional to the vocabulary for
-        # a set of values none of which changed, so a fold is written only when
-        # it differs from the row already there.
-        answers = ["crane", "slate"]
-        sources = self._leaderboard_sources(answers, ["crane", "slate", "raise"])
-        collect_report(sources, ReportRequest(report_kind="leaderboard"))
-        with patch.object(
-            ScoreCache, "publish_opener_erds", autospec=True,
-        ) as published:
-            collect_report(sources, ReportRequest(report_kind="leaderboard"))
-        self.assertTrue(published.call_args_list, "the build published nothing")
-        self.assertEqual(
-            [row for call in published.call_args_list for row in call.args[1]],
-            [])
-        self.assertEqual(
-            [opener for call in published.call_args_list
-             for opener in call.args[2]],
-            [])
-
-    def test_a_stored_fold_is_deleted_once_its_opener_stops_screening(self):
-        # The stored fold asserts that every one of an opener's groups holds a
-        # result.  Deleting one of those results falsifies that, so the next
-        # build must take the stored row with it rather than leave it naming a
-        # tree that is gone.
-        answers = ["crane", "slate"]
-        sources = self._leaderboard_sources(answers, ["crane", "howdy"])
-        collided_key = ScoreCache.encode_subset(answers)
-        cache = ScoreCache(sources.cache_path, answers,
-                           checkpoint_on_close=False)
-        cache.write(collided_key, ERD_ALL, "crane", 1.5,
-                    max_depth=2, solve_budget=None)
-        cache.close()
-        collect_report(sources, ReportRequest(report_kind="leaderboard"))
-        cache = ScoreCache(sources.cache_path, answers,
-                           checkpoint_on_close=False)
-        self.assertIn("howdy", cache.opener_erd_map(ERD_ALL))
-        cache._conn.execute(
-            "DELETE FROM branch_best_by_policy WHERE branch_key = ?",
-            (collided_key,))
-        cache.close()
-
-        data = collect_report(
-            sources, ReportRequest(report_kind="leaderboard"))["data"]
-        self.assertNotIn("howdy",
-                         {row["word"] for row in leaderboard_rows(data)})
-        cache = ScoreCache(sources.cache_path, answers,
-                           checkpoint_on_close=False)
-        self.addCleanup(cache.close)
-        self.assertNotIn("howdy", cache.opener_erd_map(ERD_ALL))
-
-    def test_leaderboard_folds_only_the_candidates_its_screen_admits(self):
-        # Folding builds a state dict per response group, so a vocabulary of
-        # openers still being searched costs far more to fold than to screen.
-        # HOWDY is the one candidate here that a cached branch result has not
-        # settled, so the screen must keep it out of the fold entirely.
-        sources = self._leaderboard_sources(
-            ["crane", "slate"], ["crane", "slate", "raise", "howdy"]
-        )
-        with patch(
-            "report_model._candidate_erd_summary", wraps=_candidate_erd_summary,
-        ) as folded:
-            report = collect_report(
-                sources, ReportRequest(report_kind="leaderboard")
-            )
-        self.assertEqual(folded.call_count, 3)
-        self.assertEqual(report["data"]["counts"],
-                         {"complete": 3, "pending": 1, "infeasible": 0})
-
-    def test_leaderboard_drops_a_candidate_whose_child_result_is_deleted(self):
-        # HOWDY shares no letters with either answer, so both collide in one
-        # two-answer group -- the only candidate here whose completeness turns
-        # on a cached branch result rather than on playing a lone survivor.
-        sources = self._leaderboard_sources(
-            ["crane", "slate"], ["crane", "slate", "raise", "howdy"]
-        )
-        answers = ["crane", "slate"]
-        collided_key = ScoreCache.encode_subset(answers)
-        pending = collect_report(
-            sources, ReportRequest(report_kind="leaderboard"))["data"]
-        self.assertEqual(pending["counts"]["complete"], 3)
-        self.assertNotIn("howdy",
-                         {row["word"] for row in leaderboard_rows(pending)})
-
-        cache = ScoreCache(sources.cache_path, answers,
-                           checkpoint_on_close=False)
-        cache.write(collided_key, ERD_ALL, "crane", 1.5,
-                    max_depth=2, solve_budget=None)
-        cache.close()
-        complete = collect_report(
-            sources, ReportRequest(report_kind="leaderboard"))["data"]
-        self.assertEqual(complete["counts"]["complete"], 4)
-        self.assertIn("howdy",
-                      {row["word"] for row in leaderboard_rows(complete)})
-
-        # Nothing names HOWDY when this row goes, and nothing needs to: the
-        # next build folds HOWDY from the group that no longer resolves.
-        cache = ScoreCache(sources.cache_path, answers,
-                           checkpoint_on_close=False)
-        cache.delete(collided_key, ERD_ALL)
-        cache.close()
-
-        second = collect_report(
-            sources, ReportRequest(report_kind="leaderboard"))["data"]
-        self.assertEqual(second["counts"]["complete"], 3)
-        self.assertEqual(second["counts"]["pending"], 1)
-        self.assertNotIn("howdy",
-                         {row["word"] for row in leaderboard_rows(second)})
-        self.assertEqual(leaderboard_rows(second), leaderboard_rows(pending))
-
-    def test_collect_word_report_populates_candidate_erd_summary(self):
+    def test_collect_word_report_populatesfold_response_groups(self):
         request = ReportRequest(
             branch_target=parse_report_branch_target("salet"),
         )
@@ -2290,6 +2136,30 @@ class ReportModelTest(unittest.TestCase):
             telemetry_path=self.telemetry_path,
         )
 
+    def _record_opener_verdicts(self, sources, answers, candidates):
+        """Store each opener's verdict the way a finishing worker does.
+
+        An opener's ERD is written when its last branch completes, so a fixture
+        that wants a populated ranking has to go through the same call the
+        worker goes through rather than through a leaderboard build, which no
+        longer writes anything.  An opener the fold leaves pending has not
+        finished and gets no row.
+        """
+        cache = ScoreCache(sources.cache_path, answers,
+                           checkpoint_on_close=False)
+        try:
+            matrix = PatternMatrix.load_or_build(
+                sources.cache_path, candidates, answers, cache)
+            return {
+                word: store_opener_verdict(
+                    cache, word,
+                    opener_response_groups(matrix, word, answers),
+                    ERD_ALL, GAME_GUESSES - 1)
+                for word in candidates
+            }
+        finally:
+            cache.close()
+
     def _signal_sources(self, queue_path):
         directory = self.temporary_directory.name
         return ReportOpeners(
@@ -2556,15 +2426,105 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(data["sampled_row_count"], 15)
         self.assertTrue(data["sample_truncated"])
 
+    def test_a_leaderboard_reads_no_branch_results_at_all(self):
+        # The ranking is the stored verdicts, so a build reads neither the
+        # branch tables nor a partition of the vocabulary.  Folding them on
+        # read is what made this report cost seconds and grow with the share
+        # of the sweep that was finished.
+        answers = ["crane", "slate"]
+        candidates = ["crane", "slate", "raise", "howdy"]
+        sources = self._leaderboard_sources(answers, candidates)
+        self._record_opener_verdicts(sources, answers, candidates)
+        with patch.object(ScoreCache, "report_branch_states",
+                          autospec=True) as read_branches, \
+             patch.object(PatternMatrix, "load_or_build",
+                          autospec=True) as load_matrix:
+            data = collect_report(
+                sources, ReportRequest(report_kind="leaderboard"))["data"]
+        read_branches.assert_not_called()
+        load_matrix.assert_not_called()
+        self.assertEqual([row["word"] for row in leaderboard_rows(data)],
+                         ["crane", "slate", "raise"])
+
+    def test_a_leaderboard_row_is_the_verdict_that_was_stored(self):
+        # An opener's stored ERD is the swarm's answer for that opener, not a
+        # memo of a derivation the build could redo.  Poisoning one row is the
+        # only way to tell a read from a refold: on an honest cache the two
+        # agree on every digit.
+        answers = ["crane", "slate"]
+        candidates = ["crane", "slate", "raise", "howdy"]
+        sources = self._leaderboard_sources(answers, candidates)
+        self._record_opener_verdicts(sources, answers, candidates)
+        cache = ScoreCache(sources.cache_path, answers,
+                           checkpoint_on_close=False)
+        cache.write_opener_erd("raise", ERD_ALL, "complete", 0.5, 1, 2)
+        cache.close()
+
+        rows = leaderboard_rows(collect_report(
+            sources, ReportRequest(report_kind="leaderboard"))["data"])
+        self.assertEqual([row["word"] for row in rows],
+                         ["raise", "crane", "slate"])
+        self.assertEqual(rows[0]["erd"], 0.5)
+        self.assertEqual(rows[0]["max_remaining_depth"], 1)
+
+    def test_a_leaderboards_counts_partition_the_candidate_list(self):
+        # An opener that finished has a verdict; one that has not has no row.
+        # So the three counts are a partition of the candidate list by
+        # construction rather than a tally that has to agree with one.
+        answers = ["crane", "slate"]
+        candidates = ["crane", "slate", "raise", "howdy"]
+        sources = self._leaderboard_sources(answers, candidates)
+        self._record_opener_verdicts(sources, answers, candidates)
+        cache = ScoreCache(sources.cache_path, answers,
+                           checkpoint_on_close=False)
+        # An opener the swarm finished and found unsolvable within budget: it
+        # has no finite ERD, so it is counted and never ranked.
+        cache.write_opener_erd("raise", ERD_ALL, "infeasible", None, None, 2)
+        cache.close()
+
+        data = collect_report(
+            sources, ReportRequest(report_kind="leaderboard"))["data"]
+        self.assertEqual(data["counts"],
+                         {"complete": 2, "infeasible": 1, "pending": 1})
+        self.assertEqual(
+            data["counts"]["complete"] + data["counts"]["infeasible"]
+            + data["counts"]["pending"], data["candidate_count"])
+        self.assertEqual([row["word"] for row in leaderboard_rows(data)],
+                         ["crane", "slate"])
+        # The bar scale is over the ranked openers, because it exists to size
+        # the response-group bars of the rows actually displayed.
+        self.assertEqual(data["maximum_response_group_count"], 2)
+
+    def test_an_infeasible_opener_is_no_part_of_a_standings_field(self):
+        # An opener with no finite ERD has no place in the ranking, so it
+        # cannot be one of the openers another is counted against -- a rank out
+        # of a field that included it would be a rank in no ranking.
+        answers, sources = self._standing_sources()
+        self._record_opener_verdicts(
+            sources, answers, ["crane", "slate", "raise", "howdy"])
+        cache = ScoreCache(sources.cache_path, answers,
+                           checkpoint_on_close=False)
+        cache.write_opener_erd("howdy", ERD_ALL, "infeasible", None, None, 1)
+        cache.close()
+
+        standing = self._standing_for(sources, "raise")
+        self.assertEqual(standing["rank"], 3)
+        self.assertEqual(standing["ranked_total"], 3)
+        neighbourhood = leaderboard_rows(
+            {"columns": standing["neighbourhood"]})
+        self.assertEqual([row["word"] for row in neighbourhood],
+                         ["crane", "slate", "raise"])
+
     def test_leaderboard_ranks_complete_openers_by_erd(self):
         # With two answers, an opener that separates them into singletons is
         # complete with no cache reads at all: crane/slate are also answers
         # (all-green self group contributes 0 → ERD 1.5), raise is not
         # (two size-1 groups → ERD 2.0), and howdy shares no letters so both
         # answers collide in one unsolved group → pending.
-        sources = self._leaderboard_sources(
-            ["crane", "slate"], ["crane", "slate", "raise", "howdy"]
-        )
+        answers = ["crane", "slate"]
+        candidates = ["crane", "slate", "raise", "howdy"]
+        sources = self._leaderboard_sources(answers, candidates)
+        self._record_opener_verdicts(sources, answers, candidates)
         report = collect_report(sources, ReportRequest(report_kind="leaderboard"))
         self.assertEqual(report["report_kind"], "leaderboard")
         data = report["data"]
@@ -2634,35 +2594,6 @@ class ReportModelTest(unittest.TestCase):
         # card's groups is the client that already has the ranking.
         self.assertNotIn("columns", data)
 
-    def test_a_named_opener_costs_no_ranking(self):
-        """Opening a card must not screen the vocabulary to answer about one.
-
-        The ranking is what the card came from; rebuilding it to describe a
-        single row costs more than the ranking did, sends the client columns it
-        already holds, and displaces the ranking's own cache entry.
-        """
-        sources = self._leaderboard_sources(
-            ["crane", "slate"], ["crane", "slate", "raise", "howdy"]
-        )
-        screened = []
-        real_screen = report_model._screen_and_fold_openers
-
-        def recording(cache, skeletons, group_budget, policy):
-            screened.append(len(skeletons))
-            return real_screen(cache, skeletons, group_budget, policy)
-
-        with patch.object(report_model, "_screen_and_fold_openers", recording):
-            data = collect_report(sources, ReportRequest(
-                report_kind="leaderboard",
-                branch_target=parse_report_branch_target("crane")))["data"]
-
-        self.assertTrue(data["detail"]["available"])
-        self.assertEqual(
-            screened, [],
-            "a card expansion screened the vocabulary")
-        self.assertNotIn("columns", data,
-                         "a card expansion carried the ranking back")
-
     def test_a_detail_for_a_word_outside_the_vocabulary_says_so(self):
         # Asking about a word the candidate list does not hold is an ordinary
         # client request, not an error.
@@ -2710,11 +2641,11 @@ class ReportModelTest(unittest.TestCase):
         # passing a directory would apply dirname twice and strand a .npy in the
         # cwd while never finding the swarm's matrix.
         import glob
-        import report_model
-        report_model._candidate_skeleton_memo = None
         before = set(glob.glob("*.npy"))
         sources = self._leaderboard_sources(["crane", "slate"], ["crane", "slate"])
-        collect_report(sources, ReportRequest(report_kind="leaderboard"))
+        collect_report(sources, ReportRequest(
+            report_kind="leaderboard",
+            branch_target=parse_report_branch_target("crane")))
         self.assertEqual(set(glob.glob("*.npy")), before)  # nothing stray in cwd
         cache_directory = os.path.dirname(sources.cache_path)
         self.assertTrue(glob.glob(os.path.join(cache_directory, "*.npy")))
@@ -2726,7 +2657,7 @@ class ReportModelTest(unittest.TestCase):
             ["crane", "slate"], ["crane", "slate", "raise"]
         )
         with patch.object(
-            ScoreCache, "report_reusable_branch_facts",
+            ScoreCache, "opener_erd_ranking",
             side_effect=sqlite3.OperationalError("cache read failed"),
         ):
             report = collect_report(

@@ -268,6 +268,52 @@ class TestQueueAddDeleteErdCache(unittest.TestCase):
             erd_search.cmd_queue_add(self.args)
         return output.getvalue()
 
+    def test_the_repair_forgets_the_openers_stored_verdict(self):
+        """A recompute must leave the opener unranked until it finishes again.
+
+        The opener's verdict was folded over the branch results being deleted
+        here, and it is stored rather than re-derived on read, so nothing else
+        would notice it had gone stale.  The repair is where that is known --
+        it names the opener it is invalidating -- which is why nothing on the
+        read path has to work it out from a deleted branch.
+        """
+        answers = load_word_list(erd_search.ANSWER_FILE)
+        cache = ScoreCache(self.args.cache, answers,
+                           checkpoint_on_close=False)
+        cache.write_opener_erd(
+            LARGE_BRANCH_WORD, ERD_ALL, "complete", 3.5, 5, 94)
+        self.assertIsNotNone(
+            cache.opener_erd_verdict(ERD_ALL, LARGE_BRANCH_WORD))
+        cache.close()
+
+        self._add(delete_erd_cache=True)
+
+        cache = ScoreCache(self.args.cache, answers,
+                           checkpoint_on_close=False)
+        self.addCleanup(cache.close)
+        self.assertIsNone(
+            cache.opener_erd_verdict(ERD_ALL, LARGE_BRANCH_WORD),
+            "the repair left the opener ranked by a verdict it invalidated")
+
+    def test_a_plain_requeue_keeps_the_openers_stored_verdict(self):
+        # Paired with the test above: queueing a word without
+        # --delete-erd-cache deletes no branch result, so the verdict it was
+        # folded over still holds and the opener stays in the ranking.
+        answers = load_word_list(erd_search.ANSWER_FILE)
+        cache = ScoreCache(self.args.cache, answers,
+                           checkpoint_on_close=False)
+        cache.write_opener_erd(
+            LARGE_BRANCH_WORD, ERD_ALL, "complete", 3.5, 5, 94)
+        cache.close()
+
+        self._add()
+
+        cache = ScoreCache(self.args.cache, answers,
+                           checkpoint_on_close=False)
+        self.addCleanup(cache.close)
+        self.assertEqual(
+            cache.opener_erd_verdict(ERD_ALL, LARGE_BRANCH_WORD)["erd"], 3.5)
+
     def _promote(self, queue, worker='worker-0'):
         """Claim the queued branch and register it as an open active branch."""
         branch_key = bytes(queue._conn.execute(

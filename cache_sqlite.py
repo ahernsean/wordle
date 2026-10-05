@@ -317,6 +317,86 @@ class ScoreCache:
             (name, int(time.time()))
         )
 
+    def _create_opener_erd_schema(self):
+        """The stored verdict for each opener the swarm has finished.
+
+        One row per opener, written once by the worker that finishes the
+        opener's last branch, and read back as the ranking.  `state` is the
+        verdict the fold came to: `complete` carries an exact `erd` and
+        worst-case line, `infeasible` carries neither, because an opener whose
+        tree cannot be solved within budget has no finite ERD.  An opener with
+        no row here has not finished.
+
+        `response_group_count` is how many response groups the fold covered,
+        which is the opener's split of the answer list; `folded_at` is when the
+        verdict was taken.
+
+        Called from the migration as well as from schema setup, so the shape is
+        stated once.
+        """
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS opener_erd_by_policy (
+                opener TEXT NOT NULL, policy TEXT NOT NULL,
+                answer_list_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                erd REAL, max_remaining_depth INTEGER,
+                response_group_count INTEGER NOT NULL,
+                folded_at INTEGER NOT NULL,
+                PRIMARY KEY (opener, policy, answer_list_id)
+            )
+        """)
+        # The ranking's own sort key, behind the state that decides whether a
+        # row is in the ranking at all, so reading the ranking is one range of
+        # this index and a question about one opener's place in it is a seek.
+        # The primary key is on the opener, which answers "what is SALET's ERD"
+        # and nothing about order.  Covering, so neither query reaches the
+        # table.
+        self._conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_opener_erd_rank
+                ON opener_erd_by_policy
+                   (policy, answer_list_id, state, erd, max_remaining_depth,
+                    opener)
+        """)
+
+    def _migrate_opener_erds_to_state(self):
+        """Rebuild `opener_erd_by_policy` with a verdict column.
+
+        The legacy table has `erd REAL NOT NULL` and no `state`: a row meant
+        "complete" by existing at all, so an opener the swarm finished and
+        found unsolvable had nowhere to go.  Every legacy row was written by a
+        complete fold -- nothing else was ever stored -- so they migrate with
+        state 'complete'.
+
+        SQLite cannot relax NOT NULL in place, so this renames the table aside,
+        recreates it, copies, and drops the original.  The index is dropped by
+        name first, and that is load-bearing: an index follows its table
+        through a rename and keeps its name, so `CREATE INDEX IF NOT EXISTS`
+        would no-op against the legacy one and dropping the legacy table would
+        then take the only index with it, leaving the rebuilt table unindexed.
+
+        Runs before the table is created, so a database that has never held one
+        falls straight through.
+        """
+        if self._is_migration_done("opener_erd_verdict_state"):
+            return
+        columns = {row["name"] for row in self._conn.execute(
+            "PRAGMA table_info(opener_erd_by_policy)")}
+        if columns and "state" not in columns:
+            self._conn.execute("DROP INDEX IF EXISTS idx_opener_erd_rank")
+            self._conn.execute(
+                "ALTER TABLE opener_erd_by_policy RENAME TO opener_erd_legacy")
+            self._create_opener_erd_schema()
+            self._conn.execute("""
+                INSERT INTO opener_erd_by_policy
+                    (opener, policy, answer_list_id, state, erd,
+                     max_remaining_depth, response_group_count, folded_at)
+                SELECT opener, policy, answer_list_id, 'complete', erd,
+                       max_remaining_depth, response_group_count, folded_at
+                  FROM opener_erd_legacy
+            """)
+            self._conn.execute("DROP TABLE opener_erd_legacy")
+        self._mark_migration_done("opener_erd_verdict_state")
+
     def _rename_source_summaries_to_opener(self):
         # Runs before the CREATE TABLE IF NOT EXISTS statements below, so —
         # unlike the older renames in this file — there is no empty
@@ -528,38 +608,8 @@ class ScoreCache:
             self._conn.execute(
                 "ALTER TABLE completed_opener_summaries "
                 "ADD COLUMN telemetry_epochs TEXT NOT NULL DEFAULT ''")
-        # An opener's own ERD, folded over its top-level response groups once
-        # every one of them holds a reusable exact result.  Unlike a candidate's
-        # ERD at an arbitrary branch, this is bounded at one row per candidate
-        # word and is revalidated on every read: the reader rescreens each
-        # opener's groups against current branch results and deletes the rows
-        # whose openers no longer screen complete, so a repair or requeue that
-        # removes a branch result removes the folds that read it on the next
-        # read rather than leaving them asserting a tree that is gone.
-        #
-        # response_group_count is how many response groups the fold covered,
-        # which is the opener's split against the answer list it was folded
-        # over.
-        self._conn.execute("""
-            CREATE TABLE IF NOT EXISTS opener_erd_by_policy (
-                opener TEXT NOT NULL, policy TEXT NOT NULL,
-                answer_list_id TEXT NOT NULL, erd REAL NOT NULL,
-                max_remaining_depth INTEGER NOT NULL,
-                response_group_count INTEGER NOT NULL,
-                folded_at INTEGER NOT NULL,
-                PRIMARY KEY (opener, policy, answer_list_id)
-            )
-        """)
-        # The ranking's own sort key, so a question about one opener's place in
-        # it is a seek rather than a read of every fold.  The primary key is on
-        # the opener, which answers "what is SALET's ERD" and nothing about
-        # order; this index answers "how many openers beat it" and "which ones
-        # sit either side of it".  Covering, so neither query reaches the table.
-        self._conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_opener_erd_rank
-                ON opener_erd_by_policy
-                   (policy, answer_list_id, erd, max_remaining_depth, opener)
-        """)
+        self._migrate_opener_erds_to_state()
+        self._create_opener_erd_schema()
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS opener_response_group_summaries (
                 opener TEXT NOT NULL, response_pattern TEXT NOT NULL,
@@ -1352,72 +1402,58 @@ class ScoreCache:
             self._conn.execute("ROLLBACK")
             raise
 
-    def report_reusable_branch_facts(self, policy, budget):
-        """Branch results reusable at exactly one budget, as lean maps.
+    def opener_erd_verdict(self, policy, opener):
+        """One opener's stored verdict, or None if the swarm has not finished it."""
+        row = self._conn.execute(
+            """SELECT state, erd, max_remaining_depth, response_group_count,
+                      folded_at
+                 FROM opener_erd_by_policy
+                WHERE policy = ? AND answer_list_id = ? AND opener = ?""",
+            (policy, self.answer_list_id, opener.lower()),
+        ).fetchone()
+        return None if row is None else dict(row)
 
-        Returns (erd_by_key, loss_keys): a branch_key -> (best_erd,
-        max_remaining_depth) map of the results a search at `budget` would
-        reuse, and the set of keys proven a loss within it.  Both apply the
-        same gate `report_branch_states` does, decided in SQL rather than by
-        loading every row and filtering in Python.
+    def opener_erd_ranking(self, policy, limit=None):
+        """Every finished opener with a finite ERD, best first.
 
-        `report_branch_row_maps` is the other bulk loader, and it is the one to
-        use when a caller needs a branch's *facts* — its budget-specific rows,
-        update times, and which table each came from.  This one answers only
-        "is this branch settled at this budget, and at what cost", which is
-        everything a fold over response groups reads.  Folding a whole
-        vocabulary that way loads the qualifying keys and three columns instead
-        of every row and six, which on a production cache is several times
-        less work for an identical fold.
+        The whole leaderboard.  `idx_opener_erd_rank` leads with the state and
+        then the sort key, so this is one range of the index in order and never
+        reaches the table; a `limit` stops the scan rather than filtering a
+        full read.
 
-        An unrestricted result wins whenever its own worst case fits the
-        budget, so the budget-specific table only fills in keys the
-        unrestricted one did not settle — the precedence `_exact_row_for_budget`
-        applies per branch, expressed here over whole tables.
+        Returns (erd, max_remaining_depth, opener) triples, which is the order
+        the ranking is displayed in and the order a tie is broken in.
         """
-        erd_by_key = {}
-        for branch_key, best_score, max_depth in self._conn.execute(
-            """SELECT branch_key, best_score, max_depth
-                 FROM branch_best_by_policy
-                WHERE policy = ? AND answer_list_id = ?
-                  AND solve_budget IS NULL AND max_depth <= ?""",
-            (policy, self.answer_list_id, budget),
-        ):
-            erd_by_key[bytes(branch_key)] = (best_score, max_depth)
-        for branch_key, best_score, max_depth in self._conn.execute(
-            """SELECT branch_key, best_score, max_depth
-                 FROM branch_best_by_policy_and_budget
-                WHERE policy = ? AND answer_list_id = ?
-                  AND solve_budget = ? AND max_depth IS NOT NULL""",
-            (policy, self.answer_list_id, budget),
-        ):
-            erd_by_key.setdefault(bytes(branch_key), (best_score, max_depth))
-        loss_keys = {
-            bytes(row[0]) for row in self._conn.execute(
-                """SELECT branch_key FROM branch_loss_by_policy
-                    WHERE policy = ? AND answer_list_id = ?
-                      AND loss_budget >= ?""",
-                (policy, self.answer_list_id, budget),
-            )
-        }
-        return erd_by_key, loss_keys
+        return self._conn.execute(
+            """SELECT erd, max_remaining_depth, opener
+                 FROM opener_erd_by_policy
+                WHERE policy = ? AND answer_list_id = ? AND state = 'complete'
+                ORDER BY erd, max_remaining_depth, opener"""
+            + ("" if limit is None else " LIMIT ?"),
+            (policy, self.answer_list_id)
+            + (() if limit is None else (limit,)),
+        ).fetchall()
 
-    def opener_erd_map(self, policy):
-        """Stored opener folds for this answer list, keyed by opener word."""
+    def opener_erd_verdict_counts(self, policy):
+        """How many finished openers came to each verdict, and the widest split.
+
+        `maximum_response_group_count` is over the ranked openers, because it
+        exists to scale the response-group bars of the rows actually displayed.
+        """
+        row = self._conn.execute(
+            """SELECT
+                   SUM(state = 'complete') AS complete,
+                   SUM(state = 'infeasible') AS infeasible,
+                   MAX(CASE WHEN state = 'complete'
+                            THEN response_group_count END) AS widest
+                 FROM opener_erd_by_policy
+                WHERE policy = ? AND answer_list_id = ?""",
+            (policy, self.answer_list_id),
+        ).fetchone()
         return {
-            row["opener"]: {
-                "erd": row["erd"],
-                "max_remaining_depth": row["max_remaining_depth"],
-                "response_group_count": row["response_group_count"],
-                "folded_at": row["folded_at"],
-            }
-            for row in self._conn.execute(
-                """SELECT opener, erd, max_remaining_depth,
-                          response_group_count, folded_at
-                     FROM opener_erd_by_policy
-                    WHERE policy = ? AND answer_list_id = ?""",
-                (policy, self.answer_list_id),
-            )
+            "complete": row["complete"] or 0,
+            "infeasible": row["infeasible"] or 0,
+            "maximum_response_group_count": row["widest"] or 0,
         }
 
     def ranked_opener_count(self, policy, excluding):
@@ -1431,7 +1467,8 @@ class ScoreCache:
         """
         return self._conn.execute(
             """SELECT COUNT(*) FROM opener_erd_by_policy
-                WHERE policy = ? AND answer_list_id = ? AND opener <> ?""",
+                WHERE policy = ? AND answer_list_id = ? AND opener <> ?
+                  AND state = 'complete'""",
             (policy, self.answer_list_id, excluding.lower()),
         ).fetchone()[0]
 
@@ -1489,18 +1526,21 @@ class ScoreCache:
         better = self._conn.execute(
             """SELECT COUNT(*) FROM opener_erd_by_policy
                 WHERE policy = ? AND answer_list_id = ? AND opener <> ?
+                  AND state = 'complete'
                   AND (erd, max_remaining_depth, opener) < (?, ?, ?)""",
             scope + position,
         ).fetchone()[0]
         others = self._conn.execute(
             """SELECT COUNT(*) FROM opener_erd_by_policy
-                WHERE policy = ? AND answer_list_id = ? AND opener <> ?""",
+                WHERE policy = ? AND answer_list_id = ? AND opener <> ?
+                  AND state = 'complete'""",
             scope,
         ).fetchone()[0]
         above = self._conn.execute(
             """SELECT erd, max_remaining_depth, opener
                  FROM opener_erd_by_policy
                 WHERE policy = ? AND answer_list_id = ? AND opener <> ?
+                  AND state = 'complete'
                   AND (erd, max_remaining_depth, opener) < (?, ?, ?)
                 ORDER BY erd DESC, max_remaining_depth DESC, opener DESC
                 LIMIT ?""",
@@ -1510,6 +1550,7 @@ class ScoreCache:
             """SELECT erd, max_remaining_depth, opener
                  FROM opener_erd_by_policy
                 WHERE policy = ? AND answer_list_id = ? AND opener <> ?
+                  AND state = 'complete'
                   AND (erd, max_remaining_depth, opener) > (?, ?, ?)
                 ORDER BY erd, max_remaining_depth, opener
                 LIMIT ?""",
@@ -1522,69 +1563,52 @@ class ScoreCache:
             "below": [tuple(row) for row in below],
         }
 
-    def publish_opener_erds(self, rows, retired_openers, policy,
-                            folded_at=None):
-        """Replace the stored ranking in one step, or not at all.
+    def write_opener_erd(self, opener, policy, state, erd,
+                         max_remaining_depth, response_group_count,
+                         folded_at=None):
+        """Record what an opener's finished tree came to.
 
-        `rows` is an iterable of (opener, erd, max_remaining_depth,
-        response_group_count) for the openers a screen settled, and
-        `retired_openers` names the ones it no longer settles.  A stored row is
-        replaced rather than reconciled, because the caller has just rescreened
-        it against current branch results and its value is the newer of the
-        two.
+        Written once, by the worker that finishes the opener's last branch.
+        `state` is `complete` with an exact `erd` and worst-case line, or
+        `infeasible` with neither.  A repeat write replaces the row rather than
+        reconciling with it: the only way to reach this twice is to solve the
+        opener's tree again, and the later pass read the later cache.
 
-        The two halves are one statement about the field and commit together.
-        On an autocommit connection each row of an `executemany` is its own
-        transaction and visible the moment it lands, so a reader could see the
-        openers this screen settled alongside the stale rows it was about to
-        retire -- a field no build ever produced.  A reader holding a snapshot
-        is no help against that: the snapshot would be of the hybrid.
+        One row and one statement, so there is no moment at which the ranking
+        is half of two fields -- which is the whole reason the leaderboard can
+        read this table without a snapshot.
         """
-        rows = list(rows)
-        retired_openers = list(retired_openers)
-        if not rows and not retired_openers:
-            return
-        now = int(time.time()) if folded_at is None else folded_at
         try:
-            self._conn.execute("BEGIN IMMEDIATE")
-            if rows:
-                self._conn.executemany(
-                    """INSERT OR REPLACE INTO opener_erd_by_policy
-                           (opener, policy, answer_list_id, erd,
-                            max_remaining_depth, response_group_count,
-                            folded_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    [(opener.lower(), policy, self.answer_list_id, erd,
-                      max_remaining_depth, response_group_count, now)
-                     for opener, erd, max_remaining_depth, response_group_count
-                     in rows],
-                )
-            if retired_openers:
-                self._conn.executemany(
-                    """DELETE FROM opener_erd_by_policy
-                        WHERE opener = ? AND policy = ? AND answer_list_id = ?""",
-                    [(opener.lower(), policy, self.answer_list_id)
-                     for opener in retired_openers],
-                )
-            self._conn.execute("COMMIT")
+            self._conn.execute(
+                """INSERT OR REPLACE INTO opener_erd_by_policy
+                       (opener, policy, answer_list_id, state, erd,
+                        max_remaining_depth, response_group_count, folded_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (opener.lower(), policy, self.answer_list_id, state, erd,
+                 max_remaining_depth, response_group_count,
+                 int(time.time()) if folded_at is None else folded_at),
+            )
+            self.write_count += 1
         except sqlite3.OperationalError as exc:
-            try:
-                self._conn.execute("ROLLBACK")
-            except sqlite3.OperationalError:
-                pass
             if not _is_disk_io_error(exc):
                 raise
-            logger.warning(
-                "publish_opener_erds(%d stored, %d retired, %s) failed: %s",
-                len(rows), len(retired_openers), policy, exc)
-
-    def write_opener_erds(self, rows, policy, folded_at=None):
-        """Store folds for openers whose whole tree is solved."""
-        self.publish_opener_erds(rows, (), policy, folded_at)
+            logger.warning("write_opener_erd(%s, %s) failed: %s",
+                           opener, policy, exc)
 
     def delete_opener_erds(self, openers, policy):
-        """Drop stored folds for openers that no longer screen complete."""
-        self.publish_opener_erds((), openers, policy)
+        """Forget what these openers' trees came to, so they are unfinished.
+
+        For a repair or a requeue that is deliberately removing branch results
+        the opener's verdict was folded over.  The operation doing that knows
+        which openers it is invalidating, which is why nothing on the read path
+        has to work it out.
+        """
+        self._conn.executemany(
+            """DELETE FROM opener_erd_by_policy
+                WHERE opener = ? AND policy = ? AND answer_list_id = ?""",
+            [(opener.lower(), policy, self.answer_list_id)
+             for opener in openers],
+        )
 
     def completed_opener_summary_map(self, policy):
         return {row["opener"].lower(): dict(row) for row in self._conn.execute("""

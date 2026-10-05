@@ -430,11 +430,11 @@ Only `branch_best_by_policy` is the "one row per branch" table.  Any count,
 report, or query that means branches must not union the two: a branch with
 results at three budgets is one branch.
 
-### A candidate's own ERD is derived; an opener's is stored and rescreened
+### A candidate's own ERD is derived; an opener's is written when it finishes
 
 A branch result is a certificate; a **candidate's** ERD at a branch is a *fold*
 over the results of that candidate's response groups, and the two are not
-alike.  `report_model._candidate_erd_summary` is the only thing that produces
+alike.  `opener_erd.fold_response_groups` is the only thing that produces
 one, and it produces it on every read from the group facts the caller has
 already materialized.
 
@@ -459,38 +459,77 @@ as `missing`, and the candidate reads `pending` — never folded in.
 Do not reintroduce a durable memo keyed by branch, and do not add one to
 `EXPORT_TABLES`/`TABLES`.
 
-**One fold is stored, and only because it can be rechecked for less than it
-costs to keep honest.**  `opener_erd_by_policy` holds each completed opener's
-own ERD: one row per candidate word, bounded at the vocabulary rather than at
-every (branch, candidate) pair the dropped `candidate_erd_by_policy` was keyed
-by.  That bound is what makes the difference.  A reader does not trust a stored
-row — `_screen_and_fold_openers` rescreens every opener's groups against
-current branch results on every build, and `_store_opener_folds` deletes the
-rows whose openers no longer screen complete.  So a repair or a requeue that
-removes a branch result removes the folds that read it at the next read, which
-is the guarantee a branch-keyed memo could not give.
+**An opener's own ERD is written when the opener finishes, and the leaderboard
+is a read.**  `opener_erd_by_policy` holds one row per opener the swarm has
+finished: `state` is the verdict (`complete` with an exact `erd` and worst-case
+line, `infeasible` with neither), and an opener with no row has not finished.
+`_BranchWorker._snapshot_completed_openers` writes it, because the queue
+resolving the opener's last branch membership is the only moment anything knows
+the tree is done -- and that code already ran there, recording the opener's
+timing into the same cache.  `opener_erd.store_opener_verdict` is the one place
+a verdict is written, so the row means the same thing however it was reached.
 
-The screen is what makes rescreening affordable.  Folding a whole vocabulary
-builds a state dict per response group — about 1.4 million of them, nearly all
-belonging to openers still being searched.  The screen reads the same facts as
-two set lookups per group through `ScoreCache.report_reusable_branch_facts`,
-which decides the reusability gate in SQL and loads three columns of the
-qualifying rows instead of six columns of every row.  Measured on the
-production cache at 872 completed openers, a full leaderboard build went from
-25.3s to 3.0s, returning byte-identical rows.
+`collect_leaderboard_report` then orders those rows (`opener_erd_ranking`) and
+counts them (`opener_erd_verdict_counts`).  It partitions nothing, folds
+nothing, and reads no branch result at all:
+`test_a_leaderboard_reads_no_branch_results_at_all` asserts exactly that by
+mocking `report_branch_states` and `PatternMatrix.load_or_build` and requiring
+neither to be called.  `idx_opener_erd_rank` leads with `state` and then the
+ranking's own sort key `(erd, max_remaining_depth, opener)`, so the whole
+ranking is one ordered range of a covering index and a `limit` stops the scan
+rather than filtering a full read.
 
-**The screen visits every group; it must not stop at the first unsettled one.**
-A candidate holding both an unsettled group and a proven loss is `infeasible`,
-because `_candidate_erd_summary` decides infeasibility ahead of pendency — and
-an early exit can return before reaching the loss that decides it.  That is the
-one wrong answer that still looks plausible, so
-`test_a_screened_candidate_holding_a_loss_and_a_gap_is_infeasible` pins it
-against its pending-only twin: a screen cannot pass both by calling every
-unsettled candidate one thing or the other.
+Measured on the production cache's own 1,052 verdicts, and on 14,855 synthetic
+ones for the completion the sweep is heading for:
 
-Groups of fewer than two answers hold no branch result and never will — the
-fold solves them from the response pattern — so the screen must skip them
-rather than ask the cache about them.
+| | counts | ranking | columns | total |
+|---|---|---|---|---|
+| 1,052 verdicts | 0.89 ms | 1.82 ms | 1.33 ms | **4.0 ms** |
+| 14,855 verdicts | 12.7 ms | 18.6 ms | 10.6 ms | **41.9 ms** |
+| 14,855, `limit 200` | 13.1 ms | 0.31 ms | 0.19 ms | **13.6 ms** |
+
+against about 14s for the build that folded on read, which would have been
+roughly 16s at full completion.  The `limit` figure is the index doing its job:
+the ranking read stops at 200 rows instead of reading 14,855 and slicing.
+
+**The three counts are a partition by construction.**  `complete` and
+`infeasible` are the finished openers; `pending` is the candidate list minus
+both.  Nothing tallies the vocabulary, so nothing can disagree with the
+ranking about how large it is.
+
+**Do not fold the ranking on read again.**  That version partitioned all 14,855
+openers against the answer list (`_candidate_group_skeletons`: ~11s and about
+0.25 GB of strings, which is what #381 was about) and built a per-group state
+dict for each of 1,389,596 response groups, on a report the client polls every
+two seconds, to recompute numbers that only move when an opener finishes --
+about every 27 minutes.  It was also *wrong*: measured against the queue, the
+stored rows were 119 openers behind what had actually finished, because they
+were a by-product of whenever a build last ran.  A screen over the whole
+vocabulary, `report_reusable_branch_facts`, and a memo of the skeletons were
+all deleted with it.
+
+**Invalidation belongs to the operation doing the damage, not to the read.**  A
+repair or requeue is the exceptional case, it is rare, and it knows which
+opener it is invalidating: `queue add --delete-erd-cache` deletes that opener's
+verdict beside the branch results it deletes
+(`test_the_repair_forgets_the_openers_stored_verdict`, paired with a plain
+requeue that must keep it).  Nothing on the read path works it out from a
+deleted branch, and nothing needs a timestamp, a watermark or a rescreen to
+notice.
+
+**A finished opener that folds `pending` is a contradiction, and it is said out
+loud rather than recorded.**  The queue has just reported every branch the
+opener owns as finished, so a group with no reusable exact result means one is
+missing from this cache -- a branch solved under another request and since
+removed, or a write that failed.  Storing a verdict would assert a tree that is
+not there; storing nothing reports the opener as unfinished, which is what it
+is.  The worker logs it.
+
+Folding one opener is still cheap and still happens on read for a *named*
+opener: one partition of the answer list and one indexed read per group, so a
+card or a word lookup answers as freshly as the request rather than as freshly
+as the last write.  `opener_erd.fold_opener` is that path, and it is the same
+fold the worker stored.
 
 **The stored folds are also read for an opener's *position*, and that is not
 reading a fold in place of folding.**  `ScoreCache.opener_standing` answers
@@ -505,26 +544,22 @@ fold that disagrees with it is placed by what it is now and cannot be counted
 past itself.
 
 So a standing is as fresh as this request in its ERD and as fresh as the last
-leaderboard build in its rank, and `ranked_total` reports the field it was
-counted in rather than implying one.  Rescreening the vocabulary to place one
-word costs more than the ranking it would place the word in, which is the whole
-reason the lookup exists.
+finished opener in its rank, and `ranked_total` reports the field it was
+counted in rather than implying one.  Every one of those queries is over
+`state = 'complete'`: an opener with no finite ERD has no place in the ranking,
+so it cannot be one of the openers another is counted against.
 
-**An opener's stored ERD is meant to be the authoritative answer, and the rule
-above is about a different table.**  What #288 dropped was
-`candidate_erd_by_policy`, a fold keyed by (branch, candidate): an unbounded
-set whose dependencies could not be enumerated, so a deleted branch row
-falsified folds nobody could name.  `opener_erd_by_policy` holds one row per
-opener and depends only on that opener's own top-level groups -- a dependency
-set the screen already walks on every build.  Do not read "a fold cannot
-defend itself" as covering it.  That the leaderboard still re-derives all of
-them on every build, and never reads the rows it writes, is an implementation
-gap tracked in #384, not a property of the value: computing an exact ERD for
-every opener is what the swarm is for.
+**"A fold cannot defend itself" is about a different table.**  What #288
+dropped was `candidate_erd_by_policy`, a fold keyed by (branch, candidate): an
+unbounded set whose dependencies could not be enumerated, so a deleted branch
+row falsified folds nobody could name.  `opener_erd_by_policy` holds one row
+per opener and depends only on that opener's own top-level groups.  Do not read
+the rule as covering it: computing an exact ERD for every opener is what the
+swarm is for, and that number is the output, not a cache of one.
 
 `opener_erd_by_policy` is local to each machine and travels in neither
-`EXPORT_TABLES` nor `TABLES`: it is derived from branch results the export
-already carries, and the other side rescreens against its own cache.
+`EXPORT_TABLES` nor `TABLES`: each machine's own workers fold it from branch
+results the export already carries.
 
 **The obsolete `candidate_erd_by_policy` is dropped on every writable open, not
 once behind a migration flag.**  A process running code from before the table
@@ -587,10 +622,13 @@ several workers each contributed placements to.
 
 ### An expensive report is rebuilt on its own event, not on the poll
 
-`report_client.html` polls every two seconds. A leaderboard build rescreens the
-whole opener vocabulary, so serving one per poll means the server is never idle
-and requests queue behind each other — which is what
-`report_server.collect_report_once`'s shared-collection lock was papering over.
+`report_client.html` polls every two seconds. This is what the leaderboard
+build used to cost: it rescreened the whole opener vocabulary, so serving one
+per poll meant the server was never idle and requests queued behind each other
+— which is what `report_server.collect_report_once`'s shared-collection lock
+was papering over. The leaderboard is now a read of stored verdicts and no
+longer the expensive case; the machinery below stays because it also stops the
+*encoding* being repeated, and because the next expensive report will want it.
 
 `REVALIDATED_REPORT_KINDS` names the reports served from a cache that
 revalidates instead of rebuilding. A kind belongs there only if its answer is a
@@ -613,10 +651,10 @@ nothing. Do not reach for the watermark again without re-measuring that ratio;
 a 90-second sample taken during a quiet stretch shows zero changes and reads as
 a green light.
 
-The signal is a hint and never an answer: the build still rescreens every
-opener against the cache, so a stale signal costs freshness and never
-correctness. It is also not exhaustive — a repair, a reverification or an
-import changes the cache without completing any queue work — so
+The signal is a hint and never an answer: a stale signal costs freshness and
+never correctness, because the cached body is always one some build actually
+produced. It is also not exhaustive — a repair, a reverification or an import
+changes the cache without completing any queue work — so
 `REPORT_CACHE_MAX_AGE_SECONDS` bounds how long such a change can go unnoticed.
 That age is a backstop for the rare case, not the mechanism. A signal that
 cannot be read at all returns `None`, which must be treated as "assume

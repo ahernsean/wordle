@@ -33,6 +33,7 @@ import pattern_matrix as pattern_matrix_module
 from cache_sqlite import ScoreCache, mem_cache_limit
 from hint_cache import open_hint_cache
 from erd_lattice import erd_ge
+from opener_erd import opener_response_groups, store_opener_verdict
 from wordle_engine import (
     ERD_ALL,
     GAME_GUESSES,
@@ -1942,7 +1943,27 @@ class _BranchWorker:
         return True
 
     def _snapshot_completed_openers(self, openers):
+        """Record what each newly finished opener came to.
+
+        This is the moment an opener's tree is complete and the only moment
+        anything knows it: the queue has just resolved the last branch
+        membership the opener owned and named the opener here.  So this is
+        where its exact ERD is folded and stored -- once, over the opener's own
+        top-level groups.  The leaderboard then reads those rows, instead of
+        partitioning all 14,855 openers and folding 1,389,596 response groups
+        on a two-second poll to recompute numbers that only move when one of
+        these events fires, which is about every 27 minutes.
+
+        Each opener is recorded independently, and its verdict independently of
+        its timing: a failure to record one must cost neither the others nor
+        the branch finalize that triggered this.
+        """
         for opener in openers or ():
+            try:
+                self._store_opener_erd(opener)
+            except Exception:
+                logger.exception("%s could not fold completed opener %s",
+                                 self.name, opener)
             try:
                 timing = self.queue.completed_opener_timing(opener)
                 if timing["completed_at"] is None:
@@ -1957,6 +1978,34 @@ class _BranchWorker:
             except Exception:
                 logger.exception("%s could not snapshot completed opener %s",
                                  self.name, opener)
+
+    def _store_opener_erd(self, opener):
+        """Fold this opener's own ERD over its top-level groups and store it.
+
+        An opener spends the first guess, leaving `GAME_GUESSES - 1` for its
+        response groups, and each group is read at exactly that budget -- the
+        same scope rule a solver reuses a child under, so the stored number is
+        the one a search from this opener would find.
+
+        A pending fold here is a contradiction worth saying out loud: the queue
+        has just reported every branch this opener owns as finished, so a group
+        without a reusable exact result means one is missing from this cache --
+        a branch solved under another request and since removed, or a write
+        that failed.  Storing a verdict would assert a tree that is not there,
+        and storing nothing reports the opener as unfinished, which is what it
+        is.
+        """
+        summary = store_opener_verdict(
+            self.score_cache, opener,
+            opener_response_groups(
+                self.pattern_matrix, opener, self.all_answers),
+            ERD_ALL, GAME_GUESSES - 1)
+        if summary["state"] == "pending":
+            logger.warning(
+                "%s finished opener %s still folds as pending; "
+                "%d of %d groups resolved", self.name, opener,
+                summary["resolved_group_count"],
+                summary["response_group_count"])
 
     def _finish_bundle(self, branch_key, bundle_id, nodes_at_start, wall_t0,
                        censored):

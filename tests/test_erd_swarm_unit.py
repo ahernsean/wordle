@@ -131,6 +131,7 @@ def _bare_worker():
     # No hint artifact: the default a run without --hint-cache produces.
     w.hint_cache = None
     w.pattern_matrix = None
+    w.all_answers = BRANCH
     w.branch_floor_table = None
     w.score_cache = mock.MagicMock()
     w.score_cache.read_hits = 0
@@ -4236,6 +4237,65 @@ class TestCompletedOpenerSnapshots(unittest.TestCase):
 
         worker.score_cache.write_completed_opener_summary.assert_called_once_with(
             "SALET", erd_swarm.ERD_ALL, 160, 60_000, 2_000, (3,))
+
+    def test_snapshot_stores_the_finished_openers_own_erd(self):
+        # The completion event is the only moment anything knows an opener's
+        # tree is done, so it is where the exact ERD is folded and stored.  The
+        # leaderboard then reads those rows instead of refolding the whole
+        # vocabulary on a poll.
+        worker = _bare_worker()
+        worker.queue.completed_opener_timing.return_value = {
+            "first_created_at": 100, "completed_at": 160,
+            "worker_millis": 2_000, "telemetry_epochs": "3"}
+        with mock.patch.object(erd_swarm, "opener_response_groups",
+                               return_value=["groups"]) as grouped, \
+             mock.patch.object(erd_swarm, "store_opener_verdict",
+                               return_value={"state": "complete"}) as stored:
+            worker._snapshot_completed_openers(["salet"])
+
+        grouped.assert_called_once_with(
+            worker.pattern_matrix, "salet", worker.all_answers)
+        # An opener spends the first guess, so its groups are read at the
+        # budget a search from this opener would read them at.
+        stored.assert_called_once_with(
+            worker.score_cache, "salet", ["groups"], erd_swarm.ERD_ALL,
+            erd_swarm.GAME_GUESSES - 1)
+
+    def test_a_finished_opener_that_folds_pending_is_complained_about(self):
+        # The queue has just reported every branch this opener owns as
+        # finished, so a group with no reusable exact result means one is
+        # missing from this cache.  That contradiction is said out loud rather
+        # than recorded as a verdict.
+        worker = _bare_worker()
+        worker.queue.completed_opener_timing.return_value = {
+            "first_created_at": 100, "completed_at": 160,
+            "worker_millis": 2_000, "telemetry_epochs": "3"}
+        with mock.patch.object(erd_swarm, "opener_response_groups",
+                               return_value=[]), \
+             mock.patch.object(erd_swarm, "store_opener_verdict",
+                               return_value={"state": "pending",
+                                             "resolved_group_count": 3,
+                                             "response_group_count": 7}), \
+             self.assertLogs("wordle", level="WARNING") as logged:
+            worker._snapshot_completed_openers(["salet"])
+
+        self.assertIn("still folds as pending", "\n".join(logged.output))
+
+    def test_a_fold_failure_leaves_the_timing_snapshot_alone(self):
+        # The verdict and the timing are separate records of one event, so a
+        # verdict that cannot be folded must cost neither the timing nor the
+        # branch finalize that triggered this.
+        worker = _bare_worker()
+        worker.queue.completed_opener_timing.return_value = {
+            "first_created_at": 100, "completed_at": 160,
+            "worker_millis": 2_000, "telemetry_epochs": "3"}
+        with mock.patch.object(erd_swarm, "opener_response_groups",
+                               side_effect=RuntimeError("no matrix")), \
+             self.assertLogs("wordle", level="ERROR"):
+            worker._snapshot_completed_openers(["salet"])
+
+        worker.score_cache.write_completed_opener_summary.assert_called_once_with(
+            "salet", erd_swarm.ERD_ALL, 160, 60_000, 2_000, (3,))
 
     def test_snapshot_failure_does_not_abort_the_worker(self):
         worker = _bare_worker()
