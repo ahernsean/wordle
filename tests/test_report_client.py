@@ -2606,6 +2606,77 @@ class ReportClientContract:
             " ".join(self.page.locator(".erd-zoom-trail").inner_text().split()),
             "All openers › ERD 4.0000–4.0400 › ERD 4.0100–4.0300")
 
+    # Touch pointers on the histogram, one event per step: [type, pointer,
+    # fraction of the chart's width, pixels below the chart's middle].  A
+    # "read" step records the chart's transform.  Returns those readings.
+    TOUCHES_JS = """(steps) => {
+      const rect = document.querySelector('.erd-histogram-bars').getBoundingClientRect();
+      const readings = [];
+      for (const [type, id, fraction, below = 0] of steps) {
+        const bars = document.querySelector('.erd-histogram-bars');
+        if (type === 'read') { readings.push(bars.style.transform); continue; }
+        bars.dispatchEvent(new PointerEvent(type, {
+          pointerId: id, pointerType: 'touch', isPrimary: id === 1, bubbles: true,
+          clientX: rect.left + fraction * rect.width, clientY: rect.top + rect.height / 2 + below,
+        }));
+      }
+      return readings;
+    }"""
+
+    def test_one_finger_dragged_sideways_pans_the_chart(self):
+        """A drag keeps its range's width and moves it with the finger.
+
+        On 425..574, a finger dragged from 0.6 to 0.4 of the chart's width
+        moves the chart a fifth of its width left while it is down, and
+        lifting it shows the 150 numerators a fifth further on, 455..604.
+        Dragged far past the field's end, the range stops against it
+        rather than narrowing.
+        """
+        self._open_long_leaderboard(300, query="&poll=600000&erd_numerator_range=425-574")
+        width = self.page.evaluate(
+            "() => document.querySelector('.erd-histogram-bars').clientWidth")
+        readings = self.page.evaluate(self.TOUCHES_JS, [
+            ["pointerdown", 1, 0.6], ["pointermove", 1, 0.5], ["pointermove", 1, 0.4],
+            ["read"], ["pointerup", 1, 0.4]])
+        offset, scale, rise = map(float, re.findall(r"-?[\d.]+", readings[0]))
+        self.assertAlmostEqual(offset, -width / 5, places=1)
+        self.assertEqual((scale, rise), (1, 1))
+        self.assertIn("erd_numerator_range=455-604", self.page.url)
+
+        self.page.evaluate(self.TOUCHES_JS, [
+            ["pointerdown", 1, 0.1], ["pointermove", 1, 0.9], ["pointerup", 1, 0.9]])
+        self.assertIn("erd_numerator_range=350-499", self.page.url)
+
+    def test_a_finger_that_barely_moves_or_moves_up_is_not_a_drag(self):
+        """A tap that wobbles still chooses a bar, and a scroll is the page's.
+
+        A finger moving a few pixels sideways leaves the chart where it is;
+        so does one moving further up the page than across it.
+        """
+        self._open_long_leaderboard(300, query="&poll=600000")
+        readings = self.page.evaluate(self.TOUCHES_JS, [
+            ["pointerdown", 1, 0.5], ["pointermove", 1, 0.5 + 3 / 1000], ["read"],
+            ["pointermove", 1, 0.53, -60], ["read"], ["pointerup", 1, 0.53, -60]])
+        self.assertEqual(readings, ["", ""])
+        self.assertNotIn("erd_numerator_range", self.page.url)
+        self.page.locator("button.erd-histogram-bar").nth(10).click()
+        self.assertIn("erd_numerator_range=400-404", self.page.url)
+
+    def test_a_second_finger_joining_a_drag_pinches_from_where_it_is(self):
+        """A finger put down on a moved chart holds the value drawn under it.
+
+        On 425..574, one finger drags from 0.5 to 0.3, sliding the chart a
+        fifth left; a second, put down at 0.7, lands on the value at 0.9 of
+        the chart at rest.  Moved to 0.9 it spreads 0.5..0.9 at rest over
+        0.3..0.9, so the chart spans 470..569 when they lift.
+        """
+        self._open_long_leaderboard(300, query="&poll=600000&erd_numerator_range=425-574")
+        self.page.evaluate(self.TOUCHES_JS, [
+            ["pointerdown", 1, 0.5], ["pointermove", 1, 0.3],
+            ["pointerdown", 2, 0.7], ["pointermove", 2, 0.9],
+            ["pointerup", 1, 0.3], ["pointerup", 2, 0.9]])
+        self.assertIn("erd_numerator_range=470-569", self.page.url)
+
     def test_a_pinch_lifted_off_the_chart_by_the_browser_puts_it_back(self):
         """A pinch the browser takes over leaves the chart where it was."""
         self._open_long_leaderboard(300, query="&poll=600000")

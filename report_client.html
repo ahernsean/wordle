@@ -2546,7 +2546,7 @@
       }
       axis.append(element("span","",fixed(range.from/denominator,4)),element("span","dim","ERD · lower is better · tallest bar "+numText(tallest)+(tallest===1?" opener":" openers")),element("span","",fixed(range.to/denominator,4)));
       section.append(bars,axis);
-      followHistogramPinch(section,bars,range,field);
+      followHistogramTouches(section,bars,range,field);
       const shown={from:range.from,to:range.to,tallest,count:rows.length,
         bins:bins.map(bin=>({from:bin.from,to:bin.to,count:bin.rows.length}))};
       if(histogramZooming)animateHistogramZoom(bars,shownHistogramRange,shown,departingHistogram,histogramZoomStart);
@@ -2573,50 +2573,71 @@
     // A pinch has already moved the old chart under the reader's fingers, so
     // the zoom starts from where the pinch left it rather than from rest.
     const HISTOGRAM_ZOOM_MILLIS=800;
-    // Two fingers on the chart move it with them: the ERD values under each
-    // finger stay under it, so spreading them zooms in, pinching zooms out,
-    // and sliding both pans.  Lifting a finger zooms to the range then
-    // spanning the chart, clamped to the field.  The chart takes no page
-    // zoom (`touch-action: pan-y`), so one finger still scrolls the page and
-    // a tap still chooses a bar.  A pinch's lifted fingers are not a tap,
+    // The chart moves with the fingers on it, keeping the ERD values under
+    // each finger beneath it: one finger dragged sideways pans, two spread
+    // apart zoom in, pinched together zoom out, and slid together pan.
+    // Lifting a finger zooms to the range then spanning the chart, slid back
+    // inside the field if it ran past either end.  The chart takes no page
+    // zoom and no sideways page pan (`touch-action: pan-y`), so a finger
+    // moving up or down still scrolls the page, and one that barely moves is
+    // still a tap that chooses a bar.  A drag's lifted fingers are not a tap,
     // on whichever chart they land: the first lift has already drawn the next.
+    const HISTOGRAM_DRAG_PIXELS=8;
     let ignoreHistogramClicksUntil=0;
     document.addEventListener("click",event=>{
       if(performance.now()<ignoreHistogramClicksUntil&&event.target.closest?.(".erd-histogram-bar")){event.stopPropagation();event.preventDefault();}
     },true);
-    function followHistogramPinch(section,bars,range,field){
+    function followHistogramTouches(section,bars,range,field){
       const span=range.to-range.from+1,touches=new Map();
-      let start=null,moved=null;
+      // `moved` is where the chart sits: a value at `x` of the chart at rest
+      // is drawn at `offset + scale * x`, both fractions of its width.
+      // `anchors` holds, for each finger, the place at rest it put down on.
+      let anchors=null,moved={offset:0,scale:1},dragging=false,downAt=null;
       // Measured from the chart's place at rest: its drawn box moves with it.
       const place=event=>(event.clientX-section.getBoundingClientRect().left-section.clientLeft-bars.offsetLeft)/bars.clientWidth,
-        // Where the chart sits under the fingers: a value at `x` of the chart
-        // at rest is drawn at `offset + scale * x`, both fractions of its width.
-        follow=()=>{
-          const [first,second]=[...touches.values()],[firstStart,secondStart]=[...start.values()],
-            scale=Math.abs(second-first)/Math.max(1e-3,Math.abs(secondStart-firstStart));
-          return {scale,offset:first-scale*firstStart};
-        };
+        atRest=fraction=>(fraction-moved.offset)/moved.scale,
+        drawn=()=>"translateX("+moved.offset*bars.clientWidth+"px) scale("+moved.scale+",1)",
+        reset=()=>{touches.clear();anchors=null;dragging=false;moved={offset:0,scale:1};};
       section.addEventListener("gesturestart",event=>event.preventDefault());
       bars.addEventListener("pointerdown",event=>{
         if(event.pointerType!=="touch")return;
+        if(!touches.size)downAt={x:event.clientX,y:event.clientY};
         touches.set(event.pointerId,place(event));
-        if(touches.size!==2)return;
-        start=new Map(touches);moved={scale:1,offset:0};
-        for(const id of touches.keys())try{bars.setPointerCapture(id);}catch{}
+        if(touches.size>2)return;
+        // A finger joining a drag holds the place its chart has moved under it.
+        anchors=new Map([...touches].map(([id,fraction])=>[id,atRest(fraction)]));
+        if(touches.size===2){
+          dragging=true;
+          for(const id of touches.keys())try{bars.setPointerCapture(id);}catch{}
+        }
       });
       bars.addEventListener("pointermove",event=>{
         if(!touches.has(event.pointerId))return;
         touches.set(event.pointerId,place(event));
-        if(!start||touches.size!==2)return;
-        moved=follow();
-        bars.style.transform="translateX("+moved.offset*bars.clientWidth+"px) scale("+moved.scale+",1)";
+        if(!anchors||touches.size>2)return;
+        if(!dragging){
+          const across=Math.abs(event.clientX-downAt.x);
+          if(across<HISTOGRAM_DRAG_PIXELS||across<Math.abs(event.clientY-downAt.y))return;
+          dragging=true;
+          try{bars.setPointerCapture(event.pointerId);}catch{}
+        }
+        const [[firstId,first],second]=[...touches],firstAnchor=anchors.get(firstId);
+        if(second){
+          const secondAnchor=anchors.get(second[0]),
+            scale=Math.abs(second[1]-first)/Math.max(1e-3,Math.abs(secondAnchor-firstAnchor));
+          moved={scale,offset:first-scale*firstAnchor};
+        }else moved={scale:moved.scale,offset:first-moved.scale*firstAnchor};
+        bars.style.transform=drawn();
       });
-      const lift=event=>{
-        if(!touches.delete(event.pointerId)||!start)return;
-        const {scale,offset}=moved;start=null;touches.clear();ignoreHistogramClicksUntil=performance.now()+500;
+      bars.addEventListener("pointerup",event=>{
+        if(!touches.has(event.pointerId))return;
+        if(!dragging){touches.delete(event.pointerId);if(!touches.size)reset();return;}
+        const {scale,offset}=moved;reset();ignoreHistogramClicksUntil=performance.now()+500;
         const lowest=range.from+(-offset/scale)*span,highest=range.from+((1-offset)/scale)*span;
-        let from=Math.max(field.from,Math.round(lowest)),to=Math.min(field.to,Math.round(highest)-1);
-        if(to<from)[from,to]=from>field.to?[field.to,field.to]:[from,from];
+        let from=Math.round(lowest),to=Math.max(from,Math.round(highest)-1);
+        const width=to-from;
+        if(from<field.from)[from,to]=[field.from,field.from+width];
+        if(to>field.to)[from,to]=[Math.max(field.from,field.to-width),field.to];
         const chosen=from<=field.from&&to>=field.to?null:{from,to},
           current=parseERDNumeratorRange(currentState.erd_numerator_range);
         if(chosen?.from===current?.from&&chosen?.to===current?.to){
@@ -2625,11 +2646,10 @@
           return;
         }
         zoomLeaderboard(chosen,{offset,scale});
-      };
-      bars.addEventListener("pointerup",lift);
+      });
       bars.addEventListener("pointercancel",event=>{
-        if(!touches.delete(event.pointerId)||!start)return;
-        start=null;touches.clear();bars.style.transform="";
+        if(!touches.has(event.pointerId))return;
+        reset();bars.style.transform="";
       });
     }
     // The old chart, kept as a picture: its bars become plain spans, so
