@@ -261,9 +261,16 @@
     .erd-histogram-bar { flex:1 1 0; display:flex; align-items:flex-end; min-width:0; min-height:0; padding:0; border:0; border-radius:0; background:transparent; }
     button.erd-histogram-bar:hover, button.erd-histogram-bar:focus-visible { background:var(--hover-tint); }
     .erd-histogram-fill { display:block; width:100%; border-radius:2px 2px 0 0; }
-    .erd-histogram { padding-top:1.2rem; }
+    /* Clipped so a zoom animation scaling the bars past the chart's edges
+       never widens the page. */
+    .erd-histogram { padding-top:1.2rem; overflow:hidden; }
+    .erd-histogram-bars { transform-origin:0 0; }
     .erd-histogram-bar { position:relative; }
     .erd-histogram-bar.looked-up .erd-histogram-fill { box-shadow:0 0 0 2px var(--text); }
+    /* The bar whose openers are listed below, when the histogram shown is
+       the one it was chosen from. */
+    .erd-histogram-bar[aria-current=true] { background:var(--hover-tint); }
+    .erd-histogram-bar[aria-current=true] .erd-histogram-fill { box-shadow:0 0 0 2px var(--green); }
     .erd-histogram-marker { position:absolute; bottom:100%; margin-bottom:.15rem; font-size:.75rem; font-weight:700; white-space:nowrap; color:var(--text); pointer-events:none; }
     .erd-histogram-bar[data-side=start] .erd-histogram-marker { left:0; }
     .erd-histogram-bar[data-side=middle] .erd-histogram-marker { left:50%; transform:translateX(-50%); }
@@ -2396,15 +2403,20 @@
         range=requested||field,
         inRange=requested?rows.filter(row=>row.erd_numerator>=range.from&&row.erd_numerator<=range.to):rows,
         listsAll=!range||inRange.length<=LEADERBOARD_LIST_MAXIMUM_ROWS||range.from===range.to,
-        // A zoomed range keeps its own histogram however few openers it
-        // holds, so the reader can still see where they are and choose a
-        // neighbouring bar.  Only the field itself, when short enough to list,
-        // goes without one.
-        charted=range&&range.from<range.to&&(requested||!listsAll),
+        trail=requested?erdZoomTrail(field,requested)??[requested]:[],
+        // A zoomed view always has a histogram to navigate by.  A range of
+        // one ERD has only one bar of its own, so it shows the histogram it
+        // was chosen from instead, with its own bar marked as the one in view;
+        // a neighbouring value is then one tap away.  Only the field itself,
+        // when short enough to list, goes without one.
+        chartRange=!range?null:range.from<range.to?(requested||!listsAll?range:null)
+          :(trail.length>1?trail[trail.length-2]:field),
         listed=listsAll?inRange:inRange.slice(0,LEADERBOARD_PREVIEW_ROWS),
         rangeText=requested?" with ERD "+erdRangeText(range,denominator):"";
-      if(requested)fragment.append(renderERDZoomTrail(erdZoomTrail(field,requested)??[requested],denominator));
-      if(charted)fragment.append(renderERDHistogram(inRange,range,field,denominator));
+      if(requested)fragment.append(renderERDZoomTrail(trail,denominator));
+      if(chartRange&&chartRange.from<chartRange.to)fragment.append(renderERDHistogram(
+        chartRange===range?inRange:rows.filter(row=>row.erd_numerator>=chartRange.from&&row.erd_numerator<=chartRange.to),
+        chartRange,field,denominator,requested));
       // The lookup sits under the histogram so the bar it marks is in view
       // above the answer, rather than below a neighbourhood of cards.
       fragment.append(renderOpenerLookup(state,maximumResponseGroupCount));
@@ -2475,7 +2487,12 @@
       const span=field.to-field.from,position=span?((bin.from+bin.to)/2-field.from)/span:0;
       return "hsl("+Math.round(125*(1-position))+" 62% 43%)";
     }
-    function renderERDHistogram(rows,range,field,denominator){
+    // The range the histogram on screen covers, so the next one drawn can be
+    // animated from where its values sat in this one -- but only when that
+    // next one is a zoom.  A poll, a lookup or a return from another tab
+    // redraws without moving.
+    let shownHistogramRange=null,histogramZooming=false;
+    function renderERDHistogram(rows,range,field,denominator,current=null){
       const bins=erdBins(rows,range),tallest=Math.max(...bins.map(bin=>bin.rows.length)),
         section=element("section","erd-histogram"),bars=element("div","erd-histogram-bars"),axis=element("div","erd-histogram-axis");
       section.setAttribute("aria-label","ERD distribution of "+numText(rows.length)+" openers");
@@ -2489,6 +2506,7 @@
         fill.style.backgroundColor=erdFieldColor(bin,field);
         bar.append(fill);bar.title=label;
         bar.dataset.erdNumeratorRange=erdNumeratorRangeText(bin);
+        if(current&&bin.from===current.from&&bin.to===current.to)bar.setAttribute("aria-current","true");
         // Which third of the chart the bar sits in decides which way its
         // marker label runs, so a label on an outer bar stays on the page.
         bar.dataset.side=bins.length<3?"middle":["start","middle","end"][Math.floor(3*bins.indexOf(bin)/bins.length)];
@@ -2497,7 +2515,31 @@
       }
       axis.append(element("span","",fixed(range.from/denominator,4)),element("span","dim","ERD · lower is better · tallest bar "+numText(tallest)+(tallest===1?" opener":" openers")),element("span","",fixed(range.to/denominator,4)));
       section.append(bars,axis);
+      if(histogramZooming)animateHistogramZoom(bars,shownHistogramRange,range);
+      shownHistogramRange={from:range.from,to:range.to};
       return section;
+    }
+    // A zoom moves the camera rather than swapping the picture.  Every ERD
+    // value sits at a position proportional to where it falls in a chart's
+    // range, so the new chart is drawn first at the scale and offset that put
+    // its values where they were in the old one, then eased to rest: zooming
+    // in grows the chosen bar to the full width, zooming out shrinks the range
+    // just left back into its bar, and a step sideways slides.  A redraw of
+    // the same range is not a zoom and does not move.
+    const HISTOGRAM_ZOOM_MILLIS=550;
+    function animateHistogramZoom(bars,from,to){
+      if(!from||(from.from===to.from&&from.to===to.to))return;
+      if(matchMedia("(prefers-reduced-motion: reduce)").matches||!bars.animate)return;
+      const fromSpan=from.to-from.from+1,toSpan=to.to-to.from+1;
+      requestAnimationFrame(()=>{
+        if(!bars.isConnected)return;
+        const width=bars.clientWidth,
+          scale=toSpan/fromSpan,offset=(to.from-from.from)/fromSpan*width;
+        bars.animate([
+          {transform:"translateX("+offset+"px) scaleX("+scale+")",opacity:.4},
+          {transform:"none",opacity:1},
+        ],{duration:HISTOGRAM_ZOOM_MILLIS,easing:"cubic-bezier(.4,0,.2,1)"});
+      });
     }
     // The opener a reader looked up is marked on the bar that holds it, so
     // "rank 779" also reads as a place in the field.  Called from both sides:
@@ -2531,7 +2573,9 @@
     }
     function redrawLeaderboardZoom(){
       if(currentState.kind!=="leaderboard"||lastReport?.report_kind!=="leaderboard"||contextKey(currentState)!==lastContext)return;
-      applyReport(lastReport,null,currentState);displayedState=currentState;renderOwed=false;
+      histogramZooming=true;
+      try{applyReport(lastReport,null,currentState);}finally{histogramZooming=false;}
+      displayedState=currentState;renderOwed=false;
     }
     // One card, drawn the same way wherever a ranked opener appears, so a
     // neighbourhood reads as a slice of the ranking rather than as a second

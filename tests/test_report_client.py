@@ -2203,7 +2203,8 @@ class ReportClientContract:
         6,000 openers sixty to a numerator over 350..449 bin two numerators
         (120 openers) to a bar: too many to list, so the first bar opens on
         its own histogram, whose bars of 60 are listed in full.  Every step
-        is a history entry, and none of them is a request.  The poll is
+        is a history entry, none of them is a request, and none of them
+        leaves the reader without a histogram.  The poll is
         parked so that every ranking request counted is one a zoom made.
         """
         self._open_long_leaderboard(6000, per_numerator=60, query="&poll=600000")
@@ -2222,7 +2223,13 @@ class ReportClientContract:
         self.assertIn("erd_numerator_range=351-351", self.page.url)
         self.assertEqual(self._caption(),
                          "Ranked by ERD · 60 openers with ERD 3.5100")
-        self.assertEqual(self.page.locator(".erd-histogram").count(), 0)
+        # One ERD has one bar of its own, so the histogram it was chosen from
+        # stays, with its bar marked as the one listed below.
+        self.assertEqual(self.page.locator(".erd-histogram-bar").count(), 2)
+        self.assertEqual(
+            self.page.locator(".erd-histogram-bar[aria-current=true]").get_attribute(
+                "data-erd-numerator-range"),
+            "351-351")
         cards = self.page.locator(".grid.leaderboard > .leaderboard-card")
         self.assertEqual(cards.count(), 60)
         # A zoomed card keeps its place in the whole ranking.
@@ -2246,6 +2253,51 @@ class ReportClientContract:
             "() => document.querySelector('.leaderboard-caption')"
             ".textContent.includes('best 20 of 6,000 complete')")
         self.assertNotIn("erd_numerator_range", self.page.url)
+
+    def test_a_zoom_animates_from_where_the_chosen_bar_was(self):
+        """The new histogram starts in the old one's coordinates.
+
+        Of 300 openers on 350..649, the eleventh bar holds 400..404: one
+        sixtieth of the field's width, a sixth of the way along.  The zoomed
+        chart is first drawn squeezed into exactly that slot, so the reader
+        sees the bar they chose grow into the chart.  Zooming back out runs
+        the same mapping the other way.  A redraw that is not a zoom does not
+        move, even when the field under it widened: a poll bringing a new
+        worst opener redraws the chart over a new range in place.
+        """
+        self._open_long_leaderboard(300, query="&poll=600000")
+        one_animation = (
+            "() => document.querySelector('.erd-histogram-bars')"
+            ".getAnimations().length === 1")
+        starting_frame = """() => {
+          const bars = document.querySelector('.erd-histogram-bars');
+          const first = bars.getAnimations()[0].effect.getKeyframes()[0].transform;
+          const [offset, scale] = first.match(/-?[\\d.]+(?:e-?\\d+)?/g).map(Number);
+          bars.getAnimations().forEach(animation => animation.finish());
+          return {offset: offset / bars.clientWidth, scale};
+        }"""
+        self.page.locator("button.erd-histogram-bar").nth(10).click()
+        self.assertIn("erd_numerator_range=400-404", self.page.url)
+        self.page.wait_for_function(one_animation)
+        zoomed_in = self.page.evaluate(starting_frame)
+        self.assertAlmostEqual(zoomed_in["offset"], 50 / 300, places=3)
+        self.assertAlmostEqual(zoomed_in["scale"], 5 / 300, places=4)
+
+        self.page.locator(".erd-zoom-trail button", has_text="All openers").click()
+        self.page.wait_for_function(one_animation)
+        zoomed_out = self.page.evaluate(starting_frame)
+        self.assertAlmostEqual(zoomed_out["offset"], -50 / 5, places=3)
+        self.assertAlmostEqual(zoomed_out["scale"], 300 / 5, places=3)
+
+        self.page.evaluate("""async () => {
+          const report = await (await fetch('/api/view/leaderboard')).json();
+          report.data.columns.erd_numerator[299] += 1;
+          window.applyReport(report, null, window.__reportClient.getState());
+          for (let frame = 0; frame < 2; frame++) await new Promise(requestAnimationFrame);
+        }""")
+        self.assertEqual(self.page.evaluate(
+            "() => document.querySelector('.erd-histogram-bars').getAnimations().length"), 0)
+        self.assertIn("6.5000", self.page.locator(".erd-histogram-axis").inner_text())
 
     def test_a_zoomed_leaderboard_url_opens_on_its_range(self):
         """The range is in the page URL, so a zoomed view can be shared."""
@@ -2371,13 +2423,16 @@ class ReportClientContract:
     def test_the_leaderboard_lookup_asks_for_five_letters_without_a_request(self):
         # A box that forwards anything typed would spend a request to be told
         # the obvious, so the shape of an opener is checked before asking.
+        # The ranked cards fetch their breakdowns from the same endpoint, so
+        # only the lookup's own requests are counted.
         self.page.locator("[data-kind=leaderboard]").click()
         self.page.wait_for_selector(".grid.leaderboard > .leaderboard-card")
         self.page.evaluate("""() => {
           const realFetch = window.fetch.bind(window);
           window.__detailFetches = 0;
           window.fetch = (url, options) => {
-            if (String(url).includes('branch_target=')) window.__detailFetches += 1;
+            if (String(url).includes('branch_target=')
+                && new Error().stack.includes('lookUpOpener')) window.__detailFetches += 1;
             return realFetch(url, options);
           };
         }""")
