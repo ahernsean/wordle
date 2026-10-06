@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>ERD swarm reports</title>
   <style>
-    :root { color-scheme: light; --bg:#ffffff; --panel:#f8f9fa; --text:#1a1a1b; --dim:#787c7e; --green:#6aaa64; --green-complete:#9fc09f; --blue:#5f89c2; --completed-bg:#eaf2fc; --yellow:#c9b458; --gray:#787c7e; --border:#d3d6da; --sweep-empty:#d3d6da; --red:#d14b4b; --amber:#b59f3b; --hover-tint:#edf5ec; --popover-shadow:0 5px 16px rgba(0,0,0,.14); --header-bg:rgba(255,255,255,.97); --status-amber-bg:#fff9e8; --status-amber-text:#6f5a13; --status-red-bg:#fff1f1; --card-historical-bg:#f3f4f6; --tile-blank-outline:#878a8c; --chip-exact-text:#3e7c3a; --chip-cut-text:#7d6812; --chip-loss-text:#a32c2c; --flash-improved-bg:#e8f4e7; --flash-changed-bg:#fff0f0; }
+    :root { color-scheme: light; --bg:#ffffff; --panel:#f8f9fa; --text:#1a1a1b; --dim:#787c7e; --green:#6aaa64; --green-complete:#9fc09f; --blue:#5f89c2; --completed-bg:#eaf2fc; --yellow:#c9b458; --gray:#787c7e; --border:#d3d6da; --sweep-empty:#d3d6da; --red:#d14b4b; --amber:#b59f3b; --hover-tint:#edf5ec; --popover-shadow:0 5px 16px rgba(0,0,0,.14); --header-bg:rgba(255,255,255,.97); --status-amber-bg:#fff9e8; --status-amber-text:#6f5a13; --status-red-bg:#fff1f1; --card-historical-bg:#f3f4f6; --tile-blank-outline:#878a8c; --chip-exact-text:#3e7c3a; --chip-cut-text:#7d6812; --chip-loss-text:#a32c2c; --flash-improved-bg:#e8f4e7; --flash-changed-bg:#fff0f0; --lookup-bg:#eef3f8; }
     /* The OS/browser's own color-scheme preference drives the palette live --
        no toggle, no stored setting.  Every color elsewhere in this file reads
        one of these custom properties rather than a literal, so flipping the
@@ -20,7 +20,7 @@
         --header-bg:rgba(18,18,19,.97); --status-amber-bg:#3a3016; --status-amber-text:#e8cf7a;
         --status-red-bg:#3a1e1e; --card-historical-bg:#232326; --tile-blank-outline:#565758;
         --chip-exact-text:#7fc47a; --chip-cut-text:#d9c069; --chip-loss-text:#e07a7a;
-        --flash-improved-bg:#22371f; --flash-changed-bg:#3a1e1e;
+        --flash-improved-bg:#22371f; --flash-changed-bg:#3a1e1e; --lookup-bg:#17202b;
       }
     }
     * { box-sizing:border-box; }
@@ -244,7 +244,16 @@
     .leaderboard-card { padding:.65rem .75rem; overflow-x:hidden; }
     .leaderboard-card .card-title { font-size:1.05rem; gap:.55rem; }
     .leaderboard-rank { color:var(--dim); }
-    .opener-lookup { margin:.5rem 0 .9rem; padding:.6rem .75rem; border:1px solid var(--border); border-radius:6px; }
+    /* The lookup and its answer sit on a tint of their own, so a card in it
+       reads as part of the answer, not of the ranking, wherever it is cut by
+       the screen's edge. */
+    .opener-lookup { margin:.5rem 0 .9rem; padding:.6rem .75rem; border:1px solid var(--border); border-radius:6px; background:var(--lookup-bg); }
+    /* Each list's heading stays in view while its cards scroll under it, held
+       below the page header where that header is itself sticky. */
+    .leaderboard-list-heading { position:sticky; top:var(--sticky-top,0px); z-index:3; margin:.6rem 0 .4rem; padding:.35rem 0; font-size:.95rem; background:var(--bg); border-bottom:1px solid var(--border); }
+    .opener-lookup .leaderboard-list-heading { margin-top:.2rem; background:var(--lookup-bg); }
+    .leaderboard-neighbour { display:flex; align-items:center; gap:.55rem; width:100%; text-align:left; background:var(--panel); padding:.35rem .75rem; }
+    .leaderboard-card .card-title.clickable { cursor:pointer; }
     .opener-lookup-form { display:flex; flex-wrap:wrap; align-items:center; gap:.4rem .5rem; }
     .opener-lookup-form input { width:7rem; text-transform:uppercase; letter-spacing:.12em; font-family:inherit; }
     .opener-lookup-answer { margin-top:.6rem; }
@@ -489,6 +498,9 @@
     // lands between typing and submitting does not empty the box;
     // `openerStanding` is the answer on screen, and the word it answers about
     // is its own `word`.
+    // `expandedNeighbours` holds the neighbours a reader tapped open; it is
+    // emptied by each new lookup, since those are neighbours of another word.
+    const expandedNeighbours=new Set();
     let openerLookupText="", openerStanding=null, openerStandingError=null,
       openerStandingPending=null, openerStandingStale=false;
     // The panel is rebuilt by every redraw, so its own redraw has to be
@@ -2428,7 +2440,7 @@
       // The lookup sits under the histogram so the bar it marks is in view
       // above the answer, rather than below a neighbourhood of cards.
       fragment.append(renderOpenerLookup(state,maximumResponseGroupCount));
-      fragment.append(element("p","dim leaderboard-caption",
+      fragment.append(element("h3","leaderboard-caption leaderboard-list-heading",
         listsAll
           ?(requested?"Ranked by ERD · "+numText(inRange.length)+(inRange.length===1?" opener":" openers")+rangeText
             :"Ranked by ERD · showing "+numText(rows.length)+" of "+numText(data.total_rows??rows.length)+" complete")
@@ -2642,6 +2654,25 @@
       if(breakdown)card.append(renderLeaderboardBreakdown(row,state,maximumResponseGroupCount));
       return card;
     }
+    // A neighbour folded to one line: rank, word and ERD, the whole line one
+    // button so a tap anywhere on it opens the full card in its place.
+    // A sticky heading has to clear the page header where that header is
+    // sticky too, and the header's height depends on how its controls wrap;
+    // on touch screens it scrolls away, so headings stick to the very top.
+    function measureStickyTop(){
+      const header=document.querySelector("header"),
+        top=header&&getComputedStyle(header).position==="sticky"?header.getBoundingClientRect().height:0;
+      document.documentElement.style.setProperty("--sticky-top",top+"px");
+    }
+    function leaderboardNeighbourRow(row,redraw){
+      const button=element("button","leaderboard-neighbour");button.type="button";button.dataset.identity=row.word;
+      const entry=element("span","word-erd");
+      entry.append(wordTiles(row.word,null,row.word_is_answer),"/",element("span","erd-value",row.erdText));
+      button.append(element("span","leaderboard-rank","#"+numText(row.rank)),entry);
+      button.setAttribute("aria-label","#"+numText(row.rank)+" "+String(row.word).toUpperCase()+", show its response groups");
+      button.addEventListener("click",()=>{expandedNeighbours.add(row.word);redraw();});
+      return button;
+    }
     // At the full candidate vocabulary the ranking is the wrong front door for
     // the question a reader actually has, which is where one word stands --
     // not what fifteen thousand of them look like.  The lookup answers that in
@@ -2701,14 +2732,28 @@
             +numText(standing.ranked_total)),
           element("span","dim","ranked openers · better than "
             +fixed(standing.percentile,1)+"%"));
+        // The neighbourhood is a few rows read for their places, so only the
+        // looked-up opener is drawn in full; a neighbour is one line until it
+        // is tapped, anywhere on it, and folds back when its title is.  Its
+        // own heading stays in view while the reader scrolls through it, so
+        // these cards can never be mistaken for the ranking below.
         const grid=element("div","grid leaderboard"),
-          neighbours=leaderboardRows({columns:standing.neighbourhood});
+          neighbours=leaderboardRows({columns:standing.neighbourhood}),
+          heading=element("h3","leaderboard-list-heading",
+            "Around "+word+" · #"+numText(neighbours[0]?.rank)+"–#"+numText(neighbours.at(-1)?.rank));
         neighbours.forEach((row,index)=>{
+          if(index===standing.position){
+            const card=leaderboardCard(row,state,{maximumResponseGroupCount});
+            card.classList.add("looked-up");grid.append(card);return;
+          }
+          if(!expandedNeighbours.has(row.word)){grid.append(leaderboardNeighbourRow(row,draw));return;}
           const card=leaderboardCard(row,state,{maximumResponseGroupCount});
-          if(index===standing.position)card.classList.add("looked-up");
+          const title=card.querySelector(".card-title");
+          title.classList.add("clickable");title.title="Fold back to one line";
+          title.addEventListener("click",()=>{expandedNeighbours.delete(row.word);draw();});
           grid.append(card);
         });
-        answer.replaceChildren(position,grid);
+        answer.replaceChildren(heading,position,grid);
       };
       input.addEventListener("input",()=>{openerLookupText=input.value;});
       form.addEventListener("submit",event=>{
@@ -2732,7 +2777,9 @@
         openerStanding=null;openerStandingPending=null;
         openerStandingError="An opener is five letters";draw();return;
       }
-      openerStandingPending=word;openerStandingError=null;draw();
+      openerStandingPending=word;openerStandingError=null;
+      if(openerStanding?.word!==word)expandedNeighbours.clear();
+      draw();
       try{
         const response=await fetch(leaderboardDetailURL(state,word),
           {headers:{Accept:"application/json"}});
@@ -3302,7 +3349,8 @@
       document.querySelectorAll("[data-kind]").forEach(button=>button.addEventListener("click",()=>{const overview=button.dataset.overview;setState({...readControls(),kind:button.dataset.kind,branch_target:overview?"":currentState.branch_target,tree:false,branch_status:overview?[...overviewBranchStatusNames]:currentState.branch_status,branch_worker_status:overview?[...overviewBranchWorkerStatusNames]:currentState.branch_worker_status,minimum_answer_count:overview?null:currentState.minimum_answer_count,maximum_answer_count:overview?null:currentState.maximum_answer_count,budget:overview?null:currentState.budget,priority:overview?null:currentState.priority,sort:overview?"":currentState.sort,limit:overview?null:currentState.limit,answers:false,claims:false,finalization_cursor:""});}));
       installSpineCopy();
       matchMedia("(prefers-color-scheme: dark)").addEventListener("change",refreshWorkerMarkerColors);
-      addEventListener("resize",()=>{const root=byId("report");layoutSpines(root);layoutSweepMarkerDigits(root);for(const strip of root.querySelectorAll(".answer-strip"))measureAnswerStrip(strip);if(openGroupMenuNode)positionGroupMenu(openGroupMenuNode.node,openGroupMenuNode.opener);if(currentState?.kind==="leaderboard"&&lastReport&&root.clientWidth!==leaderboardReportWidth&&!reportHasFocusedControl()&&!reportHasActiveSelection())applyReport(lastReport,lastReport,currentState);});
+      measureStickyTop();
+      addEventListener("resize",()=>{measureStickyTop();const root=byId("report");layoutSpines(root);layoutSweepMarkerDigits(root);for(const strip of root.querySelectorAll(".answer-strip"))measureAnswerStrip(strip);if(openGroupMenuNode)positionGroupMenu(openGroupMenuNode.node,openGroupMenuNode.opener);if(currentState?.kind==="leaderboard"&&lastReport&&root.clientWidth!==leaderboardReportWidth&&!reportHasFocusedControl()&&!reportHasActiveSelection())applyReport(lastReport,lastReport,currentState);});
       addEventListener("popstate",()=>{abortActiveRequest();currentState=parsePageState(location);syncControls();redrawLeaderboardZoom();fetchReport();schedulePoll();});document.addEventListener("visibilitychange",()=>{if(!document.hidden){if(!skipAutomaticScan())fetchReport();schedulePoll();}});fetchReport();schedulePoll();
     }
     window.parsePageState=parsePageState;window.buildAPIURL=buildAPIURL;window.rootProgressURL=rootProgressURL;window.attachProgressiveStage=attachProgressiveStage;window.renderRootProgressHeadline=renderRootProgressHeadline;window.applyReport=applyReport;window.spineTextFromSelection=spineTextFromSelection;window.__skipAutomaticScanProbe=()=>skipAutomaticScan();window.__reportClient={setState:state=>setState(state),getState:()=>({...currentState}),fetchReport};

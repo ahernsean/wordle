@@ -2452,16 +2452,29 @@ class ReportClientContract:
         text = answer.inner_text()
         self.assertIn("Rank 1 of 2", text)
         self.assertIn("better than 50.0%", text)
-        cards = answer.locator(".grid.leaderboard > .leaderboard-card")
-        self.assertEqual(cards.count(), 2)
-        self.assertEqual(cards.nth(0).locator(".leaderboard-rank").inner_text(),
-                         "#1")
-        self.assertEqual(cards.nth(1).locator(".leaderboard-rank").inner_text(),
-                         "#2")
-        self.assertIn("looked-up", cards.nth(0).get_attribute("class").split())
-        self.assertNotIn("looked-up", cards.nth(1).get_attribute("class").split())
-        # A neighbour is drawn like any ranked card, response groups and all.
-        cards.nth(0).locator(".answer-segment").first.wait_for()
+        # The answer has a heading of its own, so its cards cannot be read
+        # as the ranking's.
+        self.assertEqual(answer.locator(".leaderboard-list-heading").inner_text(),
+                         "Around SALET · #1–#2")
+        # The looked-up opener is drawn in full; its neighbour is one line.
+        entries = answer.locator(".grid.leaderboard > *")
+        self.assertEqual(entries.count(), 2)
+        salet, crane = entries.nth(0), entries.nth(1)
+        self.assertEqual(salet.locator(".leaderboard-rank").inner_text(), "#1")
+        self.assertEqual(crane.locator(".leaderboard-rank").inner_text(), "#2")
+        self.assertIn("looked-up", salet.get_attribute("class").split())
+        salet.locator(".answer-segment").first.wait_for()
+        self.assertIn("leaderboard-neighbour", crane.get_attribute("class").split())
+        self.assertEqual(crane.locator(".answer-segment").count(), 0)
+        # A tap anywhere on the line opens it -- here its empty right end.
+        box = crane.bounding_box()
+        self.page.mouse.click(box["x"] + box["width"] - 10, box["y"] + box["height"] / 2)
+        crane = answer.locator(".leaderboard-card[data-identity=crane]")
+        crane.locator(".answer-segment").first.wait_for()
+        self.assertNotIn("looked-up", crane.get_attribute("class").split())
+        # Its title folds it back.
+        crane.locator(".card-title").click()
+        answer.locator(".leaderboard-neighbour[data-identity=crane]").wait_for()
         self.assertEqual(
             " ".join(self.page.locator(".opener-lookup-form").inner_text().split()),
             "Look up Search Clear")
@@ -2469,6 +2482,46 @@ class ReportClientContract:
         # answer to a question about one row of it.
         self.assertEqual(
             self.page.locator(".grid.leaderboard").count(), 2)
+
+    def test_a_new_lookup_folds_the_neighbours_back(self):
+        """Neighbours opened belong to the word they were neighbours of."""
+        self._look_up_opener("salet")
+        answer = self.page.locator(".opener-lookup-answer")
+        answer.locator(".leaderboard-neighbour[data-identity=crane]").click()
+        answer.locator(".leaderboard-card[data-identity=crane]").wait_for()
+        box = self.page.locator(".opener-lookup-form input")
+        box.fill("crane")
+        box.press("Enter")
+        answer.locator(".leaderboard-neighbour[data-identity=crane]").wait_for()
+        self.assertEqual(answer.locator(".leaderboard-card").count(), 1)
+
+    def test_each_leaderboard_list_keeps_its_heading_in_view(self):
+        """A heading stays put while its cards scroll under it.
+
+        On a wide screen the page header is itself sticky, so a heading sticks
+        just below it; the lookup sits on a tint of its own, so a card cut by
+        the screen's edge still shows which list it belongs to.
+        """
+        self._open_long_leaderboard(300, query="&poll=600000")
+        box = self.page.locator(".opener-lookup-form input")
+        box.fill("salet")
+        box.press("Enter")
+        self.page.locator(".opener-lookup-answer .leaderboard-list-heading").wait_for()
+        colors = self.page.evaluate("""() => [
+          getComputedStyle(document.querySelector('.opener-lookup')).backgroundColor,
+          getComputedStyle(document.body).backgroundColor]""")
+        self.assertNotIn(colors[0], ("rgba(0, 0, 0, 0)", "transparent"))
+        self.assertNotEqual(colors[0], colors[1])
+        placed = self.page.evaluate("""async () => {
+          const heading = document.querySelector('.leaderboard-caption');
+          scrollTo(0, heading.getBoundingClientRect().top + scrollY + 900);
+          await new Promise(requestAnimationFrame);
+          return {top: heading.getBoundingClientRect().top,
+                  header: document.querySelector('header').getBoundingClientRect().height,
+                  headerPosition: getComputedStyle(document.querySelector('header')).position};
+        }""")
+        self.assertEqual(placed["headerPosition"], "sticky")
+        self.assertAlmostEqual(placed["top"], placed["header"], delta=1)
 
     def test_a_lookup_window_is_numbered_from_where_it_was_cut(self):
         """A window out of the middle of the ranking carries its real ranks.
@@ -2513,11 +2566,13 @@ class ReportClientContract:
         answer = self.page.locator(".opener-lookup-answer")
         self.assertIn("Rank 42 of 958", answer.inner_text())
         self.assertIn("better than 95.6%", answer.inner_text())
-        cards = answer.locator(".grid.leaderboard > .leaderboard-card")
+        entries = answer.locator(".grid.leaderboard > *")
         self.assertEqual(
-            [cards.nth(index).locator(".leaderboard-rank").inner_text()
-             for index in range(cards.count())],
+            [entries.nth(index).locator(".leaderboard-rank").inner_text()
+             for index in range(entries.count())],
             ["#40", "#41", "#42", "#43", "#44"])
+        self.assertEqual(answer.locator(".leaderboard-list-heading").inner_text(),
+                         "Around TARSE · #40–#44")
         marked = answer.locator(".leaderboard-card.looked-up")
         self.assertEqual(marked.count(), 1)
         self.assertEqual(marked.locator(".leaderboard-rank").inner_text(), "#42")
