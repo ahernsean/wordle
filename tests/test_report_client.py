@@ -2101,13 +2101,19 @@ class ReportClientContract:
     def test_a_looked_up_opener_is_marked_on_its_histogram_bar(self):
         """The rank also reads as a place in the field.
 
-        The fixture's lookup answers SALET at 356/100, which falls in the
-        355-359 bar of 300 openers on 350..649.  The histogram sits above the
+        The fixture's lookup answers SALET at 356/100.  Twenty openers sit
+        one to a numerator on 350..369 and 280 more ten to a numerator on
+        500..527, so bars are five numerators wide and SALET's, 355..359,
+        holds five against the tallest's fifty: a short bar, so an arrow
+        standing on its fill is far below one at the top of the chart.  The histogram sits above the
         lookup, so the bar it marks is in view above the answer.  The poll is
         parked: it redraws the lookup, which would re-mark whatever histogram
         is on screen and hide a histogram that failed to mark itself.
         """
-        self._open_long_leaderboard(300, query="&poll=600000")
+        numerators = ([350 + index for index in range(20)]
+                      + [500 + index // 10 for index in range(280)])
+        self._open_long_leaderboard(300, numerators=numerators,
+                                    query="&poll=600000")
         box = self.page.locator(".opener-lookup-form input")
         box.fill("salet")
         box.press("Enter")
@@ -2115,7 +2121,23 @@ class ReportClientContract:
         marked.wait_for()
         self.assertEqual(self.page.locator(".erd-histogram-bar.looked-up").count(), 1)
         self.assertEqual(marked.get_attribute("data-erd-numerator-range"), "355-359")
-        self.assertEqual(marked.locator(".erd-histogram-marker").inner_text(), "SALET ▾")
+        self.assertEqual(marked.locator(".erd-histogram-marker-word").inner_text(), "SALET")
+        # The arrow points at the bar: centred over it, standing on its fill.
+        # The word sits above the chart, where no bar can be drawn over it.
+        placed = marked.evaluate("""bar => {
+          const arrow = bar.querySelector('.erd-histogram-marker-arrow').getBoundingClientRect();
+          const word = bar.querySelector('.erd-histogram-marker-word').getBoundingClientRect();
+          const fill = bar.querySelector('.erd-histogram-fill').getBoundingClientRect();
+          const column = bar.getBoundingClientRect();
+          return {centre: arrow.left + arrow.width / 2, left: column.left,
+                  right: column.right, arrowBottom: arrow.bottom, fillTop: fill.top,
+                  wordBottom: word.bottom, chartTop: column.top};
+        }""")
+        self.assertLessEqual(placed["wordBottom"], placed["chartTop"])
+        self.assertGreaterEqual(placed["centre"], placed["left"])
+        self.assertLessEqual(placed["centre"], placed["right"])
+        self.assertLessEqual(placed["arrowBottom"], placed["fillTop"])
+        self.assertGreater(placed["arrowBottom"], placed["fillTop"] - 6)
         self.assertLess(
             self.page.locator(".erd-histogram").bounding_box()["y"],
             self.page.locator(".opener-lookup").bounding_box()["y"])
@@ -2127,7 +2149,7 @@ class ReportClientContract:
             "?.dataset.erdNumeratorRange === '356-356'")
         self.page.locator(".erd-zoom-trail button", has_text="All openers").click()
         self.page.locator("button.erd-histogram-bar").last.click()
-        self.assertIn("erd_numerator_range=645-649", self.page.url)
+        self.assertIn("erd_numerator_range=525-527", self.page.url)
         self.assertEqual(self.page.locator(".erd-histogram-bar.looked-up").count(), 0)
         # Clearing the lookup clears the mark.
         self.page.locator(".erd-zoom-trail button", has_text="All openers").click()

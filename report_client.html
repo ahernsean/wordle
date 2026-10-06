@@ -273,10 +273,16 @@
        the one it was chosen from. */
     .erd-histogram-bar[aria-current=true] { background:var(--hover-tint); }
     .erd-histogram-bar[aria-current=true] .erd-histogram-fill { box-shadow:0 0 0 2px var(--green); }
-    .erd-histogram-marker { position:absolute; bottom:100%; margin-bottom:.15rem; font-size:.75rem; font-weight:700; white-space:nowrap; color:var(--text); pointer-events:none; }
-    .erd-histogram-bar[data-side=start] .erd-histogram-marker { left:0; }
-    .erd-histogram-bar[data-side=middle] .erd-histogram-marker { left:50%; transform:translateX(-50%); }
-    .erd-histogram-bar[data-side=end] .erd-histogram-marker { right:0; }
+    /* The marker is a zero-width column down the bar's centre line, from the
+       top of the chart to the top of the bar's fill (its bottom is set to the
+       fill's height).  The arrow stands on the fill; the word sits in the
+       clear strip above the chart, beside the line on whichever side keeps it
+       on the page, so no bar is ever drawn over it; a leader joins the two. */
+    .erd-histogram-marker { position:absolute; top:0; left:50%; width:0; font-size:.75rem; font-weight:700; white-space:nowrap; color:var(--text); pointer-events:none; }
+    .erd-histogram-marker-leader { position:absolute; top:0; bottom:.7em; left:0; border-left:1px dotted var(--text); opacity:.6; }
+    .erd-histogram-marker-arrow { position:absolute; bottom:0; left:0; transform:translateX(-50%); line-height:.75; }
+    .erd-histogram-marker-word { position:absolute; bottom:100%; left:.3em; margin-bottom:.1rem; line-height:1; }
+    .erd-histogram-bar[data-side=end] .erd-histogram-marker-word { left:auto; right:.3em; }
     .erd-histogram-axis { display:flex; justify-content:space-between; gap:.5rem; margin-top:.2rem; font-size:.8rem; text-align:center; }
     /* A flow root keeps its children's margins inside it, so the height
        measured off one drawn breakdown is the height a placeholder must hold. */
@@ -2506,13 +2512,14 @@
         // A bar with any opener in it stays visible however tall its tallest
         // neighbour: an empty bin and a bin of one are different answers.
         fill.style.height=count?"max(2px,"+(100*count/tallest)+"%)":"0";
+        bar.dataset.fillPercent=String(count?100*count/tallest:0);
         fill.style.backgroundColor=erdFieldColor(bin,field);
         bar.append(fill);bar.title=label;
         bar.dataset.erdNumeratorRange=erdNumeratorRangeText(bin);
         if(current&&bin.from===current.from&&bin.to===current.to)bar.setAttribute("aria-current","true");
-        // Which third of the chart the bar sits in decides which way its
-        // marker label runs, so a label on an outer bar stays on the page.
-        bar.dataset.side=bins.length<3?"middle":["start","middle","end"][Math.floor(3*bins.indexOf(bin)/bins.length)];
+        // A marker's word runs right of its arrow, except in the last third
+        // of the chart, where running right would leave the page.
+        bar.dataset.side=3*bins.indexOf(bin)>=2*bins.length?"end":"start";
         if(count){bar.type="button";bar.setAttribute("aria-label",label);bar.addEventListener("click",()=>zoomLeaderboard({from:bin.from,to:bin.to}));}
         bars.append(bar);
       }
@@ -2597,7 +2604,11 @@
         const range=parseERDNumeratorRange(bar.dataset.erdNumeratorRange);
         if(!range||numerator<range.from||numerator>range.to)continue;
         bar.classList.add("looked-up");
-        bar.append(element("span","erd-histogram-marker",String(openerStanding.word||"").toUpperCase()+" ▾"));
+        const marker=element("span","erd-histogram-marker");
+        marker.style.bottom=bar.dataset.fillPercent+"%";
+        marker.append(element("span","erd-histogram-marker-leader"),element("span","erd-histogram-marker-arrow","▾"),
+          element("span","erd-histogram-marker-word",String(openerStanding.word||"").toUpperCase()));
+        bar.append(marker);
         return;
       }
     }
