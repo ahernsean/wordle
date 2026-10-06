@@ -2006,14 +2006,15 @@ class ReportClientContract:
                 self.assertTrue(self.answer_notch(words.nth(word_index)))
 
     def _open_long_leaderboard(self, row_count, per_numerator=1, query="",
-                               unavailable_word=""):
+                               unavailable_word="", numerators=None):
         """Load the leaderboard with a ranking long enough to need a histogram.
 
         Every ranking request is answered with `row_count` openers over the
         fixture's denominator of 100, and the page counts its ranking and
         breakdown requests in `__rankingFetches` and `__detailFetches`.
         `unavailable_word`'s breakdown answers that it has no complete tree,
-        which draws far shorter than a placeholder.
+        which draws far shorter than a placeholder.  `numerators`, sorted,
+        replaces the evenly spread ERDs when a test needs an uneven field.
         Installed before the page loads, because the first cards fetch their
         breakdowns as soon as they draw.
         """
@@ -2037,6 +2038,8 @@ class ReportClientContract:
             window.__rankingFetches += 1;
             return realFetch(url, options).then(response => response.json()).then(report => {
               report.data.columns = leaderboardColumns(%d, 100, %d);
+              const numerators = %s;
+              if (numerators) report.data.columns.erd_numerator = numerators;
               report.data.total_rows = %d;
               return new Response(JSON.stringify(report), {
                 status: 200, headers: {'Content-Type': 'application/json'},
@@ -2044,7 +2047,7 @@ class ReportClientContract:
             });
           };
         })();""" % (unavailable_word.upper() or "-", row_count, per_numerator,
-                    row_count))
+                    json.dumps(numerators), row_count))
         self.page.goto(self.base_url + "?kind=leaderboard" + query)
         self.page.wait_for_selector(".leaderboard-caption")
 
@@ -2260,34 +2263,63 @@ class ReportClientContract:
         Of 300 openers on 350..649, the eleventh bar holds 400..404: one
         sixtieth of the field's width, a sixth of the way along.  The zoomed
         chart is first drawn squeezed into exactly that slot, so the reader
-        sees the bar they chose grow into the chart.  Zooming back out runs
+        sees the bar they chose grow into the chart, while the old chart is
+        carried by the inverse mapping until its bar fills the width.
+        Zooming back out runs
         the same mapping the other way.  A redraw that is not a zoom does not
         move, even when the field under it widened: a poll bringing a new
         worst opener redraws the chart over a new range in place.
         """
         self._open_long_leaderboard(300, query="&poll=600000")
-        one_animation = (
-            "() => document.querySelector('.erd-histogram-bars')"
-            ".getAnimations().length === 1")
-        starting_frame = """() => {
+        # Where the new chart starts and where the old one ends, as fractions
+        # of the chart's width: the two are one mapping and its inverse.
+        frames = """() => {
           const bars = document.querySelector('.erd-histogram-bars');
-          const first = bars.getAnimations()[0].effect.getKeyframes()[0].transform;
-          const [offset, scale] = first.match(/-?[\\d.]+(?:e-?\\d+)?/g).map(Number);
-          bars.getAnimations().forEach(animation => animation.finish());
-          return {offset: offset / bars.clientWidth, scale};
+          const picture = document.querySelector('.erd-histogram-departing');
+          const read = transform => {
+            const [offset, scale, rise] = transform.match(/-?[\\d.]+(?:e-?\\d+)?/g).map(Number);
+            return {offset: offset / bars.clientWidth, scale, rise};
+          };
+          const keyframes = node => node.getAnimations()[0].effect.getKeyframes();
+          const result = {
+            arriving: read(keyframes(bars)[0].transform),
+            departing: read(keyframes(picture).at(-1).transform),
+            departingBars: picture.querySelectorAll('.erd-histogram-departing-bar').length,
+          };
+          for (const node of [bars, picture])
+            node.getAnimations().forEach(animation => animation.finish());
+          return result;
         }"""
+        both_moving = (
+            "() => document.querySelector('.erd-histogram-bars').getAnimations().length === 1"
+            " && document.querySelector('.erd-histogram-departing')?.getAnimations().length === 1")
         self.page.locator("button.erd-histogram-bar").nth(10).click()
         self.assertIn("erd_numerator_range=400-404", self.page.url)
-        self.page.wait_for_function(one_animation)
-        zoomed_in = self.page.evaluate(starting_frame)
-        self.assertAlmostEqual(zoomed_in["offset"], 50 / 300, places=3)
-        self.assertAlmostEqual(zoomed_in["scale"], 5 / 300, places=4)
+        # The old chart stays, as a picture with nothing in it to click or
+        # count, so the bars a test or a reader finds are the new chart's.
+        self.assertEqual(self.page.locator(".erd-histogram-bar").count(), 5)
+        self.page.wait_for_function(both_moving)
+        zoomed_in = self.page.evaluate(frames)
+        self.assertEqual(zoomed_in["departingBars"], 60)
+        self.assertAlmostEqual(zoomed_in["arriving"]["offset"], 50 / 300, places=3)
+        self.assertAlmostEqual(zoomed_in["arriving"]["scale"], 5 / 300, places=4)
+        self.assertAlmostEqual(zoomed_in["departing"]["offset"], -50 / 5, places=3)
+        self.assertAlmostEqual(zoomed_in["departing"]["scale"], 300 / 5, places=3)
+        # The chosen bar is as tall as the chart, so the chart starts full height.
+        self.assertAlmostEqual(zoomed_in["arriving"]["rise"], 1, places=4)
+        self.page.wait_for_function(
+            "() => !document.querySelector('.erd-histogram-departing')")
 
         self.page.locator(".erd-zoom-trail button", has_text="All openers").click()
-        self.page.wait_for_function(one_animation)
-        zoomed_out = self.page.evaluate(starting_frame)
-        self.assertAlmostEqual(zoomed_out["offset"], -50 / 5, places=3)
-        self.assertAlmostEqual(zoomed_out["scale"], 300 / 5, places=3)
+        self.page.wait_for_function(both_moving)
+        zoomed_out = self.page.evaluate(frames)
+        self.assertEqual(zoomed_out["departingBars"], 5)
+        self.assertAlmostEqual(zoomed_out["arriving"]["offset"], -50 / 5, places=3)
+        self.assertAlmostEqual(zoomed_out["arriving"]["scale"], 300 / 5, places=3)
+        self.assertAlmostEqual(zoomed_out["departing"]["offset"], 50 / 300, places=3)
+        self.assertAlmostEqual(zoomed_out["departing"]["scale"], 5 / 300, places=4)
+        self.page.wait_for_function(
+            "() => !document.querySelector('.erd-histogram-departing')")
 
         self.page.evaluate("""async () => {
           const report = await (await fetch('/api/view/leaderboard')).json();
@@ -2298,6 +2330,55 @@ class ReportClientContract:
         self.assertEqual(self.page.evaluate(
             "() => document.querySelector('.erd-histogram-bars').getAnimations().length"), 0)
         self.assertIn("6.5000", self.page.locator(".erd-histogram-axis").inner_text())
+
+    def test_a_zoomed_chart_starts_at_the_height_of_its_bar(self):
+        """The new chart grows out of the bar it was chosen from.
+
+        200 openers sit forty to a numerator on 350..354 and 100 more one to
+        each third numerator from 355, so the field's bars are ten numerators
+        wide, the first holds 202 -- the tallest -- and the second, 360..369,
+        holds 3.  Zoomed into the second, the new chart's full height starts
+        at that bar's, 3/202 of the chart; zooming back out, the field starts
+        202/3 as tall, so the range left is the height the chart had.  The old
+        chart is carried by the inverse, and both scale from the baseline.
+        """
+        numerators = ([350 + index // 40 for index in range(200)]
+                      + [355 + 3 * index for index in range(100)])
+        self._open_long_leaderboard(300, numerators=numerators,
+                                    query="&poll=600000")
+        second = self.page.locator("button.erd-histogram-bar").nth(1)
+        self.assertEqual(second.get_attribute("data-erd-numerator-range"), "360-369")
+        second.click()
+        self.page.wait_for_function(
+            "() => document.querySelector('.erd-histogram-bars').getAnimations().length === 1"
+            " && document.querySelector('.erd-histogram-departing')?.getAnimations().length === 1")
+        rise_of = """() => {
+          const rise = node => Number(node.getAnimations()[0].effect.getKeyframes()
+            .find(frame => frame.transform && frame.transform !== 'none')
+            .transform.match(/scale\\([^,]+,\\s*([^)]+)\\)/)[1]);
+          return [rise(document.querySelector('.erd-histogram-bars')),
+                  rise(document.querySelector('.erd-histogram-departing')),
+                  getComputedStyle(document.querySelector('.erd-histogram-bars')).transformOrigin,
+                  document.querySelector('.erd-histogram-bars').offsetHeight];
+        }"""
+        both_moving = (
+            "() => document.querySelector('.erd-histogram-bars').getAnimations().length === 1"
+            " && document.querySelector('.erd-histogram-departing')?.getAnimations().length === 1")
+        rises = self.page.evaluate(rise_of)
+        self.assertAlmostEqual(rises[0], 3 / 202, places=4)
+        self.assertAlmostEqual(rises[1], 202 / 3, places=4)
+        # Scaled from the baseline, so a bar grows up from where it stands.
+        self.assertEqual(rises[2], "0px %dpx" % rises[3])
+        self.page.evaluate(
+            "() => document.getAnimations().forEach(animation => animation.finish())")
+        self.page.wait_for_function(
+            "() => !document.querySelector('.erd-histogram-departing')")
+
+        self.page.locator(".erd-zoom-trail button", has_text="All openers").click()
+        self.page.wait_for_function(both_moving)
+        rises = self.page.evaluate(rise_of)
+        self.assertAlmostEqual(rises[0], 202 / 3, places=3)
+        self.assertAlmostEqual(rises[1], 3 / 202, places=4)
 
     def test_a_zoomed_leaderboard_url_opens_on_its_range(self):
         """The range is in the page URL, so a zoomed view can be shared."""

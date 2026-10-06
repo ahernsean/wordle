@@ -260,11 +260,13 @@
        as easy to hit as the tallest. */
     .erd-histogram-bar { flex:1 1 0; display:flex; align-items:flex-end; min-width:0; min-height:0; padding:0; border:0; border-radius:0; background:transparent; }
     button.erd-histogram-bar:hover, button.erd-histogram-bar:focus-visible { background:var(--hover-tint); }
-    .erd-histogram-fill { display:block; width:100%; border-radius:2px 2px 0 0; }
+    .erd-histogram-fill { display:block; width:100%; }
     /* Clipped so a zoom animation scaling the bars past the chart's edges
        never widens the page. */
-    .erd-histogram { padding-top:1.2rem; overflow:hidden; }
-    .erd-histogram-bars { transform-origin:0 0; }
+    .erd-histogram { position:relative; padding-top:1.2rem; overflow:hidden; }
+    .erd-histogram-departing { position:absolute; display:flex; align-items:stretch; gap:1px; transform-origin:0 100%; pointer-events:none; }
+    .erd-histogram-departing-bar { flex:1 1 0; display:flex; align-items:flex-end; min-width:0; }
+    .erd-histogram-bars { transform-origin:0 100%; }
     .erd-histogram-bar { position:relative; }
     .erd-histogram-bar.looked-up .erd-histogram-fill { box-shadow:0 0 0 2px var(--text); }
     /* The bar whose openers are listed below, when the histogram shown is
@@ -2439,14 +2441,15 @@
     // keeps a range within the bar budget.  Bins sit on multiples of their
     // width, so a bin is the same span of ERD whichever range it was cut from,
     // and the outer two are trimmed to the range.
-    function erdBins(rows,range){
-      let width=1;
-      widths:for(let scale=1;;scale*=10)
+    function erdBinWidth(range){
+      for(let scale=1;;scale*=10)
         for(const step of [1,2,5]){
-          width=step*scale;
-          if(Math.floor(range.to/width)-Math.floor(range.from/width)<LEADERBOARD_HISTOGRAM_MAXIMUM_BINS)break widths;
+          const width=step*scale;
+          if(Math.floor(range.to/width)-Math.floor(range.from/width)<LEADERBOARD_HISTOGRAM_MAXIMUM_BINS)return width;
         }
-      const first=Math.floor(range.from/width),last=Math.floor(range.to/width),bins=[];
+    }
+    function erdBins(rows,range){
+      const width=erdBinWidth(range),first=Math.floor(range.from/width),last=Math.floor(range.to/width),bins=[];
       for(let index=first;index<=last;index++)
         bins.push({from:Math.max(range.from,index*width),to:Math.min(range.to,index*width+width-1),rows:[]});
       for(const row of rows)bins[Math.floor(row.erd_numerator/width)-first].rows.push(row);
@@ -2491,7 +2494,7 @@
     // animated from where its values sat in this one -- but only when that
     // next one is a zoom.  A poll, a lookup or a return from another tab
     // redraws without moving.
-    let shownHistogramRange=null,histogramZooming=false;
+    let shownHistogramRange=null,histogramZooming=false,departingHistogram=null;
     function renderERDHistogram(rows,range,field,denominator,current=null){
       const bins=erdBins(rows,range),tallest=Math.max(...bins.map(bin=>bin.rows.length)),
         section=element("section","erd-histogram"),bars=element("div","erd-histogram-bars"),axis=element("div","erd-histogram-axis");
@@ -2515,30 +2518,68 @@
       }
       axis.append(element("span","",fixed(range.from/denominator,4)),element("span","dim","ERD · lower is better · tallest bar "+numText(tallest)+(tallest===1?" opener":" openers")),element("span","",fixed(range.to/denominator,4)));
       section.append(bars,axis);
-      if(histogramZooming)animateHistogramZoom(bars,shownHistogramRange,range);
-      shownHistogramRange={from:range.from,to:range.to};
+      const shown={from:range.from,to:range.to,tallest,count:rows.length};
+      if(histogramZooming)animateHistogramZoom(bars,shownHistogramRange,shown,departingHistogram);
+      shownHistogramRange=shown;
       return section;
     }
     // A zoom moves the camera rather than swapping the picture.  Every ERD
     // value sits at a position proportional to where it falls in a chart's
-    // range, so the new chart is drawn first at the scale and offset that put
-    // its values where they were in the old one, then eased to rest: zooming
-    // in grows the chosen bar to the full width, zooming out shrinks the range
-    // just left back into its bar, and a step sideways slides.  A redraw of
-    // the same range is not a zoom and does not move.
-    const HISTOGRAM_ZOOM_MILLIS=550;
-    function animateHistogramZoom(bars,from,to){
+    // range, so one mapping carries a value from the old chart to the new:
+    // the old chart is moved by it until its values sit where the new chart
+    // draws them, while the new chart starts at its inverse and eases to rest.
+    // Both move as one, so the bar the reader chose visibly becomes the new
+    // chart -- the rest of the old one slides off the edges as it fills, or,
+    // zooming out, the old chart shrinks back into its bar among new ones.
+    //
+    // Heights follow the bar too.  Zooming in, the new chart's full height
+    // starts at the height of the bar it was chosen from and grows to fill
+    // the chart; zooming out, the range left shrinks back to its bar's height
+    // in the chart arriving.  The old chart is carried by the inverse.  Both
+    // scale from their shared baseline.  A redraw of the same range is not a
+    // zoom and does not move.
+    const HISTOGRAM_ZOOM_MILLIS=800;
+    // The old chart, kept as a picture: its bars become plain spans, so
+    // nothing on the page can select, count or click it while it leaves.
+    function histogramPicture(bars){
+      const picture=element("div","erd-histogram-departing");
+      for(const bar of bars.children){
+        const ghost=element("span","erd-histogram-departing-bar"),fill=bar.querySelector(".erd-histogram-fill");
+        if(fill)ghost.append(fill.cloneNode(false));
+        picture.append(ghost);
+      }
+      return picture;
+    }
+    function animateHistogramZoom(bars,from,to,departing){
       if(!from||(from.from===to.from&&from.to===to.to))return;
       if(matchMedia("(prefers-reduced-motion: reduce)").matches||!bars.animate)return;
-      const fromSpan=from.to-from.from+1,toSpan=to.to-to.from+1;
+      const fromSpan=from.to-from.from+1,toSpan=to.to-to.from+1,
+        // The narrower range is the bar; its height in the wider chart is its
+        // count of openers over that chart's tallest.  An empty chart has no
+        // bar to match.
+        zoomingIn=toSpan<fromSpan,
+        rise=!(from.tallest>0&&to.tallest>0&&from.count>0&&to.count>0)?1
+          :zoomingIn?to.count/from.tallest:to.tallest/from.count,
+        timing={duration:HISTOGRAM_ZOOM_MILLIS,easing:"cubic-bezier(.4,0,.2,1)"};
       requestAnimationFrame(()=>{
         if(!bars.isConnected)return;
-        const width=bars.clientWidth,
-          scale=toSpan/fromSpan,offset=(to.from-from.from)/fromSpan*width;
+        const width=bars.clientWidth;
         bars.animate([
-          {transform:"translateX("+offset+"px) scaleX("+scale+")",opacity:.4},
+          {transform:"translateX("+(to.from-from.from)/fromSpan*width+"px) scale("+toSpan/fromSpan+","+rise+")",opacity:0},
+          {offset:.4,opacity:1},
           {transform:"none",opacity:1},
-        ],{duration:HISTOGRAM_ZOOM_MILLIS,easing:"cubic-bezier(.4,0,.2,1)"});
+        ],timing);
+        if(!departing)return;
+        Object.assign(departing.style,{top:bars.offsetTop+"px",left:bars.offsetLeft+"px",width:width+"px",height:bars.offsetHeight+"px"});
+        // Behind the new chart, and fading from the start: carried the other
+        // way the old chart grows far past the new one's height, and drawn on
+        // top it would hide the chart the reader is arriving at.
+        bars.before(departing);
+        departing.animate([
+          {transform:"none",opacity:1},
+          {offset:.6,opacity:0},
+          {transform:"translateX("+(from.from-to.from)/toSpan*width+"px) scale("+fromSpan/toSpan+","+1/rise+")",opacity:0},
+        ],timing).finished.then(()=>departing.remove(),()=>departing.remove());
       });
     }
     // The opener a reader looked up is marked on the bar that holds it, so
@@ -2573,8 +2614,9 @@
     }
     function redrawLeaderboardZoom(){
       if(currentState.kind!=="leaderboard"||lastReport?.report_kind!=="leaderboard"||contextKey(currentState)!==lastContext)return;
-      histogramZooming=true;
-      try{applyReport(lastReport,null,currentState);}finally{histogramZooming=false;}
+      const shown=byId("report").querySelector(".erd-histogram-bars");
+      histogramZooming=true;departingHistogram=shown&&histogramPicture(shown);
+      try{applyReport(lastReport,null,currentState);}finally{histogramZooming=false;departingHistogram=null;}
       displayedState=currentState;renderOwed=false;
     }
     // One card, drawn the same way wherever a ranked opener appears, so a
