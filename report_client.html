@@ -2607,7 +2607,7 @@
         const marker=element("span","erd-histogram-marker");
         marker.style.bottom=bar.dataset.fillPercent+"%";
         marker.append(element("span","erd-histogram-marker-leader"),element("span","erd-histogram-marker-arrow","▾"),
-          element("span","erd-histogram-marker-word",String(openerStanding.word||"").toUpperCase()));
+          element("span","erd-histogram-marker-word",String(openerStanding.word||"").toUpperCase()+" #"+numText(openerStanding.rank)));
         bar.append(marker);
         return;
       }

@@ -2121,7 +2121,7 @@ class ReportClientContract:
         marked.wait_for()
         self.assertEqual(self.page.locator(".erd-histogram-bar.looked-up").count(), 1)
         self.assertEqual(marked.get_attribute("data-erd-numerator-range"), "355-359")
-        self.assertEqual(marked.locator(".erd-histogram-marker-word").inner_text(), "SALET")
+        self.assertEqual(marked.locator(".erd-histogram-marker-word").inner_text(), "SALET #1")
         # The arrow points at the bar: centred over it, standing on its fill.
         # The word sits above the chart, where no bar can be drawn over it.
         placed = marked.evaluate("""bar => {
