@@ -93,7 +93,7 @@
     table.work-distribution thead th { background:var(--panel); box-shadow:inset 0 -1px 0 var(--border); }
     table.work-distribution th:first-child, table.work-distribution td:first-child { text-align:left; }
     /* The ratio is the column the report exists for, so an imbalanced band is
-       coloured rather than left for the reader to find among the numbers. */
+       colored rather than left for the reader to find among the numbers. */
     table.work-distribution td.ratio-heavy { color:var(--red); }
     table.work-distribution td.ratio-light { color:var(--dim); }
     p.work-distribution-legend { margin:.4rem 0 0; color:var(--dim); font-size:.9em; }
@@ -154,7 +154,7 @@
     .metric strong { overflow-wrap:anywhere; }
     .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(min(100%,15rem),1fr)); gap:.4rem; }
     .grid.workers { grid-template-columns:repeat(auto-fill,minmax(min(100%,12.5rem),1fr)); }
-    .grid.leaderboard { grid-template-columns:minmax(0,1fr); gap:.65rem; }
+    .grid.leaderboard { grid-template-columns:minmax(0,1fr); gap:.65rem; overflow-anchor:none; }
     .card, .section { min-width:0; background:var(--panel); border:1px solid var(--border); border-radius:6px; padding:.4rem .55rem; overflow-wrap:anywhere; }
     .section { margin:.45rem 0; }
     /* Two sections that each use little horizontal space, shown side by
@@ -253,6 +253,28 @@
     /* The looked-up opener is a row of its own neighbourhood, so it is marked
        in place rather than repeated above it. */
     .leaderboard-card.looked-up { border-color:var(--green); box-shadow:inset 3px 0 var(--green); }
+    .erd-zoom-trail { display:flex; flex-wrap:wrap; align-items:center; gap:.3rem .45rem; margin:.25rem 0 .6rem; }
+    .erd-histogram { margin:.25rem 0 .75rem; }
+    .erd-histogram-bars { display:flex; align-items:stretch; gap:1px; height:8rem; border-bottom:1px solid var(--border); }
+    /* A bar is the whole column, not just its fill, so a bin of one opener is
+       as easy to hit as the tallest. */
+    .erd-histogram-bar { flex:1 1 0; display:flex; align-items:flex-end; min-width:0; min-height:0; padding:0; border:0; border-radius:0; background:transparent; }
+    button.erd-histogram-bar:hover, button.erd-histogram-bar:focus-visible { background:var(--hover-tint); }
+    .erd-histogram-fill { display:block; width:100%; border-radius:2px 2px 0 0; }
+    .erd-histogram { padding-top:1.2rem; }
+    .erd-histogram-bar { position:relative; }
+    .erd-histogram-bar.looked-up .erd-histogram-fill { box-shadow:0 0 0 2px var(--text); }
+    .erd-histogram-marker { position:absolute; bottom:100%; margin-bottom:.15rem; font-size:.75rem; font-weight:700; white-space:nowrap; color:var(--text); pointer-events:none; }
+    .erd-histogram-bar[data-side=start] .erd-histogram-marker { left:0; }
+    .erd-histogram-bar[data-side=middle] .erd-histogram-marker { left:50%; transform:translateX(-50%); }
+    .erd-histogram-bar[data-side=end] .erd-histogram-marker { right:0; }
+    .erd-histogram-axis { display:flex; justify-content:space-between; gap:.5rem; margin-top:.2rem; font-size:.8rem; text-align:center; }
+    /* A flow root keeps its children's margins inside it, so the height
+       measured off one drawn breakdown is the height a placeholder must hold. */
+    .leaderboard-breakdown { display:flow-root; }
+    /* Room for the breakdown a card is still fetching until one has been
+       drawn to measure, so the cards beneath it do not jump when it lands. */
+    .leaderboard-breakdown:not(.drawn) { min-height:9rem; }
     .response-visual-key { display:flex; flex-wrap:wrap; align-items:center; gap:.35rem .45rem; margin:.35rem 0 .45rem; font-size:.8rem; color:var(--dim); }
     .response-color-gradient { flex:0 1 10rem; min-width:5rem; height:.55rem; border-radius:999px; background:linear-gradient(90deg,hsl(320 70% 42%),hsl(0 62% 43%),hsl(62 62% 43%),hsl(125 62% 43%),hsl(210 62% 43%)); }
     .response-visual-label { margin:.4rem 0 .15rem; color:var(--dim); font-size:.8rem; }
@@ -445,7 +467,7 @@
     const treelessKinds=new Set(["cache","hotspots","work_distribution","leaderboard","openers"]);
     const populationNames={current_queue_branches:"current queue branches",recent_branch_finalizations:"recent branch finalizations",recent_cut_reuse_misses:"recent cut-reuse misses",recent_claim_coordination_buckets:"recent claim coordination buckets",recent_claims_by_branch:"recent claims by branch"};
     const collapsedNodes=new Set(), initializedNodes=new Set(), collapsedWordGroups=new Set(), initializedWordGroups=new Set(), collapsedResponseGroups=new Set(), stickyOrders=new Map(), packedOrders=new Map(), gridColumnCounts=new Map(), treePageHistory=new Map(), treeGroupPages=new Map(),
-      expandedOpeners=new Set(), openerBreakdowns=new Map(),
+      openerBreakdowns=new Map(),
       reportEntityTags=new Map();
     // The lookup's own state, outside the DOM because the report is redrawn on
     // every poll.  `openerLookupText` is what is typed, kept so a redraw that
@@ -545,6 +567,19 @@
     }
     const workerName=worker=>{const number=String(worker.worker_number??String(worker.worker_id).split("-").pop());return /^[0-9]+$/.test(number)?"w"+number:String(worker.worker_id);};
     const bool=value=>value==="1"||value==="true";
+    // An ERD range is a span of numerators over the answer count: every
+    // opener's ERD is on that lattice, so integer bounds name a bin exactly
+    // where decimal ones would round.  Both bounds are inclusive.
+    const parseERDNumeratorRange=text=>{
+      const match=/^(\d+)-(\d+)$/.exec(String(text||""));
+      if(!match)return null;
+      const from=Number(match[1]),to=Number(match[2]);
+      return from<=to?{from,to}:null;
+    };
+    const erdNumeratorRangeText=value=>{
+      const range=typeof value==="object"&&value?value:parseERDNumeratorRange(value);
+      return range?range.from+"-"+range.to:"";
+    };
     const intOrNull=value=>{if(value===null||value===""||value===undefined)return null;const parsed=Number.parseInt(value,10);return Number.isFinite(parsed)?parsed:null;};
     // A completed branch is held to explain why it left, so the hold applies
     // to any overview filter that was showing branches able to finish under
@@ -558,7 +593,7 @@
     const isOverviewState=(kind,branchTarget,tree)=>kind==="auto"&&String(branchTarget||"").trim()===""&&!tree;
 
     function normalizeState(state){
-      const normalized={kind:explicitKinds.has(state.kind)?state.kind:"auto",branch_target:(state.branch_target||"").trim(),tree:!!state.tree,branch_status:branchValues(state.branch_status,branchStatusNames),branch_worker_status:branchValues(state.branch_worker_status,branchWorkerStatusNames),opener_state:branchValues(state.opener_state,sourceStateNames)||[],opener_offset:intOrNull(state.opener_offset),branch_row_offset:intOrNull(state.branch_row_offset),minimum_answer_count:intOrNull(state.minimum_answer_count),maximum_answer_count:intOrNull(state.maximum_answer_count),budget:intOrNull(state.budget),priority:intOrNull(state.priority),sort:state.sort||"",group_by:state.group_by||"",limit:intOrNull(state.limit),by:state.by||"",epoch:intOrNull(state.epoch),since_seconds:intOrNull(state.since_seconds),sample_size:intOrNull(state.sample_size),poll:Math.max(200,intOrNull(state.poll)||DEFAULT_POLL),answers:!!state.answers,claims:!!state.claims,worker_id:state.worker_id||null,finalization_cursor:String(state.finalization_cursor||""),tree_cursor:state.tree_cursor||null};
+      const normalized={kind:explicitKinds.has(state.kind)?state.kind:"auto",branch_target:(state.branch_target||"").trim(),tree:!!state.tree,branch_status:branchValues(state.branch_status,branchStatusNames),branch_worker_status:branchValues(state.branch_worker_status,branchWorkerStatusNames),opener_state:branchValues(state.opener_state,sourceStateNames)||[],opener_offset:intOrNull(state.opener_offset),branch_row_offset:intOrNull(state.branch_row_offset),minimum_answer_count:intOrNull(state.minimum_answer_count),maximum_answer_count:intOrNull(state.maximum_answer_count),budget:intOrNull(state.budget),priority:intOrNull(state.priority),sort:state.sort||"",group_by:state.group_by||"",limit:intOrNull(state.limit),by:state.by||"",epoch:intOrNull(state.epoch),since_seconds:intOrNull(state.since_seconds),sample_size:intOrNull(state.sample_size),poll:Math.max(200,intOrNull(state.poll)||DEFAULT_POLL),answers:!!state.answers,claims:!!state.claims,worker_id:state.worker_id||null,finalization_cursor:String(state.finalization_cursor||""),tree_cursor:state.tree_cursor||null,erd_numerator_range:erdNumeratorRangeText(state.erd_numerator_range)};
       const overviewState=normalized.kind==="auto"&&normalized.branch_target===""&&!normalized.tree;
       if(normalized.branch_status===undefined)normalized.branch_status=overviewState?[...overviewBranchStatusNames]:[];
       if(normalized.branch_worker_status===undefined)normalized.branch_worker_status=overviewState?[...overviewBranchWorkerStatusNames]:[];
@@ -572,6 +607,7 @@
       if(treelessKinds.has(normalized.kind))normalized.tree=false;
       if(normalized.tree&&normalized.limit!==null&&![10,25,50,100].includes(normalized.limit))normalized.limit=10;
       if(normalized.kind==="cache"){normalized.branch_status=[];normalized.branch_worker_status=[];normalized.minimum_answer_count=null;normalized.maximum_answer_count=null;normalized.priority=null;normalized.sort="";}
+      if(normalized.kind!=="leaderboard")normalized.erd_numerator_range="";
       if(normalized.kind==="leaderboard"){normalized.branch_status=[];normalized.branch_worker_status=[];normalized.branch_target="";normalized.claims=false;normalized.answers=false;}
       // The sources report reads only the source word and the row limit; every
       // branch filter is meaningless against a membership row.  A target that
@@ -611,7 +647,7 @@
     function parsePageState(locationObject){
       const query=new URLSearchParams(locationObject.search||"");
       const parseFilter=name=>query.has(name)?(query.get(name)==="all"?[]:query.get(name).split(",")):undefined;
-      return normalizeState({kind:query.get("kind")||"auto",branch_target:query.get("branch_target")||"",tree:bool(query.get("tree")),branch_status:parseFilter("branch_status"),branch_worker_status:parseFilter("branch_worker_status"),opener_state:parseFilter("opener_state"),opener_offset:query.get("opener_offset"),branch_row_offset:query.get("branch_row_offset"),minimum_answer_count:query.get("minimum_answer_count"),maximum_answer_count:query.get("maximum_answer_count"),budget:query.get("budget"),priority:query.get("priority"),sort:query.get("sort"),group_by:query.get("group_by"),limit:query.get("limit"),by:query.get("by"),epoch:query.get("epoch"),since_seconds:query.get("since_seconds"),sample_size:query.get("sample_size"),poll:query.get("poll"),answers:bool(query.get("answers")),claims:bool(query.get("claims")),worker_id:query.get("worker"),finalization_cursor:query.get("finalization_cursor"),tree_cursor:query.get("tree_cursor")});
+      return normalizeState({kind:query.get("kind")||"auto",branch_target:query.get("branch_target")||"",tree:bool(query.get("tree")),branch_status:parseFilter("branch_status"),branch_worker_status:parseFilter("branch_worker_status"),opener_state:parseFilter("opener_state"),opener_offset:query.get("opener_offset"),branch_row_offset:query.get("branch_row_offset"),minimum_answer_count:query.get("minimum_answer_count"),maximum_answer_count:query.get("maximum_answer_count"),budget:query.get("budget"),priority:query.get("priority"),sort:query.get("sort"),group_by:query.get("group_by"),limit:query.get("limit"),by:query.get("by"),epoch:query.get("epoch"),since_seconds:query.get("since_seconds"),sample_size:query.get("sample_size"),poll:query.get("poll"),answers:bool(query.get("answers")),claims:bool(query.get("claims")),worker_id:query.get("worker"),finalization_cursor:query.get("finalization_cursor"),tree_cursor:query.get("tree_cursor"),erd_numerator_range:query.get("erd_numerator_range")});
     }
     function stateQuery(state,includeClient=true){
       const query=new URLSearchParams();
@@ -629,6 +665,9 @@
       if(state.finalization_cursor)query.set("finalization_cursor",state.finalization_cursor);
       if(state.tree_cursor)query.set("tree_cursor",state.tree_cursor);
       if(includeClient&&state.poll!==DEFAULT_POLL)query.set("poll",String(state.poll));
+      // The leaderboard's zoom is drawn from the ranking the client already
+      // holds, so it travels in the page URL and never in the request.
+      if(includeClient&&state.erd_numerator_range)query.set("erd_numerator_range",state.erd_numerator_range);
       return query;
     }
     function buildAPIURL(state){
@@ -1352,7 +1391,7 @@
     //
     // A payer that reached this branch in one guess is named by the pair --
     // the finalize row was written at that node, so the branch is that
-    // opener's response group -- and the response colours the tiles.  A payer
+    // opener's response group -- and the response colors the tiles.  A payer
     // that needed more guesses is drawn as its opener alone, because no
     // single guess of that opener isolates this answer set: QAJAQ reaches
     // {sheet, skeet, sweet} only after two more, and its own first response
@@ -2332,24 +2371,171 @@
       }
       return fragment;
     }
+    // The leaderboard opens on the shape of the field rather than on a list:
+    // fifteen thousand openers on one page is a scroll nobody finishes, and
+    // the question most readers bring is where the good openers lie.  The
+    // histogram is drawn from the ranking the client already holds, so
+    // choosing a bar narrows what is drawn without asking the server
+    // anything.  A range narrow enough to read is listed in full; a wider one
+    // shows its best few beneath its own histogram.
+    const LEADERBOARD_HISTOGRAM_MAXIMUM_BINS=60,LEADERBOARD_LIST_MAXIMUM_ROWS=100,LEADERBOARD_PREVIEW_ROWS=20;
     function renderLeaderboard(report,previous,state){
       const data=report.data,fragment=document.createDocumentFragment(),counts=data.counts||{},metrics=element("div","metrics");
       metrics.append(metric("complete",counts.complete),metric("pending",counts.pending),metric("candidates",data.candidate_count));
       fragment.append(element("h2","","Opener leaderboard"),metrics);
       const rows=leaderboardRows(data);
       const maximumResponseGroupCount=data.maximum_response_group_count||data.response_pattern_count||243;
-      fragment.append(renderOpenerLookup(state));
-      fragment.append(element("p","dim","Ranked by ERD · showing "+numText(rows.length)+" of "+numText(data.total_rows??rows.length)+" complete"));
-      if(!rows.length){fragment.append(element("p","empty","No opener has a complete tree yet"));return fragment;}
+      if(!rows.length){fragment.append(renderOpenerLookup(state,maximumResponseGroupCount),element("p","empty","No opener has a complete tree yet"));return fragment;}
+      // Breakdowns observed under the previous render belong to cards this
+      // one replaces.
+      breakdownObserver?.disconnect();breakdownFetchQueue.length=0;
+      const denominator=data.columns?.erd_denominator||data.answer_count,
+        // The ranking is sorted by ERD, so its ends are the field's range.
+        field=Number.isInteger(rows[0].erd_numerator)?{from:rows[0].erd_numerator,to:rows[rows.length-1].erd_numerator}:null,
+        requested=field&&parseERDNumeratorRange(state.erd_numerator_range),
+        range=requested||field,
+        inRange=requested?rows.filter(row=>row.erd_numerator>=range.from&&row.erd_numerator<=range.to):rows,
+        listsAll=!range||inRange.length<=LEADERBOARD_LIST_MAXIMUM_ROWS||range.from===range.to,
+        // A zoomed range keeps its own histogram however few openers it
+        // holds, so the reader can still see where they are and choose a
+        // neighbouring bar.  Only the field itself, when short enough to list,
+        // goes without one.
+        charted=range&&range.from<range.to&&(requested||!listsAll),
+        listed=listsAll?inRange:inRange.slice(0,LEADERBOARD_PREVIEW_ROWS),
+        rangeText=requested?" with ERD "+erdRangeText(range,denominator):"";
+      if(requested)fragment.append(renderERDZoomTrail(erdZoomTrail(field,requested)??[requested],denominator));
+      if(charted)fragment.append(renderERDHistogram(inRange,range,field,denominator));
+      // The lookup sits under the histogram so the bar it marks is in view
+      // above the answer, rather than below a neighbourhood of cards.
+      fragment.append(renderOpenerLookup(state,maximumResponseGroupCount));
+      fragment.append(element("p","dim leaderboard-caption",
+        listsAll
+          ?(requested?"Ranked by ERD · "+numText(inRange.length)+(inRange.length===1?" opener":" openers")+rangeText
+            :"Ranked by ERD · showing "+numText(rows.length)+" of "+numText(data.total_rows??rows.length)+" complete")
+          :"Ranked by ERD · best "+numText(listed.length)+" of "+numText(inRange.length)
+            +(requested?rangeText:" complete")+" · choose a bar to see the rest"));
+      markLookedUpOpener(fragment);
+      if(!listed.length){fragment.append(element("p","empty","No ranked opener has an ERD in this range"));return fragment;}
       const grid=element("div","grid leaderboard");
-      for(const row of rows)grid.append(leaderboardCard(row,state,{maximumResponseGroupCount}));
+      for(const row of listed)grid.append(leaderboardCard(row,state,{maximumResponseGroupCount}));
       fragment.append(grid);return fragment;
+    }
+    const erdRangeText=(range,denominator)=>range.from===range.to
+      ?fixed(range.from/denominator,4)
+      :fixed(range.from/denominator,4)+"–"+fixed(range.to/denominator,4);
+    // Bin widths run 1, 2, 5, 10, 20, 50 ... numerators, the narrowest that
+    // keeps a range within the bar budget.  Bins sit on multiples of their
+    // width, so a bin is the same span of ERD whichever range it was cut from,
+    // and the outer two are trimmed to the range.
+    function erdBins(rows,range){
+      let width=1;
+      widths:for(let scale=1;;scale*=10)
+        for(const step of [1,2,5]){
+          width=step*scale;
+          if(Math.floor(range.to/width)-Math.floor(range.from/width)<LEADERBOARD_HISTOGRAM_MAXIMUM_BINS)break widths;
+        }
+      const first=Math.floor(range.from/width),last=Math.floor(range.to/width),bins=[];
+      for(let index=first;index<=last;index++)
+        bins.push({from:Math.max(range.from,index*width),to:Math.min(range.to,index*width+width-1),rows:[]});
+      for(const row of rows)bins[Math.floor(row.erd_numerator/width)-first].rows.push(row);
+      return bins;
+    }
+    // The ranges a reader passed through to reach `target`, each one a bin of
+    // the one before, ending with `target` itself.  The descent is re-run from
+    // the field as it stands, so a range reached before the field widened --
+    // a new best opener moves the outer bins -- has no trail, and the caller
+    // shows the range alone.
+    function erdZoomTrail(field,target){
+      const trail=[];let range=field;
+      while(range.from!==target.from||range.to!==target.to){
+        const bin=erdBins([],range).find(bin=>bin.from<=target.from&&target.to<=bin.to);
+        if(!bin||(bin.from===range.from&&bin.to===range.to))return null;
+        trail.push(bin);range=bin;
+      }
+      return trail;
+    }
+    function renderERDZoomTrail(trail,denominator){
+      const nav=element("nav","erd-zoom-trail"),
+        step=(text,range)=>{const button=element("button","",text);button.type="button";button.addEventListener("click",()=>zoomLeaderboard(range));return button;};
+      nav.setAttribute("aria-label","Leaderboard zoom");
+      nav.append(step("All openers",null));
+      trail.forEach((range,index)=>{
+        nav.append(element("span","dim","›"));
+        nav.append(index===trail.length-1
+          ?element("strong","","ERD "+erdRangeText(range,denominator))
+          :step("ERD "+erdRangeText(range,denominator),range));
+      });
+      return nav;
+    }
+    // A bar's color places it in the whole field, green at the best ERD to
+    // red at the worst, and is never rescaled to the zoomed range: a zoomed
+    // histogram is then visibly a slice of the one it came from, and a bar
+    // keeps its color as the reader descends into it.
+    function erdFieldColor(bin,field){
+      const span=field.to-field.from,position=span?((bin.from+bin.to)/2-field.from)/span:0;
+      return "hsl("+Math.round(125*(1-position))+" 62% 43%)";
+    }
+    function renderERDHistogram(rows,range,field,denominator){
+      const bins=erdBins(rows,range),tallest=Math.max(...bins.map(bin=>bin.rows.length)),
+        section=element("section","erd-histogram"),bars=element("div","erd-histogram-bars"),axis=element("div","erd-histogram-axis");
+      section.setAttribute("aria-label","ERD distribution of "+numText(rows.length)+" openers");
+      for(const bin of bins){
+        const count=bin.rows.length,
+          label="ERD "+erdRangeText(bin,denominator)+" · "+numText(count)+(count===1?" opener":" openers"),
+          bar=element(count?"button":"span","erd-histogram-bar"),fill=element("span","erd-histogram-fill");
+        // A bar with any opener in it stays visible however tall its tallest
+        // neighbour: an empty bin and a bin of one are different answers.
+        fill.style.height=count?"max(2px,"+(100*count/tallest)+"%)":"0";
+        fill.style.backgroundColor=erdFieldColor(bin,field);
+        bar.append(fill);bar.title=label;
+        bar.dataset.erdNumeratorRange=erdNumeratorRangeText(bin);
+        // Which third of the chart the bar sits in decides which way its
+        // marker label runs, so a label on an outer bar stays on the page.
+        bar.dataset.side=bins.length<3?"middle":["start","middle","end"][Math.floor(3*bins.indexOf(bin)/bins.length)];
+        if(count){bar.type="button";bar.setAttribute("aria-label",label);bar.addEventListener("click",()=>zoomLeaderboard({from:bin.from,to:bin.to}));}
+        bars.append(bar);
+      }
+      axis.append(element("span","",fixed(range.from/denominator,4)),element("span","dim","ERD · lower is better · tallest bar "+numText(tallest)+(tallest===1?" opener":" openers")),element("span","",fixed(range.to/denominator,4)));
+      section.append(bars,axis);
+      return section;
+    }
+    // The opener a reader looked up is marked on the bar that holds it, so
+    // "rank 779" also reads as a place in the field.  Called from both sides:
+    // a histogram drawn after the answer arrived marks it as it is built, and
+    // an answer arriving after the histogram marks the one on screen.  A
+    // zoomed range that does not hold the opener has no bar to mark.
+    function markLookedUpOpener(root){
+      for(const marked of root.querySelectorAll(".erd-histogram-bar.looked-up")){
+        marked.classList.remove("looked-up");marked.querySelector(".erd-histogram-marker")?.remove();
+      }
+      const numerator=openerStanding?.available?openerStanding.erd_numerator:null;
+      if(!Number.isInteger(numerator))return;
+      for(const bar of root.querySelectorAll(".erd-histogram-bar")){
+        const range=parseERDNumeratorRange(bar.dataset.erdNumeratorRange);
+        if(!range||numerator<range.from||numerator>range.to)continue;
+        bar.classList.add("looked-up");
+        bar.append(element("span","erd-histogram-marker",String(openerStanding.word||"").toUpperCase()+" ▾"));
+        return;
+      }
+    }
+    // Zooming redraws from the ranking already held: the range is not a
+    // request parameter, so nothing is fetched and the poll's revalidation is
+    // undisturbed.  Each step is a history entry, so Back zooms out.
+    function zoomLeaderboard(range){
+      abortActiveRequest();
+      currentState=normalizeState({...currentState,erd_numerator_range:range});
+      const query=stateQuery(currentState,true).toString();
+      history.pushState(null,"",location.pathname+(query?"?"+query:""));
+      redrawLeaderboardZoom();
+      byId("report").querySelector(".erd-zoom-trail,.erd-histogram,.leaderboard-caption")?.scrollIntoView({block:"nearest"});
+    }
+    function redrawLeaderboardZoom(){
+      if(currentState.kind!=="leaderboard"||lastReport?.report_kind!=="leaderboard"||contextKey(currentState)!==lastContext)return;
+      applyReport(lastReport,null,currentState);displayedState=currentState;renderOwed=false;
     }
     // One card, drawn the same way wherever a ranked opener appears, so a
     // neighbourhood reads as a slice of the ranking rather than as a second
-    // way of showing the same row.  A neighbourhood passes no breakdown: the
-    // expander is keyed on the word in `expandedOpeners`, so two cards for one
-    // opener would open and close together.
+    // way of showing the same row.
     function leaderboardCard(row,state,{breakdown=true,maximumResponseGroupCount=null}={}){
       const card=element("article","card leaderboard-card");card.dataset.identity=row.word;
       const title=element("div","card-title"),entry=element("span","word-erd");
@@ -2365,19 +2551,19 @@
     // one bounded request: the server reduces the named opener's own groups and
     // counts its place in the stored ranking, so nothing on this path grows
     // with the vocabulary.
-    function renderOpenerLookup(state){
+    function renderOpenerLookup(state,maximumResponseGroupCount){
       const host=element("section","opener-lookup"),
         form=element("form","opener-lookup-form"),
         answer=element("div","opener-lookup-answer"),
         input=document.createElement("input"),
-        submit=element("button","","Look up"),
+        submit=element("button","","Search"),
         clear=element("button","","Clear");
       input.type="text";input.maxLength=5;input.spellcheck=false;
       input.autocapitalize="characters";input.placeholder="word";
       input.setAttribute("aria-label","Opener to look up");
       input.value=openerLookupText;
       submit.type="submit";clear.type="button";
-      form.append(element("span","dim","Where does"),input,submit,clear);
+      form.append(element("span","dim","Look up"),input,submit,clear);
       host.append(form,answer);
       // Drawn in place rather than by asking for the report again: the answer
       // is about one word, and redrawing the ranking to show it would discard
@@ -2399,6 +2585,7 @@
           answer.replaceChildren(element("p","error",openerStandingError));
           return;
         }
+        markLookedUpOpener(byId("report"));
         if(!openerStanding){answer.replaceChildren();return;}
         const standing=openerStanding,word=String(standing.word||"").toUpperCase();
         if(!standing.available){
@@ -2420,7 +2607,7 @@
         const grid=element("div","grid leaderboard"),
           neighbours=leaderboardRows({columns:standing.neighbourhood});
         neighbours.forEach((row,index)=>{
-          const card=leaderboardCard(row,state,{breakdown:false});
+          const card=leaderboardCard(row,state,{maximumResponseGroupCount});
           if(index===standing.position)card.classList.add("looked-up");
           grid.append(card);
         });
@@ -2438,7 +2625,7 @@
       draw();
       return host;
     }
-    // The endpoint is the one a card expansion already uses: both questions
+    // The endpoint is the one a card's breakdown already uses: both questions
     // rest on the same reduction of one opener's groups, so asking for either pays
     // for it once.
     async function lookUpOpener(state,typed){
@@ -2464,51 +2651,118 @@
       }
       draw();
     }
-    // A card's response groups are 5.9 KB against the 20 bytes of column that
-    // rank it, so they are fetched for the one opener a reader opened rather
-    // than shipped for all of them.  The open set and the fetched breakdowns
-    // live outside the DOM because the report re-renders on every poll.
     function leaderboardDetailURL(state,word){
       const url=new URL(buildAPIURL({...state,kind:"leaderboard"}),location.origin);
       url.searchParams.set("branch_target",String(word).toUpperCase());
       return url.pathname+url.search;
     }
+    // A card's response groups are 5.9 KB against the 20 bytes of column that
+    // rank it, so each card fetches its own as it nears the viewport rather
+    // than the ranking carrying them all.  The fetched breakdowns live outside
+    // the DOM because the report is redrawn whenever the ranking changes, and
+    // a card redrawn with its breakdown already held draws it at once.
+    //
+    // Fetches are capped in flight: a reader who jumps to the bottom of a long
+    // range brings every card past them into the margin together, and the
+    // ones still on screen should not wait behind the ones scrolled by.
+    const LEADERBOARD_BREAKDOWN_FETCH_LIMIT=4,breakdownFetchQueue=[],breakdownLoaders=new WeakMap(),pendingBreakdowns=new Map();
+    // A placeholder takes the height of the first breakdown drawn, which at
+    // one width is close to every breakdown's, so most arrivals move nothing.
+    // It is learned once and then held: a placeholder that changed height
+    // between two renders of the same card would move everything beneath it.
+    let breakdownObserver=null,breakdownFetchesInFlight=0,drawnBreakdownHeight=null;
+    // The placeholders drawn before the height was known are brought to it
+    // too, with the page scrolled by whatever that changes above the reader.
+    function learnBreakdownHeight(height){
+      if(drawnBreakdownHeight!==null)return;
+      drawnBreakdownHeight=height;
+      const placeholders=[...document.querySelectorAll(".leaderboard-breakdown:not(.drawn)")],
+        above=placeholders.map(node=>node.getBoundingClientRect()).map(box=>box.bottom<=0?box.height:null);
+      for(const node of placeholders)node.style.minHeight=height+"px";
+      const shift=placeholders.reduce((total,node,index)=>above[index]===null?total:total+node.getBoundingClientRect().height-above[index],0);
+      if(shift)scrollBy(0,shift);
+    }
+    function observeLeaderboardBreakdown(host,load){
+      breakdownObserver??=new IntersectionObserver(entries=>{
+        for(const entry of entries){
+          if(!entry.isIntersecting)continue;
+          breakdownObserver.unobserve(entry.target);
+          breakdownLoaders.get(entry.target)?.();
+        }
+      },{rootMargin:"400px 0px"});
+      breakdownLoaders.set(host,load);
+      breakdownObserver.observe(host);
+    }
+    function queueBreakdownFetch(task){breakdownFetchQueue.push(task);pumpBreakdownFetches();}
+    function pumpBreakdownFetches(){
+      while(breakdownFetchesInFlight<LEADERBOARD_BREAKDOWN_FETCH_LIMIT&&breakdownFetchQueue.length){
+        const task=breakdownFetchQueue.shift();breakdownFetchesInFlight++;
+        task().finally(()=>{breakdownFetchesInFlight--;pumpBreakdownFetches();});
+      }
+    }
+    // One request per opener however many cards ask: a redraw while a fetch
+    // is in flight builds a new card that asks again.
+    function fetchOpenerBreakdown(state,word){
+      if(!pendingBreakdowns.has(word))pendingBreakdowns.set(word,(async()=>{
+        try{
+          const response=await fetch(leaderboardDetailURL(state,word),{headers:{Accept:"application/json"}});
+          if(!response.ok)throw new Error("Breakdown request failed ("+response.status+")");
+          const detail=(await response.json()).data.detail||{available:false,response_groups:[]};
+          // Only a breakdown that exists is worth keeping.  "Not finished yet"
+          // is a statement about this instant -- a repair has just
+          // invalidated the opener -- and caching it would answer every later
+          // card with it for the life of the page.
+          if(detail.available)openerBreakdowns.set(word,detail);
+          return detail;
+        }finally{pendingBreakdowns.delete(word);}
+      })());
+      return pendingBreakdowns.get(word);
+    }
     function renderLeaderboardBreakdown(row,state,maximumResponseGroupCount){
-      const details=element("details","leaderboard-breakdown"),
-        summary=element("summary","clickable","Response groups"),
-        host=element("div","leaderboard-breakdown-body");
-      details.open=expandedOpeners.has(row.word);
-      details.append(summary,host);
-      const draw=(fetched=null)=>{
-        const detail=fetched||openerBreakdowns.get(row.word);
-        if(!detail){host.replaceChildren(element("p","dim","Loading response groups…"));return;}
+      const host=element("div","leaderboard-breakdown");
+      const fill=detail=>{
+        host.classList.add("drawn");host.style.minHeight="";
         if(!detail.available){host.replaceChildren(element("p","empty","No complete tree for this opener yet"));return;}
         host.replaceChildren(renderResponseGroupBreakdown(detail,{maximumResponseGroupCount,
           selection:{branchTargetPrefix:String(row.word||"").toUpperCase(),
             open:branchTarget=>setState({...state,kind:"auto",branch_target:branchTarget,tree:false,finalization_cursor:""})}}));
       };
-      const load=async()=>{
-        if(openerBreakdowns.has(row.word)){draw();return;}
-        host.replaceChildren(element("p","dim","Loading response groups…"));
-        try{
-          const response=await fetch(leaderboardDetailURL(state,row.word),{headers:{Accept:"application/json"}});
-          if(!response.ok)throw new Error("Breakdown request failed ("+response.status+")");
-          const detail=(await response.json()).data.detail||{available:false,response_groups:[]};
-          // Only a breakdown that exists is worth keeping.  "Not finished yet"
-          // is a statement about this instant -- the opener is still being
-          // swept, or a repair has just invalidated it -- and caching it would
-          // answer every later expansion with it, so a card opened once early
-          // would read as unfinished for the life of the page.
-          if(detail.available)openerBreakdowns.set(row.word,detail);
-          draw(detail);
-        }catch(error){host.replaceChildren(element("p","error",error.message));}
+      // A breakdown that lands wholly above the viewport would push everything
+      // the reader is looking at down by however much it differs from its
+      // placeholder, so the page scrolls by that much with it -- at once, and
+      // again a frame later for whatever the strip and legend change when
+      // they settle their own layout in that frame.  The leaderboard opts out
+      // of the browser's own scroll anchoring, which Chromium has and WebKit
+      // does not, so the correction happens once and in both engines.
+      const draw=detail=>{
+        const box=host.getBoundingClientRect(),above=box.bottom<=0;
+        let height=box.height;
+        const follow=()=>{
+          const settled=host.getBoundingClientRect().height;
+          if(above&&settled!==height)scrollBy(0,settled-height);
+          height=settled;
+        };
+        fill(detail);follow();
+        requestAnimationFrame(()=>{
+          // A redraw in between replaced this card, and the page it would
+          // correct for is gone with it.
+          if(!host.isConnected)return;
+          follow();
+          if(detail.available)learnBreakdownHeight(height);
+        });
       };
-      details.addEventListener("toggle",()=>{
-        if(details.open){expandedOpeners.add(row.word);load();}
-        else expandedOpeners.delete(row.word);
-      });
-      if(details.open)load();
-      return details;
+      const held=openerBreakdowns.get(row.word);
+      if(held){fill(held);return host;}
+      host.append(element("p","dim","Loading response groups…"));
+      if(drawnBreakdownHeight)host.style.minHeight=drawnBreakdownHeight+"px";
+      observeLeaderboardBreakdown(host,()=>queueBreakdownFetch(async()=>{
+        // A card a redraw has already replaced is not worth a request; its
+        // replacement is observed in its own right.
+        if(!host.isConnected)return;
+        try{draw(await fetchOpenerBreakdown(state,row.word));}
+        catch(error){host.replaceChildren(element("p","error",error.message));}
+      }));
+      return host;
     }
     // The ranking arrives as parallel arrays: at the full candidate vocabulary
     // a row-shaped payload is mostly repeated JSON keys and a constant answer
@@ -2536,6 +2790,7 @@
         rows.push({
           word:words.slice(index*width,(index+1)*width),
           rank:firstRank+index,
+          erd_numerator:numerator,
           erd,
           erdText:erdValue(erd,denominator),
           max_remaining_depth:depths[index],
@@ -2951,7 +3206,7 @@
       installSpineCopy();
       matchMedia("(prefers-color-scheme: dark)").addEventListener("change",refreshWorkerMarkerColors);
       addEventListener("resize",()=>{const root=byId("report");layoutSpines(root);layoutSweepMarkerDigits(root);for(const strip of root.querySelectorAll(".answer-strip"))measureAnswerStrip(strip);if(openGroupMenuNode)positionGroupMenu(openGroupMenuNode.node,openGroupMenuNode.opener);if(currentState?.kind==="leaderboard"&&lastReport&&root.clientWidth!==leaderboardReportWidth&&!reportHasFocusedControl()&&!reportHasActiveSelection())applyReport(lastReport,lastReport,currentState);});
-      addEventListener("popstate",()=>{abortActiveRequest();currentState=parsePageState(location);syncControls();fetchReport();schedulePoll();});document.addEventListener("visibilitychange",()=>{if(!document.hidden){if(!skipAutomaticScan())fetchReport();schedulePoll();}});fetchReport();schedulePoll();
+      addEventListener("popstate",()=>{abortActiveRequest();currentState=parsePageState(location);syncControls();redrawLeaderboardZoom();fetchReport();schedulePoll();});document.addEventListener("visibilitychange",()=>{if(!document.hidden){if(!skipAutomaticScan())fetchReport();schedulePoll();}});fetchReport();schedulePoll();
     }
     window.parsePageState=parsePageState;window.buildAPIURL=buildAPIURL;window.rootProgressURL=rootProgressURL;window.attachProgressiveStage=attachProgressiveStage;window.renderRootProgressHeadline=renderRootProgressHeadline;window.applyReport=applyReport;window.spineTextFromSelection=spineTextFromSelection;window.__skipAutomaticScanProbe=()=>skipAutomaticScan();window.__reportClient={setState:state=>setState(state),getState:()=>({...currentState}),fetchReport};
     document.addEventListener("DOMContentLoaded",initialize);

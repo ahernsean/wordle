@@ -48,20 +48,39 @@ SWEEP_BITMAP_JS = (
 # The leaderboard ships its ranking as parallel arrays rather than one object
 # per row, so a test that wants N ranked openers states the count and gets the
 # columns.  ERDs are laid on the lattice the denominator defines, which is what
-# the cards render as exact fractions.
+# the cards render as exact fractions; `perNumerator` openers share each ERD,
+# which is how a test packs a histogram bin past the length of a listed range.
+# Words count up in base 26 from AAAAA, so each is five letters and the
+# server will answer a breakdown request for it.
 LEADERBOARD_COLUMNS_JS = (
-    "const leaderboardColumns=(rowCount,denominator)=>{"
+    "const leaderboardColumns=(rowCount,denominator,perNumerator=1)=>{"
     "const bytes=new Uint8Array(Math.ceil(rowCount/8));"
     "let words='';"
     "for(let index=0;index<rowCount;index++)"
-    "words+='a'+String(index).padStart(4,'0');"
+    "words+=Array.from({length:5},(_,place)=>"
+    "String.fromCharCode(97+Math.floor(index/26**(4-place))%26)).join('');"
     "let binary='';"
     "for(const byte of bytes)binary+=String.fromCharCode(byte);"
     "return {word_width:5,words,erd_denominator:denominator,"
     "erd_numerator:Array.from({length:rowCount},(_,index)=>"
-    "Math.round(3.5*denominator)+index),"
+    "Math.round(3.5*denominator)+Math.floor(index/perNumerator)),"
     "max_remaining_depth:Array.from({length:rowCount},()=>6),"
     "word_is_answer_bitmap:btoa(binary)};};"
+)
+# A card fetches its response groups as it nears the viewport, so a test that
+# measures positions waits for every breakdown in reach to land first; a
+# measurement taken mid-arrival describes a page that is still moving.
+BREAKDOWNS_SETTLED_JS = (
+    "() => ![...document.querySelectorAll('.leaderboard-breakdown:not(.drawn)')]"
+    ".some(node => { const box = node.getBoundingClientRect();"
+    " return box.bottom > -400 && box.top < innerHeight + 400; })"
+)
+SETTLE_BREAKDOWNS_JS = (
+    "const settleBreakdowns = async () => {"
+    "for (let attempt = 0; attempt < 400 && !(" + BREAKDOWNS_SETTLED_JS + ")();"
+    " attempt++) await new Promise(resolve => setTimeout(resolve, 25));"
+    "for (let frame = 0; frame < 3; frame++)"
+    " await new Promise(requestAnimationFrame);};"
 )
 # Both browser suites run by default, and a browser that will not start is a
 # failure rather than a skip.  This client is used overwhelmingly from WebKit
@@ -1571,18 +1590,19 @@ class ReportClientContract:
     def _menu(self):
         return self.page.locator(".group-menu")
 
-    def _open_leaderboard_breakdown(self, index=0):
-        """Open a ranked card's response groups and wait for them to arrive.
+    def _leaderboard_breakdown(self, index=0):
+        """Bring a ranked card on screen and wait for its response groups.
 
-        A collapsed card carries no breakdown at all: the groups are 5.9 KB
-        apiece against the 20 bytes that rank an opener, so they are fetched
-        for the one card a reader opens.  Every assertion about segments,
-        legends or group menus therefore has to open a card first.
+        The ranking carries no breakdowns: the groups are 5.9 KB apiece
+        against the 20 bytes that rank an opener, so each card fetches its own
+        as it nears the viewport.  Every assertion about segments, legends or
+        group menus therefore waits for that fetch to land.
         """
-        cards = self.page.locator(".grid.leaderboard > .leaderboard-card")
-        cards.nth(index).locator("summary").click()
-        self.page.wait_for_selector(".leaderboard-card .answer-segment")
-        return cards.nth(index)
+        card = self.page.locator(
+            ".grid.leaderboard > .leaderboard-card").nth(index)
+        card.scroll_into_view_if_needed()
+        card.locator(".answer-segment").first.wait_for()
+        return card
 
     def test_word_report_breakdown_group_opens_a_menu_naming_the_group(self):
         # Which group a tap landed on is a guess until the menu names it, so
@@ -1878,7 +1898,7 @@ class ReportClientContract:
         # one place and a menu in the other.
         self.page.locator("[data-kind=leaderboard]").click()
         self.page.wait_for_selector(".grid.leaderboard > .leaderboard-card")
-        self._open_leaderboard_breakdown(0)
+        self._leaderboard_breakdown(0)
         self.page.locator(".leaderboard-card .answer-segment").first.click()
         self.page.wait_for_selector(".group-menu")
         self.assertEqual(
@@ -1895,7 +1915,7 @@ class ReportClientContract:
         # every segment and say nothing.  The leaderboard sends no solved flag.
         self.page.locator("[data-kind=leaderboard]").click()
         self.page.wait_for_selector(".grid.leaderboard > .leaderboard-card")
-        self._open_leaderboard_breakdown(0)
+        self._leaderboard_breakdown(0)
         self.assertEqual(
             self.page.locator(".leaderboard-card .answer-segment.solved-group").count(),
             0)
@@ -1921,12 +1941,6 @@ class ReportClientContract:
         self.assertIn("Worst-case solve: 6 guesses", text)
         self.assertNotIn("max remaining depth", text)
         self.assertNotIn("expected guesses remaining", text)
-        # A collapsed card is rank, word, ERD and worst case.  The response
-        # groups are 5.9 KB apiece against 20 bytes of ranking, so they are
-        # fetched only for a card the reader opens.
-        self.assertNotIn("5 answer groups (more groups = better)", text)
-        self.assertNotIn("Largest: 31 answers (31.0%)", text)
-        self.assertIn("Response groups", text)
         self.assertIn("CRANE", text)
         self.assertTrue(self.answer_notch(
             self.page.locator(".card", has_text="CRANE").first.locator(".word")))
@@ -1938,7 +1952,10 @@ class ReportClientContract:
         rank = cards.nth(0).locator(".leaderboard-rank")
         self.assertEqual(rank.inner_text(), "#1")
         self.assertNotIn("chip", rank.get_attribute("class").split())
-        card = self._open_leaderboard_breakdown(0)
+        # Nobody opens a card: its groups arrive because it is on screen.
+        card = self._leaderboard_breakdown(0)
+        self.assertIn("5 answer groups (more groups = better)", card.inner_text())
+        self.assertEqual(card.locator("summary").count(), 0)
         answer_strip = card.locator(".answer-strip")
         segments = answer_strip.locator(".answer-segment")
         self.assertEqual(segments.count(), 5)
@@ -1988,13 +2005,265 @@ class ReportClientContract:
             for word_index in range(words.count()):
                 self.assertTrue(self.answer_notch(words.nth(word_index)))
 
+    def _open_long_leaderboard(self, row_count, per_numerator=1, query="",
+                               unavailable_word=""):
+        """Load the leaderboard with a ranking long enough to need a histogram.
+
+        Every ranking request is answered with `row_count` openers over the
+        fixture's denominator of 100, and the page counts its ranking and
+        breakdown requests in `__rankingFetches` and `__detailFetches`.
+        `unavailable_word`'s breakdown answers that it has no complete tree,
+        which draws far shorter than a placeholder.
+        Installed before the page loads, because the first cards fetch their
+        breakdowns as soon as they draw.
+        """
+        self.page.add_init_script("""(() => {
+          """ + LEADERBOARD_COLUMNS_JS + """
+          const realFetch = window.fetch.bind(window);
+          window.__rankingFetches = 0;
+          window.__detailFetches = 0;
+          window.fetch = (url, options) => {
+            if (!String(url).includes('/leaderboard')) return realFetch(url, options);
+            if (String(url).includes('branch_target=')) {
+              window.__detailFetches += 1;
+              if (!String(url).includes('branch_target=%s')) return realFetch(url, options);
+              return realFetch(url, options).then(response => response.json()).then(body => {
+                body.data.detail = {word: 'x', available: false, response_groups: []};
+                return new Response(JSON.stringify(body), {
+                  status: 200, headers: {'Content-Type': 'application/json'},
+                });
+              });
+            }
+            window.__rankingFetches += 1;
+            return realFetch(url, options).then(response => response.json()).then(report => {
+              report.data.columns = leaderboardColumns(%d, 100, %d);
+              report.data.total_rows = %d;
+              return new Response(JSON.stringify(report), {
+                status: 200, headers: {'Content-Type': 'application/json'},
+              });
+            });
+          };
+        })();""" % (unavailable_word.upper() or "-", row_count, per_numerator,
+                    row_count))
+        self.page.goto(self.base_url + "?kind=leaderboard" + query)
+        self.page.wait_for_selector(".leaderboard-caption")
+
+    def _settle_breakdowns(self):
+        self.page.wait_for_function(BREAKDOWNS_SETTLED_JS)
+        self.page.evaluate(
+            "async () => { for (let frame = 0; frame < 3; frame++)"
+            " await new Promise(requestAnimationFrame); }")
+
+    def _caption(self):
+        return self.page.locator(".leaderboard-caption").inner_text()
+
+    def test_a_long_leaderboard_opens_on_its_distribution(self):
+        """Overview first: the field's shape, then its best few.
+
+        300 openers on consecutive numerators 350..649 bin five to a bar, the
+        narrowest width within the 60-bar budget, and the cards below are only
+        the best 20.
+        """
+        self._open_long_leaderboard(300)
+        bars = self.page.locator(".erd-histogram-bar")
+        self.assertEqual(bars.count(), 60)
+        self.assertEqual(bars.first.get_attribute("data-erd-numerator-range"),
+                         "350-354")
+        self.assertEqual(bars.last.get_attribute("data-erd-numerator-range"),
+                         "645-649")
+        self.assertIn("best 20 of 300 complete", self._caption())
+        cards = self.page.locator(".grid.leaderboard > .leaderboard-card")
+        self.assertEqual(cards.count(), 20)
+        self.assertEqual(cards.first.locator(".leaderboard-rank").inner_text(), "#1")
+        axis = self.page.locator(".erd-histogram-axis").inner_text()
+        self.assertIn("3.5000", axis)
+        self.assertIn("6.4900", axis)
+        self.assertIn("tallest bar 5 openers", axis)
+        # Green at the best end of the field, red at the worst.
+        first, last = self.page.evaluate("""() => {
+          const fills = [...document.querySelectorAll('.erd-histogram-fill')];
+          const rgb = node => getComputedStyle(node).backgroundColor.match(/\\d+/g).map(Number);
+          return [rgb(fills[0]), rgb(fills[fills.length - 1])];
+        }""")
+        self.assertGreater(first[1], first[0])
+        self.assertGreater(last[0], last[1])
+        for width in (375, 390, 480, 800, 1200):
+            with self.subTest(width=width):
+                self.page.set_viewport_size({"width": width, "height": 800})
+                measured = self.page.evaluate(
+                    "() => ({scroll: document.documentElement.scrollWidth,"
+                    " client: document.documentElement.clientWidth})")
+                self.assertLessEqual(measured["scroll"], measured["client"])
+
+    def test_a_looked_up_opener_is_marked_on_its_histogram_bar(self):
+        """The rank also reads as a place in the field.
+
+        The fixture's lookup answers SALET at 356/100, which falls in the
+        355-359 bar of 300 openers on 350..649.  The histogram sits above the
+        lookup, so the bar it marks is in view above the answer.  The poll is
+        parked: it redraws the lookup, which would re-mark whatever histogram
+        is on screen and hide a histogram that failed to mark itself.
+        """
+        self._open_long_leaderboard(300, query="&poll=600000")
+        box = self.page.locator(".opener-lookup-form input")
+        box.fill("salet")
+        box.press("Enter")
+        marked = self.page.locator(".erd-histogram-bar.looked-up")
+        marked.wait_for()
+        self.assertEqual(self.page.locator(".erd-histogram-bar.looked-up").count(), 1)
+        self.assertEqual(marked.get_attribute("data-erd-numerator-range"), "355-359")
+        self.assertEqual(marked.locator(".erd-histogram-marker").inner_text(), "SALET ▾")
+        self.assertLess(
+            self.page.locator(".erd-histogram").bounding_box()["y"],
+            self.page.locator(".opener-lookup").bounding_box()["y"])
+        # Zooming into the bar keeps the mark; zooming away from it has no
+        # bar to mark.
+        marked.click()
+        self.page.wait_for_function(
+            "() => document.querySelector('.erd-histogram-bar.looked-up')"
+            "?.dataset.erdNumeratorRange === '356-356'")
+        self.page.locator(".erd-zoom-trail button", has_text="All openers").click()
+        self.page.locator("button.erd-histogram-bar").last.click()
+        self.assertIn("erd_numerator_range=645-649", self.page.url)
+        self.assertEqual(self.page.locator(".erd-histogram-bar.looked-up").count(), 0)
+        # Clearing the lookup clears the mark.
+        self.page.locator(".erd-zoom-trail button", has_text="All openers").click()
+        self.page.locator(".erd-histogram-bar.looked-up").wait_for()
+        self.page.locator(".opener-lookup-form button", has_text="Clear").click()
+        self.assertEqual(self.page.locator(".erd-histogram-bar.looked-up").count(), 0)
+
+    def test_a_zoomed_range_short_enough_to_list_keeps_its_histogram(self):
+        """Choosing a bar never takes the histogram away.
+
+        A range of five openers lists all of them, and still draws its own
+        bars so a neighbouring one can be chosen without zooming back out.
+        """
+        self._open_long_leaderboard(300)
+        self.page.locator("button.erd-histogram-bar").first.click()
+        self.assertEqual(self._caption(), "Ranked by ERD · 5 openers with ERD 3.5000–3.5400")
+        self.assertEqual(self.page.locator(".erd-histogram-bar").count(), 5)
+        self.assertEqual(
+            self.page.locator(".grid.leaderboard > .leaderboard-card").count(), 5)
+
+    def test_cards_fetch_their_breakdowns_as_they_come_on_screen(self):
+        """A card costs a request only once the reader nears it.
+
+        Jumping from the top of twenty cards to the last passes the middle
+        ones without bringing them near the screen, so they are still unasked
+        until the reader goes back to them.
+        """
+        self.page.set_viewport_size({"width": 1200, "height": 800})
+        self._open_long_leaderboard(300)
+        cards = self.page.locator(".grid.leaderboard > .leaderboard-card")
+        cards.first.locator(".answer-segment").first.wait_for()
+        on_arrival = self.page.evaluate("() => window.__detailFetches")
+        self.assertLess(on_arrival, 10)
+        cards.last.scroll_into_view_if_needed()
+        cards.last.locator(".answer-segment").first.wait_for()
+        middle = cards.nth(on_arrival + 2)
+        self.assertEqual(middle.locator(".answer-segment").count(), 0)
+        self.assertLess(self.page.evaluate("() => window.__detailFetches"), 20)
+        middle.scroll_into_view_if_needed()
+        middle.locator(".answer-segment").first.wait_for()
+
+    def test_a_breakdown_landing_above_the_reader_moves_nothing_they_see(self):
+        """A card above the viewport changing height keeps the page still.
+
+        Jumping to the bottom leaves the middle cards unfetched; scrolling
+        back up brings one into the margin above the viewport, where it
+        fetches and draws.  Its breakdown is far shorter than its placeholder,
+        so without the page scrolling with it everything on screen would jump
+        up by the difference.
+        """
+        self.page.set_viewport_size({"width": 1200, "height": 800})
+        self._open_long_leaderboard(300, unavailable_word="aaaam")
+        cards = self.page.locator(".grid.leaderboard > .leaderboard-card")
+        cards.first.locator(".answer-segment").first.wait_for()
+        cards.last.scroll_into_view_if_needed()
+        self._settle_breakdowns()
+        target = self.page.locator(".leaderboard-card[data-identity=aaaam]")
+        self.assertEqual(target.locator(".leaderboard-breakdown.drawn").count(), 0)
+        reference = cards.last
+        before = target.evaluate("""node => {
+          scrollBy(0, node.getBoundingClientRect().bottom + 100);
+          return document.querySelector(
+            '.grid.leaderboard > .leaderboard-card:last-child').getBoundingClientRect().top;
+        }""")
+        target.locator(".leaderboard-breakdown.drawn").wait_for(state="attached")
+        self._settle_breakdowns()
+        self.assertIn("No complete tree", target.inner_text())
+        self.assertLess(target.evaluate("node => node.getBoundingClientRect().bottom"), 0)
+        self.assertAlmostEqual(
+            reference.evaluate("node => node.getBoundingClientRect().top"),
+            before, delta=1)
+
+    def test_choosing_a_bar_zooms_into_it_without_asking_the_server(self):
+        """Each bar is a range of the ranking the client already holds.
+
+        6,000 openers sixty to a numerator over 350..449 bin two numerators
+        (120 openers) to a bar: too many to list, so the first bar opens on
+        its own histogram, whose bars of 60 are listed in full.  Every step
+        is a history entry, and none of them is a request.  The poll is
+        parked so that every ranking request counted is one a zoom made.
+        """
+        self._open_long_leaderboard(6000, per_numerator=60, query="&poll=600000")
+        self.assertEqual(self.page.locator(".erd-histogram-bar").count(), 50)
+        rankings = self.page.evaluate("() => window.__rankingFetches")
+
+        self.page.locator("button.erd-histogram-bar").first.click()
+        self.assertIn("erd_numerator_range=350-351", self.page.url)
+        self.assertIn("best 20 of 120 with ERD 3.5000–3.5100", self._caption())
+        self.assertEqual(self.page.locator(".erd-histogram-bar").count(), 2)
+        self.assertEqual(
+            " ".join(self.page.locator(".erd-zoom-trail").inner_text().split()),
+            "All openers › ERD 3.5000–3.5100")
+
+        self.page.locator("button.erd-histogram-bar").nth(1).click()
+        self.assertIn("erd_numerator_range=351-351", self.page.url)
+        self.assertEqual(self._caption(),
+                         "Ranked by ERD · 60 openers with ERD 3.5100")
+        self.assertEqual(self.page.locator(".erd-histogram").count(), 0)
+        cards = self.page.locator(".grid.leaderboard > .leaderboard-card")
+        self.assertEqual(cards.count(), 60)
+        # A zoomed card keeps its place in the whole ranking.
+        self.assertEqual(cards.first.locator(".leaderboard-rank").inner_text(), "#61")
+        self.assertEqual(
+            " ".join(self.page.locator(".erd-zoom-trail").inner_text().split()),
+            "All openers › ERD 3.5000–3.5100 › ERD 3.5100")
+
+        # The trail climbs; Back retraces.
+        self.page.locator(".erd-zoom-trail button", has_text="3.5100").click()
+        self.assertIn("best 20 of 120", self._caption())
+        self.assertEqual(self.page.evaluate("() => window.__rankingFetches"),
+                         rankings)
+        self.page.go_back()
+        self.page.wait_for_function(
+            "() => document.querySelector('.leaderboard-caption')"
+            ".textContent.includes('60 openers with ERD 3.5100')")
+        self.page.go_back()
+        self.page.go_back()
+        self.page.wait_for_function(
+            "() => document.querySelector('.leaderboard-caption')"
+            ".textContent.includes('best 20 of 6,000 complete')")
+        self.assertNotIn("erd_numerator_range", self.page.url)
+
+    def test_a_zoomed_leaderboard_url_opens_on_its_range(self):
+        """The range is in the page URL, so a zoomed view can be shared."""
+        self._open_long_leaderboard(
+            6000, per_numerator=60, query="&erd_numerator_range=350-351")
+        self.assertIn("best 20 of 120 with ERD 3.5000–3.5100", self._caption())
+        self.assertNotIn(
+            "erd_numerator_range",
+            self.page.evaluate(
+                "() => window.buildAPIURL(window.__reportClient.getState())"))
+
     def test_leaderboard_poll_renders_changed_data(self):
         self.page.locator("[data-kind=leaderboard]").click()
         self.page.wait_for_selector("text=Opener leaderboard")
         self.page.evaluate("""() => {
           const realFetch = window.fetch.bind(window);
           window.fetch = (url, options) => realFetch(url, options).then(async response => {
-            if (!String(url).includes('/leaderboard')) return response;
+            if (!String(url).includes('/leaderboard') || String(url).includes('branch_target=')) return response;
             const report = await response.json();
             report.data.columns.erd_numerator[0] = 987;
             return new Response(JSON.stringify(report), {
@@ -2036,9 +2305,11 @@ class ReportClientContract:
                          "#2")
         self.assertIn("looked-up", cards.nth(0).get_attribute("class").split())
         self.assertNotIn("looked-up", cards.nth(1).get_attribute("class").split())
-        # A neighbourhood card carries no expander: the open set is keyed on
-        # the word, so a second card for one opener would open with the first.
-        self.assertEqual(cards.nth(0).locator("summary").count(), 0)
+        # A neighbour is drawn like any ranked card, response groups and all.
+        cards.nth(0).locator(".answer-segment").first.wait_for()
+        self.assertEqual(
+            " ".join(self.page.locator(".opener-lookup-form").inner_text().split()),
+            "Look up Search Clear")
         # The ranking is still below its own heading, not replaced by the
         # answer to a question about one row of it.
         self.assertEqual(
@@ -2170,13 +2441,15 @@ class ReportClientContract:
         self.page.wait_for_selector(".grid.leaderboard > .leaderboard-card")
         # The fixture server serves the leaderboard without an entity tag, so
         # the first poll to carry one has to be arranged -- which is the state
-        # the real server puts a freshly opened page in.
+        # the real server puts a freshly opened page in.  The neighbourhood's
+        # cards fetch their breakdowns from the same endpoint, so only the
+        # lookup's own requests are counted.
         self.page.evaluate("""() => {
           const realFetch = window.fetch.bind(window);
           window.__detailFetches = 0;
           window.fetch = (url, options) => {
             if (String(url).includes('branch_target=')) {
-              window.__detailFetches += 1;
+              if (new Error().stack.includes('lookUpOpener')) window.__detailFetches += 1;
               return realFetch(url, options);
             }
             return realFetch(url, options).then(async response => {
@@ -2318,12 +2591,14 @@ class ReportClientContract:
         # defers a redraw.  Letting go of it is what a reader does to read the
         # answer.
         self.page.evaluate("() => document.activeElement.blur()")
+        # The ranked cards fetch their breakdowns afresh under a new ranking
+        # from the same endpoint, so only the lookup's own requests are counted.
         self.page.evaluate("""() => {
           const realFetch = window.fetch.bind(window);
           window.__detailFetches = 0;
           window.fetch = (url, options) => {
             if (String(url).includes('branch_target=')) {
-              window.__detailFetches += 1;
+              if (new Error().stack.includes('lookUpOpener')) window.__detailFetches += 1;
               return realFetch(url, options);
             }
             return realFetch(url, options).then(async response => {
@@ -2350,19 +2625,30 @@ class ReportClientContract:
     def test_an_unfinished_breakdown_is_asked_for_again(self):
         """"Not finished yet" describes this instant, not the opener.
 
-        An opener still being swept, or one a repair has just invalidated,
-        answers unavailable.  Keeping that answer would hand it to every later
-        expansion, so a card opened early would read as unfinished for the life
-        of the page even after its tree completed.
+        An opener a repair has just invalidated answers unavailable.  Keeping
+        that answer would hand it to every later card for the opener, so it
+        would read as unfinished for the life of the page even after its tree
+        completed again.
         """
-        self.page.locator("[data-kind=leaderboard]").click()
-        self.page.wait_for_selector(".grid.leaderboard > .leaderboard-card")
-        self.page.evaluate("""() => {
+        # Installed before the page loads: a card on screen fetches its
+        # breakdown as soon as it is drawn.
+        self.page.add_init_script("""(() => {
           const realFetch = window.fetch.bind(window);
           window.__detailFetches = 0;
           window.__detailAvailable = false;
+          window.__moveRanking = false;
           window.fetch = (url, options) => {
-            if (!String(url).includes('branch_target=')) return realFetch(url, options);
+            if (!String(url).includes('/leaderboard')) return realFetch(url, options);
+            if (!String(url).includes('branch_target=')) {
+              if (!window.__moveRanking) return realFetch(url, options);
+              return realFetch(url, options).then(response => response.json()).then(report => {
+                report.data.columns.erd_numerator[1] += 1;
+                return new Response(JSON.stringify(report), {
+                  status: 200, headers: {'Content-Type': 'application/json'},
+                });
+              });
+            }
+            if (!String(url).includes('SALET')) return realFetch(url, options);
             window.__detailFetches += 1;
             return realFetch(url, options).then(response => response.json()).then(body => {
               body.data.detail = window.__detailAvailable
@@ -2376,18 +2662,18 @@ class ReportClientContract:
               });
             });
           };
-        }""")
-        summary = self.page.locator(
-            ".grid.leaderboard > .leaderboard-card").nth(0).locator("summary")
-        summary.click()
+        })();""")
+        self.page.goto(self.base_url + "?kind=leaderboard")
         self.page.wait_for_selector("text=No complete tree for this opener yet")
-        summary.click()  # collapse
 
-        # The sweep finished it; opening again must ask rather than answer
-        # from what it kept.
-        self.page.evaluate("() => { window.__detailAvailable = true; }")
-        summary.click()
-        self.page.wait_for_selector(".leaderboard-card .answer-segment")
+        # The sweep finished it, and the ranking moved, so the card is drawn
+        # afresh; the new card must ask rather than answer from what was kept.
+        self.page.evaluate(
+            "() => { window.__detailAvailable = true; window.__moveRanking = true; }")
+        self.page.evaluate(
+            "async () => { await window.__reportClient.fetchReport(); }")
+        self.page.wait_for_selector(
+            ".leaderboard-card[data-identity=salet] .answer-segment")
         self.assertEqual(self.page.evaluate("() => window.__detailFetches"), 2)
 
     def test_a_leaderboard_poll_sends_back_the_tag_it_was_given(self):
@@ -2476,20 +2762,18 @@ class ReportClientContract:
                       self.page.locator("#report").inner_text())
 
     def _defer_a_ranking_behind_an_open_card(self):
-        """Suppress one changed ranking behind a focused card, and return.
+        """Suppress one changed ranking behind an open group menu, and return.
 
-        Opening a card leaves focus on its summary, and a poll that replaced
-        the report would delete that summary out from under the reader.  The
-        client therefore declines to draw -- while still banking the report and
-        its entity tag, because those describe what the server holds.
+        A poll that replaced the report would delete the menu out from under
+        the reader, so the client declines to draw -- while still banking the
+        report and its entity tag, because those describe what the server
+        holds.
         """
         self.page.locator("[data-kind=leaderboard]").click()
         self.page.wait_for_selector(".grid.leaderboard > .leaderboard-card")
-        self._open_leaderboard_breakdown()
-        self.page.evaluate(
-            "() => document.querySelector('.leaderboard-breakdown summary').focus()")
-        self.assertEqual(
-            self.page.evaluate("() => document.activeElement.tagName"), "SUMMARY")
+        self._leaderboard_breakdown()
+        self.page.locator(".leaderboard-card .answer-segment").first.click()
+        self.page.wait_for_selector(".group-menu")
         self.page.evaluate("""() => {
           const realFetch = window.fetch.bind(window);
           window.__polls = 0;
@@ -2521,7 +2805,8 @@ class ReportClientContract:
         until some later opener completes -- forever, with the swarm stopped.
         """
         self._defer_a_ranking_behind_an_open_card()
-        self.page.evaluate("() => { window.__still304 = true; document.activeElement.blur(); }")
+        self.page.evaluate("() => { window.__still304 = true; }")
+        self.page.keyboard.press("Escape")
         self.page.evaluate("async () => { await window.__reportClient.fetchReport(); }")
         self.assertIn("9.870 987/100", self.page.locator("#report").inner_text())
 
@@ -2533,7 +2818,7 @@ class ReportClientContract:
         normally means "the screen is current" means the opposite here.
         """
         self._defer_a_ranking_behind_an_open_card()
-        self.page.evaluate("() => document.activeElement.blur()")
+        self.page.keyboard.press("Escape")
         self.page.evaluate("async () => { await window.__reportClient.fetchReport(); }")
         self.assertIn("9.870 987/100", self.page.locator("#report").inner_text())
 
@@ -2542,6 +2827,7 @@ class ReportClientContract:
         # ranking standing still rather than as a failure.
         self.page.locator("[data-kind=leaderboard]").click()
         self.page.wait_for_selector(".grid.leaderboard > .leaderboard-card")
+        self._settle_breakdowns()
         before = self.page.locator("#report").inner_text()
         self.page.evaluate("""() => {
           const realFetch = window.fetch.bind(window);
@@ -2563,7 +2849,7 @@ class ReportClientContract:
           const realFetch = window.fetch.bind(window);
           let leaderboard;
           window.fetch = (url, options) => realFetch(url, options).then(async response => {
-            if (!String(url).includes('/leaderboard')) return response;
+            if (!String(url).includes('/leaderboard') || String(url).includes('branch_target=')) return response;
             if (!leaderboard) {
               leaderboard = await response.json();
               leaderboard.data.columns = leaderboardColumns(12, leaderboard.data.answer_count);
@@ -2581,6 +2867,7 @@ class ReportClientContract:
         self.assertEqual(cards.count(), 12)
         card = cards.nth(8)
         card.scroll_into_view_if_needed()
+        self._settle_breakdowns()
         before = card.evaluate("(node) => { window.scrollBy(0, 40); return node.getBoundingClientRect().top; }")
         card.evaluate("(node) => node.dataset.testMarker = 'still-here'")
         self.page.evaluate("async () => { await window.__reportClient.fetchReport(); }")
@@ -2597,7 +2884,7 @@ class ReportClientContract:
         self.page.evaluate("""() => {
           const realFetch = window.fetch.bind(window);
           window.fetch = (url, options) => realFetch(url, options).then(async response => {
-            if (!String(url).includes('/leaderboard')) return response;
+            if (!String(url).includes('/leaderboard') || String(url).includes('branch_target=')) return response;
             const report = await response.json();
             report.data.counts.pending = 123;
             return new Response(JSON.stringify(report), {
@@ -2620,7 +2907,7 @@ class ReportClientContract:
           let leaderboard, allowChangedReport = false;
           window.__changeLeaderboardReport = () => { allowChangedReport = true; };
           window.fetch = (url, options) => realFetch(url, options).then(async response => {
-            if (!String(url).includes('/leaderboard')) return response;
+            if (!String(url).includes('/leaderboard') || String(url).includes('branch_target=')) return response;
             if (!leaderboard) {
               leaderboard = await response.json();
               leaderboard.data.columns = leaderboardColumns(12, leaderboard.data.answer_count);
@@ -2640,6 +2927,7 @@ class ReportClientContract:
         self.assertEqual(cards.count(), 12)
         card = cards.nth(8)
         card.scroll_into_view_if_needed()
+        self._settle_breakdowns()
         before = card.evaluate("(node) => { window.scrollBy(0, 40); return node.getBoundingClientRect().top; }")
         self.page.evaluate("async () => { window.__changeLeaderboardReport(); await window.__reportClient.fetchReport(); await new Promise(requestAnimationFrame); }")
         # The poll has to have changed something, or holding the reader's
@@ -2654,6 +2942,10 @@ class ReportClientContract:
         )
 
     def test_changed_leaderboard_poll_keeps_the_reader_at_the_bottom(self):
+        # The reports below are drawn by hand, so a live poll redrawing the
+        # page between them would measure a different view; it is parked.
+        self.page.goto(self.base_url + "?kind=leaderboard&poll=600000")
+        self.page.wait_for_selector(".grid.leaderboard > .leaderboard-card")
         self.page.set_viewport_size({"width": 834, "height": 1112})
         distances = self.page.evaluate("""async () => {
           """ + LEADERBOARD_COLUMNS_JS + """
@@ -2666,6 +2958,7 @@ class ReportClientContract:
               await new Promise(requestAnimationFrame);
             }
           };
+          """ + SETTLE_BREAKDOWNS_JS + """
           const base = await (await fetch('/api/view/leaderboard')).json();
           const state = {...__reportClient.getState(), kind: 'leaderboard'};
           const leaderboard = count => {
@@ -2677,7 +2970,11 @@ class ReportClientContract:
           };
           const before = leaderboard(12), after = leaderboard(15), later = leaderboard(18);
           applyReport(before, null, state);
-          await settle();
+          await settleBreakdowns();
+          // Breakdowns landing below the reader lengthen the page under
+          // them, so the bottom is only the bottom once they have all landed.
+          scrollTo(0, document.documentElement.scrollHeight);
+          await settleBreakdowns();
           scrollTo(0, document.documentElement.scrollHeight);
           applyReport(after, before, state);
           await settle();
@@ -2702,7 +2999,7 @@ class ReportClientContract:
         self.page.evaluate("""() => {
           const realFetch = window.fetch.bind(window);
           window.fetch = (url, options) => realFetch(url, options).then(async response => {
-            if (!String(url).includes('/leaderboard')) return response;
+            if (!String(url).includes('/leaderboard') || String(url).includes('branch_target=')) return response;
             const report = await response.json();
             report.data.columns.erd_numerator[0] = window.__numerator;
             return new Response(JSON.stringify(report), {
@@ -5552,13 +5849,11 @@ class ReportClientContract:
         )
         page = context.new_page()
         try:
-            page.goto(self.base_url + "?kind=leaderboard")
-            page.wait_for_selector("text=Opener leaderboard")
-            # A card's breakdown is fetched when it is opened, so the groups
-            # under measurement are supplied by the detail request rather than
-            # written into the ranking.  Installed after the navigation, which
-            # would otherwise discard the override.
-            page.evaluate("""() => {
+            # A card fetches its breakdown as it comes on screen, so the
+            # groups under measurement are supplied by the detail request
+            # rather than written into the ranking.  Installed before the
+            # page loads, because the first cards fetch as soon as they draw.
+            page.add_init_script("""(() => {
               const realFetch = window.fetch.bind(window);
               window.fetch = (url, options) => realFetch(url, options).then(async response => {
                 if (!String(url).includes('branch_target=')) return response;
@@ -5579,8 +5874,8 @@ class ReportClientContract:
                   status: 200, headers: {'Content-Type': 'application/json'},
                 });
               });
-            }""")
-            page.locator(".grid.leaderboard > .leaderboard-card").nth(0).locator("summary").click()
+            })();""")
+            page.goto(self.base_url + "?kind=leaderboard")
             page.wait_for_selector(".response-bucket-legend > span")
             measured = page.evaluate("""async () => {
               await new Promise(requestAnimationFrame);
@@ -5610,7 +5905,7 @@ class ReportClientContract:
         # wait, so nothing gets a chance to re-render first.
         self.page.goto(self.base_url + "?kind=leaderboard")
         self.page.wait_for_selector(".grid.leaderboard > .leaderboard-card")
-        self._open_leaderboard_breakdown(0)
+        self._leaderboard_breakdown(0)
         self.page.wait_for_selector(".response-bucket-legend > span")
         for width in (375, 480, 600, 700, 800, 801, 900, 1000, 1100, 1199, 1200):
             with self.subTest(width=width):
