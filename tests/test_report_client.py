@@ -2170,6 +2170,93 @@ class ReportClientContract:
         self.assertEqual(
             self.page.locator(".grid.leaderboard > .leaderboard-card").count(), 5)
 
+    def test_a_row_limit_never_reaches_the_leaderboard(self):
+        """The histogram is the whole field, so the ranking is never cut.
+
+        A limit in the URL -- or one carried from another report's filters --
+        would have the server send only the leading rows, and the histogram
+        would present that slice as every complete opener.
+        """
+        self._open_long_leaderboard(300, query="&limit=25")
+        state = self.page.evaluate("() => window.__reportClient.getState()")
+        self.assertIsNone(state["limit"])
+        self.assertNotIn("limit", self.page.evaluate(
+            "() => window.buildAPIURL(window.__reportClient.getState())"))
+        self.assertIn("best 20 of 300 complete", self._caption())
+
+    def test_a_breakdown_that_failed_to_load_is_retried_on_a_tap(self):
+        """A failure is not the card's last word, and not a retry loop.
+
+        The first request for every breakdown fails, as it would while the
+        report server restarts.  The card says so and waits: a card on
+        screen retrying by itself would ask again as fast as it was refused.
+        Tapping the message asks once more.
+        """
+        self.page.add_init_script("""(() => {
+          const realFetch = window.fetch.bind(window);
+          const refused = new Set();
+          window.__refusals = 0;
+          window.fetch = (url, options) => {
+            const text = String(url);
+            if (!text.includes('branch_target=') || refused.has(text))
+              return realFetch(url, options);
+            refused.add(text);
+            window.__refusals += 1;
+            return Promise.resolve(new Response('{}', {status: 503}));
+          };
+        })();""")
+        self._open_long_leaderboard(300, query="&poll=600000")
+        card = self.page.locator(".grid.leaderboard > .leaderboard-card").first
+        retry = card.locator(".leaderboard-breakdown-retry")
+        retry.wait_for()
+        self.assertIn("tap to retry", retry.inner_text())
+        refusals = self.page.evaluate("() => window.__refusals")
+        self.page.wait_for_timeout(300)
+        self.assertEqual(self.page.evaluate("() => window.__refusals"), refusals)
+        self.assertEqual(card.locator(".answer-segment").count(), 0)
+        retry.click()
+        card.locator(".answer-segment").first.wait_for()
+
+    def test_a_lookup_draws_its_card_from_its_own_answer(self):
+        """The lookup's answer already holds the opener's response groups.
+
+        Asking the same endpoint again for the card would partition the
+        answers twice, and could fail after the lookup succeeded.
+        """
+        self.page.add_init_script("""(() => {
+          const realFetch = window.fetch.bind(window);
+          window.__cardFetches = 0;
+          window.fetch = (url, options) => {
+            if (String(url).includes('branch_target=SALET')
+                && new Error().stack.includes('fetchOpenerBreakdown'))
+              window.__cardFetches += 1;
+            return realFetch(url, options);
+          };
+        })();""")
+        self._open_long_leaderboard(300, query="&poll=600000")
+        box = self.page.locator(".opener-lookup-form input")
+        box.fill("salet")
+        box.press("Enter")
+        card = self.page.locator(".opener-lookup-answer .leaderboard-card.looked-up")
+        card.locator(".answer-segment").first.wait_for()
+        self.assertEqual(self.page.evaluate("() => window.__cardFetches"), 0)
+
+    def test_an_opened_neighbour_folds_from_the_keyboard(self):
+        """What a key opened, a key can close."""
+        self._look_up_opener("salet")
+        answer = self.page.locator(".opener-lookup-answer")
+        row = answer.locator(".leaderboard-neighbour[data-identity=crane]")
+        self.assertEqual(row.get_attribute("aria-expanded"), "false")
+        row.focus()
+        self.page.keyboard.press("Enter")
+        title = answer.locator(".leaderboard-card[data-identity=crane] .card-title")
+        title.wait_for()
+        self.assertEqual(title.get_attribute("role"), "button")
+        self.assertEqual(title.get_attribute("aria-expanded"), "true")
+        title.focus()
+        self.page.keyboard.press(" ")
+        answer.locator(".leaderboard-neighbour[data-identity=crane]").wait_for()
+
     def test_cards_fetch_their_breakdowns_as_they_come_on_screen(self):
         """A card costs a request only once the reader nears it.
 

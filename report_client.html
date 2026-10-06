@@ -254,6 +254,7 @@
     .opener-lookup .leaderboard-list-heading { margin-top:.2rem; background:var(--lookup-bg); }
     .leaderboard-neighbour { display:flex; align-items:center; gap:.55rem; width:100%; text-align:left; background:var(--panel); padding:.35rem .75rem; }
     .leaderboard-card .card-title.clickable { cursor:pointer; }
+    .leaderboard-breakdown-retry { display:block; width:100%; margin:.4rem 0; text-align:left; }
     .opener-lookup-form { display:flex; flex-wrap:wrap; align-items:center; gap:.4rem .5rem; }
     .opener-lookup-form input { width:7rem; text-transform:uppercase; letter-spacing:.12em; font-family:inherit; }
     .opener-lookup-answer { margin-top:.6rem; }
@@ -635,7 +636,10 @@
       if(normalized.tree&&normalized.limit!==null&&![10,25,50,100].includes(normalized.limit))normalized.limit=10;
       if(normalized.kind==="cache"){normalized.branch_status=[];normalized.branch_worker_status=[];normalized.minimum_answer_count=null;normalized.maximum_answer_count=null;normalized.priority=null;normalized.sort="";}
       if(normalized.kind!=="leaderboard")normalized.erd_numerator_range="";
-      if(normalized.kind==="leaderboard"){normalized.branch_status=[];normalized.branch_worker_status=[];normalized.branch_target="";normalized.claims=false;normalized.answers=false;}
+      // The leaderboard reads the whole ranking and pages it by its histogram,
+      // so a row limit -- typed, or carried from another report -- would
+      // present the leading slice as the whole field.
+      if(normalized.kind==="leaderboard"){normalized.branch_status=[];normalized.branch_worker_status=[];normalized.branch_target="";normalized.claims=false;normalized.answers=false;normalized.limit=null;}
       // The sources report reads only the source word and the row limit; every
       // branch filter is meaningless against a membership row.  A target that
       // names no word is dropped, and one that reaches a word through a spine
@@ -2670,6 +2674,7 @@
       entry.append(wordTiles(row.word,null,row.word_is_answer),"/",element("span","erd-value",row.erdText));
       button.append(element("span","leaderboard-rank","#"+numText(row.rank)),entry);
       button.setAttribute("aria-label","#"+numText(row.rank)+" "+String(row.word).toUpperCase()+", show its response groups");
+      button.setAttribute("aria-expanded","false");
       button.addEventListener("click",()=>{expandedNeighbours.add(row.word);redraw();});
       return button;
     }
@@ -2750,7 +2755,13 @@
           const card=leaderboardCard(row,state,{maximumResponseGroupCount});
           const title=card.querySelector(".card-title");
           title.classList.add("clickable");title.title="Fold back to one line";
-          title.addEventListener("click",()=>{expandedNeighbours.delete(row.word);draw();});
+          title.setAttribute("role","button");title.tabIndex=0;title.setAttribute("aria-expanded","true");
+          const fold=()=>{expandedNeighbours.delete(row.word);draw();};
+          title.addEventListener("click",fold);
+          title.addEventListener("keydown",event=>{
+            if(event.key!=="Enter"&&event.key!==" ")return;
+            event.preventDefault();fold();
+          });
           grid.append(card);
         });
         answer.replaceChildren(heading,position,grid);
@@ -2784,7 +2795,10 @@
         const response=await fetch(leaderboardDetailURL(state,word),
           {headers:{Accept:"application/json"}});
         if(!response.ok)throw new Error("Lookup failed ("+response.status+")");
-        const standing=(await response.json()).data.standing;
+        const {standing,detail}=(await response.json()).data;
+        // The answer carries the opener's own response groups, so its card
+        // draws from them rather than asking the same endpoint again.
+        if(detail?.available)openerBreakdowns.set(detail.word||word,detail);
         if(openerStandingPending!==word)return;
         openerStandingPending=null;
         openerStanding=standing||{word,available:false,state:"absent"};
@@ -2899,13 +2913,22 @@
       if(held){fill(held);return host;}
       host.append(element("p","dim","Loading response groups…"));
       if(drawnBreakdownHeight)host.style.minHeight=drawnBreakdownHeight+"px";
-      observeLeaderboardBreakdown(host,()=>queueBreakdownFetch(async()=>{
+      // A failed request is retried when the reader taps it, never on its
+      // own: a card on screen while the server is down would otherwise ask
+      // again as fast as it was refused.
+      const load=()=>queueBreakdownFetch(async()=>{
         // A card a redraw has already replaced is not worth a request; its
         // replacement is observed in its own right.
         if(!host.isConnected)return;
         try{draw(await fetchOpenerBreakdown(state,row.word));}
-        catch(error){host.replaceChildren(element("p","error",error.message));}
-      }));
+        catch(error){
+          const retry=element("button","leaderboard-breakdown-retry error",error.message+" · tap to retry");
+          retry.type="button";
+          retry.addEventListener("click",()=>{host.replaceChildren(element("p","dim","Loading response groups…"));load();});
+          host.replaceChildren(retry);
+        }
+      });
+      observeLeaderboardBreakdown(host,load);
       return host;
     }
     // The ranking arrives as parallel arrays: at the full candidate vocabulary
