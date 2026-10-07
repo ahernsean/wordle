@@ -1084,7 +1084,7 @@ pip install -r requirements.txt       # runtime only (numpy)
 **Claude Code on the web** starts from a bare image with neither dependency
 installed. `.claude/hooks/session-start.sh` installs them into `python3.13`.
 Browser tests need nothing set to run; the hook only sets
-`SKIP_WEBKIT_CONTAINER_TESTS=1`, and prints that it did, when the image carries
+`SKIP_WEBKIT_TESTS=1`, and prints that it did, when the image carries
 neither podman nor docker. It no-ops on a local checkout (`CLAUDE_CODE_REMOTE`),
 which keeps whatever environment the developer set up.
 
@@ -1138,10 +1138,11 @@ or a clear, which keep the same container.
   from WebKit — Safari and iOS Chrome — so a green run that covered only
   Chromium would leave the primary engine untested.
 
-  `SKIP_WEBKIT_CONTAINER_TESTS=1` opts out for a machine that can start
-  neither the native build nor the container fallback, and
-  `SKIP_BROWSER_TESTS=1` opts out of both engines. Setting either is a
-  deliberate statement that the run does not cover that engine — reach for
+  Each engine has one opt-out, named for the engine and nothing else:
+  `SKIP_WEBKIT_TESTS=1` for a machine that can start neither the native
+  build nor the container fallback, and `SKIP_CHROMIUM_TESTS=1` for one that
+  cannot start Chromium. A run covering neither sets both. Setting either is
+  a deliberate statement that the run does not cover that engine — reach for
   them only when the environment genuinely cannot host the browser, never to
   get a red suite green.
 
@@ -1263,11 +1264,10 @@ read and dealt with when it arrives.
 
 The same holds for the browser suite. A change to `report_client.html` runs
 the browser tests that exercise what it changed, selected with `-k`, on both
-engines, plus their mutation checks. Both engines run unless a `SKIP_*`
-variable is set: `SKIP_BROWSER_TESTS=1` turns off both, and
-`SKIP_WEBKIT_CONTAINER_TESTS=1` turns off WebKit alone. Check that neither is
-exported before calling a run green on both; the web session hook can export
-the WebKit one. The
+engines, plus their mutation checks. Both engines run unless their opt-out is
+set: `SKIP_CHROMIUM_TESTS=1` turns off Chromium and `SKIP_WEBKIT_TESTS=1`
+turns off WebKit. Check that neither is exported before calling a run green
+on both; the web session hook can export the WebKit one. The
 rest of `tests.test_report_client` is CI's job. "Both engines" settles which
 browsers a focused run covers, not how many tests it runs; see the WebKit
 notes above. A change touching shared client machinery (rendering, polling,
