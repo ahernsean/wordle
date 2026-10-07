@@ -1084,7 +1084,7 @@ pip install -r requirements.txt       # runtime only (numpy)
 **Claude Code on the web** starts from a bare image with neither dependency
 installed. `.claude/hooks/session-start.sh` installs them into `python3.13`.
 Browser tests need nothing set to run; the hook only sets
-`SKIP_WEBKIT_CONTAINER_TESTS=1`, and prints that it did, when the image carries
+`SKIP_WEBKIT_TESTS=1`, and prints that it did, when the image carries
 neither podman nor docker. It no-ops on a local checkout (`CLAUDE_CODE_REMOTE`),
 which keeps whatever environment the developer set up.
 
@@ -1138,10 +1138,11 @@ or a clear, which keep the same container.
   from WebKit — Safari and iOS Chrome — so a green run that covered only
   Chromium would leave the primary engine untested.
 
-  `SKIP_WEBKIT_CONTAINER_TESTS=1` opts out for a machine that can start
-  neither the native build nor the container fallback, and
-  `SKIP_BROWSER_TESTS=1` opts out of both engines. Setting either is a
-  deliberate statement that the run does not cover that engine — reach for
+  Each engine has one opt-out, named for the engine and nothing else:
+  `SKIP_WEBKIT_TESTS=1` for a machine that can start neither the native
+  build nor the container fallback, and `SKIP_CHROMIUM_TESTS=1` for one that
+  cannot start Chromium. A run covering neither sets both. Setting either is
+  a deliberate statement that the run does not cover that engine — reach for
   them only when the environment genuinely cannot host the browser, never to
   get a red suite green.
 
@@ -1255,14 +1256,30 @@ Python module, review this inventory in the same change and run the combined
 coverage gate. If the expanded scope falls below 98%, add tests for the missing
 production behavior rather than narrowing the inventory.
 
-Commits with failing tests must not be pushed.
+Commits with failing tests must not be pushed. "Failing tests" means tests
+you ran that failed: the focused tests above, on every engine they cover. It
+does not mean every test in the repository must have passed locally first.
+Tests the diff cannot reach are CI's to run, and a CI failure in one of them is
+read and dealt with when it arrives.
+
+The same holds for the browser suite. A change to `report_client.html` runs
+the browser tests that exercise what it changed, selected with `-k`, on both
+engines, plus their mutation checks. Both engines run unless their opt-out is
+set: `SKIP_CHROMIUM_TESTS=1` turns off Chromium and `SKIP_WEBKIT_TESTS=1`
+turns off WebKit. Check that neither is exported before calling a run green
+on both; the web session hook can export the WebKit one. The
+rest of `tests.test_report_client` is CI's job. "Both engines" settles which
+browsers a focused run covers, not how many tests it runs; see the WebKit
+notes above. A change touching shared client machinery (rendering, polling,
+scroll restoration) has more related tests, so find them; it still does not
+need the whole module.
 
 A commit whose diff is entirely markdown, documentation, or other non-code
-files cannot change test outcomes, so the suite is not required for it. Push it
-as is; do not fix unrelated pre-existing failures to clear the gate. If the
-diff touches code at all — including test files, build configuration, or a code
-snippet embedded in a doc that the suite executes — the rule above applies in
-full.
+files cannot change test outcomes, so no tests need to run for it. Push it as
+is; do not fix unrelated pre-existing failures to clear the gate. If the diff
+touches code at all — including test files, build configuration, or a code
+snippet embedded in a doc that the suite executes — run its focused tests as
+described above before pushing.
 
 **`SWARM.md`'s command examples are executable.**
 `test_every_swarm_guide_command_example_parses` extracts each one and feeds it

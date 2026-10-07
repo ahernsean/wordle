@@ -88,15 +88,12 @@ SETTLE_BREAKDOWNS_JS = (
 # (Safari and iOS Chrome), so a run that quietly covered only Chromium would
 # report green while leaving the primary engine untested.
 #
-# The opt-outs exist for an environment that genuinely cannot host a browser —
-# no playwright, or neither a native WebKit build nor a container runtime to
-# fall back to.  Setting one is a deliberate statement that this run does not
-# cover that engine.
-SKIP_BROWSER_TESTS = os.environ.get("SKIP_BROWSER_TESTS") == "1"
-SKIP_WEBKIT_CONTAINER_TESTS = (
-    SKIP_BROWSER_TESTS
-    or os.environ.get("SKIP_WEBKIT_CONTAINER_TESTS") == "1"
-)
+# Each engine has one opt-out, for an environment that genuinely cannot host
+# it — no playwright, or for WebKit neither a native build nor a container
+# runtime to fall back to.  Setting one is a deliberate statement that this
+# run does not cover that engine; a run covering neither sets both.
+SKIP_CHROMIUM_TESTS = os.environ.get("SKIP_CHROMIUM_TESTS") == "1"
+SKIP_WEBKIT_TESTS = os.environ.get("SKIP_WEBKIT_TESTS") == "1"
 
 # Longer than the grid choreography, so a report applied before this has elapsed
 # is one the transition has already finished with.
@@ -7418,12 +7415,12 @@ class ReportClientContract:
                     self.assertGreater(os.path.getsize(screenshot), 0)
 
 
-@unittest.skipIf(SKIP_BROWSER_TESTS, "SKIP_BROWSER_TESTS=1")
+@unittest.skipIf(SKIP_CHROMIUM_TESTS, "SKIP_CHROMIUM_TESTS=1")
 class ChromiumReportClientTest(ReportClientContract, unittest.TestCase):
     """The client's contract against Chromium."""
 
     engine_name = "Chromium"
-    opt_out_hint = "set SKIP_BROWSER_TESTS=1 to run without any browser coverage"
+    opt_out_hint = "set SKIP_CHROMIUM_TESTS=1 to run without Chromium coverage"
     launch_failure_hint = "Playwright Chromium failed to start"
 
     @classmethod
@@ -7431,8 +7428,7 @@ class ChromiumReportClientTest(ReportClientContract, unittest.TestCase):
         return _launch_chromium(playwright)
 
 
-@unittest.skipIf(SKIP_WEBKIT_CONTAINER_TESTS,
-                 "SKIP_WEBKIT_CONTAINER_TESTS=1")
+@unittest.skipIf(SKIP_WEBKIT_TESTS, "SKIP_WEBKIT_TESTS=1")
 class WebKitReportClientTest(ReportClientContract, unittest.TestCase):
     """The client's contract against WebKit, which is how it is mostly used.
 
@@ -7444,14 +7440,13 @@ class WebKitReportClientTest(ReportClientContract, unittest.TestCase):
     """
 
     engine_name = "WebKit"
-    opt_out_hint = ("set SKIP_WEBKIT_CONTAINER_TESTS=1 to run without WebKit "
-                    "coverage")
+    opt_out_hint = "set SKIP_WEBKIT_TESTS=1 to run without WebKit coverage"
     launch_failure_hint = (
         "WebKit failed to start natively and its container fallback also "
         "failed.  Native WebKit needs `playwright install --with-deps "
         "webkit`; the container fallback needs podman or docker and the "
         "mcr.microsoft.com/playwright image at the installed playwright's "
-        "version.  Set SKIP_WEBKIT_CONTAINER_TESTS=1 to run without WebKit "
+        "version.  Set SKIP_WEBKIT_TESTS=1 to run without WebKit "
         "coverage."
     )
     #: Set when the native build could not run and the container answered.

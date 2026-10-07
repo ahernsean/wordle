@@ -49,7 +49,7 @@ command -v "$PYTHON" >/dev/null 2>&1 || PYTHON=python3
 # not always carry.  Opt out explicitly when there is none, so the reason is a
 # line in this hook's output rather than a suite that quietly covers one engine.
 if ! command -v podman >/dev/null 2>&1 && ! command -v docker >/dev/null 2>&1; then
-  echo 'export SKIP_WEBKIT_CONTAINER_TESTS=1' >> "${CLAUDE_ENV_FILE:-/dev/null}"
+  echo 'export SKIP_WEBKIT_TESTS=1' >> "${CLAUDE_ENV_FILE:-/dev/null}"
   echo "No podman or docker: WebKit browser tests are disabled in this session."
 fi
 
