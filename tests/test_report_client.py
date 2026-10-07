@@ -5,6 +5,7 @@ import collections
 import copy
 import itertools
 import json
+import math
 from http.server import ThreadingHTTPServer
 from html.parser import HTMLParser
 import os
@@ -2488,6 +2489,296 @@ class ReportClientContract:
         rises = self.page.evaluate(rise_of)
         self.assertAlmostEqual(rises[0], 202 / 3, places=3)
         self.assertAlmostEqual(rises[1], 3 / 202, places=4)
+
+    # Two touch pointers on the histogram, put down at `start` and moved to
+    # `end` (fractions of the chart's width), then lifted unless `lift` is
+    # false.  Returns the chart's transform while the fingers were down.
+    PINCH_JS = """([start, end, lift]) => {
+      const bars = document.querySelector('.erd-histogram-bars');
+      const rect = bars.getBoundingClientRect(), y = rect.top + rect.height / 2;
+      const fire = (type, id, fraction) => bars.dispatchEvent(new PointerEvent(type, {
+        pointerId: id, pointerType: 'touch', isPrimary: id === 1, bubbles: true,
+        clientX: rect.left + fraction * rect.width, clientY: y,
+      }));
+      fire('pointerdown', 1, start[0]); fire('pointerdown', 2, start[1]);
+      fire('pointermove', 1, end[0]); fire('pointermove', 2, end[1]);
+      const transform = bars.style.transform;
+      if (lift) {
+        fire('pointerup', 1, end[0]); fire('pointerup', 2, end[1]);
+        // The tap a browser fires where the last finger left.
+        document.elementFromPoint(rect.left + end[1] * rect.width - 2, rect.bottom - 2)
+          ?.closest('button')?.click();
+      }
+      return transform;
+    }"""
+
+    def test_a_pinch_zooms_to_the_range_between_the_fingers(self):
+        """The values under each finger stay under it, then become the range.
+
+        300 openers, one to each numerator on 350..649.  Fingers a quarter
+        and three quarters of the way along sit on 425 and 575; spread to the
+        chart's edges, the chart doubles and moves left by half its width
+        while they are down, and lifting them zooms to 425..574 without a
+        request.  The zoom starts where the pinch left the old chart, so the
+        new chart arrives already in place and the old one leaves from under
+        the fingers.  Its height starts at its own: every bar it covers holds
+        as many openers as the tallest.  The lifted fingers are not a tap.
+        """
+        self._open_long_leaderboard(300, query="&poll=600000")
+        rankings = self.page.evaluate("() => window.__rankingFetches")
+        entries = self.page.evaluate("() => history.length")
+        self.assertEqual(self.page.locator(".erd-histogram-bars").evaluate(
+            "node => getComputedStyle(node).touchAction"), "pan-y")
+
+        during = self.page.evaluate(self.PINCH_JS, [[0.25, 0.75], [0, 1], True])
+        width = self.page.evaluate(
+            "() => document.querySelector('.erd-histogram-bars').clientWidth")
+        offset, scale, rise = map(float, re.findall(r"-?[\d.]+", during))
+        self.assertAlmostEqual(offset, -width / 2, places=1)
+        self.assertEqual((scale, rise), (2, 1))
+        self.assertIn("erd_numerator_range=425-574", self.page.url)
+        self.assertIn("best 20 of 150 with ERD 4.2500–5.7400", self._caption())
+        self.assertEqual(
+            " ".join(self.page.locator(".erd-zoom-trail").inner_text().split()),
+            "All openers › ERD 4.2500–5.7400")
+        self.assertEqual(self.page.evaluate("() => window.__rankingFetches"), rankings)
+
+        self.page.wait_for_function(
+            "() => document.querySelector('.erd-histogram-bars').getAnimations().length === 1"
+            " && document.querySelector('.erd-histogram-departing')?.getAnimations().length === 1")
+        frames = self.page.evaluate("""() => {
+          const width = document.querySelector('.erd-histogram-bars').clientWidth;
+          const read = node => node.getAnimations()[0].effect.getKeyframes()
+            .map(frame => frame.transform).filter(Boolean)
+            .map(transform => transform === 'none' ? null
+              : transform.match(/-?[\\d.]+(?:e-?\\d+)?/g).map(Number)
+                .map((value, index) => index ? value : value / width));
+          const result = [read(document.querySelector('.erd-histogram-bars'))[0],
+                          read(document.querySelector('.erd-histogram-departing'))[0]];
+          document.getAnimations().forEach(animation => animation.finish());
+          return result;
+        }""")
+        arriving, departing = frames
+        self.assertAlmostEqual(arriving[0], 0, places=3)
+        self.assertAlmostEqual(arriving[1], 1, places=4)
+        self.assertAlmostEqual(arriving[2], 1, places=4)
+        self.assertAlmostEqual(departing[0], -0.5, places=3)
+        self.assertAlmostEqual(departing[1], 2, places=4)
+
+        # The tap that followed the lift did not choose the bar under it,
+        # and a tap once the fingers are well away does.
+        self.assertEqual(self.page.evaluate("() => history.length"), entries + 1)
+        self.page.wait_for_timeout(600)
+        self.page.locator("button.erd-histogram-bar").first.click()
+        self.assertIn("erd_numerator_range=425-429", self.page.url)
+
+    def test_a_pinch_out_past_the_field_returns_to_all_openers(self):
+        """A pinch is clamped to the field, and the whole field is no range.
+
+        From 425..574, fingers drawn in from a quarter and three quarters to
+        three eighths and five eighths halve the chart around its middle:
+        the chart would span 350..649, which is every opener.  Pinched in
+        further, the whole field is still the range, so the chart settles
+        back where it was.
+        """
+        self._open_long_leaderboard(300, query="&poll=600000&erd_numerator_range=425-574")
+        self.page.evaluate(self.PINCH_JS, [[0.25, 0.75], [0.375, 0.625], True])
+        self.page.wait_for_function(
+            "() => !location.search.includes('erd_numerator_range')")
+        self.assertIn("best 20 of 300 complete", self._caption())
+        self.assertFalse(self.page.locator(".erd-zoom-trail").count())
+
+        self.page.evaluate(self.PINCH_JS, [[0.25, 0.75], [0.3, 0.7], True])
+        self.assertNotIn("erd_numerator_range", self.page.url)
+        self.assertEqual(self.page.evaluate(
+            "() => document.querySelector('.erd-histogram-bars').style.transform"), "")
+
+    def test_a_pinched_range_keeps_the_trail_that_holds_it(self):
+        """A range that is no bin sits beneath the narrowest bin holding it.
+
+        From the field's bar 400..404, fingers a fifth and four fifths of
+        the way along spread to the edges choose 401..403, a range no bar
+        of that chart is, so the trail still climbs through the bar.
+        """
+        self._open_long_leaderboard(300, query="&poll=600000&erd_numerator_range=400-404")
+        self.page.evaluate(self.PINCH_JS, [[0.2, 0.8], [0, 1], True])
+        self.assertIn("erd_numerator_range=401-403", self.page.url)
+        self.assertEqual(
+            " ".join(self.page.locator(".erd-zoom-trail").inner_text().split()),
+            "All openers › ERD 4.0000–4.0400 › ERD 4.0100–4.0300")
+
+    # Touch pointers on the histogram, one event per step: [type, pointer,
+    # fraction of the chart's width, pixels below the chart's middle].  A
+    # "read" step records the chart's transform.  Returns those readings.
+    TOUCHES_JS = """(steps) => {
+      // The chart's box at rest: a chart mid-zoom is drawn elsewhere.
+      const chart = document.querySelector('.erd-histogram-bars'), box = chart.parentElement.getBoundingClientRect();
+      const rect = {left: box.left + chart.parentElement.clientLeft + chart.offsetLeft,
+                    top: box.top + chart.parentElement.clientTop + chart.offsetTop,
+                    width: chart.clientWidth, height: chart.clientHeight};
+      const readings = [];
+      for (const [type, id, fraction, below = 0] of steps) {
+        const bars = document.querySelector('.erd-histogram-bars');
+        if (type === 'read') { readings.push(bars.style.transform); continue; }
+        bars.dispatchEvent(new PointerEvent(type, {
+          pointerId: id, pointerType: 'touch', isPrimary: id === 1, bubbles: true,
+          clientX: rect.left + fraction * rect.width, clientY: rect.top + rect.height / 2 + below,
+        }));
+      }
+      return readings;
+    }"""
+
+    def test_one_finger_dragged_sideways_pans_the_chart(self):
+        """A drag keeps its range's width and moves it with the finger.
+
+        On 425..574, a finger dragged from 0.6 to 0.4 of the chart's width
+        moves the chart a fifth of its width left while it is down, and
+        lifting it shows the 150 numerators a fifth further on, 455..604.
+        Dragged far past the field's end, the range stops against it
+        rather than narrowing.
+        """
+        self._open_long_leaderboard(300, query="&poll=600000&erd_numerator_range=425-574")
+        width = self.page.evaluate(
+            "() => document.querySelector('.erd-histogram-bars').clientWidth")
+        readings = self.page.evaluate(self.TOUCHES_JS, [
+            ["pointerdown", 1, 0.6], ["pointermove", 1, 0.5], ["pointermove", 1, 0.4],
+            ["read"], ["pointerup", 1, 0.4]])
+        offset, scale, rise = map(float, re.findall(r"-?[\d.]+", readings[0]))
+        self.assertAlmostEqual(offset, -width / 5, places=1)
+        self.assertEqual((scale, rise), (1, 1))
+        self.assertIn("erd_numerator_range=455-604", self.page.url)
+
+        self.page.evaluate(self.TOUCHES_JS, [
+            ["pointerdown", 1, 0.1], ["pointermove", 1, 0.9], ["pointerup", 1, 0.9]])
+        self.assertIn("erd_numerator_range=350-499", self.page.url)
+
+    def test_a_finger_that_barely_moves_or_moves_up_is_not_a_drag(self):
+        """A tap that wobbles still chooses a bar, and a scroll is the page's.
+
+        A finger moving a few pixels sideways leaves the chart where it is;
+        so does one moving further up the page than across it.
+        """
+        self._open_long_leaderboard(300, query="&poll=600000")
+        readings = self.page.evaluate(self.TOUCHES_JS, [
+            ["pointerdown", 1, 0.5], ["pointermove", 1, 0.5 + 3 / 1000], ["read"],
+            ["pointermove", 1, 0.53, -60], ["read"], ["pointerup", 1, 0.53, -60]])
+        self.assertEqual(readings, ["", ""])
+        self.assertNotIn("erd_numerator_range", self.page.url)
+        self.page.locator("button.erd-histogram-bar").nth(10).click()
+        self.assertIn("erd_numerator_range=400-404", self.page.url)
+
+    def test_a_second_finger_joining_a_drag_pinches_from_where_it_is(self):
+        """A finger put down on a moved chart holds the value drawn under it.
+
+        On 425..574, one finger drags from 0.5 to 0.3, sliding the chart a
+        fifth left; a second, put down at 0.7, lands on the value at 0.9 of
+        the chart at rest.  Moved to 0.9 it spreads 0.5..0.9 at rest over
+        0.3..0.9, so the chart spans 470..569 when they lift.
+        """
+        self._open_long_leaderboard(300, query="&poll=600000&erd_numerator_range=425-574")
+        self.page.evaluate(self.TOUCHES_JS, [
+            ["pointerdown", 1, 0.5], ["pointermove", 1, 0.3],
+            ["pointerdown", 2, 0.7], ["pointermove", 2, 0.9],
+            ["pointerup", 1, 0.3], ["pointerup", 2, 0.9]])
+        self.assertIn("erd_numerator_range=470-569", self.page.url)
+
+    def test_fingers_brought_together_at_an_edge_leave_the_whole_field(self):
+        """Two fingers meeting shrink the chart to a sliver, not to nothing.
+
+        Brought together on the chart's right edge, the fingers would put the
+        chart at zero width, a range with no bounds.  Held at a hundredth of
+        the width, the range runs a hundred times past the field, which is
+        the field itself.
+        """
+        self._open_long_leaderboard(300, query="&poll=600000&erd_numerator_range=425-574")
+        self.page.evaluate(self.PINCH_JS, [[0.25, 0.75], [1, 1], True])
+        self.page.wait_for_function(
+            "() => !location.search.includes('erd_numerator_range')")
+        self.assertIn("best 20 of 300 complete", self._caption())
+
+    def test_a_pinch_that_changes_nothing_settles_without_moving_under_reduced_motion(self):
+        """Settling back is motion like any other."""
+        self.page.emulate_media(reduced_motion="reduce")
+        self._open_long_leaderboard(300, query="&poll=600000")
+        self.page.evaluate(self.PINCH_JS, [[0.25, 0.75], [0.3, 0.7], True])
+        self.assertEqual(self.page.evaluate(
+            "() => document.querySelector('.erd-histogram-bars').getAnimations().length"), 0)
+        self.page.emulate_media(reduced_motion="no-preference")
+        self.page.evaluate(self.PINCH_JS, [[0.25, 0.75], [0.3, 0.7], True])
+        self.assertEqual(self.page.evaluate(
+            "() => document.querySelector('.erd-histogram-bars').getAnimations().length"), 1)
+
+    def test_a_finger_on_a_chart_still_zooming_holds_it_where_it_is_drawn(self):
+        """The values a finger lands on are the ones it is seen to land on.
+
+        A bar tap starts the chart zooming into 400..404; held halfway, the
+        chart is drawn part-way between the field's slot for that bar and
+        rest.  A finger landing there stops the zoom with the chart where it
+        is, and a drag from there moves that chart: lifted, the range is
+        the one drawn across the chart, worked out here from the transform
+        the finger found.  A tap on a held chart lets it go back to rest.
+        """
+        self._open_long_leaderboard(300, query="&poll=600000")
+        hold = """() => {
+          const bars = document.querySelector('.erd-histogram-bars');
+          const [animation] = bars.getAnimations();
+          animation.pause(); animation.currentTime = 200;
+          const drawn = new DOMMatrixReadOnly(getComputedStyle(bars).transform);
+          return [drawn.e / bars.clientWidth, drawn.a];
+        }"""
+        moving = "() => document.querySelector('.erd-histogram-bars').getAnimations().length === 1"
+        self.page.locator("button.erd-histogram-bar").nth(10).click()
+        self.page.wait_for_function(moving)
+        offset, scale = self.page.evaluate(hold)
+        self.assertLess(scale, 0.9)
+        self.page.evaluate(self.TOUCHES_JS, [["pointerdown", 1, 0.5]])
+        held = self.page.evaluate("""() => {
+          const bars = document.querySelector('.erd-histogram-bars');
+          return [bars.getAnimations().length, !!document.querySelector('.erd-histogram-departing'),
+                  new DOMMatrixReadOnly(getComputedStyle(bars).transform).e / bars.clientWidth];
+        }""")
+        self.assertEqual(held[:2], [0, False])
+        self.assertAlmostEqual(held[2], offset, places=3)
+
+        self.page.evaluate(self.TOUCHES_JS, [["pointermove", 1, 0.6], ["pointerup", 1, 0.6]])
+        js_round = lambda value: math.floor(value + 0.5)
+        moved = offset + 0.1
+        lowest = js_round(400 + (-moved / scale) * 5)
+        highest = max(lowest, js_round(400 + ((1 - moved) / scale) * 5) - 1)
+        self.assertNotEqual((lowest, highest), (400, 404))
+        self.assertIn("erd_numerator_range=%d-%d" % (lowest, highest), self.page.url)
+
+        self.page.locator("button.erd-histogram-bar").first.click()
+        self.page.wait_for_function(moving)
+        self.page.evaluate(hold)
+        self.page.evaluate(self.TOUCHES_JS, [["pointerdown", 1, 0.5], ["pointerup", 1, 0.5]])
+        self.assertEqual(self.page.evaluate(
+            "() => document.querySelector('.erd-histogram-bars').style.transform"), "")
+
+    def test_a_third_finger_takes_no_part_in_a_pinch(self):
+        """Only the first two fingers move the chart, and only they end it."""
+        self._open_long_leaderboard(300, query="&poll=600000")
+        self.page.evaluate(self.TOUCHES_JS, [
+            ["pointerdown", 1, 0.25], ["pointerdown", 2, 0.75],
+            ["pointerdown", 3, 0.5], ["pointermove", 3, 0.1], ["pointerup", 3, 0.1],
+            ["pointermove", 1, 0], ["pointermove", 2, 1],
+            ["pointerup", 1, 0], ["pointerup", 2, 1]])
+        self.assertIn("erd_numerator_range=425-574", self.page.url)
+
+    def test_a_pinch_lifted_off_the_chart_by_the_browser_puts_it_back(self):
+        """A pinch the browser takes over leaves the chart where it was."""
+        self._open_long_leaderboard(300, query="&poll=600000")
+        self.page.evaluate(self.PINCH_JS, [[0.25, 0.75], [0, 1], False])
+        self.page.evaluate("""() => {
+          const bars = document.querySelector('.erd-histogram-bars');
+          for (const id of [1, 2])
+            bars.dispatchEvent(new PointerEvent('pointercancel', {
+              pointerId: id, pointerType: 'touch', bubbles: true}));
+          return bars.style.transform;
+        }""")
+        self.assertEqual(self.page.evaluate(
+            "() => document.querySelector('.erd-histogram-bars').style.transform"), "")
+        self.assertNotIn("erd_numerator_range", self.page.url)
 
     def test_a_zoomed_leaderboard_url_opens_on_its_range(self):
         """The range is in the page URL, so a zoomed view can be shared."""
