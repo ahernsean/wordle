@@ -2582,7 +2582,9 @@
     // moving up or down still scrolls the page, and one that barely moves is
     // still a tap that chooses a bar.  A drag's lifted fingers are not a tap,
     // on whichever chart they land: the first lift has already drawn the next.
-    const HISTOGRAM_DRAG_PIXELS=8;
+    // Two fingers brought together shrink the chart toward nothing; held at
+    // a hundredth of its width, the range they leave is merely the field.
+    const HISTOGRAM_DRAG_PIXELS=8,HISTOGRAM_MINIMUM_SCALE=.01;
     let ignoreHistogramClicksUntil=0;
     document.addEventListener("click",event=>{
       if(performance.now()<ignoreHistogramClicksUntil&&event.target.closest?.(".erd-histogram-bar")){event.stopPropagation();event.preventDefault();}
@@ -2597,13 +2599,31 @@
       const place=event=>(event.clientX-section.getBoundingClientRect().left-section.clientLeft-bars.offsetLeft)/bars.clientWidth,
         atRest=fraction=>(fraction-moved.offset)/moved.scale,
         drawn=()=>"translateX("+moved.offset*bars.clientWidth+"px) scale("+moved.scale+",1)",
-        reset=()=>{touches.clear();anchors=null;dragging=false;moved={offset:0,scale:1};};
+        reset=()=>{touches.clear();anchors=null;dragging=false;moved={offset:0,scale:1};},
+        // The chart eases back to rest from where the fingers left it.
+        settle=({offset,scale})=>{
+          bars.style.transform="";
+          if((offset===0&&scale===1)||matchMedia("(prefers-reduced-motion: reduce)").matches||!bars.animate)return;
+          bars.animate([{transform:"translateX("+offset*bars.clientWidth+"px) scale("+scale+",1)"},{transform:"none"}],{duration:HISTOGRAM_ZOOM_MILLIS/2,easing:"cubic-bezier(.4,0,.2,1)"});
+        },
+        // A finger landing on a chart still zooming takes it where it is
+        // drawn, so the values it holds are the ones it is seen to hold.
+        // The rise of a zoom is let go: a drag moves the chart sideways only.
+        freeze=()=>{
+          const animations=bars.getAnimations?.()??[];
+          if(!animations.length)return;
+          const drawnNow=new DOMMatrixReadOnly(getComputedStyle(bars).transform);
+          for(const animation of animations)animation.cancel();
+          section.querySelector(".erd-histogram-departing")?.remove();
+          moved={offset:drawnNow.e/bars.clientWidth,scale:drawnNow.a||1};
+          bars.style.transform=drawn();
+        };
       section.addEventListener("gesturestart",event=>event.preventDefault());
       bars.addEventListener("pointerdown",event=>{
-        if(event.pointerType!=="touch")return;
-        if(!touches.size)downAt={x:event.clientX,y:event.clientY};
+        // A third finger takes no part: the gesture is the first two.
+        if(event.pointerType!=="touch"||touches.size>=2)return;
+        if(!touches.size){downAt={x:event.clientX,y:event.clientY};freeze();}
         touches.set(event.pointerId,place(event));
-        if(touches.size>2)return;
         // A finger joining a drag holds the place its chart has moved under it.
         anchors=new Map([...touches].map(([id,fraction])=>[id,atRest(fraction)]));
         if(touches.size===2){
@@ -2614,7 +2634,7 @@
       bars.addEventListener("pointermove",event=>{
         if(!touches.has(event.pointerId))return;
         touches.set(event.pointerId,place(event));
-        if(!anchors||touches.size>2)return;
+        if(!anchors)return;
         if(!dragging){
           const across=Math.abs(event.clientX-downAt.x);
           if(across<HISTOGRAM_DRAG_PIXELS||across<Math.abs(event.clientY-downAt.y))return;
@@ -2624,14 +2644,18 @@
         const [[firstId,first],second]=[...touches],firstAnchor=anchors.get(firstId);
         if(second){
           const secondAnchor=anchors.get(second[0]),
-            scale=Math.abs(second[1]-first)/Math.max(1e-3,Math.abs(secondAnchor-firstAnchor));
+            scale=Math.max(HISTOGRAM_MINIMUM_SCALE,Math.abs(second[1]-first)/Math.max(1e-3,Math.abs(secondAnchor-firstAnchor)));
           moved={scale,offset:first-scale*firstAnchor};
         }else moved={scale:moved.scale,offset:first-moved.scale*firstAnchor};
         bars.style.transform=drawn();
       });
       bars.addEventListener("pointerup",event=>{
         if(!touches.has(event.pointerId))return;
-        if(!dragging){touches.delete(event.pointerId);if(!touches.size)reset();return;}
+        if(!dragging){
+          touches.delete(event.pointerId);
+          if(!touches.size){const left=moved;reset();settle(left);}
+          return;
+        }
         const {scale,offset}=moved;reset();ignoreHistogramClicksUntil=performance.now()+500;
         const lowest=range.from+(-offset/scale)*span,highest=range.from+((1-offset)/scale)*span;
         let from=Math.round(lowest),to=Math.max(from,Math.round(highest)-1);
@@ -2640,11 +2664,7 @@
         if(to>field.to)[from,to]=[Math.max(field.from,field.to-width),field.to];
         const chosen=from<=field.from&&to>=field.to?null:{from,to},
           current=parseERDNumeratorRange(currentState.erd_numerator_range);
-        if(chosen?.from===current?.from&&chosen?.to===current?.to){
-          bars.style.transform="";
-          bars.animate?.([{transform:"translateX("+offset*bars.clientWidth+"px) scale("+scale+",1)"},{transform:"none"}],{duration:HISTOGRAM_ZOOM_MILLIS/2,easing:"cubic-bezier(.4,0,.2,1)"});
-          return;
-        }
+        if(chosen?.from===current?.from&&chosen?.to===current?.to){settle({offset,scale});return;}
         zoomLeaderboard(chosen,{offset,scale});
       });
       bars.addEventListener("pointercancel",event=>{
