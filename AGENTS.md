@@ -1263,9 +1263,11 @@ read and dealt with when it arrives.
 
 The same holds for the browser suite. A change to `report_client.html` runs
 the browser tests that exercise what it changed, selected with `-k`, on both
-engines, plus their mutation checks. WebKit runs unless a `SKIP_*` variable
-is set, so check that none is exported (the web session hook can export
-`SKIP_WEBKIT_CONTAINER_TESTS=1`) before calling a run green on both. The
+engines, plus their mutation checks. Both engines run unless a `SKIP_*`
+variable is set: `SKIP_BROWSER_TESTS=1` turns off both, and
+`SKIP_WEBKIT_CONTAINER_TESTS=1` turns off WebKit alone. Check that neither is
+exported before calling a run green on both; the web session hook can export
+the WebKit one. The
 rest of `tests.test_report_client` is CI's job. "Both engines" settles which
 browsers a focused run covers, not how many tests it runs; see the WebKit
 notes above. A change touching shared client machinery (rendering, polling,
