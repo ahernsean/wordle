@@ -41,7 +41,7 @@ from wordle_engine import ERD_ALL, GAME_GUESSES, ResponseCache, load_word_list
 from wordle_ui import fmt_pattern, parse_pattern
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 WORKER_STALE_SECONDS = 20
 DEFAULT_TREE_PAGE_SIZE = 10
 # A tree page groups sibling nodes by the guess word on their spine, and a page
@@ -1973,13 +1973,13 @@ def collect_root_progress_report(sources: ReportOpeners,
                     "branch_count": summary["branch_count"],
                     "open_branch_count": 0,
                     "search_node_count": summary["search_node_count"],
-                    "wall_millis": summary["worker_millis"],
+                    "wall_time_millis": summary["worker_time_millis"],
                     "first_created_at": summary["first_created_at"],
                     "last_finalized_at": summary["last_finalized_at"],
                     "telemetry_epochs": [int(epoch) for epoch in
                                          summary["telemetry_epochs"].split(",")
                                          if epoch],
-                    "elapsed_millis": (
+                    "elapsed_time_millis": (
                         (summary["last_finalized_at"] - summary["first_created_at"]) * 1000
                         if summary["first_created_at"] is not None
                         and summary["last_finalized_at"] is not None else None),
@@ -2004,8 +2004,8 @@ def collect_root_progress_report(sources: ReportOpeners,
             "branch_count": totals["branch_count"] if totals else 0,
             "open_branch_count": totals["open_branch_count"] if totals else 0,
             "search_node_count": totals["search_node_count"] if totals else 0,
-            "wall_millis": totals["wall_millis"] if totals else 0,
-            "elapsed_millis": totals["elapsed_millis"] if totals else None,
+            "wall_time_millis": totals["wall_time_millis"] if totals else 0,
+            "elapsed_time_millis": totals["elapsed_time_millis"] if totals else None,
             "first_created_at": totals["first_created_at"] if totals else None,
             "last_finalized_at": (totals["last_finalized_at"]
                                   if totals else None),
@@ -2046,8 +2046,8 @@ def collect_root_progress_report(sources: ReportOpeners,
         row["inherited_branch_count"] = rollup["branch_count"] if rollup else 0
         row["inherited_search_node_count"] = (
             rollup["search_node_count"] if rollup else 0)
-        row["inherited_wall_millis"] = rollup["wall_millis"] if rollup else 0
-        row["inherited_elapsed_millis"] = (
+        row["inherited_wall_time_millis"] = rollup["wall_time_millis"] if rollup else 0
+        row["inherited_elapsed_time_millis"] = (
             (rollup["last_finalized_at"] - rollup["first_created_at"]) * 1000
             if rollup and rollup["first_created_at"] is not None
             and rollup["last_finalized_at"] is not None else None)
@@ -2066,11 +2066,11 @@ def collect_root_progress_report(sources: ReportOpeners,
         row["shown_search_node_count"] = (
             row["inherited_search_node_count"] if inherited
             else row["search_node_count"])
-        row["shown_wall_millis"] = (
-            row["inherited_wall_millis"] if inherited else row["wall_millis"])
-        row["shown_elapsed_millis"] = (
-            row["inherited_elapsed_millis"] if inherited
-            else row["elapsed_millis"])
+        row["shown_wall_time_millis"] = (
+            row["inherited_wall_time_millis"] if inherited else row["wall_time_millis"])
+        row["shown_elapsed_time_millis"] = (
+            row["inherited_elapsed_time_millis"] if inherited
+            else row["elapsed_time_millis"])
         rows.append(row)
     # Default to the tree's cost.  Ranking on this opener's own nodes sinks
     # every inherited group to the bottom on zero, which hides exactly the
@@ -2137,7 +2137,7 @@ def collect_root_progress_report(sources: ReportOpeners,
         "state_counts": collections.Counter(row["state"] for row in rows),
         "branch_count": sum(row["branch_count"] for row in rows),
         "search_node_count": node_total,
-        "wall_millis": sum(row["wall_millis"] for row in rows),
+        "wall_time_millis": sum(row["wall_time_millis"] for row in rows),
         "open_branch_count": progress["open_branch_count"],
         "counted_branch_count": progress["counted_branch_count"],
         "requested_at": earliest_request,
@@ -2155,8 +2155,8 @@ def collect_root_progress_report(sources: ReportOpeners,
             row["inherited_branch_count"] for row in rows),
         "inherited_search_node_count": sum(
             row["inherited_search_node_count"] for row in rows),
-        "inherited_wall_millis": sum(
-            row["inherited_wall_millis"] for row in rows),
+        "inherited_wall_time_millis": sum(
+            row["inherited_wall_time_millis"] for row in rows),
     }
     return report
 
@@ -2253,8 +2253,8 @@ def _candidate_eta(queue_payload, eta_sample, live_worker_count, now):
     inspected = eta_sample["inspected_candidate_count"]
     pruned = eta_sample["pruned_candidate_count"]
     evaluated = eta_sample["evaluated_candidate_count"]
-    inspection_millis = eta_sample["inspection_worker_millis"]
-    evaluation_millis = eta_sample["evaluation_worker_millis"]
+    inspection_time_millis = eta_sample["inspection_worker_time_millis"]
+    evaluation_time_millis = eta_sample["evaluation_worker_time_millis"]
     inspection_workers = eta_sample.get("inspection_worker_count")
     evaluation_workers = eta_sample.get("evaluation_worker_count")
     inspection_worker_count_known = not eta_sample.get(
@@ -2276,30 +2276,30 @@ def _candidate_eta(queue_payload, eta_sample, live_worker_count, now):
     if remaining == 0:
         return None
     if inspected:
-        if inspection_millis <= 0:
+        if inspection_time_millis <= 0:
             return result
         surviving_fraction = max(0, inspected - pruned) / inspected
         remaining_inspections = remaining
         expected_full_evaluations = remaining * surviving_fraction
         inspection_worker_seconds = (
-            remaining_inspections * inspection_millis / inspected / 1000
+            remaining_inspections * inspection_time_millis / inspected / 1000
         )
         if expected_full_evaluations:
-            if evaluated == 0 or evaluation_millis <= 0:
+            if evaluated == 0 or evaluation_time_millis <= 0:
                 return result
             evaluation_worker_seconds = (
-                expected_full_evaluations * evaluation_millis / evaluated / 1000
+                expected_full_evaluations * evaluation_time_millis / evaluated / 1000
             )
         else:
             evaluation_worker_seconds = 0
     else:
-        if evaluated == 0 or evaluation_millis <= 0:
+        if evaluated == 0 or evaluation_time_millis <= 0:
             return result
         remaining_inspections = 0
         expected_full_evaluations = remaining
         inspection_worker_seconds = 0
         evaluation_worker_seconds = (
-            remaining * evaluation_millis / evaluated / 1000
+            remaining * evaluation_time_millis / evaluated / 1000
         )
     def speedup(worker_count):
         worker_count = max(1, round(worker_count))
@@ -3681,7 +3681,7 @@ def _work_distribution_band_rows(bands, edge_seconds):
     totals = {
         key: sum(band[key] for band in bands)
         for key in ("branch_count", "claim_count", "search_node_count",
-                    "coordination_millis", "worker_millis")
+                    "coordination_time_millis", "worker_time_millis")
     }
 
     def share(value, total):
@@ -3692,24 +3692,24 @@ def _work_distribution_band_rows(bands, edge_seconds):
         band = by_index.get(index, {})
         branch_count = band.get("branch_count", 0)
         search_node_count = band.get("search_node_count", 0)
-        coordination_millis = band.get("coordination_millis", 0)
+        coordination_time_millis = band.get("coordination_time_millis", 0)
         node_share = share(search_node_count, totals["search_node_count"])
         coordination_share = share(
-            coordination_millis, totals["coordination_millis"])
+            coordination_time_millis, totals["coordination_time_millis"])
         rows.append({
             "band_index": index,
             "band_label": label,
             "branch_count": branch_count,
             "claim_count": band.get("claim_count", 0),
             "search_node_count": search_node_count,
-            "coordination_millis": coordination_millis,
-            "worker_millis": band.get("worker_millis", 0),
+            "coordination_time_millis": coordination_time_millis,
+            "worker_time_millis": band.get("worker_time_millis", 0),
             "branch_share": share(branch_count, totals["branch_count"]),
             "claim_share": share(band.get("claim_count", 0),
                                  totals["claim_count"]),
             "search_node_share": node_share,
-            "worker_time_share": share(band.get("worker_millis", 0),
-                                       totals["worker_millis"]),
+            "worker_time_share": share(band.get("worker_time_millis", 0),
+                                       totals["worker_time_millis"]),
             "search_nodes_per_branch": (
                 search_node_count / branch_count if branch_count else None),
             # A band that did no search has no work for its coordination to be
@@ -3742,8 +3742,8 @@ def collect_work_distribution_report(
     edge_seconds = WORK_DISTRIBUTION_BAND_EDGE_SECONDS
     empty_rows, empty_totals = _work_distribution_band_rows([], edge_seconds)
     empty_population = {"branch_count": 0, "claim_count": 0,
-                        "search_node_count": 0, "coordination_millis": 0,
-                        "worker_millis": 0}
+                        "search_node_count": 0, "coordination_time_millis": 0,
+                        "worker_time_millis": 0}
     data = {
         "population": None,
         "epoch": request.epoch,
@@ -3816,17 +3816,17 @@ def _opener_summary_payload(row, rollup, timing, generated_at, answer_set):
     open_branch_count = rollup["open_branch_count"]
     state = _merged_opener_state(row)
     completed_at = None
-    elapsed_millis = worker_millis = None
+    elapsed_time_millis = worker_time_millis = None
     if state == "complete":
         completed_at = timing["completed_at"]
         if completed_at is None:
             completed_at = _row_value(row, "completed_at")
-        elapsed_millis = timing["elapsed_millis"]
-        worker_millis = timing["worker_millis"]
+        elapsed_time_millis = timing["elapsed_time_millis"]
+        worker_time_millis = timing["worker_time_millis"]
     elif state == "active":
         started_at = _row_value(row, "started_at")
         if started_at is not None:
-            elapsed_millis = max(0, generated_at - started_at) * 1000
+            elapsed_time_millis = max(0, generated_at - started_at) * 1000
     return {
         "opener": opener.lower() if opener else None,
         "opener_is_answer": _is_answer(opener, answer_set),
@@ -3842,8 +3842,8 @@ def _opener_summary_payload(row, rollup, timing, generated_at, answer_set):
         "open_branch_count": open_branch_count,
         "done_branch_count": max(0, branch_count - open_branch_count),
         "worker_count": rollup["worker_count"],
-        "elapsed_millis": elapsed_millis,
-        "worker_millis": worker_millis,
+        "elapsed_time_millis": elapsed_time_millis,
+        "worker_time_millis": worker_time_millis,
     }
 
 
@@ -3886,11 +3886,11 @@ _OPENER_SORT_KEYS = {
                                if row["requested_at"] is not None else float("inf"),
                                row["opener"] or ""),
     "erd": _opener_erd_sort_key,
-    "elapsed": lambda row: (-(row["elapsed_millis"] or 0)
-                            if row["elapsed_millis"] is not None else float("inf"),
+    "elapsed": lambda row: (-(row["elapsed_time_millis"] or 0)
+                            if row["elapsed_time_millis"] is not None else float("inf"),
                             row["opener"] or ""),
-    "worker_time": lambda row: (-(row["worker_millis"] or 0)
-                                if row["worker_millis"] is not None else float("inf"),
+    "worker_time": lambda row: (-(row["worker_time_millis"] or 0)
+                                if row["worker_time_millis"] is not None else float("inf"),
                                 row["opener"] or ""),
 }
 
@@ -3903,13 +3903,13 @@ def _sorted_openers(rows, sort):
 
 def _duration_group_key(duration_millis):
     """Bucket a non-negative duration into the Openers report's time ranges."""
-    for index, (maximum_millis, label) in enumerate((
+    for index, (maximum_duration_millis, label) in enumerate((
         (60 * 60 * 1000, "[0, 1 hour)"),
         (24 * 60 * 60 * 1000, "[1 hour, 1 day)"),
         (7 * 24 * 60 * 60 * 1000, "[1 day, 1 week)"),
         (30 * 24 * 60 * 60 * 1000, "[1 week, 1 month)"),
     )):
-        if duration_millis < maximum_millis:
+        if duration_millis < maximum_duration_millis:
             return index, label
     return 4, "[1 month, ∞)"
 
@@ -3943,11 +3943,11 @@ def _opener_group_key(row, group_by, generated_at):
     if group_by == "completed":
         return _completed_at_group_key(row["completed_at"], generated_at)
     if group_by == "elapsed":
-        return (_duration_group_key(row["elapsed_millis"])
-                if row["elapsed_millis"] is not None else (5, "not completed"))
+        return (_duration_group_key(row["elapsed_time_millis"])
+                if row["elapsed_time_millis"] is not None else (5, "not completed"))
     if group_by == "worker_time":
-        return (_duration_group_key(row["worker_millis"])
-                if row["worker_millis"] is not None else (5, "not completed"))
+        return (_duration_group_key(row["worker_time_millis"])
+                if row["worker_time_millis"] is not None else (5, "not completed"))
     if group_by == "requested":
         return _duration_group_key(
             max(0, generated_at - row["requested_at"]) * 1000)
@@ -4230,8 +4230,8 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
                 row, rollups[(_row_value(row, "opener") or "").lower() or None],
                 timings.get(
                     (_row_value(row, "opener") or "").lower() or None,
-                    {"completed_at": None, "elapsed_millis": None,
-                     "worker_millis": None},
+                    {"completed_at": None, "elapsed_time_millis": None,
+                     "worker_time_millis": None},
                 ),
                 generated_at, answer_set,
             )

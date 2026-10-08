@@ -21,12 +21,12 @@
     "branch_share": 0.5777777777777777,
     "claim_count": 364,
     "claim_share": 0.3888888888888889,
-    "coordination_millis": 14924,
+    "coordination_time_millis": 14924,
     "coordination_share_per_work_share": 231869.61965811966,
     "search_node_count": 728,
     "search_node_share": 1.6771877638057388e-06,
     "search_nodes_per_branch": 28.0,
-    "worker_millis": 7644,
+    "worker_time_millis": 7644,
     "worker_time_share": 0.0005290125016920925
    },
    {
@@ -36,12 +36,12 @@
     "branch_share": 0.2,
     "claim_count": 288,
     "claim_share": 0.3076923076923077,
-    "coordination_millis": 11808,
+    "coordination_time_millis": 11808,
     "coordination_share_per_work_share": 515.2658214624881,
     "search_node_count": 259200,
     "search_node_share": 0.0005971525664539114,
     "search_nodes_per_branch": 28800.0,
-    "worker_millis": 97920,
+    "worker_time_millis": 97920,
     "worker_time_share": 0.006776675060922254
    },
    {
@@ -51,12 +51,12 @@
     "branch_share": 0.1111111111111111,
     "claim_count": 200,
     "claim_share": 0.21367521367521367,
-    "coordination_millis": 8200,
+    "coordination_time_millis": 8200,
     "coordination_share_per_work_share": 10.305316429249762,
     "search_node_count": 9000000,
     "search_node_share": 0.020734464112983034,
     "search_nodes_per_branch": 1800000.0,
-    "worker_millis": 520000,
+    "worker_time_millis": 520000,
     "worker_time_share": 0.03598724501306752
    },
    {
@@ -66,12 +66,12 @@
     "branch_share": 0.06666666666666667,
     "claim_count": 72,
     "claim_share": 0.07692307692307693,
-    "coordination_millis": 2952,
+    "coordination_time_millis": 2952,
     "coordination_share_per_work_share": 0.5152658214624881,
     "search_node_count": 64800000,
     "search_node_share": 0.14928814161347786,
     "search_nodes_per_branch": 21600000.0,
-    "worker_millis": 3024000,
+    "worker_time_millis": 3024000,
     "worker_time_share": 0.20927967099906958
    },
    {
@@ -81,12 +81,12 @@
     "branch_share": 0.044444444444444446,
     "claim_count": 12,
     "claim_share": 0.01282051282051282,
-    "coordination_millis": 492,
+    "coordination_time_millis": 492,
     "coordination_share_per_work_share": 0.015457974643874644,
     "search_node_count": 360000000,
     "search_node_share": 0.8293785645193213,
     "search_nodes_per_branch": 180000000.0,
-    "worker_millis": 10800000,
+    "worker_time_millis": 10800000,
     "worker_time_share": 0.7474273964252486
    }
   ],
@@ -99,16 +99,16 @@
   "totals": {
    "branch_count": 45,
    "claim_count": 936,
-   "coordination_millis": 38376,
+   "coordination_time_millis": 38376,
    "search_node_count": 434059928,
-   "worker_millis": 14449564
+   "worker_time_millis": 14449564
   },
   "unmeasured": {
    "branch_count": 1,
    "claim_count": 5,
-   "coordination_millis": 150,
+   "coordination_time_millis": 150,
    "search_node_count": 60000,
-   "worker_millis": 0
+   "worker_time_millis": 0
   },
   "window_started_at": null
  },
@@ -124,7 +124,7 @@
  },
  "generated_at": 1771000000,
  "report_kind": "work_distribution",
- "schema_version": 4,
+ "schema_version": 5,
  "sources": {
   "cache": {
    "error": null,

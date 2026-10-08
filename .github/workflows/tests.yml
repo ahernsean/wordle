@@ -218,7 +218,7 @@ jobs:
                 f"(max {r['max_overhead_factor']:.1f}x); "
                 f"nodes {r['swarm_nodes']} vs {r['engine_nodes']}, "
                 f"claims {r['claim_count']}, "
-                f"coordination {r['coordination_millis']}ms")
+                f"coordination {r['coordination_time_millis']}ms")
           if not r['passed']:
               print(f"FAIL: {r['overhead_ratio']:.2f}x exceeds the "
                     f"{r['max_overhead_factor']:.1f}x overhead cap")

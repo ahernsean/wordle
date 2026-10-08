@@ -32,7 +32,7 @@ except ImportError:
 ROOT = os.path.dirname(os.path.dirname(__file__))
 FIXTURE_DIRECTORY = os.path.join(ROOT, "tests", "fixtures", "reports")
 # The client's DEFAULT_POLL; a re-render lands on every one of these.
-CLIENT_POLL_MILLIS = 2000
+CLIENT_POLL_INTERVAL_MILLIS = 2000
 CLIENT_PATH = os.path.join(ROOT, "report_client.html")
 # The sweep strip arrives as a base64 bitset, one bit per candidate, sized by
 # the whole candidate list rather than by how far the sweep has reached.  A
@@ -97,7 +97,7 @@ SKIP_WEBKIT_TESTS = os.environ.get("SKIP_WEBKIT_TESTS") == "1"
 
 # Longer than the grid choreography, so a report applied before this has elapsed
 # is one the transition has already finished with.
-GRID_TRANSITION_MILLIS = 1700
+GRID_TRANSITION_DURATION_MILLIS = 1700
 
 # Helpers for the grid-transition tests, prepended to their page scripts.
 #
@@ -154,7 +154,7 @@ GRID_SCRIPT_HELPERS = """
     });
     return samples;
   };
-""" % (GRID_TRANSITION_MILLIS, GRID_TRANSITION_MILLIS)
+""" % (GRID_TRANSITION_DURATION_MILLIS, GRID_TRANSITION_DURATION_MILLIS)
 
 
 def _preinstalled_chromium():
@@ -731,7 +731,7 @@ class ReportClientContract:
         }""")
         self.assertGreater(scrolled[0], 0, "table must overflow horizontally")
         self.assertGreater(scrolled[1], 0, "table must overflow vertically")
-        self.page.wait_for_timeout(2 * CLIENT_POLL_MILLIS)
+        self.page.wait_for_timeout(2 * CLIENT_POLL_INTERVAL_MILLIS)
         after = self.page.evaluate("""() => {
           const box = document.querySelector('.root-progress-scroll');
           return [box.scrollLeft, box.scrollTop];
@@ -906,7 +906,7 @@ class ReportClientContract:
         try:
             self.apply_branch_target("SALET")
             self.page.wait_for_selector(".root-progress-host p.error")
-            self.page.wait_for_timeout(3 * CLIENT_POLL_MILLIS)
+            self.page.wait_for_timeout(3 * CLIENT_POLL_INTERVAL_MILLIS)
             # One request for the life of the panel.  Re-firing is what makes
             # the panel alternate between the computing notice and the error,
             # and those wrap to different heights on a phone, so every poll
@@ -1492,7 +1492,7 @@ class ReportClientContract:
             settled = self.page.evaluate("window.__rootProgressCalls")
             # The cheap first stage and the inherited-cost rollup, once each.
             self.assertEqual(settled, 2)
-            self.page.wait_for_timeout(3 * CLIENT_POLL_MILLIS)
+            self.page.wait_for_timeout(3 * CLIENT_POLL_INTERVAL_MILLIS)
             self.assertEqual(
                 self.page.evaluate("window.__rootProgressCalls"), settled)
         finally:
@@ -1658,7 +1658,7 @@ class ReportClientContract:
         self.page.locator(
             ".response-group-breakdown .answer-segment").first.click()
         self.page.wait_for_selector(".group-menu")
-        self.page.wait_for_timeout(int(CLIENT_POLL_MILLIS * 2.5))
+        self.page.wait_for_timeout(int(CLIENT_POLL_INTERVAL_MILLIS * 2.5))
         self.assertEqual(self._menu().count(), 1,
                          "a poll took the menu away")
         # Still wired to its group, not merely still on screen.
@@ -4036,7 +4036,7 @@ class ReportClientContract:
         facts = self.page.evaluate("""async () => {
           const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
           branch.data.recent_finalizations[0]={
-            ...branch.data.recent_finalizations[0],outcome:'loss',loss_proof:'ceiling_above_budget',budget:3,ceiling:3.25,wall_millis:374529,
+            ...branch.data.recent_finalizations[0],outcome:'loss',loss_proof:'ceiling_above_budget',budget:3,ceiling:3.25,wall_time_millis:374529,
           };
           applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
           const card=document.querySelector('[data-grid-key="finalizations"] .card');
@@ -6728,7 +6728,7 @@ class ReportClientContract:
         return requests
 
     def test_work_distribution_is_exempt_while_its_first_scan_is_in_flight(self):
-        # A scan slower than STUCK_REQUEST_MILLIS would otherwise be aborted and
+        # A scan slower than STUCK_REQUEST_TIMEOUT_MILLIS would otherwise be aborted and
         # restarted while lastReport still held the previous view, and an
         # aborted fetch does not stop the query already running on the server.
         # The exemption must hold from the moment the scan starts, not from the
@@ -7164,8 +7164,8 @@ class ReportClientContract:
           const report = await (await fetch('/api/view/openers')).json();
           const row = report.data.summary[0];
           row.state = 'active';
-          row.elapsed_millis = 30000;
-          row.worker_millis = null;
+          row.elapsed_time_millis = 30000;
+          row.worker_time_millis = null;
           delete report.data.summary_groups;
           applyReport(report, null, parsePageState({search:'?kind=openers'}));
           return document.querySelector('.card.source-word').innerText;

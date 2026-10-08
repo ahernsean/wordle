@@ -106,7 +106,7 @@ def _bare_worker():
     w._time_account = erd_swarm._WorkerTimeAccount()
     w._time_account_nodes = 0
     w._time_account_claim_timing = (0, 0, 0, 0)
-    w._bundle_coordination_millis = {}
+    w._bundle_coordination_time_millis = {}
     w._scan_selected_work = False
     w._adaptive = True
     w._typical_cache = {}
@@ -434,7 +434,7 @@ class TestCancelPath(unittest.TestCase):
         self.assertFalse(result)
         w.queue.record_bundle_stats.assert_called_once_with(
             branch_key, "bundle-1", 0, mock.ANY, censored=True,
-            coordination_millis=None, evaluation_time_millis=mock.ANY)
+            coordination_time_millis=None, evaluation_time_millis=mock.ANY)
 
     def test_evaluate_bundle_returns_false_when_evaluate_claim_fails_mid_bundle(self):
         # Not cancelled at the loop level, but evaluate_claim itself reports
@@ -448,7 +448,7 @@ class TestCancelPath(unittest.TestCase):
         w.evaluate_claim.assert_called_once()
         w.queue.record_bundle_stats.assert_called_once_with(
             branch_key, "bundle-2", 0, mock.ANY, censored=True,
-            coordination_millis=None, evaluation_time_millis=mock.ANY)
+            coordination_time_millis=None, evaluation_time_millis=mock.ANY)
 
     def test_forced_candidate_cost_does_not_leak_into_sibling_cap_check(self):
         # A (forced) does 5000 nodes of work; B (not forced) does 1. The
@@ -522,7 +522,7 @@ class TestCancelPath(unittest.TestCase):
         w.queue.republish_remainder.assert_not_called()
         w.queue.record_bundle_stats.assert_called_once_with(
             branch_key, "bundle-5", 5000, mock.ANY, censored=True,
-            coordination_millis=None, evaluation_time_millis=mock.ANY)
+            coordination_time_millis=None, evaluation_time_millis=mock.ANY)
 
 
 class TestEvaluateClaimPatternMatrix(unittest.TestCase):
@@ -560,7 +560,7 @@ class TestEvaluateClaimPatternMatrix(unittest.TestCase):
             result = w.evaluate_claim(branch_key, BRANCH, len(BRANCH), idx=0)
         self.assertTrue(result)
         kwargs = w.queue.apply_candidate_result.call_args.kwargs
-        self.assertGreaterEqual(kwargs['evaluation_millis'], 0)
+        self.assertGreaterEqual(kwargs['evaluation_time_millis'], 0)
         self.assertEqual(kwargs['evaluation_bound_erd'], 2.25)
 
 class TestSubbranchSolver(unittest.TestCase):
@@ -2492,7 +2492,7 @@ class TestTwoLevelERDPruneBundles(unittest.TestCase):
             "clart", bound_erd, None)
         worker.queue.complete_bundle_two_level_erd_prunes.side_effect = (
             lambda _branch_key, _bundle_id, candidate_indices, nodes_spent=0,
-            wall_millis=0, bound_erd=None, worker_count=None, worker_id=None:
+            wall_time_millis=0, bound_erd=None, worker_count=None, worker_id=None:
                 len(candidate_indices))
 
         def count_heartbeat(*_args, **_kwargs):
@@ -2517,7 +2517,7 @@ class TestTwoLevelERDPruneBundles(unittest.TestCase):
         self.assertEqual(lower_bound.call_count, len(candidate_indices))
         worker.queue.complete_bundle_two_level_erd_prunes.assert_called_once_with(
             b"branch", "bundle-1", candidate_indices,
-            nodes_spent=len(candidate_indices), wall_millis=mock.ANY,
+            nodes_spent=len(candidate_indices), wall_time_millis=mock.ANY,
             bound_erd=3.1, worker_count=1, worker_id=worker.name)
         worker.queue.add_nodes_spent.assert_not_called()
         worker._evaluate_bundle_member.assert_not_called()
@@ -2538,7 +2538,7 @@ class TestTwoLevelERDPruneBundles(unittest.TestCase):
         self.assertTrue(completed)
         worker.queue.complete_bundle_two_level_erd_prunes.assert_called_once_with(
             b"branch", "bundle-1", [0, 2],
-            nodes_spent=len(candidate_indices), wall_millis=mock.ANY,
+            nodes_spent=len(candidate_indices), wall_time_millis=mock.ANY,
             bound_erd=3.1, worker_count=1, worker_id=worker.name)
         self.assertEqual(worker._evaluate_bundle_member.call_count, 1)
         self.assertEqual(worker._evaluate_bundle_member.call_args.args[3], 1)
@@ -2585,7 +2585,7 @@ class TestTwoLevelERDPruneBundles(unittest.TestCase):
         self.assertTrue(cancelled)
         worker.queue.complete_bundle_two_level_erd_prunes.assert_called_once_with(
             b"branch", "bundle-1", [0], nodes_spent=1,
-            wall_millis=mock.ANY, bound_erd=3.1, worker_count=1,
+            wall_time_millis=mock.ANY, bound_erd=3.1, worker_count=1,
             worker_id=worker.name)
 
 
@@ -3375,7 +3375,7 @@ class TestFinalizeTelemetryFailureIsolation(unittest.TestCase):
     def test_telemetry_insert_failure_still_runs_cleanup(self):
         w = self._finalizing_worker()
         w.queue.add_branch_finalize_log.side_effect = RuntimeError(
-            "no column named total_bundle_wall_millis")
+            "no column named total_bundle_wall_time_millis")
         key = b"branch-key"
         # Real key shape: the packing order depends on the branch's budget, so
         # a branch finalized at one budget must not leave an order behind for
@@ -3413,7 +3413,7 @@ class TestFinalizeTelemetryFailureIsolation(unittest.TestCase):
 
 
 _TIMING = {"first_created_at": 100, "completed_at": 160,
-           "worker_millis": 2_000, "telemetry_epochs": "3"}
+           "worker_time_millis": 2_000, "telemetry_epochs": "3"}
 
 
 def _reduction(state, **overrides):
@@ -5311,12 +5311,12 @@ class TestDependencyWaitAttribution(unittest.TestCase):
         self.assertGreaterEqual(rows[0]["bundles_claimed"], 1)
 
     def test_blocked_time_never_exceeds_the_episode(self):
-        """blocked_millis is a part of the episode, not a separate clock."""
+        """blocked_time_millis is a part of the episode, not a separate clock."""
         w = self._worker()
         w.cooperative_solve(BRANCH[:3], ROOT_BUDGET)
         for row in self._wait_rows():
-            self.assertLessEqual(row["blocked_millis"], row["episode_millis"])
-            self.assertGreaterEqual(row["blocked_millis"], 0)
+            self.assertLessEqual(row["blocked_time_millis"], row["episode_time_millis"])
+            self.assertGreaterEqual(row["blocked_time_millis"], 0)
 
     def test_a_pair_refused_by_the_cap_is_recorded_as_worker_cap(self):
         """The measurement the worker-cap decision rests on.
@@ -5389,7 +5389,7 @@ class TestDependencyWaitAttribution(unittest.TestCase):
         A claim transaction can decline for reasons with no column of their own
         — a dependency whose identity changed under the waiter, or a retry loop
         that ran out and reported nothing.  Dropping those would leave
-        blocked_millis holding time no counter accounts for.
+        blocked_time_millis holding time no counter accounts for.
         """
         w = self._worker()
         words = BRANCH[:3]
@@ -5449,7 +5449,7 @@ class TestDependencyWaitAttribution(unittest.TestCase):
             w.cooperative_solve(words, ROOT_BUDGET)
         rows = self._wait_rows()
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["blocked_millis"], 0)
+        self.assertEqual(rows[0]["blocked_time_millis"], 0)
         self._assert_blocks(rows[0])
 
 class TestAStaleResultIsNotAppliedPiecemeal(unittest.TestCase):

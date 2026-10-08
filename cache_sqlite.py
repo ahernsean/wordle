@@ -317,6 +317,37 @@ class ScoreCache:
             (name, int(time.time()))
         )
 
+    # Summary columns holding a duration once named only its unit.  Neither
+    # table travels between machines, so each cache renames its own.
+    TIME_QUANTITY_RENAMES = (
+        ("completed_opener_summaries", {
+            "elapsed_millis": "elapsed_time_millis",
+            "worker_millis": "worker_time_millis",
+        }),
+        ("opener_response_group_summaries", {
+            "worker_millis": "worker_time_millis",
+        }),
+    )
+
+    def _name_time_quantities(self):
+        """Rename the summary columns in TIME_QUANTITY_RENAMES.
+
+        Guarded by schema_migrations, and within it decided from each table's
+        columns, so a cache created with the current names records the
+        migration without renaming anything.
+        """
+        migration = "name_time_quantities"
+        if self._is_migration_done(migration):
+            return
+        for table, renames in self.TIME_QUANTITY_RENAMES:
+            columns = {row["name"] for row in self._conn.execute(
+                f"PRAGMA table_info({table})")}
+            for old, new in renames.items():
+                if old in columns:
+                    self._conn.execute(
+                        f"ALTER TABLE {table} RENAME COLUMN {old} TO {new}")
+        self._mark_migration_done(migration)
+
     def _rename_source_summaries_to_opener(self):
         # Runs before the CREATE TABLE IF NOT EXISTS statements below, so —
         # unlike the older renames in this file — there is no empty
@@ -517,7 +548,7 @@ class ScoreCache:
             CREATE TABLE IF NOT EXISTS completed_opener_summaries (
                 opener TEXT NOT NULL, policy TEXT NOT NULL,
                 answer_list_id TEXT NOT NULL, completed_at INTEGER NOT NULL,
-                elapsed_millis INTEGER, worker_millis INTEGER NOT NULL,
+                elapsed_time_millis INTEGER, worker_time_millis INTEGER NOT NULL,
                 telemetry_epochs TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (opener, policy, answer_list_id)
             )
@@ -566,11 +597,12 @@ class ScoreCache:
                 opener TEXT NOT NULL, response_pattern TEXT NOT NULL,
                 policy TEXT NOT NULL, answer_list_id TEXT NOT NULL,
                 branch_count INTEGER NOT NULL, search_node_count INTEGER NOT NULL,
-                worker_millis INTEGER NOT NULL, first_created_at INTEGER,
+                worker_time_millis INTEGER NOT NULL, first_created_at INTEGER,
                 last_finalized_at INTEGER, telemetry_epochs TEXT NOT NULL,
                 PRIMARY KEY (opener, response_pattern, policy, answer_list_id)
             )
         """)
+        self._name_time_quantities()
         # 'subset_blob' was renamed to 'subset_key' — same encoding, cleaner
         # name. Databases migrated from lookahead_result or subgroup_pick may
         # still carry the old column name (in subgroup_best_by_policy before
@@ -1541,14 +1573,14 @@ class ScoreCache:
 
     def completed_opener_summary_map(self, policy):
         return {row["opener"].lower(): dict(row) for row in self._conn.execute("""
-            SELECT opener, completed_at, elapsed_millis, worker_millis,
+            SELECT opener, completed_at, elapsed_time_millis, worker_time_millis,
                    telemetry_epochs
             FROM completed_opener_summaries
             WHERE policy = ? AND answer_list_id = ?
         """, (policy, self.answer_list_id))}
 
     def write_completed_opener_summary(self, opener, policy, completed_at,
-                                       elapsed_millis, worker_millis,
+                                       elapsed_time_millis, worker_time_millis,
                                        telemetry_epochs=()):
         """Record when an opener finished and what it cost.
 
@@ -1560,14 +1592,14 @@ class ScoreCache:
         self._conn.execute("""
             INSERT OR REPLACE INTO completed_opener_summaries
                 (opener, policy, answer_list_id, completed_at,
-                 elapsed_millis, worker_millis, telemetry_epochs)
+                 elapsed_time_millis, worker_time_millis, telemetry_epochs)
             VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (opener.lower(), policy, self.answer_list_id, completed_at,
-              elapsed_millis, worker_millis,
+              elapsed_time_millis, worker_time_millis,
               ",".join(str(epoch) for epoch in sorted(set(telemetry_epochs)))))
 
     def add_opener_response_group_summary(self, opener, response_pattern,
-                                          policy, nodes, worker_millis,
+                                          policy, nodes, worker_time_millis,
                                           created_at, finalized_at, epoch):
         row = self._conn.execute("""
             SELECT telemetry_epochs FROM opener_response_group_summaries
@@ -1581,18 +1613,18 @@ class ScoreCache:
         self._conn.execute("""
             INSERT INTO opener_response_group_summaries
                 (opener, response_pattern, policy, answer_list_id,
-                 branch_count, search_node_count, worker_millis,
+                 branch_count, search_node_count, worker_time_millis,
                  first_created_at, last_finalized_at, telemetry_epochs)
             VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
             ON CONFLICT(opener, response_pattern, policy, answer_list_id)
             DO UPDATE SET branch_count = branch_count + 1,
                 search_node_count = search_node_count + excluded.search_node_count,
-                worker_millis = worker_millis + excluded.worker_millis,
+                worker_time_millis = worker_time_millis + excluded.worker_time_millis,
                 first_created_at = MIN(first_created_at, excluded.first_created_at),
                 last_finalized_at = MAX(last_finalized_at, excluded.last_finalized_at),
                 telemetry_epochs = excluded.telemetry_epochs
         """, (opener.lower(), response_pattern, policy, self.answer_list_id,
-              nodes, worker_millis or 0, created_at, finalized_at,
+              nodes, worker_time_millis or 0, created_at, finalized_at,
               ",".join(sorted(epochs, key=int))))
 
     def opener_response_group_summary_map(self, opener, policy):

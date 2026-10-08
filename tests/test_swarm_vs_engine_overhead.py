@@ -133,12 +133,12 @@ class TestSwarmVsDirectEngineOverhead(unittest.TestCase):
         erd = row[1] if row is not None else None
 
         queue = ERDQueue(queue_path)
-        claims, coordination_millis = queue._conn.execute(
+        claims, coordination_time_millis = queue._conn.execute(
             "SELECT COALESCE(SUM(n_claims), 0), "
-            "COALESCE(SUM(coordination_millis), 0) "
+            "COALESCE(SUM(coordination_time_millis), 0) "
             "FROM telemetry.branch_finalize_log").fetchone()
         queue.close()
-        return wall, erd, nodes, claims, coordination_millis
+        return wall, erd, nodes, claims, coordination_time_millis
 
     @staticmethod
     def _publish(result):
@@ -159,13 +159,13 @@ class TestSwarmVsDirectEngineOverhead(unittest.TestCase):
                     f"engine nodes: {result['engine_nodes']} | "
                     f"swarm nodes: {result['swarm_nodes']} | "
                     f"claims: {result['claim_count']} | "
-                    f"coordination: {result['coordination_millis']}ms\n")
+                    f"coordination: {result['coordination_time_millis']}ms\n")
 
     def test_one_worker_swarm_within_overhead_factor_of_direct_engine(self):
         engine_wall, engine_erd, engine_nodes = self._direct_engine_leg()
         self.assertIsNotNone(engine_erd, "baseline branch became unsolvable; "
                              "the workload needs recalibrating")
-        swarm_wall, swarm_erd, swarm_nodes, claims, coordination_millis = \
+        swarm_wall, swarm_erd, swarm_nodes, claims, coordination_time_millis = \
             self._swarm_leg()
 
         ratio = swarm_wall / engine_wall
@@ -179,14 +179,14 @@ class TestSwarmVsDirectEngineOverhead(unittest.TestCase):
             'engine_nodes': engine_nodes,
             'swarm_nodes': swarm_nodes,
             'claim_count': claims,
-            'coordination_millis': coordination_millis,
+            'coordination_time_millis': coordination_time_millis,
             'cpu_count': os.cpu_count(),
         })
         sys.stderr.write(
             f"\n[overhead] engine {engine_wall:.3f}s/{engine_nodes} nodes  "
             f"swarm {swarm_wall:.3f}s/{swarm_nodes} nodes  "
             f"ratio {ratio:.2f}x  claims={claims}  "
-            f"coordination={coordination_millis}ms\n")
+            f"coordination={coordination_time_millis}ms\n")
 
         # Both paths must agree on the exact optimum before timing means
         # anything.
@@ -203,7 +203,7 @@ class TestSwarmVsDirectEngineOverhead(unittest.TestCase):
             f"({swarm_wall:.3f}s vs {engine_wall:.3f}s); "
             f"swarm_nodes={swarm_nodes} vs engine_nodes={engine_nodes} "
             f"(node explosion = pruning/ceiling regression; flat nodes = "
-            f"coordination tax), coordination={coordination_millis}ms")
+            f"coordination tax), coordination={coordination_time_millis}ms")
 
 
 if __name__ == "__main__":

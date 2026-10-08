@@ -686,7 +686,7 @@ class TestRenameSourceSummariesToOpener(unittest.TestCase):
             CREATE TABLE completed_source_summaries (
                 source_word TEXT NOT NULL, policy TEXT NOT NULL,
                 answer_list_id TEXT NOT NULL, completed_at INTEGER NOT NULL,
-                elapsed_millis INTEGER, worker_millis INTEGER NOT NULL,
+                elapsed_time_millis INTEGER, worker_time_millis INTEGER NOT NULL,
                 telemetry_epochs TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (source_word, policy, answer_list_id)
             )
@@ -696,7 +696,7 @@ class TestRenameSourceSummariesToOpener(unittest.TestCase):
                 source_word TEXT NOT NULL, response_pattern TEXT NOT NULL,
                 policy TEXT NOT NULL, answer_list_id TEXT NOT NULL,
                 branch_count INTEGER NOT NULL, search_node_count INTEGER NOT NULL,
-                worker_millis INTEGER NOT NULL, first_created_at INTEGER,
+                worker_time_millis INTEGER NOT NULL, first_created_at INTEGER,
                 last_finalized_at INTEGER, telemetry_epochs TEXT NOT NULL,
                 PRIMARY KEY (source_word, response_pattern, policy, answer_list_id)
             )
@@ -753,7 +753,7 @@ class TestRenameSourceSummariesToOpener(unittest.TestCase):
             CREATE TABLE completed_opener_summaries (
                 opener TEXT NOT NULL, policy TEXT NOT NULL,
                 answer_list_id TEXT NOT NULL, completed_at INTEGER NOT NULL,
-                elapsed_millis INTEGER, worker_millis INTEGER NOT NULL,
+                elapsed_time_millis INTEGER, worker_time_millis INTEGER NOT NULL,
                 telemetry_epochs TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (opener, policy, answer_list_id)
             )
@@ -783,7 +783,7 @@ class TestRenameSourceSummariesToOpener(unittest.TestCase):
             CREATE TABLE completed_opener_summaries (
                 source_word TEXT NOT NULL, policy TEXT NOT NULL,
                 answer_list_id TEXT NOT NULL, completed_at INTEGER NOT NULL,
-                elapsed_millis INTEGER, worker_millis INTEGER NOT NULL,
+                elapsed_time_millis INTEGER, worker_time_millis INTEGER NOT NULL,
                 telemetry_epochs TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (source_word, policy, answer_list_id)
             )
@@ -793,7 +793,7 @@ class TestRenameSourceSummariesToOpener(unittest.TestCase):
                 source_word TEXT NOT NULL, response_pattern TEXT NOT NULL,
                 policy TEXT NOT NULL, answer_list_id TEXT NOT NULL,
                 branch_count INTEGER NOT NULL, search_node_count INTEGER NOT NULL,
-                worker_millis INTEGER NOT NULL, first_created_at INTEGER,
+                worker_time_millis INTEGER NOT NULL, first_created_at INTEGER,
                 last_finalized_at INTEGER, telemetry_epochs TEXT NOT NULL,
                 PRIMARY KEY (source_word, response_pattern, policy, answer_list_id)
             )

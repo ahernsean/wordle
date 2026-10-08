@@ -772,7 +772,7 @@ class OverviewRendererTest(unittest.TestCase):
                 **deepcopy(overview_report()["data"]["workers"][0]),
                 "candidate_index": 2, "worker_number": "0",
             }],
-            "bundle_summary": {"wall_millis": 120000},
+            "bundle_summary": {"wall_time_millis": 120000},
             "candidate_eta": {
                 "state": "ready", "sample_duration_seconds": 180,
                 "sample_worker_count": 1, "current_worker_count": 2,
@@ -953,15 +953,15 @@ class OverviewRendererTest(unittest.TestCase):
             "totals": totals,
             "unmeasured": unmeasured or {
                 "branch_count": 0, "claim_count": 0, "search_node_count": 0,
-                "coordination_millis": 0, "worker_millis": 0},
+                "coordination_time_millis": 0, "worker_time_millis": 0},
         }
         return report
 
     @staticmethod
     def _band(band_index, **overrides):
         band = {"band_index": band_index, "branch_count": 0, "claim_count": 0,
-                "search_node_count": 0, "coordination_millis": 0,
-                "worker_millis": 0}
+                "search_node_count": 0, "coordination_time_millis": 0,
+                "worker_time_millis": 0}
         band.update(overrides)
         return band
 
@@ -969,10 +969,10 @@ class OverviewRendererTest(unittest.TestCase):
         report = self._work_distribution_report([
             self._band(0, branch_count=39_332,
                        claim_count=499_756, search_node_count=7_643_478,
-                       coordination_millis=20_600_000, worker_millis=39_000_000),
+                       coordination_time_millis=20_600_000, worker_time_millis=39_000_000),
             self._band(4, branch_count=9,
                        claim_count=14_681, search_node_count=417_486_717,
-                       coordination_millis=600_000, worker_millis=90_000_000),
+                       coordination_time_millis=600_000, worker_time_millis=90_000_000),
         ])
 
         output = render_report(report, width=140)
@@ -990,10 +990,10 @@ class OverviewRendererTest(unittest.TestCase):
     def test_work_distribution_render_names_unmeasured_branches(self):
         report = self._work_distribution_report(
             [self._band(0, branch_count=1, claim_count=2, search_node_count=4,
-                        coordination_millis=10, worker_millis=20)],
+                        coordination_time_millis=10, worker_time_millis=20)],
             unmeasured={"branch_count": 1, "claim_count": 3,
-                        "search_node_count": 3, "coordination_millis": 0,
-                        "worker_millis": 0},
+                        "search_node_count": 3, "coordination_time_millis": 0,
+                        "worker_time_millis": 0},
         )
 
         output = render_report(report, width=140)
@@ -1005,7 +1005,7 @@ class OverviewRendererTest(unittest.TestCase):
         output = render_report(
             self._work_distribution_report(
                 [self._band(0, branch_count=1, claim_count=2,
-                            search_node_count=4, worker_millis=20)]),
+                            search_node_count=4, worker_time_millis=20)]),
             width=120,
         )
         self.assertNotIn("unrecorded", output)
@@ -1014,7 +1014,7 @@ class OverviewRendererTest(unittest.TestCase):
         output = render_report(
             self._work_distribution_report(
                 [self._band(0, branch_count=1, claim_count=2,
-                            coordination_millis=9, worker_millis=20)]),
+                            coordination_time_millis=9, worker_time_millis=20)]),
             width=120,
         )
         # Every band did zero search, so no share and no ratio exists to print.
@@ -2446,23 +2446,23 @@ def root_progress_report(estimate=None, requested_at=1_798_000_000,
                  "answer_count": 502, "started": True,
                  "branch_count": 524_184, "open_branch_count": 8_584,
                  "search_node_count": 129_900_000_000,
-                 "search_node_share": 0.989, "wall_millis": 3_400_000_000,
-                 "elapsed_millis": 968_000_000,
+                 "search_node_share": 0.989, "wall_time_millis": 3_400_000_000,
+                 "elapsed_time_millis": 968_000_000,
                  "first_created_at": 1, "last_finalized_at": 2},
                 # Open, nothing finalized: started, with no cost yet.
                 {"pattern": "-gg--", "state": "working",
                  "answer_count": 16, "started": True,
                  "branch_count": 0, "open_branch_count": 1,
                  "search_node_count": 0,
-                 "search_node_share": 0.0, "wall_millis": 0,
-                 "elapsed_millis": None,
+                 "search_node_share": 0.0, "wall_time_millis": 0,
+                 "elapsed_time_millis": None,
                  "first_created_at": 3, "last_finalized_at": None},
                 {"pattern": "--y--", "state": "waiting",
                  "answer_count": 126, "started": False,
                  "branch_count": 0, "open_branch_count": 0,
                  "search_node_count": 0,
-                 "search_node_share": 0.0, "wall_millis": 0,
-                 "elapsed_millis": None,
+                 "search_node_share": 0.0, "wall_time_millis": 0,
+                 "elapsed_time_millis": None,
                  "first_created_at": None, "last_finalized_at": None},
             ],
             "totals": {
@@ -2473,7 +2473,7 @@ def root_progress_report(estimate=None, requested_at=1_798_000_000,
                                  "loss": 1},
                 "branch_count": 550_292,
                 "search_node_count": 131_367_632_458,
-                "wall_millis": 3_471_277_846,
+                "wall_time_millis": 3_471_277_846,
                 "open_branch_count": 8632,
                 "counted_branch_count": 10,
                 "requested_at": requested_at,
@@ -2504,11 +2504,11 @@ def root_progress_report(estimate=None, requested_at=1_798_000_000,
         row["inherited_cost_known"] = bool(payer) and inherited_cost_known
         row["inherited_branch_count"] = 2 if row["inherited_cost_known"] else 0
         row["inherited_search_node_count"] = nodes if row["inherited_cost_known"] else 0
-        row["inherited_wall_millis"] = nodes * 2 if row["inherited_cost_known"] else 0
+        row["inherited_wall_time_millis"] = nodes * 2 if row["inherited_cost_known"] else 0
         row["display_state"] = report_model._root_progress_display_state(
             row["state"], row["provenance"])
-        row["inherited_elapsed_millis"] = (
-            row["inherited_wall_millis"] // 2
+        row["inherited_elapsed_time_millis"] = (
+            row["inherited_wall_time_millis"] // 2
             if row["inherited_cost_known"] else None)
         is_inherited = row["provenance"] == "inherited"
         row["shown_cost_is_inherited"] = is_inherited
@@ -2518,9 +2518,9 @@ def root_progress_report(estimate=None, requested_at=1_798_000_000,
             ("shown_branch_count", "branch_count", "inherited_branch_count"),
             ("shown_search_node_count", "search_node_count",
              "inherited_search_node_count"),
-            ("shown_wall_millis", "wall_millis", "inherited_wall_millis"),
-            ("shown_elapsed_millis", "elapsed_millis",
-             "inherited_elapsed_millis"),
+            ("shown_wall_time_millis", "wall_time_millis", "inherited_wall_time_millis"),
+            ("shown_elapsed_time_millis", "elapsed_time_millis",
+             "inherited_elapsed_time_millis"),
         ):
             row[shown] = row[borrowed] if is_inherited else row[own]
     totals = report["data"]["totals"]
@@ -2539,7 +2539,7 @@ def root_progress_report(estimate=None, requested_at=1_798_000_000,
     totals["inherited_branch_count"] = sum(r["inherited_branch_count"] for r in rows)
     totals["inherited_search_node_count"] = sum(
         r["inherited_search_node_count"] for r in rows)
-    totals["inherited_wall_millis"] = sum(r["inherited_wall_millis"] for r in rows)
+    totals["inherited_wall_time_millis"] = sum(r["inherited_wall_time_millis"] for r in rows)
     return report
 
 
@@ -3021,7 +3021,7 @@ class TerminalUtilityTest(unittest.TestCase):
             "work_started_at": 100, "work_latest_at": 200,
             "totals": {"requested_at": 90, "response_group_count": 4,
                        "open_branch_count": 1, "search_node_count": 1200,
-                       "wall_millis": 90000,
+                       "wall_time_millis": 90000,
                        "state_counts": {"waiting": 1, "evaluating": 2}},
             "estimate": {"provisional": True, "sample_duration_seconds": 60,
                          "estimated_seconds": 120, "remaining_candidate_count": 3,
@@ -3035,9 +3035,9 @@ class TerminalUtilityTest(unittest.TestCase):
                                  "shown_cost_known": False,
                                  "shown_branch_count": 0,
                                  "shown_search_node_count": 0,
-                                 "shown_wall_millis": 0,
-                                 "shown_elapsed_millis": None,
-                                 "inherited_elapsed_millis": None,
+                                 "shown_wall_time_millis": 0,
+                                 "shown_elapsed_time_millis": None,
+                                 "inherited_elapsed_time_millis": None,
                                  "paid_by_is_answer": False,
                                  "paid_by_pattern": None,
                                  "paid_by_spine": [],
@@ -3045,7 +3045,7 @@ class TerminalUtilityTest(unittest.TestCase):
                                  "inherited_cost_known": False,
                                  "inherited_branch_count": 0,
                                  "inherited_search_node_count": 0,
-                                 "inherited_wall_millis": 0}],
+                                 "inherited_wall_time_millis": 0}],
         }
         output = report_terminal.render_report(report, width=120)
         self.assertIn("estimate ~2m", output)
@@ -3293,10 +3293,10 @@ class WorkDistributionCommandEndToEndTest(unittest.TestCase):
         # Twenty claims of 20 ms each, and two of 350 s each.
         queue.add_branch_finalize_log(
             cheap, "CRANE -----", 2, 2, now, now, 20, 20, n_bundles=1,
-            evaluation_time_millis=400, coordination_millis=500)
+            evaluation_time_millis=400, coordination_time_millis=500)
         queue.add_branch_finalize_log(
             costly, "CRANE ----y", 3, 2, now, now, 800_000, 2, n_bundles=1,
-            evaluation_time_millis=700_000, coordination_millis=50)
+            evaluation_time_millis=700_000, coordination_time_millis=50)
         queue.close()
 
     def _run(self, *args):
@@ -3344,7 +3344,7 @@ class WorkDistributionCommandEndToEndTest(unittest.TestCase):
             sum(band["search_node_share"] for band in data["bands"]), 1.0)
         cheap = data["bands"][0]
         self.assertEqual(cheap["claim_count"], 20)
-        self.assertEqual(cheap["worker_millis"], 400)
+        self.assertEqual(cheap["worker_time_millis"], 400)
         self.assertGreater(cheap["coordination_share_per_work_share"], 100)
 
     def test_jsonl_output_is_one_line(self):

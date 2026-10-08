@@ -39,7 +39,7 @@
  },
  "generated_at": 1000,
  "report_kind": "hotspots",
- "schema_version": 4,
+ "schema_version": 5,
  "sources": {
   "cache": {
    "error": null,

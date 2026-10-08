@@ -135,13 +135,13 @@ class TestCostModelMigration(unittest.TestCase):
 class TestTelemetryInserts(_TmpQueue):
     def test_cost_sample_records_budget_wall_censored_epoch(self):
         self.q.add_cost_sample(ERD_ALL, 30, 500, "finalize",
-                               budget=4, wall_millis=1234)
+                               budget=4, wall_time_millis=1234)
         self.q.add_cost_sample(ERD_ALL, 30, 999, "censored",
                                budget=4, censored=1)
         rows = self.q._conn.execute(
-            "SELECT nodes, wall_millis, budget, censored, source, epoch "
+            "SELECT nodes, wall_time_millis, budget, censored, source, epoch "
             "FROM cost_samples ORDER BY id").fetchall()
-        self.assertEqual(rows[0]["wall_millis"], 1234)
+        self.assertEqual(rows[0]["wall_time_millis"], 1234)
         self.assertEqual(rows[0]["budget"], 4)
         self.assertEqual(rows[0]["censored"], 0)
         self.assertEqual(rows[1]["censored"], 1)

@@ -594,13 +594,13 @@ class _MidLoopPublisher:
 class _DependencyWait:
     """One cooperative_solve wait episode, accumulated for telemetry.
 
-    worker_time's wait_dependency_millis totals the time workers spend stuck
+    worker_time's wait_dependency_time_millis totals the time workers spend stuck
     on dependencies without saying which ones.  This carries the attribution:
     the dependency, how the episode divided between working on it, helping
     elsewhere, and being stuck, and what the worker's alternatives were the
     first time it had none.
 
-    `blocked_millis` is the stuck state alone, entered only after the worker
+    `blocked_time_millis` is the stuck state alone, entered only after the worker
     has failed to claim the branch by itself, failed to find work anywhere
     else, and failed to pair onto the branch.  The `blocks_*` counters say why
     each of those sleeps happened, and every one of them is reported by the
@@ -610,7 +610,7 @@ class _DependencyWait:
     """
 
     __slots__ = ("spine", "n_words", "budget", "help_depth", "outcome",
-                 "_started", "iterations", "blocked_millis", "empty_scans",
+                 "_started", "iterations", "blocked_time_millis", "empty_scans",
                  "helped_scans", "bundles_claimed", "pair_attempts",
                  "pair_successes", "blocks")
 
@@ -622,7 +622,7 @@ class _DependencyWait:
         self.outcome = None
         self._started = time.perf_counter()
         self.iterations = 0
-        self.blocked_millis = 0
+        self.blocked_time_millis = 0
         self.empty_scans = 0
         self.helped_scans = 0
         self.bundles_claimed = 0
@@ -631,7 +631,7 @@ class _DependencyWait:
         self.blocks = collections.Counter()
 
     @property
-    def episode_millis(self):
+    def episode_time_millis(self):
         return int((time.perf_counter() - self._started) * 1000)
 
     #: The reasons with a column of their own.  Anything else a claim
@@ -643,14 +643,14 @@ class _DependencyWait:
 
     def note_blocked(self, reason, millis):
         """Charge one sleep, against the reason the deciding code gave for it."""
-        self.blocked_millis += millis
+        self.blocked_time_millis += millis
         self.blocks[reason] += 1
 
     def other_blocks(self):
         """Sleeps whose reason has no column of its own.
 
         Keeps the counters a partition of the episode's sleeps: without it a
-        reason nobody anticipated would leave blocked_millis holding time no
+        reason nobody anticipated would leave blocked_time_millis holding time no
         counter accounts for.
         """
         return sum(count for reason, count in self.blocks.items()
@@ -690,7 +690,7 @@ class _WorkerTimeAccount:
 
     Durations come from a monotonic nanosecond clock and are floored to
     milliseconds, with "other" taking the remainder, so the integers written
-    partition interval_millis with no rounding residue.
+    partition interval_time_millis with no rounding residue.
 
     An activity can also name an owner, and the time charged to it is then
     totalled for that owner as well, across intervals, until taken.  The
@@ -758,7 +758,7 @@ class _WorkerTimeAccount:
             self._charge(self._clock())
             self._stack.pop()
 
-    def take_owned_millis(self, owner):
+    def take_owned_time_millis(self, owner):
         """The time charged to `owner` so far, which is then forgotten; None
         if nothing was."""
         nanoseconds = self._owned_nanoseconds.pop(owner, None)
@@ -787,7 +787,7 @@ class _WorkerTimeAccount:
         self._last_heartbeat = now
 
     def close_interval(self, nodes, claim_timing):
-        """End the interval and return (started_at, interval_millis,
+        """End the interval and return (started_at, interval_time_millis,
         figures) for ERDQueue.add_worker_time, then open the next one.
 
         nodes and claim_timing are this interval's differences in the worker's
@@ -795,28 +795,28 @@ class _WorkerTimeAccount:
         """
         now = self._clock()
         self._charge(now)
-        interval_millis = (now - self._interval_started) // 1_000_000
-        figures = {f"{activity}_millis": nanoseconds // 1_000_000
+        interval_time_millis = (now - self._interval_started) // 1_000_000
+        figures = {f"{activity}_time_millis": nanoseconds // 1_000_000
                    for activity, nanoseconds in self._nanoseconds.items()
                    if activity != "other"}
-        figures["other_millis"] = interval_millis - sum(figures.values())
+        figures["other_time_millis"] = interval_time_millis - sum(figures.values())
         lock_wait, transaction, commit, retries = claim_timing
         figures.update(
-            claim_lock_wait_millis=lock_wait,
-            claim_transaction_millis=transaction,
-            claim_commit_millis=commit, claim_retries=retries,
+            claim_lock_wait_time_millis=lock_wait,
+            claim_transaction_time_millis=transaction,
+            claim_commit_time_millis=commit, claim_retries=retries,
             candidates_evaluated=self.candidates_evaluated, nodes=nodes,
             fruitless_scans=self.fruitless_scans,
-            max_tick_gap_millis=(None if self._max_tick_gap is None
+            max_tick_gap_time_millis=(None if self._max_tick_gap is None
                                  else self._max_tick_gap // 1_000_000),
             max_tick_gap_activity=self._max_tick_gap_activity,
-            max_heartbeat_gap_millis=(
+            max_heartbeat_gap_time_millis=(
                 None if self._max_heartbeat_gap is None
                 else self._max_heartbeat_gap // 1_000_000),
             heartbeats_deferred=self.heartbeats_deferred)
         started_at = self.started_at
         self._open_interval(now)
-        return started_at, interval_millis, figures
+        return started_at, interval_time_millis, figures
 
 
 class _BranchWorker:
@@ -979,7 +979,7 @@ class _BranchWorker:
         self._time_account_claim_timing = self.queue.claim_timing_totals()
         # Coordination time of each open bundle's evaluated members, by
         # bundle id, recorded with the bundle's stats when it finishes.
-        self._bundle_coordination_millis = {}
+        self._bundle_coordination_time_millis = {}
 
     def _restart_coordination_window(self, origin=None):
         """Move the coordination window to `origin`, now by default.
@@ -1024,14 +1024,14 @@ class _BranchWorker:
                 < WORKER_TIME_INTERVAL_SECONDS):
             return
         claim_timing = self.queue.claim_timing_totals()
-        started_at, interval_millis, figures = (
+        started_at, interval_time_millis, figures = (
             self._time_account.close_interval(
                 self._nodes - self._time_account_nodes,
                 tuple(now - before for now, before in zip(
                     claim_timing, self._time_account_claim_timing))))
         self._time_account_nodes = self._nodes
         self._time_account_claim_timing = claim_timing
-        self.queue.add_worker_time(self.name, started_at, interval_millis,
+        self.queue.add_worker_time(self.name, started_at, interval_time_millis,
                                    figures)
 
     # -- lifecycle ----------------------------------------------------------
@@ -1224,15 +1224,15 @@ class _BranchWorker:
         self._typical_cache[key] = result
         return result
 
-    def _update_cost_model(self, n_words, nodes, budget, wall_millis=None):
+    def _update_cost_model(self, n_words, nodes, budget, wall_time_millis=None):
         """Update the cost model with a finalized cooperative branch's node count.
 
-        budget keys the (size, budget) cell; wall_millis is the branch's wall
+        budget keys the (size, budget) cell; wall_time_millis is the branch's wall
         span, the only per-solve wall figure, recorded on the raw sample.
         """
         self.queue.update_cost_model(ERD_ALL, n_words, nodes, budget=budget)
         self.queue.add_cost_sample(ERD_ALL, n_words, nodes, 'finalize',
-                                   budget=budget, wall_millis=wall_millis)
+                                   budget=budget, wall_time_millis=wall_time_millis)
         self._typical_cache.clear()   # bucket changed: drop cached predictions
 
     def _flush_cost_model_buffer(self):
@@ -1790,7 +1790,7 @@ class _BranchWorker:
                 nodes_spent=nodes_delta if record_nodes else 0,
                 infeasible=record_nodes and status == OVER_DEPTH_BUDGET,
                 tainted=budget_tainted, best=improved_best, cut=mark_cut,
-                evaluation_millis=round(cand_elapsed * 1e3),
+                evaluation_time_millis=round(cand_elapsed * 1e3),
                 evaluation_bound_erd=evaluation_bound_erd):
             # The claim was reissued, or the branch was re-created, while this
             # candidate ran.  The bundle is not abandoned with it: a one-level
@@ -1807,8 +1807,8 @@ class _BranchWorker:
         self._last_claim_complete = now_complete
         self._time_account.candidates_evaluated += 1
         if bundle_id is not None:
-            self._bundle_coordination_millis[bundle_id] = (
-                self._bundle_coordination_millis.get(bundle_id, 0)
+            self._bundle_coordination_time_millis[bundle_id] = (
+                self._bundle_coordination_time_millis.get(bundle_id, 0)
                 + int(full_coord_seconds * 1e3))
         if self._adaptive:
             # The break-even is the cost of handing work to another worker, so
@@ -1900,7 +1900,7 @@ class _BranchWorker:
             self.queue.complete_bundle_two_level_erd_prunes(
                 branch_key, bundle_id, pruned_candidate_indices,
                 nodes_spent=inspected_candidate_count,
-                wall_millis=int((time.time() - prune_started_at) * 1000),
+                wall_time_millis=int((time.time() - prune_started_at) * 1000),
                 bound_erd=bound_erd, worker_count=self.n_workers,
                 worker_id=self.name)
         return frozenset(pruned_candidate_indices), cancelled
@@ -2058,7 +2058,7 @@ class _BranchWorker:
         self.score_cache.write_completed_opener_summary(
             opener, ERD_ALL, timing["completed_at"],
             (timing["completed_at"] - timing["first_created_at"]) * 1000,
-            timing["worker_millis"] or 0, telemetry_epochs)
+            timing["worker_time_millis"] or 0, telemetry_epochs)
 
     def _finish_bundle(self, branch_key, bundle_id, nodes_at_start, wall_t0,
                        censored):
@@ -2069,20 +2069,20 @@ class _BranchWorker:
         wall_t0 is the bundle's own evaluation start (re-baselined past any
         forced member — see evaluate_bundle), so the elapsed time here is
         this bundle's evaluation wall span, not claim-handout coordination
-        overhead, which is recorded beside it as coordination_millis.
+        overhead, which is recorded beside it as coordination_time_millis.
         """
-        coordination_millis = self._bundle_coordination_millis.pop(
+        coordination_time_millis = self._bundle_coordination_time_millis.pop(
             bundle_id, None)
         evaluation_time_millis = (
             None if bundle_id is None
-            else self._time_account.take_owned_millis(bundle_id))
+            else self._time_account.take_owned_time_millis(bundle_id))
         if bundle_id is None or not self._adaptive:
             return
         nodes = self._nodes - nodes_at_start
-        wall_millis = int((time.time() - wall_t0) * 1000)
+        wall_time_millis = int((time.time() - wall_t0) * 1000)
         self.queue.record_bundle_stats(
-            branch_key, bundle_id, nodes, wall_millis, censored=censored,
-            coordination_millis=coordination_millis,
+            branch_key, bundle_id, nodes, wall_time_millis, censored=censored,
+            coordination_time_millis=coordination_time_millis,
             evaluation_time_millis=evaluation_time_millis)
 
     # -- finalize -----------------------------------------------------------
@@ -2115,7 +2115,7 @@ class _BranchWorker:
                                if branch_row else None)
         # Wall span of the branch (upper bound — solves interleave).  The only
         # per-solve wall figure, recorded on the cost sample and the finalize log.
-        wall_millis = (None if created_at is None or finalized_at is None
+        wall_time_millis = (None if created_at is None or finalized_at is None
                        else max(0, (finalized_at - created_at) * 1000))
         # Claims drained to finalize, captured before delete_branch drops the rows.
         completed_candidates = self.queue.branch_done_candidates(branch_key)
@@ -2143,7 +2143,7 @@ class _BranchWorker:
                              cache=self.rcache)
             if self._adaptive and nodes_spent > 0:
                 self._update_cost_model(len(words), nodes_spent, budget=budget,
-                                        wall_millis=wall_millis)
+                                        wall_time_millis=wall_time_millis)
             # NB: no per-finalize checkpoint — with recursive promotion a worker
             # finalizes thousands of sub-branches; checkpointing each one is
             # ruinous.  WAL is drained by the periodic _maybe_checkpoint instead.
@@ -2159,7 +2159,7 @@ class _BranchWorker:
             if self._adaptive and nodes_spent > 0:
                 self.queue.add_cost_sample(ERD_ALL, len(words), nodes_spent,
                                            'cut', budget=budget, censored=1,
-                                           wall_millis=wall_millis)
+                                           wall_time_millis=wall_time_millis)
             logger.warning('%s finalized branch (%d words) as LOSS: ceiling '
                            '%.4f exceeds budget=%s nodes=%d', self.name,
                            len(words), ceiling, budget, nodes_spent)
@@ -2178,7 +2178,7 @@ class _BranchWorker:
             if self._adaptive and nodes_spent > 0:
                 self.queue.add_cost_sample(ERD_ALL, len(words), nodes_spent,
                                            'cut', budget=budget, censored=1,
-                                           wall_millis=wall_millis)
+                                           wall_time_millis=wall_time_millis)
             logger.info('%s finalized branch (%d words) as CUT >= %.4f '
                         'budget=%s nodes=%d', self.name, len(words), ceiling,
                         budget, nodes_spent)
@@ -2206,10 +2206,10 @@ class _BranchWorker:
         # Everything above published the branch's result; that span is the
         # finalize phase of the coordination breakdown, recorded on this
         # branch's own finalize row.
-        cache_write_millis = int((time.time() - finalize_t0) * 1000)
+        cache_write_time_millis = int((time.time() - finalize_t0) * 1000)
         try:
-            (n_bundles, max_bundle_nodes, total_bundle_wall_millis,
-             censored_units, coordination_millis,
+            (n_bundles, max_bundle_nodes, total_bundle_wall_time_millis,
+             censored_units, coordination_time_millis,
              evaluation_time_millis) = (
                 self.queue.finalize_bundle_stats(branch_key))
             # Read while the branch's claim rows still exist: delete_branch
@@ -2222,7 +2222,7 @@ class _BranchWorker:
                 branch_key, spine, len(words), budget, created_at,
                 finalized_at, nodes_spent, n_claims, n_bundles=n_bundles,
                 max_bundle_nodes=max_bundle_nodes,
-                total_bundle_wall_millis=total_bundle_wall_millis,
+                total_bundle_wall_time_millis=total_bundle_wall_time_millis,
                 censored_units=censored_units, ceiling=ceiling,
                 bulk_done_candidates=bulk_done_candidates,
                 one_level_erd_pruned_candidates=
@@ -2232,11 +2232,11 @@ class _BranchWorker:
                 infeasible_candidates=infeasible_candidates,
                 infeasible_nodes=infeasible_nodes,
                 best_guess=best_guess, best_erd=best_erd,
-                cache_write_millis=cache_write_millis,
+                cache_write_time_millis=cache_write_time_millis,
                 schedule_diagnostics=schedule_diagnostics,
                 first_best_at=first_best_at,
                 nodes_at_first_best=nodes_at_first_best,
-                coordination_millis=coordination_millis,
+                coordination_time_millis=coordination_time_millis,
                 evaluation_time_millis=evaluation_time_millis,
                 **self._hint_outcome(branch_key, best_guess, budget),
                 outcome='loss' if ceiling_proves_loss else ('cut' if cut else
@@ -2245,7 +2245,7 @@ class _BranchWorker:
             if len(spine_tokens) >= 2:
                 self.score_cache.add_opener_response_group_summary(
                     spine_tokens[0], spine_tokens[1], ERD_ALL, nodes_spent,
-                    total_bundle_wall_millis, created_at, finalized_at,
+                    total_bundle_wall_time_millis, created_at, finalized_at,
                     self.queue.epoch)
         except Exception:
             logger.exception(
@@ -2280,11 +2280,11 @@ class _BranchWorker:
                            if key[0] == branch_key]:
             del self._packing_stats_cache[cached_key]
         # Restart the coordination window past this finalize.  evaluate_claim
-        # telescopes coordination_millis from the previous claim's completion,
+        # telescopes coordination_time_millis from the previous claim's completion,
         # so without this the finalize span would reappear as coordination on
         # the first claim of whatever branch this worker picks up next — a
         # different, unrelated branch.  The finalize's own cost is
-        # branch_finalize_log.cache_write_millis.
+        # branch_finalize_log.cache_write_time_millis.
         self._restart_coordination_window()
         return True
 
@@ -2571,7 +2571,7 @@ class _BranchWorker:
             return
         self.queue.add_dependency_wait(
             self.name, wait.spine, wait.n_words, wait.budget,
-            wait.episode_millis, wait.blocked_millis, wait.iterations,
+            wait.episode_time_millis, wait.blocked_time_millis, wait.iterations,
             wait.empty_scans, wait.helped_scans, wait.bundles_claimed,
             wait.pair_attempts, wait.pair_successes,
             blocks_worker_cap=wait.blocks[CLAIM_DECLINE_WORKER_CAP],
@@ -2615,7 +2615,7 @@ class _BranchWorker:
             # child's completion would then leave the enclosing claim
             # reporting a span its child had already consumed.  Restoring on
             # the way out keeps the enclosing claim measured from its own
-            # previous completion, which its candidate_evaluation_millis --
+            # previous completion, which its candidate_evaluation_time_millis --
             # covering the nested work -- cancels correctly.
             enclosing_claim_window = self._last_claim_complete
             self._restart_coordination_window()
