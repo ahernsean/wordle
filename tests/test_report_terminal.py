@@ -8,6 +8,7 @@ import os
 import random
 import shlex
 import tempfile
+import time
 from types import SimpleNamespace
 import collections
 import unittest
@@ -914,8 +915,8 @@ class OverviewRendererTest(unittest.TestCase):
         report = overview_report()
         report.update({"report_kind": "hotspots", "tree": False})
         report["data"] = {
-            "field": "coordination",
-            "population": "recent_claim_coordination_buckets",
+            "field": "cut-reuse",
+            "population": "recent_cut_reuse_misses",
             "epoch": 3,
             "since_seconds": 3600,
             "window_started_at": 100,
@@ -923,21 +924,20 @@ class OverviewRendererTest(unittest.TestCase):
             "sampled_row_count": 50000,
             "sample_truncated": True,
             "rows": [{
-                "row_id": "coordination:20:4",
+                "row_id": "cut-reuse:00",
                 "answer_count": 20,
-                "worker_count": 4,
-                "coordination_millis": 900,
+                "cut_reuse_miss_count": 4,
             }],
         }
         output = render_report(report, width=100)
-        self.assertIn("Population: recent_claim_coordination_buckets", output)
+        self.assertIn("Population: recent_cut_reuse_misses", output)
         self.assertIn("epoch=3", output)
         self.assertIn("since-seconds=3600", output)
         self.assertIn("sample-size=50000", output)
         self.assertIn("truncated=true", output)
 
     @staticmethod
-    def _work_distribution_report(bands, unattributed=None, unmeasured=None):
+    def _work_distribution_report(bands, unmeasured=None):
         # The band rows are shaped by report_model's own pricing so the render
         # is exercised against the structure it is actually handed.
         rows, totals = _work_distribution_band_rows(
@@ -945,15 +945,12 @@ class OverviewRendererTest(unittest.TestCase):
         report = overview_report()
         report.update({"report_kind": "work_distribution", "tree": False})
         report["data"] = {
-            "population": "epoch_claims_by_branch",
+            "population": "epoch_finalized_branches",
             "epoch": 17, "since_seconds": None, "window_started_at": None,
             "scan_seconds": 10.4,
             "band_edge_seconds": list(WORK_DISTRIBUTION_BAND_EDGE_SECONDS),
             "bands": rows,
             "totals": totals,
-            "unattributed": unattributed or {
-                "claim_count": 0, "search_node_count": 0,
-                "coordination_millis": 0, "worker_millis": 0},
             "unmeasured": unmeasured or {
                 "branch_count": 0, "claim_count": 0, "search_node_count": 0,
                 "coordination_millis": 0, "worker_millis": 0},
@@ -962,8 +959,7 @@ class OverviewRendererTest(unittest.TestCase):
 
     @staticmethod
     def _band(band_index, **overrides):
-        band = {"band_index": band_index, "branch_count": 0,
-                "unfinished_branch_count": 0, "claim_count": 0,
+        band = {"band_index": band_index, "branch_count": 0, "claim_count": 0,
                 "search_node_count": 0, "coordination_millis": 0,
                 "worker_millis": 0}
         band.update(overrides)
@@ -971,17 +967,17 @@ class OverviewRendererTest(unittest.TestCase):
 
     def test_work_distribution_render_shows_every_band_and_the_ratio_legend(self):
         report = self._work_distribution_report([
-            self._band(0, branch_count=39_332, unfinished_branch_count=4,
+            self._band(0, branch_count=39_332,
                        claim_count=499_756, search_node_count=7_643_478,
                        coordination_millis=20_600_000, worker_millis=39_000_000),
-            self._band(4, branch_count=9, unfinished_branch_count=9,
+            self._band(4, branch_count=9,
                        claim_count=14_681, search_node_count=417_486_717,
                        coordination_millis=600_000, worker_millis=90_000_000),
         ])
 
         output = render_report(report, width=140)
 
-        self.assertIn("Population: epoch_claims_by_branch", output)
+        self.assertIn("Population: epoch_finalized_branches", output)
         self.assertIn("epoch=17", output)
         self.assertIn("window=whole epoch", output)
         self.assertIn("scanned in 10.4s", output)
@@ -991,27 +987,28 @@ class OverviewRendererTest(unittest.TestCase):
         self.assertIn("39,332", output)
         self.assertIn("coordination-time share ÷ search-node share", output)
 
-    def test_work_distribution_render_names_claims_with_no_branch_attribution(self):
+    def test_work_distribution_render_names_unmeasured_branches(self):
         report = self._work_distribution_report(
             [self._band(0, branch_count=1, claim_count=2, search_node_count=4,
                         coordination_millis=10, worker_millis=20)],
-            unattributed={"claim_count": 1, "search_node_count": 3,
-                          "coordination_millis": 7, "worker_millis": 5},
+            unmeasured={"branch_count": 1, "claim_count": 3,
+                        "search_node_count": 3, "coordination_millis": 0,
+                        "worker_millis": 0},
         )
 
-        output = render_report(report, width=120)
+        output = render_report(report, width=140)
 
-        self.assertIn("1 claim with no recorded branch attribution", output)
-        self.assertNotIn("1 claims with no recorded", output)
+        self.assertIn("plus 1 branch with unrecorded worker or coordination "
+                      "time", output)
 
-    def test_work_distribution_render_omits_the_unattributed_line_at_zero(self):
+    def test_work_distribution_render_omits_the_unmeasured_line_at_zero(self):
         output = render_report(
             self._work_distribution_report(
                 [self._band(0, branch_count=1, claim_count=2,
                             search_node_count=4, worker_millis=20)]),
             width=120,
         )
-        self.assertNotIn("no recorded branch attribution", output)
+        self.assertNotIn("unrecorded", output)
 
     def test_work_distribution_render_dashes_a_band_with_no_search(self):
         output = render_report(
@@ -1022,27 +1019,6 @@ class OverviewRendererTest(unittest.TestCase):
         )
         # Every band did zero search, so no share and no ratio exists to print.
         self.assertIn("—", output)
-
-    def test_accuracy_render_distinguishes_requested_and_achieved_samples(self):
-        report = overview_report()
-        report.update({"report_kind": "accuracy", "tree": False})
-        report["data"] = {
-            "epoch": 4, "population_row_count": None,
-            "requested_sample_size": 50_000, "sampled_row_count": 2,
-            "erd_pruned_row_count": 1, "non_erd_pruned_row_count": 1,
-            "no_prediction_row_count": 1,
-            "calibration": {"row_count": 1,
-                            "actual_predicted_ratio": {
-                                "p1": 0.1, "p10": 0.2, "p50": 1.0,
-                                "p90": 5.0, "p99": 10.0}},
-            "largest_under_predicted": [], "rows": [],
-        }
-        output = render_report(report, width=120)
-        self.assertIn("population not counted", output)
-        self.assertIn("random sample 2/50,000 requested", output)
-        self.assertIn("non-pruned calibration rows 1", output)
-        self.assertIn("p1=0.10", output)
-
 
 class CandidateSweepBarTest(unittest.TestCase):
     def test_block_heights_scale_with_cell_completion(self):
@@ -2232,7 +2208,6 @@ class ViewParserTest(unittest.TestCase):
             (["--workers"], "workers", None),
             (["--worker", "2"], "workers", "2"),
             (["--cache"], "cache", None),
-            (["--accuracy"], "accuracy", None),
         ]
         for options, report_kind, worker_id in cases:
             with self.subTest(options=options):
@@ -2244,29 +2219,6 @@ class ViewParserTest(unittest.TestCase):
                 args = run_view.call_args.args[0]
                 self.assertEqual(args.report_kind, report_kind)
                 self.assertEqual(args.worker, worker_id)
-                if report_kind == "accuracy":
-                    self.assertEqual(args.limit, 20)
-                    self.assertIsNone(args.since_seconds)
-
-    def test_accuracy_offset_is_forwarded_to_the_report_request(self):
-        with (
-            patch("sys.argv", ["erd_search.py", "view", "--accuracy",
-                              "--limit", "5", "--accuracy-offset", "10"]),
-            patch("report_terminal.run_view") as run_view,
-        ):
-            erd_search.main()
-        self.assertEqual(run_view.call_args.args[0].accuracy_offset, 10)
-
-    def test_accuracy_since_seconds_is_forwarded_to_the_report_request(self):
-        with (
-            patch("sys.argv", ["erd_search.py", "view", "--accuracy",
-                              "--since-seconds", "60"]),
-            patch("report_terminal.run_view") as run_view,
-        ):
-            erd_search.main()
-        args = run_view.call_args.args[0]
-        self.assertEqual(args.since_seconds, 60)
-        self.assertEqual(args.limit, 20)
 
     def test_incompatible_report_options_and_invalid_branch_filters_are_rejected(self):
         invalid_arguments = [
@@ -2359,7 +2311,7 @@ class ViewParserTest(unittest.TestCase):
     def test_hotspot_defaults_and_sample_cap_are_normalized(self):
         with (
             patch("sys.argv", [
-                "erd_search.py", "view", "--hotspots", "--by", "coordination",
+                "erd_search.py", "view", "--hotspots", "--by", "cut-reuse",
                 "--sample-size", "2000000",
             ]),
             patch("report_terminal.run_view") as run_view,
@@ -2367,7 +2319,7 @@ class ViewParserTest(unittest.TestCase):
             erd_search.main()
         args = run_view.call_args.args[0]
         self.assertEqual(args.report_kind, "hotspots")
-        self.assertEqual(args.hotspot_field, "coordination")
+        self.assertEqual(args.hotspot_field, "cut-reuse")
         self.assertEqual(args.since_seconds, 3600)
         self.assertEqual(args.sample_size, 1_000_000)
         self.assertEqual(args.limit, 10)
@@ -3060,7 +3012,7 @@ class TerminalUtilityTest(unittest.TestCase):
         # ownership row mark it -- the same fact the web client notches.
         self.assertEqual(output.count("RAISE*"), 2)
 
-    def test_root_progress_and_accuracy_renderers_show_estimates_and_raw_rows(self):
+    def test_root_progress_renderer_shows_its_estimate(self):
         report = overview_report()
         report.update({"report_kind": "root_progress", "tree": False})
         report["data"] = {
@@ -3098,22 +3050,6 @@ class TerminalUtilityTest(unittest.TestCase):
         output = report_terminal.render_report(report, width=120)
         self.assertIn("estimate ~2m", output)
         self.assertIn("excludes 1 waiting groups and 1 stalled branches", output)
-        report["report_kind"] = "accuracy"
-        report["data"] = {
-            "epoch": 2, "population_row_count": 4, "sampled_row_count": 2,
-            "requested_sample_size": 3, "erd_pruned_row_count": 1,
-            "non_erd_pruned_row_count": 1, "no_prediction_row_count": 0,
-            "calibration": {"row_count": 1, "actual_predicted_ratio": {"mean": 1.2}},
-            "largest_under_predicted": [{"candidate_word": "raise", "n_words": 3,
-                                           "budget": None, "predicted_work": None,
-                                           "actual_nodes": 20, "actual_predicted_ratio": None}],
-            "rows": [{"candidate_word": "raise", "idx": 2, "worker_id": None,
-                      "bundle_id": None, "outcome": None, "evaluation_millis": None,
-                      "republish_count": 1}], "raw_row_offset": 5,
-        }
-        output = report_terminal.render_report(report, width=120)
-        self.assertIn("Raw rows (offset 5)", output)
-        self.assertIn("RAISE idx=2", output)
 
 
 if __name__ == "__main__":
@@ -3353,16 +3289,14 @@ class WorkDistributionCommandEndToEndTest(unittest.TestCase):
         queue = ERDQueue(self.queue_path)
         cheap = encode_subset(["crane", "slate"])
         costly = encode_subset(["crane", "slate", "fresh"])
-        queue.create_branch(cheap, 2, 2)
-        queue.create_branch(costly, 3, 2)
-        for index in range(20):
-            queue.add_claim_telemetry(
-                2, 25, 1, 2, branch_key=cheap, idx=index,
-                candidate_evaluation_millis=20)
-        for index in range(2):
-            queue.add_claim_telemetry(
-                3, 25, 400_000, 2, branch_key=costly, idx=index,
-                candidate_evaluation_millis=350_000)
+        now = int(time.time())
+        # Twenty claims of 20 ms each, and two of 350 s each.
+        queue.add_branch_finalize_log(
+            cheap, "CRANE -----", 2, 2, now, now, 20, 20, n_bundles=1,
+            evaluation_time_millis=400, coordination_millis=500)
+        queue.add_branch_finalize_log(
+            costly, "CRANE ----y", 3, 2, now, now, 800_000, 2, n_bundles=1,
+            evaluation_time_millis=700_000, coordination_millis=50)
         queue.close()
 
     def _run(self, *args):
@@ -3382,7 +3316,7 @@ class WorkDistributionCommandEndToEndTest(unittest.TestCase):
     def test_text_output_bands_the_two_branches_apart(self):
         text = self._run()
         self.assertIn("Work distribution by worker time", text)
-        self.assertIn("Population: epoch_claims_by_branch", text)
+        self.assertIn("Population: epoch_finalized_branches", text)
         band_rows = {
             line.split()[0]: line.split()
             for line in text.splitlines() if line.startswith(("<=", "2-", "30-",
@@ -3401,7 +3335,7 @@ class WorkDistributionCommandEndToEndTest(unittest.TestCase):
         self.assertEqual(report["report_kind"], "work_distribution")
         self.assertTrue(report["sources"]["queue"]["ok"])
         data = report["data"]
-        self.assertEqual(data["population"], "epoch_claims_by_branch")
+        self.assertEqual(data["population"], "epoch_finalized_branches")
         self.assertEqual(data["totals"]["claim_count"], 22)
         self.assertEqual(data["totals"]["branch_count"], 2)
         self.assertAlmostEqual(

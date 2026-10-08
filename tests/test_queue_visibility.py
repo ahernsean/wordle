@@ -38,17 +38,9 @@ class QueueVisibilityTests(unittest.TestCase):
             "idx_branch_finalize_log_finalized_at",
             "idx_cut_reuse_misses_branch_recorded_at",
             "idx_cut_reuse_misses_epoch_recorded_id",
-            "idx_claim_telemetry_epoch_id",
-            "idx_claim_telemetry_epoch_recorded_id",
-            "idx_claim_telemetry_branch_recorded_at",
-            "idx_candidate_accuracy_epoch_id",
-            "idx_candidate_accuracy_epoch_recorded_id",
         }
         indexes = set()
-        for table in (
-            "branch_finalize_log", "cut_reuse_misses", "claim_telemetry",
-            "candidate_accuracy"
-        ):
+        for table in ("branch_finalize_log", "cut_reuse_misses"):
             indexes.update(
                 row["name"] for row in self.q._conn.execute(
                     f"PRAGMA telemetry.index_list({table})"
@@ -57,77 +49,13 @@ class QueueVisibilityTests(unittest.TestCase):
         self.assertTrue(expected.issubset(indexes))
         self.q._migrate()
         indexes_after = set()
-        for table in (
-            "branch_finalize_log", "cut_reuse_misses", "claim_telemetry",
-            "candidate_accuracy"
-        ):
+        for table in ("branch_finalize_log", "cut_reuse_misses"):
             indexes_after.update(
                 row["name"] for row in self.q._conn.execute(
                     f"PRAGMA telemetry.index_list({table})"
                 )
             )
         self.assertEqual(indexes, indexes_after)
-
-    def test_candidate_accuracy_report_calibrates_and_filters_raw_rows(self):
-        self.q.add_candidate_accuracy(
-            self.user_key, 25, 4, 10.0, 3.0, 2.0, False, 40,
-            opener="salet", candidate_word="crane", idx=7,
-            bundle_id="w1:1", worker_id="worker-1", outcome="solved",
-            evaluation_millis=12, republish_count=2)
-        self.q.add_candidate_accuracy(
-            self.user_key, 25, 4, 0.0, 3.0, 3.5, True, 0,
-            opener="salet", candidate_word="slate", idx=8)
-        self.q.add_candidate_accuracy(
-            self.user_key, 25, 4, 0.0, 3.0, 2.0, False, 5,
-            opener="salet", candidate_word="trace", idx=9)
-        report = self.q.report_candidate_accuracy(
-            epoch=0, opener="salet", limit=1)
-        self.assertEqual(report["requested_sample_size"], 50_000)
-        self.assertEqual(report["erd_pruned_row_count"], 1)
-        self.assertEqual(report["non_erd_pruned_row_count"], 2)
-        self.assertEqual(report["no_prediction_row_count"], 2)
-        self.assertEqual(report["sampled_row_count"], 3)
-        self.assertIsNone(report["population_row_count"])
-        self.assertEqual(
-            report["calibration"]["actual_predicted_ratio"]["p50"], 4.0)
-        row = report["rows"][0]
-        self.assertEqual(row["candidate_word"], "trace")
-        self.assertIsNone(row["actual_predicted_ratio"])
-        under_predicted = report["largest_under_predicted"][0]
-        self.assertEqual(under_predicted["idx"], 7)
-        self.assertEqual(under_predicted["republish_count"], 2)
-        self.assertNotIn(
-            "trace", [row["candidate_word"]
-                      for row in report["largest_under_predicted"]])
-
-    def test_candidate_accuracy_report_filters_offsets_and_empty_samples(self):
-        for idx, candidate_word in enumerate(("crane", "slate")):
-            self.q.add_candidate_accuracy(
-                self.user_key, 25, 4, 10.0, 3.0, 2.0, False, 20,
-                opener="salet", candidate_word=candidate_word, idx=idx)
-        filtered = self.q.report_candidate_accuracy(
-            epoch=0, budget=4, minimum_answer_count=20,
-            maximum_answer_count=30, opener="salet",
-            branch_key=self.user_key, limit=1, raw_row_offset=1)
-        self.assertEqual(filtered["rows"][0]["candidate_word"], "crane")
-        self.assertEqual(filtered["raw_row_offset"], 1)
-        empty = self.q.report_candidate_accuracy(epoch=0, opener="none")
-        self.assertEqual(empty["sampled_row_count"], 0)
-        self.assertIsNone(
-            empty["calibration"]["actual_predicted_ratio"]["p99"])
-
-    def test_candidate_accuracy_report_honors_since_without_counting_filter(self):
-        self.q.add_candidate_accuracy(
-            self.user_key, 25, 4, 10.0, 3.0, 2.0, False, 20,
-            opener="salet", candidate_word="crane")
-        self.q._conn.execute(
-            "UPDATE telemetry.candidate_accuracy SET recorded_at = 100")
-        self.assertEqual(
-            self.q.report_candidate_accuracy(
-                epoch=0, since=101)["sampled_row_count"], 0)
-        report = self.q.report_candidate_accuracy(epoch=0, since=100)
-        self.assertEqual(report["sampled_row_count"], 1)
-        self.assertEqual(report["population_row_count"], 1)
 
     def test_candidate_republish_count_defaults_to_zero_and_reads_a_republish(self):
         self.q.create_branch(self.user_key, len(WORDS), len(WORDS))
@@ -238,13 +166,14 @@ class QueueVisibilityTests(unittest.TestCase):
                    (?, 10, 7, 3.0, 1000, 0, 950)
         """, (branch_id, branch_id))
         self.q._conn.execute("""
-            INSERT INTO telemetry.claim_telemetry
-                (n_words, coordination_millis, candidate_evaluation_millis,
-                 evaluation_bound_erd, work_nodes, branch_id, epoch,
-                 recorded_at)
-            VALUES (5, 900, 9000, 2.5, 1, ?, 0, 850),
-                   (5, 1100, 11000, 3.0, 1, ?, 0, 950)
-        """, (branch_id, branch_id))
+            INSERT INTO candidate_claims
+                (branch_id, idx, claimed_by, done, done_at,
+                 evaluation_millis, evaluation_bound_erd)
+            VALUES (?, 0, 'worker-0', 1, 850, 9000, 2.5),
+                   (?, 1, 'worker-0', 1, 950, 11000, 3.0),
+                   (?, 2, 'one-level-erd-prune', 1, 960, NULL, NULL),
+                   (?, 3, 'worker-1', 1, 970, 5000, 2.5)
+        """, (branch_id, branch_id, branch_id, branch_id))
 
         sample = self.q.branch_candidate_eta_sample(
             self.user_key, window_seconds=600, now=1_000)
@@ -263,10 +192,10 @@ class QueueVisibilityTests(unittest.TestCase):
             UPDATE active_branches SET created_at = 900 WHERE branch_id = ?
         """, (branch_id,))
         self.q._conn.execute("""
-            INSERT INTO telemetry.claim_telemetry
-                (n_words, coordination_millis, candidate_evaluation_millis,
-                 evaluation_bound_erd, work_nodes, branch_id, epoch, recorded_at)
-            VALUES (5, 1, 11000, NULL, 1, ?, 0, 950)
+            INSERT INTO candidate_claims
+                (branch_id, idx, claimed_by, done, done_at,
+                 evaluation_millis, evaluation_bound_erd)
+            VALUES (?, 0, 'worker-0', 1, 950, 11000, NULL)
         """, (branch_id,))
 
         sample = self.q.branch_candidate_eta_sample(
@@ -286,15 +215,17 @@ class QueueVisibilityTests(unittest.TestCase):
                 ("worker-2", self.coop_key)):
             self.q.heartbeat(
                 worker_id, 1, branch_key, 100, now, 0)
-        self.q.add_claim_telemetry(
-            100, 1, 1, 6, branch_key=self.user_key,
-            worker_id="worker-0", candidate_evaluation_millis=1)
+        bundle_id, [idx], _forced = self.q.claim_next_bundle(
+            self.user_key, "worker-0", 10, list(range(10)), [0.0] * 10,
+            small_count=1, count_cap=1)
+        self.assertTrue(self.q.apply_candidate_result(
+            self.user_key, idx, claimed_by="worker-0", bundle_id=bundle_id,
+            evaluation_millis=1))
 
         row = self.q._conn.execute("""
-            SELECT worker_count, branch_worker_count
-            FROM telemetry.claim_telemetry
+            SELECT branch_worker_count FROM candidate_claims
+            WHERE evaluation_millis IS NOT NULL
         """).fetchone()
-        self.assertEqual(row["worker_count"], 6)
         self.assertEqual(row["branch_worker_count"], 2)
         sample = self.q.branch_candidate_eta_sample(
             self.user_key, window_seconds=60, now=now)
@@ -402,51 +333,12 @@ class QueueVisibilityTests(unittest.TestCase):
         )
         self.assertEqual(back_to_first["recent_finalizations"][0]["outcome"], "loss")
 
-    def test_historical_hotspots_are_bounded_and_coordination_is_bucketed(self):
-        now = int(time.time())
-        for index in range(5):
-            self.q._conn.execute("""
-                INSERT INTO telemetry.claim_telemetry
-                    (n_words, coordination_millis, work_nodes, claim_retries,
-                     busy_wait_millis, worker_count, epoch, recorded_at)
-                VALUES (?, ?, 100, 1, 2, ?, 0, ?)
-            """, (10 + index % 2, 20 + index, 2 + index % 2, now))
-        result = self.q.report_hotspots(
-            "coordination", epoch=0, since=now - 60,
-            sample_size=3, limit=2,
-        )
-        self.assertEqual(result["population"], "recent_claim_coordination_buckets")
-        self.assertEqual(result["sample_size"], 3)
-        self.assertEqual(result["sampled_row_count"], 3)
-        self.assertTrue(result["sample_truncated"])
-        self.assertLessEqual(len(result["rows"]), 2)
-        self.assertTrue(all(row["row_id"].startswith("coordination:")
-                            for row in result["rows"]))
-        with self.assertRaisesRegex(ValueError, "cannot be attributed"):
+    def test_coordination_is_not_a_hotspot_field(self):
+        # Coordination is recorded per branch and per worker, not per claim,
+        # so there are no claim rows to bucket.
+        with self.assertRaisesRegex(ValueError, "unsupported hotspot field"):
             self.q.report_hotspots(
-                "coordination", 0, now - 60, 3, 2,
-                spine_prefix="CRANE -----",
-            )
-
-    def test_coordination_hotspot_claim_count_counts_only_claims(self):
-        # claim_telemetry is one row per candidate evaluation, so this
-        # report's claim_count is a true claim count.  Branch finalize cost
-        # deliberately lives on branch_finalize_log instead: routing it here
-        # would inflate claim_count and SUM(coordination_millis) with rows
-        # that are not claims at all.
-        now = int(time.time())
-        for idx in range(3):
-            self.q.add_claim_telemetry(
-                10, 20, 100, 2, branch_key=self.user_key, idx=idx,
-                bundle_id="worker-0:1:0")
-        self.q.add_branch_finalize_log(
-            self.user_key, "CRANE -----", 10, 4, now, now, 100, 3,
-            cache_write_millis=500)
-        result = self.q.report_hotspots(
-            "coordination", epoch=0, since=now - 60, sample_size=50, limit=10)
-        self.assertEqual(len(result["rows"]), 1)
-        self.assertEqual(result["rows"][0]["claim_count"], 3)
-        self.assertEqual(result["rows"][0]["coordination_millis"], 60)
+                "coordination", 0, int(time.time()) - 60, 3, 2)
 
     def test_current_hotspots_support_queue_and_tree_populations(self):
         self.q.create_branch(
@@ -655,13 +547,6 @@ class QueueVisibilityTests(unittest.TestCase):
                 WHERE branch_key = ? ORDER BY recorded_at DESC LIMIT 5
             """, (self.user_key,))
         )
-        claim_plan = " ".join(
-            row["detail"] for row in self.q._conn.execute("""
-                EXPLAIN QUERY PLAN
-                SELECT * FROM telemetry.claim_telemetry
-                WHERE epoch = ? ORDER BY id DESC LIMIT 5
-            """, (0,))
-        )
         finalization_sample_plan = " ".join(
             row["detail"] for row in self.q._conn.execute("""
                 EXPLAIN QUERY PLAN
@@ -678,23 +563,13 @@ class QueueVisibilityTests(unittest.TestCase):
                 ORDER BY recorded_at DESC, id DESC LIMIT 5
             """, (0, 1))
         )
-        claim_sample_plan = " ".join(
-            row["detail"] for row in self.q._conn.execute("""
-                EXPLAIN QUERY PLAN
-                SELECT * FROM telemetry.claim_telemetry
-                WHERE epoch = ? AND recorded_at >= ?
-                ORDER BY recorded_at DESC, id DESC LIMIT 5
-            """, (0, 1))
-        )
         self.assertIn("idx_branch_finalize_log_branch_recorded_at", finalize_plan)
         self.assertIn("idx_cut_reuse_misses_branch_recorded_at", cut_plan)
-        self.assertIn("idx_claim_telemetry_epoch_id", claim_plan)
         self.assertIn(
             "idx_branch_finalize_log_epoch_recorded_id",
             finalization_sample_plan,
         )
         self.assertIn("idx_cut_reuse_misses_epoch_recorded_id", cut_sample_plan)
-        self.assertIn("idx_claim_telemetry_epoch_recorded_id", claim_sample_plan)
 
     def test_user_in_progress_joins_pending_and_active_state(self):
         self.q.add_pending_many([(self.user_key, len(WORDS), 5, "crane", 1)])
@@ -889,19 +764,20 @@ class WorkDistributionTests(unittest.TestCase):
         self.q = ERDQueue(os.path.join(self._tmp.name, "q.sqlite3"))
         self.addCleanup(self.q.close)
 
-    def _branch(self, tag, size):
-        return ScoreCache.encode_subset(_words(tag, size))
+    def _finalized(self, tag, size, claims, nodes, worker_millis,
+                   coordination_millis=10, created_at=None):
+        """Log a finalized branch the way maybe_finalize does."""
+        finalized_at = int(time.time())
+        self.q.add_branch_finalize_log(
+            ScoreCache.encode_subset(_words(tag, 4)), f"{tag.upper()} -----",
+            size, 3, finalized_at if created_at is None else created_at,
+            finalized_at, nodes, claims, n_bundles=1,
+            evaluation_time_millis=worker_millis,
+            coordination_millis=coordination_millis)
 
-    def _claims(self, branch_key, count, nodes, evaluation_millis,
-                coordination_millis=10):
-        for idx in range(count):
-            self.q.add_claim_telemetry(
-                10, coordination_millis, nodes, 2, branch_key=branch_key,
-                idx=idx, candidate_evaluation_millis=evaluation_millis)
-
-    def _report(self, since=None):
+    def _report(self, since=None, **answer_count_range):
         return self.q.report_work_distribution(
-            self.q.epoch, since, BAND_EDGE_MILLIS)
+            self.q.epoch, since, BAND_EDGE_MILLIS, **answer_count_range)
 
     def _band(self, report, band_index):
         for band in report["bands"]:
@@ -909,16 +785,12 @@ class WorkDistributionTests(unittest.TestCase):
                 return band
         return None
 
-    def test_bands_come_from_summed_worker_time(self):
-        cheap = self._branch("cheap", 4)
-        costly = self._branch("costl", 6)
-        self.q.create_branch(cheap, 4, 3)
-        self.q.create_branch(costly, 6, 3)
-        # Ten claims of 100 ms each land the cheap branch at one second, under
-        # the two-second edge, even though it took more claims than the costly
-        # one; the band key is time, not claim count.
-        self._claims(cheap, 10, 5, 100)
-        self._claims(costly, 2, 900_000, 25_000)
+    def test_bands_come_from_worker_time_not_claim_count(self):
+        # More claims than the costly branch, yet one second of work: the band
+        # key is time.
+        self._finalized("cheap", 4, claims=10, nodes=50, worker_millis=1_000)
+        self._finalized("costl", 6, claims=2, nodes=1_800_000,
+                        worker_millis=50_000)
 
         report = self._report()
 
@@ -930,196 +802,80 @@ class WorkDistributionTests(unittest.TestCase):
         self.assertIsNone(self._band(report, 1))
 
     def test_a_branch_that_waited_on_children_bands_by_its_own_work(self):
-        # The production shape of a promoting parent: it evaluates a handful of
-        # candidates itself, its children are solved by other workers, and its
-        # finalize row records the whole span including the wait.  Banding on
-        # that span would file the parent among the expensive branches.
-        parent = self._branch("paren", 8)
-        child = self._branch("child", 5)
-        self.q.create_branch(parent, 8, 3, spine="CRANE -----")
-        self.q.create_branch(child, 5, 3, spine="CRANE ----- LUBES -y---")
-        self._claims(parent, 3, 40, 200)
-        self._claims(child, 4, 500_000, 20_000)
+        # A promoting parent's finalize row spans hours of waiting on its
+        # children, and its own work is a fraction of a second.
         finalized_at = int(time.time())
-        self.q.add_branch_finalize_log(
-            parent, "CRANE -----", 8, 3, finalized_at - 10_000, finalized_at,
-            120, 3)
+        self._finalized("paren", 8, claims=3, nodes=120, worker_millis=600,
+                        created_at=finalized_at - 10_000)
+        self._finalized("child", 5, claims=4, nodes=2_000_000,
+                        worker_millis=80_000)
 
         report = self._report()
 
         self.assertEqual(self._band(report, 0)["branch_count"], 1)
-        self.assertEqual(self._band(report, 0)["worker_millis"], 600)
         self.assertEqual(self._band(report, 0)["search_node_count"], 120)
-        # The child's work is the child's, in its own band.
         self.assertEqual(self._band(report, 2)["branch_count"], 1)
         self.assertEqual(self._band(report, 2)["search_node_count"], 2_000_000)
 
-    def test_node_totals_across_bands_count_each_node_once(self):
-        parent = self._branch("paren", 8)
-        child = self._branch("child", 5)
-        self.q.create_branch(parent, 8, 3)
-        self.q.create_branch(child, 5, 3)
-        self._claims(parent, 3, 40, 200)
-        self._claims(child, 4, 500_000, 20_000)
+    def test_coordination_is_totalled_with_its_band(self):
+        self._finalized("cheap", 4, claims=2, nodes=5, worker_millis=100,
+                        coordination_millis=70)
+        self._finalized("chea2", 4, claims=2, nodes=5, worker_millis=100,
+                        coordination_millis=30)
 
-        report = self._report()
+        self.assertEqual(
+            self._band(self._report(), 0)["coordination_millis"], 100)
 
-        banded_nodes = sum(band["search_node_count"] for band in report["bands"])
-        recorded_nodes = self.q._conn.execute(
-            "SELECT SUM(work_nodes) AS nodes FROM telemetry.claim_telemetry"
-        ).fetchone()["nodes"]
-        self.assertEqual(banded_nodes, recorded_nodes)
-
-    def test_claims_outside_a_branch_are_totalled_separately(self):
-        branch_key = self._branch("cheap", 4)
-        self.q.create_branch(branch_key, 4, 3)
-        self._claims(branch_key, 2, 5, 100)
-        # A bulk lower-bound proof takes a claim with no branch context.
-        self.q.add_claim_telemetry(10, 7, 3, 2, candidate_evaluation_millis=50)
-        self.q.add_claim_telemetry(10, 7, 3, 2, candidate_evaluation_millis=50)
-
-        report = self._report()
-
-        self.assertEqual(sum(band["branch_count"] for band in report["bands"]), 1)
-        self.assertEqual(report["unattributed"]["claim_count"], 2)
-        self.assertEqual(report["unattributed"]["search_node_count"], 6)
-        self.assertEqual(report["unattributed"]["worker_millis"], 100)
-        self.assertEqual(report["unattributed"]["coordination_millis"], 14)
-        self.assertEqual(self._band(report, 0)["claim_count"], 2)
-
-    def test_unfinished_branch_count_counts_only_live_branches(self):
-        finished = self._branch("finis", 4)
-        running = self._branch("runni", 4)
-        self.q.create_branch(finished, 4, 3)
-        self.q.create_branch(running, 4, 3)
-        self._claims(finished, 2, 5, 100)
-        self._claims(running, 2, 5, 100)
-        self.q.delete_branch(finished)
-
-        report = self._report()
-
-        self.assertEqual(self._band(report, 0)["branch_count"], 2)
-        self.assertEqual(self._band(report, 0)["unfinished_branch_count"], 1)
-
-    def test_unfinished_branch_count_is_zero_with_nothing_running(self):
-        # The over-eager shape: a join that matched every branch would report
-        # the same count as branch_count here and pass the test above.
-        finished = self._branch("finis", 4)
-        self.q.create_branch(finished, 4, 3)
-        self._claims(finished, 2, 5, 100)
-        self.q.delete_branch(finished)
-
-        report = self._report()
-
-        self.assertEqual(self._band(report, 0)["branch_count"], 1)
-        self.assertEqual(self._band(report, 0)["unfinished_branch_count"], 0)
-
-    def test_a_window_narrows_the_population_and_the_whole_epoch_is_default(self):
-        branch_key = self._branch("cheap", 4)
-        self.q.create_branch(branch_key, 4, 3)
-        self._claims(branch_key, 10, 5, 100)
-        self.q._conn.execute(
-            "UPDATE telemetry.claim_telemetry SET recorded_at = 100 "
-            "WHERE idx < 4")
-
-        whole = self._report()
-        windowed = self._report(since=101)
-
-        self.assertEqual(self._band(whole, 0)["claim_count"], 10)
-        self.assertEqual(self._band(windowed, 0)["claim_count"], 6)
-        # A branch banded by its lifetime worker time bands lower inside a
-        # window: the window is a deliberate narrowing, not the default.
-        self.assertEqual(self._band(whole, 0)["worker_millis"], 1_000)
-        self.assertEqual(self._band(windowed, 0)["worker_millis"], 600)
-
-    def test_a_branch_with_unrecorded_worker_time_is_never_banded(self):
-        # add_claim_telemetry leaves candidate_evaluation_millis NULL when the
-        # caller does not supply it.  Coalescing that to zero would seat a
-        # branch of unknown cost in the cheapest band while still counting its
-        # nodes -- a confidently wrong distribution rather than an admitted gap.
-        measured = self._branch("measu", 4)
-        unmeasured = self._branch("unmea", 6)
-        self.q.create_branch(measured, 4, 3)
-        self.q.create_branch(unmeasured, 6, 3)
-        self._claims(measured, 2, 5, 100)
-        for idx in range(3):
-            self.q.add_claim_telemetry(
-                6, 10, 900_000, 2, branch_key=unmeasured, idx=idx)
+    def test_a_branch_with_unrecorded_time_is_never_banded(self):
+        # Coalescing an unknown to zero would seat a branch of unknown cost in
+        # the cheapest band while still counting its nodes.
+        self._finalized("measu", 4, claims=2, nodes=10, worker_millis=100)
+        self._finalized("nowrk", 6, claims=3, nodes=2_700_000,
+                        worker_millis=None)
+        self._finalized("nocrd", 6, claims=1, nodes=5, worker_millis=100,
+                        coordination_millis=None)
 
         report = self._report()
 
         self.assertEqual(sum(b["branch_count"] for b in report["bands"]), 1)
-        self.assertEqual(self._band(report, 0)["branch_count"], 1)
         self.assertEqual(self._band(report, 0)["search_node_count"], 10)
-        self.assertEqual(report["unmeasured"]["branch_count"], 1)
-        self.assertEqual(report["unmeasured"]["claim_count"], 3)
-        self.assertEqual(report["unmeasured"]["search_node_count"], 2_700_000)
+        self.assertEqual(report["unmeasured"]["branch_count"], 2)
+        self.assertEqual(report["unmeasured"]["claim_count"], 4)
+        self.assertEqual(report["unmeasured"]["search_node_count"], 2_700_005)
 
-    def test_one_unrecorded_claim_taints_its_whole_branch(self):
-        # Partial measurement is still unmeasurable: summing the known part
-        # would under-report the branch and band it too low.
-        branch_key = self._branch("mixed", 4)
-        self.q.create_branch(branch_key, 4, 3)
-        self._claims(branch_key, 4, 5, 100_000)
-        self.q.add_claim_telemetry(4, 10, 5, 2, branch_key=branch_key, idx=9)
+    def test_a_window_narrows_the_population_and_the_whole_epoch_is_default(self):
+        self._finalized("older", 4, claims=4, nodes=5, worker_millis=100)
+        self._finalized("newer", 4, claims=6, nodes=5, worker_millis=100)
+        self.q._conn.execute(
+            "UPDATE telemetry.branch_finalize_log SET recorded_at = 100 "
+            "WHERE n_claims = 4")
 
-        report = self._report()
-
-        self.assertEqual(report["bands"], [])
-        self.assertEqual(report["unmeasured"]["branch_count"], 1)
-        self.assertEqual(report["unmeasured"]["claim_count"], 5)
+        self.assertEqual(self._band(self._report(), 0)["claim_count"], 10)
+        self.assertEqual(
+            self._band(self._report(since=101), 0)["claim_count"], 6)
 
     def test_an_answer_count_range_narrows_the_banded_population(self):
-        small = self._branch("small", 4)
-        large = self._branch("large", 9)
-        self.q.create_branch(small, 4, 3)
-        self.q.create_branch(large, 9, 3)
-        for idx in range(3):
-            self.q.add_claim_telemetry(
-                4, 10, 5, 2, branch_key=small, idx=idx,
-                candidate_evaluation_millis=100)
-        for idx in range(2):
-            self.q.add_claim_telemetry(
-                9, 10, 900_000, 2, branch_key=large, idx=idx,
-                candidate_evaluation_millis=25_000)
-
-        only_large = self.q.report_work_distribution(
-            self.q.epoch, None, BAND_EDGE_MILLIS, minimum_answer_count=5)
-        only_small = self.q.report_work_distribution(
-            self.q.epoch, None, BAND_EDGE_MILLIS, maximum_answer_count=4)
-
-        self.assertEqual(self._band(only_large, 2)["branch_count"], 1)
-        self.assertIsNone(self._band(only_large, 0))
-        self.assertEqual(self._band(only_large, 2)["claim_count"], 2)
-        self.assertEqual(self._band(only_small, 0)["branch_count"], 1)
-        self.assertIsNone(self._band(only_small, 2))
-        self.assertEqual(self._band(only_small, 0)["claim_count"], 3)
-
-    def test_an_answer_count_range_bounds_both_ends(self):
         for size in (3, 7, 20):
-            branch_key = self._branch(f"b{size:03d}", 4)
-            self.q.create_branch(branch_key, 4, 3)
-            self.q.add_claim_telemetry(
-                size, 10, 5, 2, branch_key=branch_key, idx=0,
-                candidate_evaluation_millis=100)
+            self._finalized(f"b{size:03d}", size, claims=size, nodes=5,
+                            worker_millis=100)
 
-        banded = self.q.report_work_distribution(
-            self.q.epoch, None, BAND_EDGE_MILLIS,
-            minimum_answer_count=5, maximum_answer_count=10)
+        banded = self._report(minimum_answer_count=5,
+                              maximum_answer_count=10)
+        at_least = self._report(minimum_answer_count=5)
+        at_most = self._report(maximum_answer_count=7)
 
-        self.assertEqual(self._band(banded, 0)["branch_count"], 1)
-        self.assertEqual(self._band(banded, 0)["claim_count"], 1)
+        self.assertEqual(self._band(banded, 0)["claim_count"], 7)
+        self.assertEqual(self._band(at_least, 0)["claim_count"], 27)
+        self.assertEqual(self._band(at_most, 0)["claim_count"], 10)
 
     def test_rows_outside_the_epoch_are_excluded(self):
-        branch_key = self._branch("cheap", 4)
-        self.q.create_branch(branch_key, 4, 3)
-        self._claims(branch_key, 3, 5, 100)
+        self._finalized("cheap", 4, claims=3, nodes=5, worker_millis=100)
 
         other_epoch = self.q.report_work_distribution(
             self.q.epoch + 1, None, BAND_EDGE_MILLIS)
 
         self.assertEqual(other_epoch["bands"], [])
-        self.assertEqual(other_epoch["unattributed"]["claim_count"], 0)
+        self.assertEqual(other_epoch["unmeasured"]["branch_count"], 0)
 
 
 if __name__ == "__main__":

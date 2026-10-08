@@ -78,99 +78,6 @@ class _TmpQueue(unittest.TestCase):
         return claim[1][0] if claim is not None else None
 
 
-class TestFruitlessScanColumnMigration(unittest.TestCase):
-    """A telemetry file written before the scan columns existed gains them on
-    open, and its existing rows say the split is unknown rather than absent."""
-
-    def _legacy_telemetry_file(self, queue_path):
-        """Write a claim_telemetry table in its pre-scan-column shape, holding
-        one row, at the telemetry path the queue will attach."""
-        telemetry_path = erd_queue.derive_telemetry_path(queue_path)
-        connection = sqlite3.connect(telemetry_path)
-        connection.execute("""
-            CREATE TABLE claim_telemetry (
-                id                        INTEGER PRIMARY KEY AUTOINCREMENT,
-                n_words                   INTEGER NOT NULL,
-                coordination_millis       INTEGER NOT NULL,
-                candidate_evaluation_millis INTEGER,
-                work_nodes                INTEGER NOT NULL,
-                claim_retries             INTEGER,
-                busy_wait_millis          INTEGER,
-                worker_count              INTEGER,
-                branch_worker_count       INTEGER,
-                evaluation_bound_erd      REAL,
-                branch_id                 INTEGER,
-                spine                     TEXT,
-                worker_id                 TEXT,
-                bundle_id                 TEXT,
-                idx                       INTEGER,
-                bundle_start_idx          INTEGER,
-                bundle_end_idx            INTEGER,
-                claim_transaction_millis  INTEGER,
-                claim_commit_millis       INTEGER,
-                scheduling_millis         INTEGER,
-                idle_millis               INTEGER,
-                epoch                     INTEGER NOT NULL DEFAULT 0,
-                recorded_at               INTEGER NOT NULL
-            )
-        """)
-        connection.execute(
-            "INSERT INTO claim_telemetry (n_words, coordination_millis, "
-            "work_nodes, scheduling_millis, idle_millis, recorded_at) "
-            "VALUES (40, 21, 1500, 4, 10, 0)")
-        connection.commit()
-        connection.close()
-        return telemetry_path
-
-    def test_open_adds_the_scan_columns_and_leaves_old_rows_unknown(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            queue_path = os.path.join(temporary_directory, 'q.sqlite3')
-            telemetry_path = self._legacy_telemetry_file(queue_path)
-
-            ProductionERDQueue(queue_path).close()
-
-            connection = sqlite3.connect(telemetry_path)
-            connection.row_factory = sqlite3.Row
-            columns = [row[1] for row in connection.execute(
-                "PRAGMA table_info(claim_telemetry)")]
-            row = connection.execute(
-                "SELECT scan_openers_walked, fruitless_scan_millis, "
-                "fruitless_scans, fruitless_scan_openers_walked, idle_millis "
-                "FROM claim_telemetry").fetchone()
-            connection.close()
-            for column in ('scan_openers_walked', 'fruitless_scan_millis',
-                           'fruitless_scans',
-                           'fruitless_scan_openers_walked'):
-                self.assertIn(column, columns)
-            # A backfill of 0 would claim the row had no fruitless scans; its
-            # scan cost is in fact folded into idle_millis and unrecoverable,
-            # which is what NULL says.
-            self.assertEqual(tuple(row)[:4], (None, None, None, None))
-            self.assertEqual(row['idle_millis'], 10)
-
-    def test_reopening_a_migrated_file_changes_nothing(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            queue_path = os.path.join(temporary_directory, 'q.sqlite3')
-            telemetry_path = self._legacy_telemetry_file(queue_path)
-
-            ProductionERDQueue(queue_path).close()
-            connection = sqlite3.connect(telemetry_path)
-            after_first = [row[1] for row in connection.execute(
-                "PRAGMA table_info(claim_telemetry)")]
-            connection.close()
-
-            ProductionERDQueue(queue_path).close()
-            connection = sqlite3.connect(telemetry_path)
-            after_second = [row[1] for row in connection.execute(
-                "PRAGMA table_info(claim_telemetry)")]
-            row_count = connection.execute(
-                "SELECT COUNT(*) FROM claim_telemetry").fetchone()[0]
-            connection.close()
-
-            self.assertEqual(after_first, after_second)
-            self.assertEqual(row_count, 1)
-
-
 class TestLegacyPriorityMigration(unittest.TestCase):
     def test_migration_neutralizes_only_unfinished_legacy_priorities(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -540,13 +447,6 @@ class TestBranchLifecycle(_TmpQueue):
             conn.commit()
         finally:
             conn.close()
-        telemetry_conn = sqlite3.connect(erd_queue.derive_telemetry_path(self.queue_path))
-        try:
-            telemetry_conn.execute(
-                "ALTER TABLE candidate_accuracy RENAME COLUMN opener TO source_word")
-            telemetry_conn.commit()
-        finally:
-            telemetry_conn.close()
 
     def test_rename_source_to_opener_migration_preserves_data_on_a_legacy_database(self):
         pending_key = ScoreCache.encode_subset(WORDS[:4])
@@ -557,9 +457,6 @@ class TestBranchLifecycle(_TmpQueue):
                              priority=claimed["priority"],
                              opener_work_id=claimed["opener_work_id"],
                              opener="crane", opener_pattern=42)
-        self.q.add_candidate_accuracy(
-            self.key, len(WORDS), 5, 1.0, 1.0, 1.0, False, 3,
-            group_sizes="1-2", opener="crane")
 
         self._revert_to_pre_opener_schema()
 
@@ -602,11 +499,6 @@ class TestBranchLifecycle(_TmpQueue):
                 "SELECT opener_pattern FROM branch_opener_work "
                 "LIMIT 1").fetchone()
             self.assertEqual(membership_row["opener_pattern"], 42)
-
-            accuracy_row = migrated._conn.execute(
-                "SELECT opener FROM telemetry.candidate_accuracy "
-                "LIMIT 1").fetchone()
-            self.assertEqual(accuracy_row["opener"], "crane")
 
             # The migrated schema must still validate against current code's
             # expectations, and the pre-opener-aware backfill (which fires
@@ -2086,7 +1978,7 @@ class TestOpenerWorkConcurrency(_TmpQueue):
 
 class TestCostModel(_TmpQueue):
     """Cost model: cold read, warm read, geometric mean, policy isolation,
-    mark_claims_done, add_nodes_spent, add_claim_telemetry."""
+    mark_claims_done, add_nodes_spent."""
 
     def test_cold_read_returns_none(self):
         self.assertIsNone(self.q.get_cost_typical("erd_all", 10, budget=COST_MODEL_BUDGET))
@@ -2177,61 +2069,6 @@ class TestCostModel(_TmpQueue):
         self.assertEqual(row['nodes_spent'], 150)
         self.assertEqual(row['infeasible_candidates'], 2)
         self.assertEqual(row['infeasible_nodes'], 50)
-
-    def test_add_claim_telemetry_inserts_row(self):
-        self.q.add_claim_telemetry(
-            10, 5000, 300, 4, candidate_evaluation_millis=1200)
-        row = self.q._conn.execute(
-            "SELECT * FROM claim_telemetry ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-        self.assertIsNotNone(row)
-        self.assertEqual(row['n_words'], 10)
-        self.assertEqual(row['coordination_millis'], 5000)
-        self.assertEqual(row['candidate_evaluation_millis'], 1200)
-        self.assertEqual(row['work_nodes'], 300)
-        self.assertEqual(row['worker_count'], 4)
-        self.assertIsNone(row['branch_worker_count'])
-        # Branch/bundle attribution and the phase breakdown are all optional
-        # keyword arguments: an old-style positional-only call still inserts
-        # a row, with every new column defaulting to NULL/0.
-        self.assertIsNone(row['branch_id'])
-        self.assertIsNone(row['spine'])
-        self.assertIsNone(row['worker_id'])
-        self.assertIsNone(row['bundle_id'])
-        self.assertIsNone(row['idx'])
-        self.assertIsNone(row['bundle_start_idx'])
-        self.assertIsNone(row['bundle_end_idx'])
-        self.assertEqual(row['claim_transaction_millis'], 0)
-        self.assertEqual(row['claim_commit_millis'], 0)
-        self.assertEqual(row['scheduling_millis'], 0)
-        self.assertEqual(row['idle_millis'], 5000)
-
-    def test_add_claim_telemetry_carries_branch_attribution(self):
-        # A claim's branch has always been through create_branch (registering
-        # it in `branches`) by the time any candidate is evaluated against
-        # it, which is what makes add_claim_telemetry's branch_key -> branch_id
-        # interning a lookup rather than a fresh registration.
-        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, budget=5)
-        self.q.add_claim_telemetry(
-            10, 5000, 300, 4, branch_key=self.key, spine='CRANE 12',
-            worker_id='worker-3', bundle_id='worker-3:123:0', idx=7,
-            bundle_start_idx=0, bundle_end_idx=9)
-        row = self.q._conn.execute(
-            "SELECT * FROM claim_telemetry ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-        self.assertIsNotNone(row['branch_id'])
-        resolved = self.q._conn.execute(
-            "SELECT branch_key FROM branches WHERE branch_id = ?",
-            (row['branch_id'],)).fetchone()
-        self.assertEqual(resolved['branch_key'], self.key)
-        self.assertEqual(row['spine'], 'CRANE 12')
-        self.assertEqual(row['worker_id'], 'worker-3')
-        self.assertEqual(row['branch_worker_count'], 1)
-        self.assertEqual(row['bundle_id'], 'worker-3:123:0')
-        self.assertEqual(row['idx'], 7)
-        self.assertEqual(row['bundle_start_idx'], 0)
-        self.assertEqual(row['bundle_end_idx'], 9)
-        self.assertEqual(row['idle_millis'], 5000)
 
     def test_add_backstop_telemetry_inserts_row(self):
         self.q.add_backstop_telemetry(8, 2, 65000, 500, None, 6)

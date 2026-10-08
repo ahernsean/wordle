@@ -6,8 +6,7 @@ land before the packer:
     accumulators forward at budget = -1, a placeholder no longer read;
   - budget-keyed reads: each (size_bucket, budget) cell is isolated, with no
     cross-budget fallback;
-  - the new telemetry inserts (branch_finalize_log, candidate_accuracy) and the
-    extended cost_samples / claim_telemetry columns;
+  - the telemetry inserts (branch_finalize_log, cost_samples);
   - epoch tagging (baseline epoch 0, set_epoch);
   - estimate_candidate_work (the metric the §10 go/no-go gate validates).
 """
@@ -44,9 +43,9 @@ class TestEpochBaseline(_TmpQueue):
         self.assertEqual(self.q.epoch, 1)
         self.assertEqual(self.q.get_meta("epoch"), "1")
         # New telemetry now carries epoch 1.
-        self.q.add_claim_telemetry(50, 12, 3, 6)
+        self.q.add_cost_sample(ERD_ALL, 50, 12, "finalize", budget=3)
         ep = self.q._conn.execute(
-            "SELECT epoch FROM claim_telemetry").fetchone()["epoch"]
+            "SELECT epoch FROM cost_samples").fetchone()["epoch"]
         self.assertEqual(ep, 1)
 
 
@@ -149,47 +148,6 @@ class TestTelemetryInserts(_TmpQueue):
         self.assertEqual(rows[1]["source"], "censored")
         self.assertEqual(rows[0]["epoch"], 0)
 
-    def test_claim_telemetry_carries_contention_and_epoch(self):
-        self.q._last_claim_busy_millis = 7
-        self.q._last_claim_retries = 0
-        self.q.add_claim_telemetry(40, 21, 1500, 6)
-        row = self.q._conn.execute(
-            "SELECT busy_wait_millis, claim_retries, epoch "
-            "FROM claim_telemetry").fetchone()
-        self.assertEqual(row["busy_wait_millis"], 7)
-        self.assertEqual(row["claim_retries"], 0)
-        self.assertEqual(row["epoch"], 0)
-
-    def test_claim_telemetry_carries_phase_breakdown(self):
-        self.q._last_claim_busy_millis = 2
-        self.q._last_claim_transaction_millis = 5
-        self.q._last_claim_commit_millis = 3
-        self.q.add_claim_telemetry(40, 21, 1500, 6, scheduling_millis=4,
-                                   fruitless_scan_millis=1, fruitless_scans=2)
-        row = self.q._conn.execute(
-            "SELECT coordination_millis, busy_wait_millis, "
-            "claim_transaction_millis, claim_commit_millis, "
-            "scheduling_millis, fruitless_scan_millis, fruitless_scans, "
-            "idle_millis FROM claim_telemetry").fetchone()
-        self.assertEqual(row["busy_wait_millis"], 2)
-        self.assertEqual(row["claim_transaction_millis"], 5)
-        self.assertEqual(row["claim_commit_millis"], 3)
-        self.assertEqual(row["scheduling_millis"], 4)
-        self.assertEqual(row["fruitless_scan_millis"], 1)
-        self.assertEqual(row["fruitless_scans"], 2)
-        # The fruitless scans lie outside the coordination window, so they do
-        # not reduce the remainder.
-        self.assertEqual(row["idle_millis"], 21 - 5 - 3 - 2 - 4)
-        # The five phases partition coordination_millis exactly.
-        self.assertEqual(
-            row["claim_transaction_millis"] + row["claim_commit_millis"]
-            + row["busy_wait_millis"] + row["scheduling_millis"]
-            + row["idle_millis"],
-            row["coordination_millis"])
-        # Consumed and reset, same contract as busy_wait_millis/claim_retries.
-        self.assertEqual(self.q._last_claim_transaction_millis, 0)
-        self.assertEqual(self.q._last_claim_commit_millis, 0)
-
     def test_branch_finalize_log_persists_branch_timing(self):
         self.q.add_branch_finalize_log(
             b"key", "SALET --g-- ", 30, 4, created_at=100,
@@ -206,25 +164,6 @@ class TestTelemetryInserts(_TmpQueue):
         self.assertAlmostEqual(row["best_erd"], 1.75)
         # Packer-era columns stay NULL under single-candidate claiming.
         self.assertIsNone(row["max_bundle_nodes"])
-
-    def test_candidate_accuracy_records_prediction_point(self):
-        self.q.add_candidate_accuracy(
-            b"key", 30, 4, predicted_work=820.0, bound_erd=3.41,
-            candidate_cost_lower_bound=2.9, erd_lower_bound_pruned=False,
-            actual_nodes=771)
-        self.q.add_candidate_accuracy(
-            b"key", 30, 4, predicted_work=0.0, bound_erd=3.41,
-            candidate_cost_lower_bound=3.5, erd_lower_bound_pruned=True,
-            actual_nodes=4)
-        rows = self.q._conn.execute(
-            "SELECT predicted_work, erd_lower_bound_pruned, actual_nodes, epoch "
-            "FROM candidate_accuracy ORDER BY id").fetchall()
-        self.assertEqual(rows[0]["erd_lower_bound_pruned"], 0)
-        self.assertAlmostEqual(rows[0]["predicted_work"], 820.0)
-        self.assertEqual(rows[1]["erd_lower_bound_pruned"], 1)
-        self.assertEqual(rows[1]["actual_nodes"], 4)
-        self.assertEqual(rows[0]["epoch"], 0)
-
 
 class TestEstimateCandidateWork(unittest.TestCase):
     """estimate_candidate_work: ERD-pruned -> 0, else sum typical over recursed groups."""
@@ -342,110 +281,6 @@ class TestCutoffMetric(unittest.TestCase):
         # ERD-pruned; loop reaches both 1s.
         work = estimate_candidate_work_cutoff(sizes, True, n, 3.0, 4, self._warm(1.0))
         self.assertEqual(work, 1.0)       # only the size-3 group contributes
-
-
-class TestCandidateAccuracyGroupSizes(_TmpQueue):
-    def test_group_sizes_persisted(self):
-        self.q.add_candidate_accuracy(
-            b"k", 30, 4, 820.0, 3.41, 2.9, erd_lower_bound_pruned=False,
-            actual_nodes=771, group_sizes="12-8-5-3-1")
-        row = self.q._conn.execute(
-            "SELECT group_sizes FROM candidate_accuracy").fetchone()
-        self.assertEqual(row["group_sizes"], "12-8-5-3-1")
-
-    def test_group_sizes_optional_defaults_null(self):
-        self.q.add_candidate_accuracy(
-            b"k", 30, 4, 0.0, 3.41, 3.5, erd_lower_bound_pruned=True,
-            actual_nodes=4)
-        row = self.q._conn.execute(
-            "SELECT group_sizes FROM candidate_accuracy").fetchone()
-        self.assertIsNone(row["group_sizes"])
-
-    def test_opener_persisted_for_per_opener_segmentation(self):
-        self.q.add_candidate_accuracy(
-            b"k", 30, 4, 820.0, 3.41, 2.9, erd_lower_bound_pruned=False,
-            actual_nodes=771, group_sizes="12-8-5", opener="salet")
-        row = self.q._conn.execute(
-            "SELECT opener FROM candidate_accuracy").fetchone()
-        self.assertEqual(row["opener"], "salet")
-
-    def test_identity_lifecycle_fields_join_to_claim_telemetry(self):
-        branch_key = b"accuracy-branch"
-        branch_id = self.q._intern_branch(branch_key, create=True)
-        self.q._conn.execute(
-            "INSERT INTO candidate_republish (branch_id, idx, count) "
-            "VALUES (?, ?, ?)", (branch_id, 7, 2))
-        self.q.add_candidate_accuracy(
-            branch_key, 30, 4, 820.0, 3.41, 2.9,
-            erd_lower_bound_pruned=False, actual_nodes=771,
-            candidate_word="crane", worker_id="worker-3", bundle_id="3:9:1",
-            idx=7, started_at=123, evaluation_millis=12, outcome="exact")
-        row = self.q._conn.execute("""
-            SELECT branch_id, candidate_word, worker_id, bundle_id, idx,
-                   started_at, evaluation_millis, outcome, republish_count, recorded_at
-            FROM candidate_accuracy
-        """).fetchone()
-        self.assertEqual(row["branch_id"], branch_id)
-        self.assertEqual(row["candidate_word"], "crane")
-        self.assertEqual(row["worker_id"], "worker-3")
-        self.assertEqual(row["bundle_id"], "3:9:1")
-        self.assertEqual(row["idx"], 7)
-        self.assertEqual(row["started_at"], 123)
-        self.assertEqual(row["evaluation_millis"], 12)
-        self.assertEqual(row["outcome"], "exact")
-        self.assertEqual(row["republish_count"], 2)
-        self.assertIsNotNone(row["recorded_at"])
-
-
-class TestCandidateAccuracyMigration(unittest.TestCase):
-    def test_pre_migration_row_keeps_unknown_identity_and_outcome(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, "q.sqlite3")
-            queue = ERDQueue(path)
-            migration = "candidate_accuracy_identity_lifecycle"
-            queue._conn.execute("DROP TABLE telemetry.candidate_accuracy")
-            queue._conn.execute("""
-                CREATE TABLE telemetry.candidate_accuracy (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    branch_key BLOB,
-                    n_words INTEGER NOT NULL,
-                    budget INTEGER,
-                    predicted_work REAL,
-                    bound_erd REAL,
-                    candidate_cost_lower_bound REAL,
-                    erd_lower_bound_pruned INTEGER NOT NULL,
-                    actual_nodes INTEGER NOT NULL,
-                    group_sizes TEXT,
-                    opener TEXT,
-                    epoch INTEGER NOT NULL DEFAULT 0,
-                    recorded_at INTEGER NOT NULL
-                )
-            """)
-            queue._conn.execute("""
-                INSERT INTO telemetry.candidate_accuracy
-                    (branch_key, n_words, erd_lower_bound_pruned, actual_nodes,
-                     epoch, recorded_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (b"old", 30, 0, 771, 0, 100))
-            queue._conn.execute(
-                "DELETE FROM schema_migrations WHERE name = ?", (migration,))
-            queue.close()
-
-            migrated = ERDQueue(path)
-            self.addCleanup(migrated.close)
-            row = migrated._conn.execute("""
-                SELECT candidate_word, worker_id, bundle_id, idx, started_at,
-                       evaluation_millis, outcome, republish_count, recorded_at
-                FROM candidate_accuracy
-            """).fetchone()
-            self.assertEqual(row["recorded_at"], 100)
-            for field in ("candidate_word", "worker_id", "bundle_id", "idx",
-                          "started_at", "evaluation_millis", "outcome",
-                          "republish_count"):
-                self.assertIsNone(row[field])
-            self.assertIsNotNone(migrated._conn.execute(
-                "SELECT 1 FROM schema_migrations WHERE name = ?", (migration,)
-            ).fetchone())
 
 
 class TestMetricObserverHook(unittest.TestCase):

@@ -49,7 +49,6 @@ from wordle_engine import (
     cache_all_scores,
     candidate_two_level_cost_lower_bound,
     evaluate_candidate,
-    estimate_candidate_work,
     load_word_list,
     _cache_reuse,
 )
@@ -129,13 +128,6 @@ OVERRUN_K = 4            # a frame spending > K * typical(n) nodes triggers publ
 COLD_BACKSTOP_SECONDS = 600
 MIN_HANDOFF_CANDIDATES = 4   # minimum remaining candidates to bother handing off
 
-# candidate_accuracy logs every non-ERD-pruned claim (the metric-design signal,
-# rare in the deep regime) but only 1-in-N ERD-pruned claims (~1 node each,
-# redundant) so a multi-day corpus stays bounded.  1 = log all (the
-# validation-gate default); raise it (e.g.
-# ERD_LOWER_BOUND_PRUNED_SAMPLE_EVERY=100) for a long production run.
-ERD_LOWER_BOUND_PRUNED_SAMPLE_EVERY = max(
-    1, int(os.environ.get('ERD_LOWER_BOUND_PRUNED_SAMPLE_EVERY', '1')))
 MIN_PUBLISH_BRANCH_WORDS = 2  # frames with fewer answer words are base cases, never
                               # worth tracking for overrun (the candidate loop on a
                               # 1-word branch never even runs)
@@ -602,10 +594,9 @@ class _MidLoopPublisher:
 class _DependencyWait:
     """One cooperative_solve wait episode, accumulated for telemetry.
 
-    `claim_telemetry.idle_millis` is a residual — whatever is left of a
-    coordination window after the four measured phases — so it totals waiting
-    without saying what was waited on.  This carries the attribution: the
-    dependency, how the episode divided between working on it, helping
+    worker_time's wait_dependency_millis totals the time workers spend stuck
+    on dependencies without saying which ones.  This carries the attribution:
+    the dependency, how the episode divided between working on it, helping
     elsewhere, and being stuck, and what the worker's alternatives were the
     first time it had none.
 
@@ -660,8 +651,7 @@ class _DependencyWait:
 
         Keeps the counters a partition of the episode's sleeps: without it a
         reason nobody anticipated would leave blocked_millis holding time no
-        counter accounts for, which is the shape of defect idle_millis already
-        has and this table exists to avoid repeating.
+        counter accounts for.
         """
         return sum(count for reason, count in self.blocks.items()
                    if reason not in self.NAMED_BLOCK_REASONS)
@@ -701,6 +691,12 @@ class _WorkerTimeAccount:
     Durations come from a monotonic nanosecond clock and are floored to
     milliseconds, with "other" taking the remainder, so the integers written
     partition interval_millis with no rounding residue.
+
+    An activity can also name an owner, and the time charged to it is then
+    totalled for that owner as well, across intervals, until taken.  The
+    worker names a bundle as the owner of its evaluations, which makes each
+    bundle's total its own evaluation time with every nested bundle's
+    evaluation, and every wait, excluded.
     """
 
     #: Every activity, in worker_time column order.  A wait is named for the
@@ -714,7 +710,8 @@ class _WorkerTimeAccount:
     def __init__(self, clock=time.perf_counter_ns, wall_clock=time.time):
         self._clock = clock
         self._wall_clock = wall_clock
-        self._stack = ["other"]
+        self._stack = [("other", None)]
+        self._owned_nanoseconds = {}
         now = clock()
         self._since = now
         self._open_interval(now)
@@ -734,27 +731,38 @@ class _WorkerTimeAccount:
         self._max_heartbeat_gap = None
 
     def _charge(self, now):
-        self._nanoseconds[self._stack[-1]] += now - self._since
+        name, owner = self._stack[-1]
+        elapsed = now - self._since
+        self._nanoseconds[name] += elapsed
+        if owner is not None:
+            self._owned_nanoseconds[owner] = (
+                self._owned_nanoseconds.get(owner, 0) + elapsed)
         self._since = now
 
     @property
     def current(self):
         """The innermost open activity."""
-        return self._stack[-1]
+        return self._stack[-1][0]
 
     @contextmanager
-    def activity(self, name):
-        """Charge the time inside this block to `name`, less any activity
-        opened inside it."""
+    def activity(self, name, owner=None):
+        """Charge the time inside this block to `name`, and to `owner` when
+        one is given, less any activity opened inside it."""
         if name not in self._nanoseconds:
             raise ValueError(f"unknown worker activity {name!r}")
         self._charge(self._clock())
-        self._stack.append(name)
+        self._stack.append((name, owner))
         try:
             yield
         finally:
             self._charge(self._clock())
             self._stack.pop()
+
+    def take_owned_millis(self, owner):
+        """The time charged to `owner` so far, which is then forgotten; None
+        if nothing was."""
+        nanoseconds = self._owned_nanoseconds.pop(owner, None)
+        return None if nanoseconds is None else nanoseconds // 1_000_000
 
     def interval_elapsed_seconds(self):
         return (self._clock() - self._interval_started) / 1e9
@@ -924,38 +932,14 @@ class _BranchWorker:
         self._last_wal_traffic = self.queue.wal_traffic_snapshot()
         self._last_wal_traffic_log = time.time()
         self._work_context = WorkContext.empty()
-        # Work-selection scan time for the claim currently in hand, set by
-        # claim_one and consumed by the first candidate's telemetry row (the
-        # scan is paid once per claim, like the claim transaction itself),
-        # alongside the number of opener-work requests that scan examined.
-        self._pending_scheduling_millis = 0
-        self._pending_scan_openers_walked = 0
-        # The scans since that telemetry row that found nothing.  A scan that
-        # claims nothing has no claim to be billed to, so these accumulate
-        # until a claim succeeds and are consumed by its row: they are the
-        # exhausted-scan cost, which would otherwise be indistinguishable from
-        # waiting inside idle_millis.
-        self._pending_fruitless_scan_millis = 0
-        self._pending_fruitless_scans = 0
-        self._pending_fruitless_scan_openers_walked = 0
-        # Openers examined by the scan in flight, counted by
-        # _claim_one_uninstrumented and banked by claim_one, and whether that
-        # scan selected a branch despite returning no bundle.  The count is
-        # monotonic across the scan and the baseline marks where the current
-        # coordination window opened, because the two figures they pair with
-        # have different spans: the whole scan for the fruitless cost, and only
-        # the part inside the current window for the scheduling phase.
-        self._scan_openers_walked = 0
-        self._scan_openers_walked_baseline = 0
-        self._scan_opener_in_flight = False
-        self._scan_attributed_baseline = 0
+        # Whether the scan in flight selected a branch despite returning no
+        # bundle, set by _claim_one_uninstrumented so claim_one can tell a
+        # scan that found nothing from one that lost its bundle to a rival.
         self._scan_selected_work = False
         # Direct cooperative callers can create active branches without a
         # opener-work request.  Keep their tight claim loop free of the
         # opener-admission query used by queued opener work.
         self._opener_work_enabled = self.queue.has_opener_work()
-        # Counts ERD-pruned candidate_accuracy claims for 1-in-N down-sampling.
-        self._erd_lower_bound_pruned_accuracy_n = 0
         # In-memory cache of cost-model predictions keyed by sub-branch size.
         # Cleared on any cost-model write so new samples take effect.
         self._typical_cache = {}
@@ -975,14 +959,14 @@ class _BranchWorker:
             self._word_idx = None
             self._mid_loop_publisher = None
         # Live coordination/throughput estimators feeding the adaptive publish
-        # threshold (node-equivalents); both are outbound telemetry's in-memory
-        # twins — the claim_telemetry table is never read back for control.
+        # threshold (node-equivalents).  Nothing reads telemetry back for
+        # control; these are the only inputs the threshold has.
         self._coord_ema = _LogEMA()
         self._node_time_ema = _LogEMA()
-        # Completion time of the previous evaluated claim.  The outbound
-        # claim_telemetry coordination figure telescopes from here, so it
-        # captures claim acquisition and inter-claim overhead — matching the
-        # lifetime eval%/coord% split, not just the in-evaluate_claim window.
+        # Completion time of the previous evaluated claim.  A claim's
+        # coordination figure telescopes from here, so it captures claim
+        # acquisition and inter-claim overhead, not just the in-evaluate_claim
+        # window.
         self._last_claim_complete = time.time()
         # Nesting depth of _help_other_branch calls on this worker's stack —
         # see MAX_HELP_RECURSION_DEPTH.
@@ -998,47 +982,14 @@ class _BranchWorker:
         self._bundle_coordination_millis = {}
 
     def _restart_coordination_window(self, origin=None):
-        """Move the coordination window to `origin` (now by default) and drop
-        the queue attribution that predates it.
+        """Move the coordination window to `origin`, now by default.
 
-        The window and the counters attributed to it have different reset
-        points: the window restarts here, at every wait and at every finalize,
-        while the queue's _last_claim_busy_millis and its siblings are cleared
-        only when a telemetry row consumes them, and this worker's carried
-        scheduling figure waits for that same row.  Moving the window without
-        them leaves lock waits, claim transactions and the work-selection scan
-        from before the new origin to be reported as phases of a window that
-        excludes them, which makes the phases exceed coordination_millis.
-        Every restart goes through here so they cannot drift apart.
-
-        Measured on epoch 19 before the scheduling figure was included: 259 of
-        393,923 rows reported a scan longer than the whole window it was billed
-        to.
+        coordination_seconds telescopes from the window's origin, so a span
+        that is not the cost of handing work between claims -- a wait, a
+        finalize, a helped sub-branch -- must restart it rather than be
+        charged to the next completed claim.
         """
         self._last_claim_complete = time.time() if origin is None else origin
-        self.queue.discard_claim_attribution()
-        # The scan that chose the claim in hand belongs to the window that just
-        # ended, so it cannot be reported as a phase of the next one.  The
-        # fruitless counters deliberately stay: they are a phase of no window
-        # at all, and are still owed to whichever row reports them.
-        self._pending_scheduling_millis = 0
-        self._pending_scan_openers_walked = 0
-        # A scan in flight across this restart keeps only the openers it walks
-        # from here, so the count it banks describes the same span as the
-        # duration it is clamped to.  The opener being processed is kept: its
-        # own finalize is what restarted the window, and the same iteration can
-        # still promote and claim, which would otherwise report scan time
-        # against no openers at all.
-        self._scan_openers_walked_baseline = max(
-            0, self._scan_openers_walked
-            - (1 if self._scan_opener_in_flight else 0))
-        # discard_claim_attribution has just zeroed the queue's counters, so a
-        # scan in flight must measure its own attribution from zero too.  Left
-        # at its scan-start value the baseline exceeds the counters, the delta
-        # clamps to 0, and the scheduling figure is never reduced by the lock
-        # wait and claim transaction that follow this restart -- which are then
-        # added to it as phases of the same row.
-        self._scan_attributed_baseline = 0
 
     def _idle_wait(self, seconds, reason):
         """Sleep while this worker has no claimable work, then reopen the
@@ -1444,8 +1395,8 @@ class _BranchWorker:
                        bound_erd=None):
         """Prove the worker is alive without counting a node.
 
-        `_nodes` means candidate evaluations — the cost model, add_nodes_spent
-        and the accuracy rows all read it as one — so a signal that fires per
+        `_nodes` means candidate evaluations — the cost model and
+        add_nodes_spent both read it as one — so a signal that fires per
         response group, or anywhere else below a candidate, must come through
         here instead of `_heartbeat`.  A worker that has not reached this
         within HB_TIMEOUT_SECONDS has its in-flight claims reclaimed and
@@ -1702,8 +1653,7 @@ class _BranchWorker:
     # -- evaluate one candidate claim ---------------------------------------
 
     def evaluate_claim(self, branch_key, words, n_words, idx, budget=None,
-                       bundle_id=None, bundle_start_idx=None,
-                       bundle_end_idx=None):
+                       bundle_id=None):
         """Evaluate the single candidate self.all_words[idx] against branch_key.
 
         Folds the result into the branch's shared best and marks the claim
@@ -1714,9 +1664,8 @@ class _BranchWorker:
         whose strategy can't win within budget is infeasible (and taints the
         branch — see ERDQueue.mark_branch_tainted).
 
-        bundle_id/bundle_start_idx/bundle_end_idx identify the claim_next_bundle
-        bundle this candidate belongs to, for claim_telemetry attribution; all
-        three are None for a claim taken outside the bundle path.
+        bundle_id identifies the claim_next_bundle bundle this candidate
+        belongs to; it is None for a claim taken outside the bundle path.
         """
         candidate = self.all_words[idx]
         self._cur_candidate = candidate
@@ -1773,32 +1722,7 @@ class _BranchWorker:
         self._cand_max_depth = 0
         nodes_before = self._nodes
         cand_t0 = time.time()
-        # Work-metric capture for the §10 validation gate: under single-candidate
-        # claiming this claim's nodes_delta IS the candidate's true cost, so the
-        # observer records the predicted work and the bound it was computed
-        # against; the accuracy row is written below once actual_nodes is known.
-        metric = {}
-
-        def _metric_observer(group_sizes, has_self, candidate_cost_lower_bound,
-                             bound, erd_lower_bound_pruned):
-            # A pruned candidate is cut before recursing and so costs nothing,
-            # whichever gate cut it.  estimate_candidate_work only recognizes
-            # the closed-form gate, so honour the engine's classification here
-            # rather than re-deriving it from the group sizes.
-            metric['predicted'] = 0.0 if erd_lower_bound_pruned else (
-                estimate_candidate_work(
-                    group_sizes, has_self, n_words, bound, budget, self._typical))
-            metric['bound'] = None if bound == float('inf') else bound
-            metric['candidate_cost_lower_bound'] = candidate_cost_lower_bound
-            metric['erd_lower_bound_pruned'] = erd_lower_bound_pruned
-            # Persist the group-size multiset for non-ERD-pruned rows: the
-            # sufficient statistic to recompute any candidate work metric
-            # offline.  ERD-pruned rows are exactly 0, so their sizes carry no
-            # metric-design signal.
-            metric['group_sizes'] = (None if erd_lower_bound_pruned else
-                                     '-'.join(str(k) for k in group_sizes))
-
-        with self._time_account.activity("evaluation"):
+        with self._time_account.activity("evaluation", owner=bundle_id):
             status, cost, cand_md, budget_tainted = evaluate_candidate(
                 words, candidate, self.rcache, self.score_cache,
                 n=n_words, best_erd=float('inf'), guesses=self.all_words,
@@ -1807,7 +1731,6 @@ class _BranchWorker:
                 subbranch_solver=self._subbranch_solver,
                 bound_provider=_bound_provider,
                 mid_loop_publisher=self._mid_loop_publisher,
-                metric_observer=_metric_observer if self._adaptive else None,
                 pattern_matrix=self.pattern_matrix,
                 branch_floor_table=self.branch_floor_table,
                 hint_cache=self.hint_cache,
@@ -1831,38 +1754,7 @@ class _BranchWorker:
         record_nodes = (self._adaptive
                         and (nodes_delta > 0 or status == OVER_DEPTH_BUDGET))
 
-        candidate_outcome = {
-            SOLVED: 'exact',
-            OVER_ERD_LIMIT: 'cut',
-            OVER_DEPTH_BUDGET: 'loss',
-        }.get(status, 'cancelled')
-
-        def _record_candidate_accuracy():
-            if not self._adaptive or not metric:
-                return
-            # Log every non-ERD-pruned claim; down-sample the redundant
-            # ERD-pruned mass so a multi-day corpus stays bounded (see
-            # ERD_LOWER_BOUND_PRUNED_SAMPLE_EVERY).
-            if metric['erd_lower_bound_pruned']:
-                log_it = (self._erd_lower_bound_pruned_accuracy_n
-                          % ERD_LOWER_BOUND_PRUNED_SAMPLE_EVERY) == 0
-                self._erd_lower_bound_pruned_accuracy_n += 1
-            else:
-                log_it = True
-            if log_it:
-                self.queue.add_candidate_accuracy(
-                    branch_key, n_words, budget, metric['predicted'],
-                    metric['bound'], metric['candidate_cost_lower_bound'],
-                    metric['erd_lower_bound_pruned'], nodes_delta,
-                    group_sizes=metric['group_sizes'],
-                    opener=self._work_context.opener,
-                    candidate_word=candidate, worker_id=self.name,
-                    bundle_id=bundle_id, idx=idx, started_at=int(cand_t0),
-                    evaluation_millis=round(cand_elapsed * 1e3),
-                    outcome=candidate_outcome)
-
         if status in _ABORT_STATUSES:  # pragma: no cover
-            _record_candidate_accuracy()
             return False
 
         # What this evaluation has to say about the branch, decided before any
@@ -1897,7 +1789,9 @@ class _BranchWorker:
                 budget=budget,
                 nodes_spent=nodes_delta if record_nodes else 0,
                 infeasible=record_nodes and status == OVER_DEPTH_BUDGET,
-                tainted=budget_tainted, best=improved_best, cut=mark_cut):
+                tainted=budget_tainted, best=improved_best, cut=mark_cut,
+                evaluation_millis=round(cand_elapsed * 1e3),
+                evaluation_bound_erd=evaluation_bound_erd):
             # The claim was reissued, or the branch was re-created, while this
             # candidate ran.  The bundle is not abandoned with it: a one-level
             # prune sweep replaces a single claim row, so the siblings may
@@ -1907,8 +1801,6 @@ class _BranchWorker:
                 '%s lost candidate %s (idx=%d) mid-evaluation; its result '
                 'describes a branch incarnation this worker no longer holds '
                 'and was discarded', self.name, candidate, idx)
-        # The outbound claim telemetry is required for branch ETA reporting,
-        # regardless of whether this worker uses adaptive decomposition.
         now_complete = time.time()
         full_coord_seconds = max(
             0.0, (now_complete - self._last_claim_complete) - cand_elapsed)
@@ -1920,37 +1812,12 @@ class _BranchWorker:
                 + int(full_coord_seconds * 1e3))
         if self._adaptive:
             # The break-even is the cost of handing work to another worker, so
-            # the coordination term is the whole inter-claim span — the same
-            # quantity the telemetry records — not the residue inside one
+            # the coordination term is the whole inter-claim span -- the same
+            # quantity bundle_stats records -- not the residue inside one
             # candidate's own call.
             self._coord_ema.add(full_coord_seconds)
             if nodes_delta >= NODE_TIME_MIN_SAMPLE_NODES and cand_elapsed > 0:
                 self._node_time_ema.add(cand_elapsed / nodes_delta)
-            _record_candidate_accuracy()
-        scheduling_millis = self._pending_scheduling_millis
-        scan_openers_walked = self._pending_scan_openers_walked
-        fruitless_scan_millis = self._pending_fruitless_scan_millis
-        fruitless_scans = self._pending_fruitless_scans
-        fruitless_scan_openers_walked = (
-            self._pending_fruitless_scan_openers_walked)
-        self._pending_scheduling_millis = 0
-        self._pending_scan_openers_walked = 0
-        self._pending_fruitless_scan_millis = 0
-        self._pending_fruitless_scans = 0
-        self._pending_fruitless_scan_openers_walked = 0
-        self.queue.add_claim_telemetry(
-            n_words, int(full_coord_seconds * 1e3), nodes_delta,
-            self.n_workers, branch_key=branch_key,
-            spine=self._work_context.spine, worker_id=self.name,
-            bundle_id=bundle_id, idx=idx,
-            bundle_start_idx=bundle_start_idx, bundle_end_idx=bundle_end_idx,
-            scheduling_millis=scheduling_millis,
-            scan_openers_walked=scan_openers_walked,
-            fruitless_scan_millis=fruitless_scan_millis,
-            fruitless_scans=fruitless_scans,
-            fruitless_scan_openers_walked=fruitless_scan_openers_walked,
-            candidate_evaluation_millis=round(cand_elapsed * 1e3),
-            evaluation_bound_erd=evaluation_bound_erd)
         self.claims_done += 1
         # Throttled, not forced: see the per-candidate heartbeat above — a forced
         # write here is per-candidate and floods the WAL on fast candidates.
@@ -1961,8 +1828,7 @@ class _BranchWorker:
     # -- evaluate a packer-issued bundle of candidate claims -----------------
 
     def _evaluate_bundle_member(self, branch_key, words, n_words, idx, budget,
-                                bundle_id, nodes_at_bundle_start, wall_t0,
-                                bundle_start_idx=None, bundle_end_idx=None):
+                                bundle_id, nodes_at_bundle_start, wall_t0):
         """evaluate_claim for one bundle member; on cancellation/abort,
         records the bundle as censored.  Returns True to keep going, False
         for the caller to abort evaluate_bundle immediately."""
@@ -1971,15 +1837,12 @@ class _BranchWorker:
                                 wall_t0, censored=True)
             return False
         if not self.evaluate_claim(branch_key, words, n_words, idx,
-                                   budget=budget, bundle_id=bundle_id,
-                                   bundle_start_idx=bundle_start_idx,
-                                   bundle_end_idx=bundle_end_idx):
+                                   budget=budget, bundle_id=bundle_id):
             self._finish_bundle(branch_key, bundle_id, nodes_at_bundle_start,
                                 wall_t0, censored=True)
             return False
         return True
 
-    @_charged_to("evaluation")
     def _complete_bundle_two_level_erd_prunes(
             self, branch_key, words, n_words, bundle_id, candidate_indices):
         """Complete two-level ERD prunes before ordinary evaluation.
@@ -2085,10 +1948,11 @@ class _BranchWorker:
         claimed_candidate_indices = indices
         prune_nodes_at_start = self._nodes
         prune_wall_t0 = time.time()
-        pruned_candidate_indices, cancelled = (
-            self._complete_bundle_two_level_erd_prunes(
-                branch_key, words, n_words, bundle_id,
-                claimed_candidate_indices))
+        with self._time_account.activity("evaluation", owner=bundle_id):
+            pruned_candidate_indices, cancelled = (
+                self._complete_bundle_two_level_erd_prunes(
+                    branch_key, words, n_words, bundle_id,
+                    claimed_candidate_indices))
         if cancelled:
             self._finish_bundle(branch_key, bundle_id, prune_nodes_at_start,
                                 prune_wall_t0, censored=True)
@@ -2102,16 +1966,10 @@ class _BranchWorker:
 
         nodes_at_bundle_start = prune_nodes_at_start
         wall_t0 = prune_wall_t0
-        bundle_start_idx = (min(claimed_candidate_indices)
-                            if claimed_candidate_indices else None)
-        bundle_end_idx = (max(claimed_candidate_indices)
-                          if claimed_candidate_indices else None)
         for pos, idx in enumerate(indices):
             if not self._evaluate_bundle_member(
                     branch_key, words, n_words, idx, budget, bundle_id,
-                    nodes_at_bundle_start, wall_t0,
-                    bundle_start_idx=bundle_start_idx,
-                    bundle_end_idx=bundle_end_idx):
+                    nodes_at_bundle_start, wall_t0):
                 return False
             if idx in forced:
                 nodes_at_bundle_start = self._nodes
@@ -2126,9 +1984,7 @@ class _BranchWorker:
                     if later_idx in forced:
                         if not self._evaluate_bundle_member(
                                 branch_key, words, n_words, later_idx, budget,
-                                bundle_id, nodes_at_bundle_start, wall_t0,
-                                bundle_start_idx=bundle_start_idx,
-                                bundle_end_idx=bundle_end_idx):
+                                bundle_id, nodes_at_bundle_start, wall_t0):
                             return False
                     else:
                         remainder.append(later_idx)
@@ -2213,18 +2069,21 @@ class _BranchWorker:
         wall_t0 is the bundle's own evaluation start (re-baselined past any
         forced member — see evaluate_bundle), so the elapsed time here is
         this bundle's evaluation wall span, not claim-handout coordination
-        overhead (that is claim_telemetry's busy_wait_millis, measured in
-        claim_next_bundle).
+        overhead, which is recorded beside it as coordination_millis.
         """
         coordination_millis = self._bundle_coordination_millis.pop(
             bundle_id, None)
+        evaluation_time_millis = (
+            None if bundle_id is None
+            else self._time_account.take_owned_millis(bundle_id))
         if bundle_id is None or not self._adaptive:
             return
         nodes = self._nodes - nodes_at_start
         wall_millis = int((time.time() - wall_t0) * 1000)
-        self.queue.record_bundle_stats(branch_key, bundle_id, nodes,
-                                       wall_millis, censored=censored,
-                                       coordination_millis=coordination_millis)
+        self.queue.record_bundle_stats(
+            branch_key, bundle_id, nodes, wall_millis, censored=censored,
+            coordination_millis=coordination_millis,
+            evaluation_time_millis=evaluation_time_millis)
 
     # -- finalize -----------------------------------------------------------
 
@@ -2350,7 +2209,8 @@ class _BranchWorker:
         cache_write_millis = int((time.time() - finalize_t0) * 1000)
         try:
             (n_bundles, max_bundle_nodes, total_bundle_wall_millis,
-             censored_units, coordination_millis) = (
+             censored_units, coordination_millis,
+             evaluation_time_millis) = (
                 self.queue.finalize_bundle_stats(branch_key))
             # Read while the branch's claim rows still exist: delete_branch
             # below drops the per-candidate record this evidence comes from.
@@ -2377,6 +2237,7 @@ class _BranchWorker:
                 first_best_at=first_best_at,
                 nodes_at_first_best=nodes_at_first_best,
                 coordination_millis=coordination_millis,
+                evaluation_time_millis=evaluation_time_millis,
                 **self._hint_outcome(branch_key, best_guess, budget),
                 outcome='loss' if ceiling_proves_loss else ('cut' if cut else
                         ('exact' if best_guess is not None else 'loss')))
@@ -2420,11 +2281,10 @@ class _BranchWorker:
             del self._packing_stats_cache[cached_key]
         # Restart the coordination window past this finalize.  evaluate_claim
         # telescopes coordination_millis from the previous claim's completion,
-        # so without this the finalize span would reappear as idle time on the
-        # first claim of whatever branch this worker picks up next — a
-        # different, unrelated branch.  The finalize's own write transactions
-        # go with it: claim_telemetry does not carry finalize cost at all, and
-        # branch_finalize_log.cache_write_millis is where it belongs.
+        # so without this the finalize span would reappear as coordination on
+        # the first claim of whatever branch this worker picks up next — a
+        # different, unrelated branch.  The finalize's own cost is
+        # branch_finalize_log.cache_write_millis.
         self._restart_coordination_window()
         return True
 
@@ -2969,11 +2829,11 @@ class _BranchWorker:
                                 branch_key, words, n_words, paired, budget)
                         else:
                             # Nothing claimable anywhere, no pair available on
-                            # the dependency: the stuck state idle_millis
-                            # totals without naming.  The claim transaction
-                            # that just refused the pair reports why, so this
-                            # is the decision itself rather than a re-read of
-                            # the state it was made against.
+                            # the dependency: the stuck state.  The claim
+                            # transaction
+                            # that just refused the pair reports why, so
+                            # this is the decision itself rather than a
+                            # re-read of the state it was made against.
                             blocked_at = time.perf_counter()
                             self._idle_wait(0.05, "dependency")
                             wait.note_blocked(
@@ -3069,89 +2929,18 @@ class _BranchWorker:
         """Return (context, branch, bundle_id, indices, forced) for the next
         bundle of candidates, or None if there is nothing to do right now.
 
-        Times the work-selection scan into _pending_scheduling_millis for the
-        resulting claim's telemetry row, net of the lock wait and claim
-        transaction the queue already accounts for separately, so the phases
-        stay disjoint, and banks the number of opener-work requests the scan
-        examined so that time has a denominator.
-
-        The figure is clamped to the window it will be reported in: a finalize
-        swept during the scan restarts that window from inside the scan, and a
-        phase cannot be longer than the span it partitions.  The fruitless
-        figure is deliberately not clamped — it is a phase of no window, and
-        clamping it to one would discard the cost this measurement exists for.
-
-        A call that selects nothing has no branch to bill, so its cost goes to
-        _pending_fruitless_scan_millis and waits for the next claim that does
-        succeed.  Charging it to scheduling_millis would attribute a scan to a
-        branch it did not choose, and it cannot go to that row's idle_millis
-        either: run() follows every such call with an idle wait, which
-        restarts the coordination window, so the scan lies outside every
-        window and no phase of any row contains it.  Untimed here it is
-        recorded nowhere at all, which is what left the exhausted scan — the
-        one path whose cost grows with queue size — the only one invisible.
-
+        A call that selects nothing is counted as a fruitless scan in the
+        worker's time account; its duration is already there as scheduling.
         Selecting nothing is not the same as returning nothing.  A scan that
         promotes a branch and loses its bundle to a racing worker also returns
         None, having done the short work of the served path rather than the
-        walk to exhaustion; _scan_selected_work marks it so it is excluded
-        from both the count and the timing population.
+        walk to exhaustion; _scan_selected_work marks it so it is not counted.
         """
-        scan_t0 = time.perf_counter()
-        self._scan_openers_walked = 0
-        self._scan_openers_walked_baseline = 0
-        self._scan_opener_in_flight = False
         self._scan_selected_work = False
-        # Last, so a restart inside the scan can move it and nothing here
-        # moves it back.
-        self._scan_attributed_baseline = self._queue_attributed_millis()
-        work = None
-        try:
-            work = self._claim_one_uninstrumented()
-            return work
-        finally:
-            attributed = max(
-                0, self._queue_attributed_millis()
-                - self._scan_attributed_baseline)
-            scan_millis = int((time.perf_counter() - scan_t0) * 1000)
-            if work is None:
-                self._pending_scheduling_millis = 0
-                self._pending_scan_openers_walked = 0
-                if not self._scan_selected_work:
-                    # Gross, where scheduling_millis is net: a scan that
-                    # produced no row has no sibling columns to carry the lock
-                    # wait and claim transactions it took, so they belong in
-                    # this figure or nowhere.  Read here and discarded by the
-                    # window restart the caller is about to perform, which is
-                    # the single owner of that clearing.
-                    self._pending_fruitless_scan_millis += scan_millis
-                    self._pending_fruitless_scans += 1
-                    self._time_account.fruitless_scans += 1
-                    self._pending_fruitless_scan_openers_walked += (
-                        self._scan_openers_walked)
-            else:
-                # A branch swept to finalization during this scan restarts the
-                # coordination window from inside it, so the scan can be older
-                # than the window it is about to be reported in.  Only the part
-                # after the current origin is a phase of that window; the rest
-                # belongs to a window that has already closed.
-                in_window_millis = int(
-                    (time.time() - self._last_claim_complete) * 1000)
-                self._pending_scheduling_millis = max(
-                    0, min(scan_millis, in_window_millis) - attributed)
-                # Paired with the clamped duration, so the two describe the
-                # same span: a full walk against a partial duration would
-                # report a per-opener cost the scan never achieved.
-                self._pending_scan_openers_walked = max(
-                    0, self._scan_openers_walked
-                    - self._scan_openers_walked_baseline)
-
-    def _queue_attributed_millis(self):
-        """Coordination time the queue has already attributed to a named phase
-        since the last telemetry row (lock wait + claim transaction + commit)."""
-        return (self.queue._last_claim_busy_millis
-                + self.queue._last_claim_transaction_millis
-                + self.queue._last_claim_commit_millis)
+        work = self._claim_one_uninstrumented()
+        if work is None and not self._scan_selected_work:
+            self._time_account.fruitless_scans += 1
+        return work
 
     def _promote_opener_work(self, opener_work_id, scheduling_role):
         """Promote one pending branch of opener_work_id into active_branches.
@@ -3268,11 +3057,6 @@ class _BranchWorker:
         candidate_rows = (self._opener_work_candidates()
                           if self._opener_work_enabled else ())
         for opener_work in candidate_rows:
-            self._scan_openers_walked += 1
-            # This opener's work spans the rest of the iteration, including any
-            # finalize that restarts the window from inside it, so a restart
-            # here keeps it rather than dropping a walk still under way.
-            self._scan_opener_in_flight = True
             if top_priority is None:
                 top_priority = opener_work['requested_priority']
             opener_work_id = opener_work['opener_work_id']
@@ -3307,7 +3091,6 @@ class _BranchWorker:
                 # exhausted scan and is nothing like one, so say which it was.
                 self._scan_selected_work = True
                 return None
-        self._scan_opener_in_flight = False
         # A queue upgraded while active work is present can carry branches
         # from before opener lineage was recorded.  They remain claimable
         # until finalization; new work always follows opener-first order.

@@ -80,12 +80,12 @@ missing in CI. The `scaling` job deliberately keeps its explicit
 `coverage numpy`: every assertion it makes is a wall-clock ratio, and a
 first-call JIT compile would land inside the measurement.
 
-### idle_millis is a residual; dependency_wait is its attribution
+### dependency_wait says what a stuck worker was waiting for
 
-`idle_millis` is not measured. It is whatever remains of a coordination window
-after the four measured phases, so it totals waiting without saying what was
-waited on — and it is the swarm's largest single cost (61.5% of all worker time
-on epoch 21, against 3.4% for the scan and 2.3% for lock waits).
+`worker_time.wait_dependency_millis` totals the time workers sleep on a
+dependency without saying which one or why — and waiting on dependencies is the
+swarm's largest single cost (61.5% of all worker time on epoch 21, against 3.4%
+for the scan and 2.3% for lock waits).
 
 `telemetry.dependency_wait` carries one row per `cooperative_solve` episode that
 reached the wait loop: the dependency's spine, size and budget, how the episode
@@ -104,15 +104,14 @@ only then sleeps:
 | `blocks_help_capped` | `MAX_HELP_RECURSION_DEPTH` forbade scanning | raising that cap |
 | `blocks_other` | the dependency changed identity, or a retry ran out | nothing; it keeps the sum honest |
 
-Those are different problems with different fixes, and `idle_millis` cannot
-tell them apart.
+Those are different problems with different fixes, and a total cannot tell
+them apart.
 
 **Every sleep increments exactly one counter, so the five sum to the episode's
 sleep count.** That is what `blocks_other` is for — a claim transaction can
 decline for reasons with no column of their own, and dropping those would leave
-`blocked_millis` holding time no counter accounts for, which is precisely the
-defect `idle_millis` has. A counter that is a partition can be audited; a
-counter that is a selection cannot.
+`blocked_millis` holding time no counter accounts for. A counter that is a
+partition can be audited; a counter that is a selection cannot.
 
 **Every reason is reported by the code that decided it, never sampled
 afterwards.** The two claim outcomes come from `ERDQueue.last_claim_decline()`,
@@ -127,16 +126,21 @@ it afterwards is reading a system that has already moved, and a holder count
 from one instant beside an availability count from another does not blur the
 answer, it inverts it. An episode that never reached the loop writes no row.
 
-### Worker time is a partition; the per-claim rows are not
+### Worker time is a partition
 
 `telemetry.worker_time` holds one row per worker per
 `WORKER_TIME_INTERVAL_SECONDS` (60): the worker's whole wall time over the
 interval, split by what it was doing. The activity columns sum to
 `interval_millis` exactly, so a share read from them is a share of real time.
-That is what the per-claim rows cannot give: each candidate's evaluation span
-contains every candidate evaluated inside it (a dependency wait that helps
-elsewhere), so summing them counts nested work twice, and every real sleep
-restarts the coordination window, so no claim row holds a sleep at all.
+A sum of per-candidate spans cannot give that: each candidate's evaluation
+span contains every candidate evaluated inside it (a dependency wait that helps
+elsewhere), so the sum counts nested work twice, and a sleep falls between
+candidates, inside no span at all.
+
+**There is no per-claim telemetry, and it should not come back.**
+One row per claim was about 12 million rows a day, most of the telemetry file,
+spent answering questions these per-interval and per-branch totals answer
+directly.
 
 **Each span is charged to the innermost open activity and nothing else.**
 `_WorkerTimeAccount` keeps a stack; `_charged_to` puts a whole method on it
@@ -157,10 +161,22 @@ actually written, which is what stale-claim reclaim reads),
 held, and `telemetry.claim_reclaim` records every worker whose claims a
 reclaim freed, with its heartbeat age at that moment.
 
-A branch's coordination time travels with its other costs:
-`bundle_stats.coordination_millis` sums each bundle's members and
-`branch_finalize_log.coordination_millis` sums the bundles, so coordination
-per unit of work is readable per branch without the per-claim rows.
+A branch's coordination and evaluation time travel with its other costs:
+`bundle_stats` records both per bundle and `branch_finalize_log` sums them per
+branch, and `view --work-distribution` bands finalized branches by evaluation
+time. **A branch's evaluation time is the account's own evaluation charge,
+owned by the bundle being evaluated** (`activity("evaluation",
+owner=bundle_id)`), never its bundles' wall time. A parent bundle's clock runs
+on while its candidate helps a child branch, and restarts after a forced
+member, so wall time counts the child's work twice and the forced member's
+never. Owned time is the innermost charge, so the branches' evaluation times
+sum to the workers' `evaluation_millis` exactly.
+
+The branch view's ETA needs evaluation times while a branch is still open, so
+they live on the branch's own `candidate_claims` rows (`evaluation_millis`,
+`evaluation_bound_erd`, `branch_worker_count`), written by the transaction that
+completes each candidate. Those rows go when the branch finalizes, so nothing
+there accumulates.
 
 ### Priority ladders, and the fan-out they prevent
 
@@ -231,112 +247,25 @@ Exhaustion means nothing anywhere is claimable, which is the drained or
 fully-occupied condition rather than the common one. Do not read the flat
 common case as a guarantee for the whole scheduler.
 
-**A scan that selects nothing lands in `fruitless_scan_millis`, and that
-column is not a phase of `coordination_millis`.** `scheduling_millis` is the
-scan that chose the branch its row belongs to. An exhausted scan chose nothing,
-so no claim can carry it — and `run()` follows every such scan with an idle
-wait, which restarts the coordination window, so its cost is outside every
-window rather than inside the next row's. Before these columns it was recorded
-nowhere at all: the one scheduling path whose cost grows with queue size was
-the only one with no measurement. Do not add it to the five phases; the parts
-would exceed the whole and `idle_millis` would sit at its `max(0, …)` clamp.
-
-`fruitless_scans` counts those scans, so the fallback rate is measured here
-rather than inferred, and `scan_openers_walked`/`fruitless_scan_openers_walked`
-carry the queue depth each scan walked — the quantity the `6N + 4` cost is
-linear in, without which neither millis column can be read. A row predating the
-columns holds NULL, not 0, because its split is unrecoverable.
+**A scan that selects nothing is counted in `worker_time.fruitless_scans`**,
+so the fallback rate is measured rather than inferred; its duration is already
+in `scheduling_millis` with every other scan.
 
 **Returning None is not the same as selecting nothing.** A scan that promotes a
 branch and loses its bundle to a racing worker returns None from the short
 served path, never having walked to exhaustion; `_scan_selected_work` marks it
-so it stays out of both the count and the timing population.
+so it stays out of the count.
 
-### Two clocks, one restart
+### The coordination window feeds the publish threshold
 
-Claim timing runs on two counters with **different reset points**, and three
-separate defects have come from moving one without the other.
-
-- The **coordination window** — `_BranchWorker._last_claim_complete`.
-  `coordination_millis` telescopes from it. It restarts at every wait, after
-  every finalize, and around a helped sub-branch.
-- The **queue's claim attribution** — `_last_claim_busy_millis`,
-  `_last_claim_retries`, `_last_claim_transaction_millis`,
-  `_last_claim_commit_millis` on the `ERDQueue` connection. The first two
-  accumulate with `+=`. Nothing clears any of them except
-  `add_claim_telemetry`, when a row consumes them.
-- The worker's **carried scheduling figure** — `_pending_scheduling_millis`
-  and `_pending_scan_openers_walked`, banked when a claim is taken and waiting
-  for that claim's first telemetry row.
-
-`_pending_fruitless_scan_*` is the exception and must **not** be cleared by a
-restart, nor clamped to a window: it is a phase of no window at all, so no
-window ending can invalidate it, and it is still owed to whichever row reports
-it next.
-
-**A scan can outlive the window it will be reported in.** `_claim_active_branch`
-sweeps branches for finalization as it walks, and `maybe_finalize` restarts the
-window — from *inside* `claim_one`. The scan is then older than the window its
-scheduling figure is a phase of, so `claim_one` clamps that figure to
-`time.time() - _last_claim_complete`: a phase cannot be longer than the span it
-partitions. Live on epoch 20 this was 8 rows in 28,030, every one a single-node
-claim on a large branch (`coord=17` against `sched=308`), which is the shape a
-finalize sweep leaves behind.
-
-**The opener count must cover the same span as the duration it is banked
-with.** `scan_openers_walked` is counted from the current window origin, so it
-pairs with the clamped `scheduling_millis`; `fruitless_scan_openers_walked`
-counts the whole walk, because the fruitless duration is unclamped. Pairing a
-full walk with a clamped duration reports a per-opener scan cost the scan never
-achieved — and cost against queue depth is the only reason the counts exist.
-
-The count is a monotonic total plus a baseline marking where the current window
-opened, not a second counter, because **the opener being processed when the
-restart fires is still in that window**. `_claim_active_branch` sweeps for
-finalization while processing an opener, so the restart lands after that
-opener's loop increment and before the same iteration promotes and claims;
-dropping it reports scan time against no openers at all, which is an infinite
-cost per opener in the metric the count computes. `_scan_opener_in_flight`
-marks that case and is cleared when the loop ends, because the direct-branch
-and pairing fallback past it walk no openers and must credit none.
-
-**The queue-attribution baseline moves with the restart for the same reason.**
-`claim_one` subtracts the queue's share from the scheduling figure so the
-phases stay disjoint, measured as a delta against
-`_scan_attributed_baseline`. A restart calls `discard_claim_attribution()`,
-which zeroes those counters — so a baseline taken at scan start is then larger
-than they are, the delta clamps to zero, and the lock wait and claim
-transaction taken *after* the restart are never subtracted while still landing
-on the same row. `_restart_coordination_window` therefore resets the baseline
-to 0 alongside everything else, and `claim_one` sets it **last** in its
-prologue so nothing there moves it back. It is the queue's counters as the scan
-opens, never zero: residue from earlier queue work is not this scan's to
-subtract.
-
-So a restart that moves the window forward leaves attribution describing work
-that happened *before* the new origin, and the next row reports it as a phase
-of a window that excludes it. The parts then exceed the whole and
-`idle_millis` sits on its `max(0, …)` clamp — visible only under contention,
-which is why unit tests miss it.
-
-**Every window restart goes through `_restart_coordination_window`**, which
-moves the origin, calls `queue.discard_claim_attribution()`, and drops the
-carried scheduling figure, all together. Epoch 19 measured what happens when
-only part of that is done: fixing the queue's counters alone took production
-partition violations from 0.182% to 0.066% of rows, and every one of the 259
-that survived named `scheduling_millis` as the oversized phase.
-`test_every_window_restart_drops_the_queue_attribution_with_it` is an AST guard
-that refuses a bare `_last_claim_complete` assignment, because the defect keeps
-arriving at sites nobody wrote a behavioural test for. Two sites assign
-directly and are exempt with stated reasons: `__init__` starts both clocks at
-zero, and `evaluate_claim` advances the window immediately before the
-`add_claim_telemetry` that clears the attribution itself.
-
-Discarding is the right outcome, not a loss: the restarted window already
-excludes the span those counters measure, so reporting zero is what keeps a row
-self-consistent. A caller that wants to keep the figure must read it *before*
-restarting — which is exactly what `claim_one` does to make
-`fruitless_scan_millis` gross.
+`_BranchWorker._last_claim_complete` is the origin of the **coordination
+window**: a claim's coordination is the span from the previous claim's
+completion to its own, less its evaluation. It feeds `_coord_ema`, which
+`_publish_threshold` reads on every promotion decision, and
+`bundle_stats.coordination_millis`, which carries it to the branch's finalize
+row. It restarts at every wait, after every finalize, and around a helped
+sub-branch, through `_restart_coordination_window`, because none of those spans
+is the cost of handing work from one claim to the next.
 
 Three costs on that path are already removed and must not come back.
 `_claim_paired_branch` rewalks the branches the main loop recorded instead of
@@ -1431,9 +1360,9 @@ successful merge unless `--keep-source` is given.
 Swarm telemetry lives in a **separate** Linux-only file,
 `runtime/erd_queue_telemetry.sqlite3` (`<stem>_telemetry<ext>`, computed by
 `derive_telemetry_path`), which `ERDQueue` opens as an attached schema named
-`telemetry`. The `claim_telemetry`, `branch_finalize_log` and `dependency_wait`
+`telemetry`. The `worker_time`, `branch_finalize_log` and `dependency_wait`
 tables are there, not
-in the main queue file — `add_claim_telemetry` and `add_branch_finalize_log` write
+in the main queue file — `add_worker_time` and `add_branch_finalize_log` write
 `telemetry.<table>`, and reads join through the `telemetry.` prefix. Because
 attached-schema tables do not appear in the main file's `sqlite_master`, running
 `.tables` on `runtime/erd_queue.sqlite3` shows no telemetry tables; open the

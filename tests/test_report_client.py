@@ -4524,9 +4524,9 @@ class ReportClientContract:
           result.cache=document.querySelector('[data-identity="01"]').className;
 
           const hotspots=await (await fetch('/api/view/hotspots')).json(),changedHotspots=structuredClone(hotspots);
-          changedHotspots.data.rows[0].claim_count++;
+          changedHotspots.data.rows[0].cut_reuse_miss_count++;
           applyReport(changedHotspots,hotspots,{...state,kind:'hotspots'});
-          result.hotspot=document.querySelector('[data-identity="coordination:20:4"]').className;
+          result.hotspot=document.querySelector('[data-identity="cut-reuse:0a1b"]').className;
           return result;
         }""")
         self.assertIn("flash-improved", classes["tree"])
@@ -5710,7 +5710,7 @@ class ReportClientContract:
         states = self.page.evaluate("""() => ({
           overview: parsePageState({search:''}),
           all: parsePageState({search:'?branch_worker_status=all'}),
-          historical: parsePageState({search:'?kind=hotspots&by=coordination&branch_status=queued&branch_worker_status=active'}),
+          historical: parsePageState({search:'?kind=hotspots&by=cut-reuse&branch_status=queued&branch_worker_status=active'}),
           tree: parsePageState({search:'?branch_target=RAISE%20.....&tree=1&claims=1&answers=1'}),
           word: parsePageState({search:'?branch_target=RAISE&sort=nodes'})
         })""")
@@ -6670,8 +6670,8 @@ class ReportClientContract:
         self.page.locator("[data-kind=hotspots]").click()
         self.page.wait_for_selector("text=hotspots report")
         text = self.page.locator("#report").inner_text()
-        self.assertIn("recent claim coordination buckets", text)
-        self.assertNotIn("recent_claim_coordination_buckets", text)
+        self.assertIn("recent cut-reuse misses", text)
+        self.assertNotIn("recent_cut_reuse_misses", text)
         self.page.locator("[data-kind=cache]").click()
         self.page.wait_for_selector("text=cache report")
         cache_text = self.page.locator("#report").inner_text()
@@ -6690,8 +6690,8 @@ class ReportClientContract:
         self.assertEqual(
             labels, ["<=2s", "2-30s", "30-300s", "300-3,600s", ">3,600s"])
         text = self.page.locator("#report").inner_text()
-        self.assertIn("epoch claims by branch", text)
-        self.assertNotIn("epoch_claims_by_branch", text)
+        self.assertIn("finalized branches", text)
+        self.assertNotIn("epoch_finalized_branches", text)
         self.assertIn("whole epoch", text)
         # The cheap band coordinates far out of proportion to its work and the
         # expensive band far under; both are called out rather than left in the
@@ -6712,17 +6712,12 @@ class ReportClientContract:
         self.assertIn("360,000,000", row)
         self.assertNotIn("360000000", row)
 
-    def test_work_distribution_names_claims_with_no_branch_attribution(self):
-        self.open_work_distribution()
-        text = self.page.locator("#report").inner_text()
-        self.assertIn("no recorded branch attribution", text)
-
     def test_work_distribution_names_branches_it_could_not_band(self):
         # A branch with no recorded worker time is excluded rather than seated
         # in the cheapest band, and the reader is told it exists.
         self.open_work_distribution()
         text = self.page.locator("#report").inner_text()
-        self.assertIn("unrecorded worker time", text)
+        self.assertIn("unrecorded worker or coordination time", text)
 
     def _distribution_requests(self):
         """Record every distribution scan the page starts from now on."""

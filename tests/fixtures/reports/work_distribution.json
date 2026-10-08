@@ -26,7 +26,6 @@
     "search_node_count": 728,
     "search_node_share": 1.6771877638057388e-06,
     "search_nodes_per_branch": 28.0,
-    "unfinished_branch_count": 0,
     "worker_millis": 7644,
     "worker_time_share": 0.0005290125016920925
    },
@@ -42,7 +41,6 @@
     "search_node_count": 259200,
     "search_node_share": 0.0005971525664539114,
     "search_nodes_per_branch": 28800.0,
-    "unfinished_branch_count": 0,
     "worker_millis": 97920,
     "worker_time_share": 0.006776675060922254
    },
@@ -58,7 +56,6 @@
     "search_node_count": 9000000,
     "search_node_share": 0.020734464112983034,
     "search_nodes_per_branch": 1800000.0,
-    "unfinished_branch_count": 0,
     "worker_millis": 520000,
     "worker_time_share": 0.03598724501306752
    },
@@ -74,7 +71,6 @@
     "search_node_count": 64800000,
     "search_node_share": 0.14928814161347786,
     "search_nodes_per_branch": 21600000.0,
-    "unfinished_branch_count": 3,
     "worker_millis": 3024000,
     "worker_time_share": 0.20927967099906958
    },
@@ -90,7 +86,6 @@
     "search_node_count": 360000000,
     "search_node_share": 0.8293785645193213,
     "search_nodes_per_branch": 180000000.0,
-    "unfinished_branch_count": 2,
     "worker_millis": 10800000,
     "worker_time_share": 0.7474273964252486
    }
@@ -98,7 +93,7 @@
   "epoch": 0,
   "maximum_answer_count": null,
   "minimum_answer_count": null,
-  "population": "epoch_claims_by_branch",
+  "population": "epoch_finalized_branches",
   "scan_seconds": 0.184,
   "since_seconds": null,
   "totals": {
@@ -106,14 +101,7 @@
    "claim_count": 936,
    "coordination_millis": 38376,
    "search_node_count": 434059928,
-   "unfinished_branch_count": 5,
    "worker_millis": 14449564
-  },
-  "unattributed": {
-   "claim_count": 37,
-   "coordination_millis": 666,
-   "search_node_count": 0,
-   "worker_millis": 74
   },
   "unmeasured": {
    "branch_count": 1,

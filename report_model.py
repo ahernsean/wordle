@@ -258,8 +258,6 @@ class ReportRequest:
     tree_cursor: str | None = None
     since_seconds: int | None = None
     sample_size: int | None = None
-    opener: str | None = None
-    raw_row_offset: int = 0
     inherited_cost: bool = False
 
 
@@ -267,19 +265,15 @@ def validate_report_request(request: ReportRequest) -> None:
     """Reject report options that have no meaning for the selected report."""
     report_kind = request.report_kind
     branch_target_kind = request.branch_target.kind
-    if request.tree and report_kind in ("cache", "hotspots", "accuracy", "leaderboard", "openers"):
+    if request.tree and report_kind in ("cache", "hotspots", "leaderboard", "openers"):
         raise ValueError(f"--tree cannot be used with --{report_kind}")
     if (request.tree_parent or request.tree_cursor) and not request.tree:
         raise ValueError("tree_parent and tree_cursor require tree")
-    if request.raw_row_offset and report_kind != "accuracy":
-        raise ValueError("raw_row_offset requires an accuracy report")
     # Only root progress attributes inherited work, so only it can price it.
     # Accepting the flag elsewhere would answer a question the report does not
     # ask, and answer it silently.
     if request.inherited_cost and report_kind != "root_progress":
         raise ValueError("--inherited-cost requires a root progress report")
-    if request.raw_row_offset < 0:
-        raise ValueError("raw_row_offset cannot be negative")
     if request.include_claims and (
         request.tree
         or report_kind != "auto"
@@ -365,18 +359,12 @@ def validate_report_request(request: ReportRequest) -> None:
     historical_hotspot = request.hotspot_field in (
         "evaluated-candidates", "bulk-completed-candidates",
         "one-level-erd-prunes", "two-level-erd-prunes",
-        "cut-reuse", "coordination",
+        "cut-reuse",
     )
     if report_kind == "hotspots" and historical_hotspot and (
         request.filters.branch_statuses or request.filters.branch_worker_statuses
     ):
         raise ValueError("historical hotspots cannot use branch filters")
-    if (
-        report_kind == "hotspots"
-        and request.hotspot_field == "coordination"
-        and branch_target_kind != "root"
-    ):
-        raise ValueError("coordination hotspots cannot use a branch target")
     if request.worker_id is not None and report_kind != "workers":
         raise ValueError("worker requires a workers report")
     if report_kind == "work_distribution":
@@ -3692,8 +3680,8 @@ def _work_distribution_band_rows(bands, edge_seconds):
     by_index = {band["band_index"]: band for band in bands}
     totals = {
         key: sum(band[key] for band in bands)
-        for key in ("branch_count", "unfinished_branch_count", "claim_count",
-                    "search_node_count", "coordination_millis", "worker_millis")
+        for key in ("branch_count", "claim_count", "search_node_count",
+                    "coordination_millis", "worker_millis")
     }
 
     def share(value, total):
@@ -3712,7 +3700,6 @@ def _work_distribution_band_rows(bands, edge_seconds):
             "band_index": index,
             "band_label": label,
             "branch_count": branch_count,
-            "unfinished_branch_count": band.get("unfinished_branch_count", 0),
             "claim_count": band.get("claim_count", 0),
             "search_node_count": search_node_count,
             "coordination_millis": coordination_millis,
@@ -3754,8 +3741,9 @@ def collect_work_distribution_report(
     since_seconds = request.since_seconds
     edge_seconds = WORK_DISTRIBUTION_BAND_EDGE_SECONDS
     empty_rows, empty_totals = _work_distribution_band_rows([], edge_seconds)
-    empty_population = {"claim_count": 0, "search_node_count": 0,
-                        "coordination_millis": 0, "worker_millis": 0}
+    empty_population = {"branch_count": 0, "claim_count": 0,
+                        "search_node_count": 0, "coordination_millis": 0,
+                        "worker_millis": 0}
     data = {
         "population": None,
         "epoch": request.epoch,
@@ -3767,8 +3755,7 @@ def collect_work_distribution_report(
         "band_edge_seconds": list(edge_seconds),
         "bands": empty_rows,
         "totals": empty_totals,
-        "unattributed": dict(empty_population),
-        "unmeasured": dict(empty_population, branch_count=0),
+        "unmeasured": empty_population,
         "scan_seconds": None,
     }
     report = _semantic_report(
@@ -3795,10 +3782,9 @@ def collect_work_distribution_report(
             "window_started_at": result["since"],
             "bands": rows,
             "totals": totals,
-            "unattributed": result["unattributed"],
             "unmeasured": result["unmeasured"],
-            # The scan is linear in the epoch's claim rows, so its cost is a
-            # fact about the report worth showing rather than hiding.
+            # The scan is linear in the epoch's finalized branches, so its cost
+            # is a fact about the report worth showing rather than hiding.
             "scan_seconds": round(scan_seconds, 3),
         })
         _mark_queue_opener_ok(report)
@@ -3809,56 +3795,6 @@ def collect_work_distribution_report(
             queue.close()
     return report
 
-
-def collect_accuracy_report(sources: ReportOpeners, request: ReportRequest) -> dict:
-    """Collect the candidate-work calibration corpus without changing it."""
-    generated_at = int(time.time())
-    data = {"epoch": request.epoch, "requested_sample_size": 0,
-            "erd_pruned_row_count": 0, "non_erd_pruned_row_count": 0,
-            "no_prediction_row_count": 0, "sampled_row_count": 0,
-            "population_row_count": None,
-            "calibration": {}, "answer_count_budget_calibration": [],
-            "largest_under_predicted": [], "largest_over_predicted": [],
-            "rows": []}
-    report = _semantic_report(
-        "accuracy", sources, request.branch_target, generated_at, data, request)
-    queue = None
-    try:
-        queue = _open_report_queue(sources)
-        branch_key = None
-        if request.branch_target.kind in ("branch", "branch_reference"):
-            branch_key = resolve_branch_target(
-                request.branch_target, sorted(_decorative_answer_set(sources))).branch_key
-        opener = request.opener
-        if opener is None and request.branch_target.kind == "word":
-            opener = request.branch_target.trailing_word
-        result = queue.report_candidate_accuracy(
-            epoch=queue.epoch if request.epoch is None else request.epoch,
-            budget=request.filters.budget,
-            minimum_answer_count=request.filters.minimum_answer_count,
-            maximum_answer_count=request.filters.maximum_answer_count,
-            opener=opener, branch_key=branch_key,
-            since=(generated_at - request.since_seconds
-                   if request.since_seconds is not None else None),
-            limit=request.filters.limit,
-            sample_size=min(request.sample_size or 50_000, 1_000_000),
-            raw_row_offset=request.raw_row_offset)
-        for collection_name in ("rows", "largest_under_predicted",
-                                "largest_over_predicted"):
-            for row in result[collection_name]:
-                row_branch_key = row.pop("branch_key", None)
-                if row_branch_key is not None:
-                    row["branch_key_hex"] = bytes(row_branch_key).hex()
-                    row["branch_reference"] = branch_reference(
-                        bytes(row_branch_key))
-        data.update(result)
-        _mark_queue_opener_ok(report)
-    except (sqlite3.Error, OSError) as error:
-        _mark_queue_opener_error(report, error)
-    finally:
-        if queue is not None:
-            queue.close()
-    return report
 
 
 def _opener_summary_payload(row, rollup, timing, generated_at, answer_set):
@@ -4459,8 +4395,6 @@ def collect_report(sources: ReportOpeners, request: ReportRequest) -> dict:
         return collect_hotspot_report(sources, request)
     if report_kind == "work_distribution":
         return collect_work_distribution_report(sources, request)
-    if report_kind == "accuracy":
-        return collect_accuracy_report(sources, request)
     if report_kind == "leaderboard":
         return collect_leaderboard_report(sources, request)
     if report_kind == "openers":

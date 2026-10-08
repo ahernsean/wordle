@@ -83,7 +83,7 @@ SORT_FIELDS = {
 HOTSPOT_FIELDS = {
     "nodes", "age", "size", "workers", "priority", "slowest",
     "evaluated-candidates", "bulk-completed-candidates",
-    "one-level-erd-prunes", "two-level-erd-prunes", "cut-reuse", "coordination",
+    "one-level-erd-prunes", "two-level-erd-prunes", "cut-reuse",
 }
 class InvalidRequest(ValueError):
     pass
