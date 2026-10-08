@@ -1109,6 +1109,7 @@ class QueueAddReportingTest(unittest.TestCase):
     def setUp(self):
         self.queue = Mock()
         self.queue.lowest_unfinished_opener_priority.return_value = None
+        self.queue.unfinished_opener_request.return_value = None
         self.queue.total_branches.return_value = 0
         self.queue.status_by_branch_keys.return_value = {}
         self.queue.add_pending_many.return_value = 0

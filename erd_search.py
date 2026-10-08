@@ -353,8 +353,13 @@ def cmd_queue_add(args):
     left untouched, and the request cannot be refused at the ceiling for
     what is ultimately a no-op.
 
-    Already-queued branches are never duplicated; their priority is upgraded
-    if the new request is higher.  Branches with reusable cached results are
+    A word that is already queued -- it has an unfinished request -- keeps
+    that request and its priority, takes no rung on this batch's ladder, and
+    is reported as already queued; queue opener-priority moves it.  Any of its
+    branches not yet queued join that same request, so running the same add
+    twice changes nothing.  Already-queued branches are never duplicated; a
+    branch shared with another opener's request takes the higher of their
+    priorities.  Branches with reusable cached results are
     already solved and are not queued, unless --delete-erd-cache is given.
     For each word, reports how many unresolved branches are new versus already
     queued, and how many response groups were already solved.
@@ -411,6 +416,7 @@ def cmd_queue_add(args):
     branch_budget = GAME_GUESSES - 1
 
     n_new = 0
+    n_already_requested = 0
     n_already_queued = 0
     n_already_solved = 0
     n_reset = 0
@@ -484,11 +490,19 @@ def cmd_queue_add(args):
             word_plans[word] = (rows_to_queue, already_queued_keys,
                                already_solved_keys)
 
+        # A word with an unfinished request is already on the ladder.  Its
+        # branches join that request at its priority, so it takes no rung.
+        existing_requests = {
+            word: request for word in words_to_process
+            if (request := queue.unfinished_opener_request(word)) is not None}
         any_rows_to_queue = any(
-            plan is not None and plan[0] for plan in word_plans.values())
+            plan is not None and plan[0]
+            for word, plan in word_plans.items()
+            if word not in existing_requests)
 
         laddered_words = [word for word in words_to_process
-                          if not priority_words or word in priority_words]
+                          if (not priority_words or word in priority_words)
+                          and word not in existing_requests]
         lowest_queued = queue.lowest_unfinished_opener_priority()
         shift = 0
         if (args.priority is None and lowest_queued is not None
@@ -542,7 +556,9 @@ def cmd_queue_add(args):
                 continue
 
             rows_to_queue, already_queued_keys, already_solved_keys = plan
-            priority = ladder.get(word, OPENER_PRIORITY_MIN)
+            existing = existing_requests.get(word)
+            priority = (existing[1] if existing is not None
+                        else ladder.get(word, OPENER_PRIORITY_MIN))
             rows_with_priority = [
                 (branch_key, count, priority, word, code)
                 for branch_key, count, code in rows_to_queue]
@@ -567,6 +583,11 @@ def cmd_queue_add(args):
                       f'— {word_new:,} new, '
                       f'{word_already_queued:,} already queued, '
                       f'{word_already_solved:,} already solved.')
+            if existing is not None:
+                n_already_requested += 1
+                print(f'  {word.upper()} was already queued at priority '
+                      f'{existing[1]:,}; it stays there.  Use queue '
+                      f'opener-priority to move it.')
 
         total = queue.total_branches()
         n_added = n_new + n_already_queued
@@ -582,6 +603,9 @@ def cmd_queue_add(args):
               f'{n_already_queued:,} already queued, '
               f'{n_already_solved:,} already solved.  '
               f'Queue total: {total:,}.')
+        if n_already_requested:
+            print(f'{n_already_requested:,} word(s) were already queued and '
+                  f'kept their place.')
 
     except KeyboardInterrupt:
         print('\nInterrupted.')
@@ -787,7 +811,9 @@ def cmd_queue_opener_priority(args):
     level), so lowering one request's priority does not necessarily lower a
     branch it shares with a higher-priority request.
 
-    A word with more than one open request is ambiguous; --opener-work-id
+    A word with more than one open request -- possible only in a queue
+    written before queue add attached to an opener's existing request -- is
+    ambiguous; --opener-work-id
     picks one.  --opener-work-id may also name a completed request directly,
     which is reported as such rather than as "not found".  A word whose
     requests are all complete is reported distinctly from a word with none.

@@ -12,6 +12,8 @@ import time
 from types import SimpleNamespace
 import collections
 import unittest
+
+from tests.queue_invariants import add_second_request
 from unittest.mock import Mock, patch
 
 from cache_sqlite import ScoreCache, branch_reference
@@ -1859,11 +1861,11 @@ class OpenersCommandEndToEndTest(unittest.TestCase):
         self.assertIn("view --openers", text)
 
     def test_a_word_queued_twice_is_one_row_counting_its_branches_once(self):
-        # Opener work is keyed by (word, priority), so queueing RAISE again at
-        # a new priority makes a second request that shares a branch with the
-        # first.  The report merges them without counting that branch twice.
+        # A queue can hold a second request for RAISE that shares a branch
+        # with the first.  The report merges them without counting that branch
+        # twice.
         queue = ERDQueue(self.queue_path)
-        queue.add_pending_many([
+        add_second_request(queue, [
             (encode_subset(["crane", "slate", "w0000"]), 3, 8, "raise", 0),
             (encode_subset(["crane", "slate", "fresh"]), 3, 8, "raise", 1),
         ])

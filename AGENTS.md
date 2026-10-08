@@ -217,6 +217,16 @@ leaves room beneath each batch for the next to append into. Only work still
 the queue; a request the range cannot hold is refused rather than quietly
 seated lower.
 
+**Adding an opener that is already queued changes nothing.** It keeps its
+request and its rung, takes no rung on the new ladder, and is reported as
+already queued; `queue opener-priority` is how it moves. `add_pending_many`
+enforces this where requests are created: it looks up the opener's unfinished
+request and attaches to it inside the same write transaction, so neither a
+repeated command nor two at once can create a second. A queue written before
+this held can still carry two unfinished requests for one opener, which is why
+the readers of requests (`queue opener-priority`, the openers report) still
+handle that shape.
+
 `SOURCE_PRIORITY_MIN`/`SOURCE_PRIORITY_MAX` bound requested priorities at
 0–999,999 — one rung per opener with room to spare, since the full candidate
 list at step 5 occupies 75,000 values. Priorities at or above
@@ -680,9 +690,10 @@ lengths. |
 | **opener** | A candidate word selected as the first guess of the game. Every
 word the swarm sweeps is queued as an opener. |
 | **opener work** | A queued request to solve one opener's whole tree at a
-priority, and the ownership every branch in that tree inherits. Keyed by
-(opener, priority), so one opener may own several. It answers "who asked for
-this branch?", never "where is it?" — position is the spine's job. |
+priority, and the ownership every branch in that tree inherits. An opener has
+at most one unfinished request: adding it again joins that request, and only a
+finished opener queued again gets a new one. It answers "who asked for this
+branch?", never "where is it?" — position is the spine's job. |
 | **ERD reduction** | Combining the exact results of a node's response groups
 into that node's own ERD: one level of the recurrence evaluated over cached
 results rather than by searching. As a verb, to *reduce* an ERD. Never "fold",

@@ -13,6 +13,8 @@ import tempfile
 import types
 import unittest
 
+from tests.queue_invariants import add_second_request
+
 import erd_search
 from cache_sqlite import ScoreCache
 from erd_queue import (
@@ -181,6 +183,7 @@ class TestQueueOpenerPriority(unittest.TestCase):
         done_id = queue.opener_work_rows()[0]['opener_work_id']
         queue.claim_next('worker-0', done_id)
         queue.mark_done(key_done)
+        queue.mark_openers_complete(['salet'])
 
         key_open = ScoreCache.encode_subset(WORDS_A)
         queue.add_pending_many([(key_open, len(WORDS_A), 0, 'salet', 0)])
@@ -204,7 +207,7 @@ class TestQueueOpenerPriority(unittest.TestCase):
         key_b = ScoreCache.encode_subset(WORDS_B)
         # Distinct priorities -> distinct opener_work rows for the same word.
         queue.add_pending_many([(key_a, len(WORDS_A), 0, 'salet', 0)])
-        queue.add_pending_many([(key_b, len(WORDS_B), 1, 'salet', 0)])
+        add_second_request(queue, [(key_b, len(WORDS_B), 1, 'salet', 0)])
         rows = queue.opener_work_rows()
         self.assertEqual(len(rows), 2)
         ids = sorted(row['opener_work_id'] for row in rows)
@@ -234,7 +237,7 @@ class TestQueueOpenerPriority(unittest.TestCase):
         key_a = ScoreCache.encode_subset(WORDS_A)
         key_b = ScoreCache.encode_subset(WORDS_B)
         queue.add_pending_many([(key_a, len(WORDS_A), 0, 'salet', 0)])
-        queue.add_pending_many([(key_b, len(WORDS_B), 1, 'salet', 0)])
+        add_second_request(queue, [(key_b, len(WORDS_B), 1, 'salet', 0)])
         rows = {row['requested_priority']: row['opener_work_id']
                 for row in queue.opener_work_rows()}
         target_id = rows[0]

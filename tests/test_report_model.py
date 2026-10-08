@@ -6,6 +6,8 @@ import sqlite3
 import tempfile
 import time
 import unittest
+
+from tests.queue_invariants import add_second_request
 from dataclasses import replace
 from unittest.mock import Mock, patch
 
@@ -3773,16 +3775,16 @@ class OpenerReportTest(unittest.TestCase):
                 filters=ReportFilters(group_by="cache_state")))
 
     def test_one_word_queued_twice_merges_into_one_row(self):
-        # Opener work is keyed by (word, priority), so the same word queued at
-        # a second priority is a second request.  The report is per word: the
-        # two fold into one row, the branch they both own is counted once, and
-        # the priority reported is the one that actually schedules.
+        # A queue can hold two unfinished requests for one word.  The report
+        # is per word: the two fold into one row, the branch they both own is
+        # counted once, and the priority reported is the one that actually
+        # schedules.
         shared_key = ScoreCache.encode_subset(ANSWERS[:2])
         solo_key = ScoreCache.encode_subset(ANSWERS[2:4])
         queue = self._open_queue()
         queue.add_pending_many([(shared_key, 2, 1, "salet", 0)])
-        queue.add_pending_many([(shared_key, 2, 7, "salet", 0),
-                                (solo_key, 2, 7, "salet", 1)])
+        add_second_request(queue, [(shared_key, 2, 7, "salet", 0),
+                                   (solo_key, 2, 7, "salet", 1)])
         queue.close()
 
         report = collect_report(
