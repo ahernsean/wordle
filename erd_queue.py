@@ -592,6 +592,10 @@ CREATE TABLE IF NOT EXISTS telemetry.bundle_stats (
     nodes        INTEGER NOT NULL,
     wall_millis  INTEGER NOT NULL,
     censored     INTEGER NOT NULL DEFAULT 0,
+    -- The coordination time of the bundle's evaluated members, each member's
+    -- span from the previous claim this worker completed, less its own
+    -- evaluation.  Summed into branch_finalize_log.coordination_millis.
+    coordination_millis INTEGER,
     PRIMARY KEY (branch_key, bundle_id)
 );
 
@@ -779,6 +783,10 @@ CREATE TABLE IF NOT EXISTS telemetry.branch_finalize_log (
     hint_was_winner         INTEGER,
     first_best_at           INTEGER,
     nodes_at_first_best     INTEGER,
+    -- Coordination time of every bundle evaluated on the branch, from
+    -- bundle_stats: beside total_bundle_wall_millis it is the branch's
+    -- coordination per unit of work.  NULL when no bundle reported one.
+    coordination_millis     INTEGER,
     recorded_at             INTEGER NOT NULL
 );
 
@@ -922,6 +930,94 @@ CREATE TABLE IF NOT EXISTS telemetry.dependency_wait (
     epoch                INTEGER NOT NULL DEFAULT 0,
     recorded_at          INTEGER NOT NULL
 );
+
+-- One row per worker per accounting interval (WORKER_TIME_INTERVAL_SECONDS in
+-- erd_swarm.py): the worker's whole wall time over the interval, partitioned
+-- by what it was doing.  The *_millis activity columns sum to interval_millis
+-- exactly, so a share read from them is a share of real time, and a sleep is
+-- charged to the reason the code that slept gave for it.
+--
+-- Activities nest -- an evaluation waits on a dependency, which helps on
+-- another branch, which claims and evaluates -- and each span is charged to
+-- the innermost activity only, so nothing is counted twice.  other_millis is
+-- whatever no named activity covered: heartbeats, checkpoints and the
+-- bookkeeping between them.
+--
+-- claim_lock_wait_millis, claim_transaction_millis, claim_commit_millis and
+-- claim_retries are what the queue connection reported over the interval.
+-- They are detail of the time already partitioned above, wherever it fell,
+-- and are not further terms of the sum.
+--
+-- max_tick_gap_millis is the longest interval between liveness ticks that
+-- passed the heartbeat throttle, and max_tick_gap_activity is what the worker
+-- was doing when that gap opened.  It is at least HB_SECONDS whenever the
+-- worker is ticking, so a value approaching HB_TIMEOUT_SECONDS names a place
+-- the worker goes silent.  max_heartbeat_gap_millis is the longest interval
+-- between heartbeat rows actually written, which is what stale-claim reclaim
+-- reads, and heartbeats_deferred counts the writes skipped for a checkpoint
+-- pause.  A gap is reported in the interval in which it closed.
+CREATE TABLE IF NOT EXISTS telemetry.worker_time (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    worker_id                   TEXT    NOT NULL,
+    started_at                  REAL    NOT NULL,
+    interval_millis             INTEGER NOT NULL,
+    evaluation_millis           INTEGER NOT NULL,
+    scheduling_millis           INTEGER NOT NULL,
+    claiming_millis             INTEGER NOT NULL,
+    finalizing_millis           INTEGER NOT NULL,
+    wait_no_work_millis         INTEGER NOT NULL,
+    wait_checkpoint_pause_millis INTEGER NOT NULL,
+    wait_rival_finalize_millis  INTEGER NOT NULL,
+    wait_help_capped_millis     INTEGER NOT NULL,
+    wait_dependency_millis      INTEGER NOT NULL,
+    wait_branch_claimed_millis  INTEGER NOT NULL,
+    other_millis                INTEGER NOT NULL,
+    claim_lock_wait_millis      INTEGER NOT NULL,
+    claim_transaction_millis    INTEGER NOT NULL,
+    claim_commit_millis         INTEGER NOT NULL,
+    claim_retries               INTEGER NOT NULL,
+    candidates_evaluated        INTEGER NOT NULL,
+    nodes                       INTEGER NOT NULL,
+    fruitless_scans             INTEGER NOT NULL,
+    max_tick_gap_millis         INTEGER,
+    max_tick_gap_activity       TEXT,
+    max_heartbeat_gap_millis    INTEGER,
+    heartbeats_deferred         INTEGER NOT NULL,
+    epoch                       INTEGER NOT NULL DEFAULT 0,
+    recorded_at                 INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS telemetry.idx_worker_time_epoch_recorded
+    ON worker_time(epoch, recorded_at);
+
+-- One row per supervisor quiesce for a WAL TRUNCATE: how long workers were
+-- asked to stay off the queue, and whether the truncate won.  Workers defer
+-- heartbeat writes while the pause holds, so a pause longer than the
+-- stale-claim timeout makes every worker honouring it reclaimable.
+CREATE TABLE IF NOT EXISTS telemetry.checkpoint_pause (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at           REAL    NOT NULL,
+    pause_millis         INTEGER NOT NULL,
+    wal_bytes            INTEGER NOT NULL,
+    truncated            INTEGER NOT NULL,
+    epoch                INTEGER NOT NULL DEFAULT 0,
+    recorded_at          INTEGER NOT NULL
+);
+
+-- One row per worker whose unfinished claims a reclaim freed.  cause is
+-- 'stale' when the worker had not heartbeat within the timeout, 'worker' when
+-- the supervisor freed a named worker's claims on respawn, and 'restart' when
+-- a swarm start freed every claim left by the previous run.
+-- heartbeat_age_seconds is how long before the reclaim that worker last wrote
+-- a heartbeat, NULL when it had none.
+CREATE TABLE IF NOT EXISTS telemetry.claim_reclaim (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    worker_id             TEXT,
+    cause                 TEXT    NOT NULL,
+    claims_freed          INTEGER NOT NULL,
+    heartbeat_age_seconds INTEGER,
+    epoch                 INTEGER NOT NULL DEFAULT 0,
+    recorded_at           INTEGER NOT NULL
+);
 """
 
 # Every table _TELEMETRY_SCHEMA_SQL creates, used to detect a queue file that
@@ -929,7 +1025,8 @@ CREATE TABLE IF NOT EXISTS telemetry.dependency_wait (
 _TELEMETRY_TABLES = (
     "bundle_stats", "cost_samples", "claim_telemetry",
     "branch_finalize_log", "candidate_accuracy", "backstop_telemetry",
-    "cut_reuse_misses", "dependency_wait",
+    "cut_reuse_misses", "dependency_wait", "worker_time",
+    "checkpoint_pause", "claim_reclaim",
 )
 
 
@@ -1008,6 +1105,13 @@ class ERDQueue:
         self._last_claim_retries = 0
         self._last_claim_transaction_millis = 0
         self._last_claim_commit_millis = 0
+        # The same four figures as running totals over this connection's
+        # life, never reset, so a reader can take the difference across any
+        # interval without consuming what claim telemetry reads.
+        self._claim_lock_wait_millis_total = 0
+        self._claim_retries_total = 0
+        self._claim_transaction_millis_total = 0
+        self._claim_commit_millis_total = 0
         # Why the last claim_next_bundle declined, or None when it handed out a
         # bundle.  Decided inside the claim transaction, which is the only
         # place that can decide it: occupancy is counted against claims the
@@ -1457,6 +1561,16 @@ class ERDQueue:
             "max_best_first_position_before_winner": "INTEGER",
             "republished_candidates": "INTEGER",
             "max_candidate_republish_count": "INTEGER",
+        }, schema="telemetry")
+
+        # Per-branch coordination, carried from bundle_stats to the finalize
+        # log.  A row written before these columns holds NULL: its branch's
+        # coordination was recorded only per claim.
+        self._add_columns("bundle_stats", {
+            "coordination_millis": "INTEGER",
+        }, schema="telemetry")
+        self._add_columns("branch_finalize_log", {
+            "coordination_millis": "INTEGER",
         }, schema="telemetry")
 
         report_indexes = (
@@ -3006,8 +3120,9 @@ class ERDQueue:
         """
         _acquire_t0 = time.perf_counter()
         self._conn.execute("BEGIN IMMEDIATE")
-        self._last_claim_busy_millis += int(
-            (time.perf_counter() - _acquire_t0) * 1e3)
+        lock_wait_millis = int((time.perf_counter() - _acquire_t0) * 1e3)
+        self._last_claim_busy_millis += lock_wait_millis
+        self._claim_lock_wait_millis_total += lock_wait_millis
 
     def _commit_claim_transaction(self, txn_t0):
         """COMMIT a claim_next_bundle transaction, timing scan/write vs COMMIT.
@@ -3025,6 +3140,9 @@ class ERDQueue:
         self._conn.execute("COMMIT")
         self._last_claim_commit_millis = int(
             (time.perf_counter() - _commit_t0) * 1e3)
+        self._claim_transaction_millis_total += (
+            self._last_claim_transaction_millis)
+        self._claim_commit_millis_total += self._last_claim_commit_millis
 
     def _count_one_level_erd_prunes(self, branch_id, n):
         """Fold n one-level ERD prunes into a branch's completion counters.
@@ -3070,7 +3188,8 @@ class ERDQueue:
         self._tally_wal_traffic(label, n, n * _CLAIM_ROW_WAL_BYTES)
         return n
 
-    def _free_claims_as_holes(self, where, parameters, hole_label, claim_label):
+    def _free_claims_as_holes(self, where, parameters, hole_label, claim_label,
+                              cause):
         """Atomically record the claims matching `where` as holes and free them.
 
         The reclaim paths run in autocommit, so the pair needs its own
@@ -3078,9 +3197,23 @@ class ERDQueue:
         a hole that commits ahead of its DELETE.  Every caller runs at top
         level, never inside an open transaction.  Returns the number of claims
         freed.
+
+        Each worker whose claims were freed gets a claim_reclaim row giving
+        `cause` and the age of the worker's last heartbeat, both read inside
+        the transaction that frees the claims, so the age describes the state
+        the reclaim acted on.
         """
         self._conn.execute("BEGIN IMMEDIATE")
         try:
+            freed_by_worker = self._conn.execute(
+                f"SELECT claimed_by, COUNT(*) FROM candidate_claims "
+                f"WHERE {where} GROUP BY claimed_by", parameters).fetchall()
+            heartbeat_at = {}
+            for worker_id, _claims in freed_by_worker:
+                row = self._conn.execute(
+                    "SELECT updated_at FROM worker_heartbeat "
+                    "WHERE worker_id = ?", (worker_id,)).fetchone()
+                heartbeat_at[worker_id] = None if row is None else row[0]
             self._record_holes(where, parameters, hole_label)
             self._conn.execute(
                 f"DELETE FROM candidate_claims WHERE {where}", parameters)
@@ -3090,6 +3223,17 @@ class ERDQueue:
             self._conn.execute("ROLLBACK")
             raise
         self._tally_wal_traffic(claim_label, n, n * _CLAIM_ROW_WAL_BYTES)
+        if freed_by_worker:
+            now = int(time.time())
+            self._conn.executemany("""
+                INSERT INTO telemetry.claim_reclaim
+                    (worker_id, cause, claims_freed, heartbeat_age_seconds,
+                     epoch, recorded_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, [(worker_id, cause, claims,
+                   None if heartbeat_at[worker_id] is None
+                   else now - heartbeat_at[worker_id],
+                   self.epoch, now) for worker_id, claims in freed_by_worker])
         return n
 
     def _pack_recorded_holes(self, branch_id, bound, cost_lower_bound,
@@ -3264,9 +3408,11 @@ class ERDQueue:
                     retries += 1
         finally:
             self._conn.execute(f"PRAGMA busy_timeout = {int(self._timeout * 1000)}")
-        self._last_claim_busy_millis += int(
-            (time.perf_counter() - _acquire_t0) * 1e3)
+        lock_wait_millis = int((time.perf_counter() - _acquire_t0) * 1e3)
+        self._last_claim_busy_millis += lock_wait_millis
         self._last_claim_retries += retries
+        self._claim_lock_wait_millis_total += lock_wait_millis
+        self._claim_retries_total += retries
         _txn_t0 = time.perf_counter()
         try:
             # Never hand out a claim for a branch that has been finalized and
@@ -3548,14 +3694,15 @@ class ERDQueue:
             raise
 
     def record_bundle_stats(self, branch_key, bundle_id, nodes, wall_millis,
-                            censored=False):
+                            censored=False, coordination_millis=None):
         """Record one bundle's actual node cost and evaluation wall span.
 
         wall_millis is the bundle's own evaluation wall time (straggler/
         reclaim-window diagnostic) — NOT claim-handout coordination overhead;
         that is claim_telemetry's busy_wait_millis, measured separately in
-        claim_next_bundle.  Aggregated into branch_finalize_log at finalize
-        (see finalize_bundle_stats) and dropped along with the rest of the
+        claim_next_bundle.  coordination_millis is the coordination time of
+        the bundle's evaluated members.  Aggregated into branch_finalize_log
+        at finalize (see finalize_bundle_stats) and dropped along with the rest of the
         branch's transient state by delete_branch.  censored=1 marks a bundle
         that hit its node/wall cap and republished an unfinished remainder —
         nodes is then a lower bound on what the bundle's original member set
@@ -3580,17 +3727,19 @@ class ERDQueue:
         branch_id = self._intern_branch(branch_key)
         self._conn.execute("""
             INSERT OR REPLACE INTO telemetry.bundle_stats
-                (branch_key, bundle_id, nodes, wall_millis, censored)
-            SELECT ?, ?, ?, ?, ?
+                (branch_key, bundle_id, nodes, wall_millis, censored,
+                 coordination_millis)
+            SELECT ?, ?, ?, ?, ?, ?
             WHERE EXISTS (SELECT 1 FROM active_branches WHERE branch_id = ?)
         """, (branch_key, bundle_id, nodes, wall_millis,
-              1 if censored else 0, branch_id))
+              1 if censored else 0, coordination_millis, branch_id))
 
     def finalize_bundle_stats(self, branch_key):
         """Aggregate and clear a branch's bundle_stats rows at finalize.
 
         Returns (n_bundles, max_bundle_nodes, total_bundle_wall_millis,
-        censored_units) for branch_finalize_log — all None if no bundle
+        censored_units, coordination_millis) for branch_finalize_log — all
+        None if no bundle
         recorded any stats (e.g. a branch solved entirely from reused cache
         entries).  Deletes the rows so bundle_stats stays bounded to
         currently-open branches, matching delete_branch's candidate_claims
@@ -3599,16 +3748,18 @@ class ERDQueue:
         row = self._conn.execute("""
             SELECT COUNT(*) AS n_bundles, MAX(nodes) AS max_bundle_nodes,
                    SUM(wall_millis) AS total_bundle_wall_millis,
-                   SUM(censored) AS censored_units
+                   SUM(censored) AS censored_units,
+                   SUM(coordination_millis) AS coordination_millis
             FROM telemetry.bundle_stats WHERE branch_key = ?
         """, (branch_key,)).fetchone()
         self._conn.execute(
             "DELETE FROM telemetry.bundle_stats WHERE branch_key = ?",
             (branch_key,))
         if row["n_bundles"] == 0:
-            return (None, None, None, None)
+            return (None, None, None, None, None)
         return (row["n_bundles"], row["max_bundle_nodes"],
-                row["total_bundle_wall_millis"], row["censored_units"])
+                row["total_bundle_wall_millis"], row["censored_units"],
+                row["coordination_millis"])
 
     def claim_is_current(self, branch_key, idx, claimed_by=None,
                          bundle_id=None, budget=None):
@@ -4248,7 +4399,8 @@ class ERDQueue:
         """
         return self._free_claims_as_holes(
             stale_where, (age_floor, hb_cutoff),
-            'candidate_holes/reclaim-stale', 'candidate_claims/reclaim-stale')
+            'candidate_holes/reclaim-stale', 'candidate_claims/reclaim-stale',
+            cause='stale')
 
     def reclaim_claims_of_worker(self, worker_id: str) -> int:
         """Free all in-flight (done=0) candidate claims held by a specific worker.
@@ -4261,7 +4413,7 @@ class ERDQueue:
         return self._free_claims_as_holes(
             "done = 0 AND claimed_by = ?", (worker_id,),
             'candidate_holes/reclaim-worker',
-            'candidate_claims/reclaim-worker')
+            'candidate_claims/reclaim-worker', cause='worker')
 
     def branches_in_progress(self, opener_work_id=None):
         """Open branches ordered by effective priority then answer count."""
@@ -4379,7 +4531,7 @@ class ERDQueue:
         # (see read_cut_result); it never blocks a solve, only saves one.
         freed = self._free_claims_as_holes(
             "done = 0", (), 'candidate_holes/recover-restart',
-            'candidate_claims/recover-restart')
+            'candidate_claims/recover-restart', cause='restart')
         return n_branches_resumed, freed
 
     def worker_counts_by_branch(
@@ -6797,6 +6949,19 @@ class ERDQueue:
         """, (policy, n_words, nodes, wall_millis, budget, censored, source,
               self.epoch, now))
 
+    def claim_timing_totals(self):
+        """(lock wait millis, transaction millis, commit millis, retries) this
+        connection's claim paths have spent over its whole life.
+
+        Running totals, unaffected by add_claim_telemetry and
+        discard_claim_attribution, so an interval's share is the difference
+        between two readings.
+        """
+        return (self._claim_lock_wait_millis_total,
+                self._claim_transaction_millis_total,
+                self._claim_commit_millis_total,
+                self._claim_retries_total)
+
     def discard_claim_attribution(self):
         """Drop the claim attribution accumulated since the last telemetry row.
 
@@ -7027,7 +7192,8 @@ class ERDQueue:
                                 infeasible_nodes=None,
                                 schedule_diagnostics=None,
                                 hint_word=None, hint_was_winner=None,
-                                first_best_at=None, nodes_at_first_best=None):
+                                first_best_at=None, nodes_at_first_best=None,
+                                coordination_millis=None):
         """Persist a branch's timing/cost the moment before delete_branch drops it.
 
         The bundle-diagnostic columns (n_bundles, max_bundle_nodes,
@@ -7080,10 +7246,10 @@ class ERDQueue:
                  max_best_first_position_before_winner,
                  republished_candidates, max_candidate_republish_count,
                  hint_word, hint_was_winner, first_best_at,
-                 nodes_at_first_best,
+                 nodes_at_first_best, coordination_millis,
                  recorded_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (branch_key, spine, n_words, budget, self.epoch, created_at,
               finalized_at, nodes_spent, n_claims, n_bundles, max_bundle_nodes,
               total_bundle_wall_millis, censored_units, ceiling, outcome,
@@ -7100,7 +7266,7 @@ class ERDQueue:
               schedule_diagnostics.get("max_candidate_republish_count"),
               hint_word,
               None if hint_was_winner is None else int(hint_was_winner),
-              first_best_at, nodes_at_first_best,
+              first_best_at, nodes_at_first_best, coordination_millis,
               now))
 
     def add_dependency_wait(self, worker_id, spine, n_words, budget,
@@ -7134,6 +7300,50 @@ class ERDQueue:
               blocks_worker_cap, blocks_no_candidates,
               blocks_awaiting_finalize, blocks_help_capped, blocks_other,
               help_depth, outcome, self.epoch, now))
+
+    WORKER_TIME_COLUMNS = (
+        "evaluation_millis", "scheduling_millis", "claiming_millis",
+        "finalizing_millis", "wait_no_work_millis",
+        "wait_checkpoint_pause_millis", "wait_rival_finalize_millis",
+        "wait_help_capped_millis", "wait_dependency_millis",
+        "wait_branch_claimed_millis", "other_millis",
+        "claim_lock_wait_millis", "claim_transaction_millis",
+        "claim_commit_millis", "claim_retries", "candidates_evaluated",
+        "nodes", "fruitless_scans", "max_tick_gap_millis",
+        "max_tick_gap_activity", "max_heartbeat_gap_millis",
+        "heartbeats_deferred",
+    )
+
+    def add_worker_time(self, worker_id, started_at, interval_millis,
+                        figures):
+        """Record one worker's accounting interval.
+
+        figures maps every name in WORKER_TIME_COLUMNS to its value; see the
+        worker_time table for what each one means.  A missing name is an
+        error rather than a NULL, because the activity columns are a
+        partition and one silently absent would leave interval_millis holding
+        time no column accounts for.
+        """
+        columns = ", ".join(self.WORKER_TIME_COLUMNS)
+        placeholders = ", ".join("?" * (len(self.WORKER_TIME_COLUMNS) + 5))
+        self._conn.execute(
+            f"INSERT INTO telemetry.worker_time "
+            f"(worker_id, started_at, interval_millis, {columns}, epoch, "
+            f"recorded_at) VALUES ({placeholders})",
+            (worker_id, started_at, interval_millis,
+             *(figures[column] for column in self.WORKER_TIME_COLUMNS),
+             self.epoch, int(time.time())))
+
+    def add_checkpoint_pause(self, started_at, pause_millis, wal_bytes,
+                             truncated):
+        """Record one supervisor quiesce for a WAL TRUNCATE."""
+        self._conn.execute("""
+            INSERT INTO telemetry.checkpoint_pause
+                (started_at, pause_millis, wal_bytes, truncated, epoch,
+                 recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (started_at, pause_millis, wal_bytes, int(truncated),
+              self.epoch, int(time.time())))
 
     def add_cut_reuse_miss(self, branch_key, n_words, budget, wanted_ceiling,
                            available_bound, available_budget):

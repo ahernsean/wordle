@@ -103,6 +103,10 @@ def _bare_worker():
     w.started = 0
     w._work_context = WorkContext.empty()
     w._help_recursion_depth = 0
+    w._time_account = erd_swarm._WorkerTimeAccount()
+    w._time_account_nodes = 0
+    w._time_account_claim_timing = (0, 0, 0, 0)
+    w._bundle_coordination_millis = {}
     w._pending_scheduling_millis = 0
     w._pending_scan_openers_walked = 0
     w._pending_fruitless_scan_millis = 0
@@ -439,7 +443,8 @@ class TestCancelPath(unittest.TestCase):
                                    [0, 1], frozenset())
         self.assertFalse(result)
         w.queue.record_bundle_stats.assert_called_once_with(
-            branch_key, "bundle-1", 0, mock.ANY, censored=True)
+            branch_key, "bundle-1", 0, mock.ANY, censored=True,
+            coordination_millis=None)
 
     def test_evaluate_bundle_returns_false_when_evaluate_claim_fails_mid_bundle(self):
         # Not cancelled at the loop level, but evaluate_claim itself reports
@@ -452,7 +457,8 @@ class TestCancelPath(unittest.TestCase):
         self.assertFalse(result)
         w.evaluate_claim.assert_called_once()
         w.queue.record_bundle_stats.assert_called_once_with(
-            branch_key, "bundle-2", 0, mock.ANY, censored=True)
+            branch_key, "bundle-2", 0, mock.ANY, censored=True,
+            coordination_millis=None)
 
     def test_forced_candidate_cost_does_not_leak_into_sibling_cap_check(self):
         # A (forced) does 5000 nodes of work; B (not forced) does 1. The
@@ -525,7 +531,8 @@ class TestCancelPath(unittest.TestCase):
         self.assertEqual(seen, [0])   # cancelled before forced candidate 1 runs
         w.queue.republish_remainder.assert_not_called()
         w.queue.record_bundle_stats.assert_called_once_with(
-            branch_key, "bundle-5", 5000, mock.ANY, censored=True)
+            branch_key, "bundle-5", 5000, mock.ANY, censored=True,
+            coordination_millis=None)
 
 
 class TestEvaluateClaimPatternMatrix(unittest.TestCase):
@@ -1357,7 +1364,7 @@ class TestSolveBranchFocusedClaimTelemetryAttribution(unittest.TestCase):
         try:
             self.assertIsNone(w.claim_one())        # nothing queued yet
             self._seed_claim_attribution(w.queue)
-            w._idle_wait(0.01)                      # what run() does next
+            w._idle_wait(0.01, "no_work")           # what run() does next
             w.queue.create_branch(branch_key, len(BRANCH), len(CANDIDATES),
                                   budget=ROOT_BUDGET, spine="CRANE -----")
             work = w.claim_one()
@@ -1728,7 +1735,7 @@ class TestSolveBranchFocusedClaimTelemetryAttribution(unittest.TestCase):
             w.queue.direct_branches_in_progress = slow_scan
             self.assertIsNone(w.claim_one())        # nothing queued yet
             w.queue.direct_branches_in_progress = real_scan
-            w._idle_wait(0.01)                      # what run() does next
+            w._idle_wait(0.01, "no_work")           # what run() does next
             w.queue.create_branch(branch_key, len(BRANCH), len(CANDIDATES),
                                   budget=ROOT_BUDGET, spine="CRANE -----")
             work = w.claim_one()
@@ -3949,7 +3956,7 @@ class TestCoordinationWindowExcludesNonHandoffTime(unittest.TestCase):
         opened_at = time.time() - 400.0
         worker._last_claim_complete = opened_at
         with mock.patch('erd_swarm.time.sleep'):
-            worker._idle_wait(0.05)
+            worker._idle_wait(0.05, "dependency")
         self.assertGreater(worker._last_claim_complete, opened_at + 300.0)
 
     def test_a_promoted_solve_gives_its_claims_their_own_window(self):
@@ -4172,7 +4179,8 @@ class TestFinalizeTelemetryFailureIsolation(unittest.TestCase):
             "nodes_at_first_best": 40,
             "spine": "SALET -g-g-",
         }
-        w.queue.finalize_bundle_stats.return_value = (None, None, None, None)
+        w.queue.finalize_bundle_stats.return_value = (
+            None, None, None, None, None)
         return w
 
     def test_telemetry_insert_failure_still_runs_cleanup(self):
@@ -4548,7 +4556,8 @@ class TestMaybeFinalizeTriage(unittest.TestCase):
             "spine": "SALET -g-g-",
         }
         w.queue.get_pending_branch.return_value = None
-        w.queue.finalize_bundle_stats.return_value = (None, None, None, None)
+        w.queue.finalize_bundle_stats.return_value = (
+            None, None, None, None, None)
         return w
 
     def test_cut_publishes_bound_and_never_caches(self):
