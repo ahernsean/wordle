@@ -2780,8 +2780,13 @@ class _BranchWorker:
                     # "didn't look", not "looked and found nothing", so it is
                     # not license to pair.  Poll instead, exactly as
                     # _help_other_branch's capped-depth contract already
-                    # promises its callers.
+                    # promises its callers.  A worker can stay parked here
+                    # for hours while it still holds claims up its help stack,
+                    # so it must keep proving it is alive or those claims are
+                    # reclaimed as stale and redone by someone else.
                     self._cur_candidate = None
+                    self._liveness_tick(branch_key, n_words, None, None,
+                                        None, None)
                     blocked_at = time.perf_counter()
                     self._idle_wait(0.05, "help_capped")
                     wait.note_blocked(

@@ -5367,6 +5367,30 @@ class TestDependencyWaitAttribution(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self._assert_blocks(rows[0], blocks_help_capped=1)
 
+    def test_a_worker_parked_at_the_recursion_cap_keeps_its_claims(self):
+        """Parked at the cap, a worker still holds claims up its help stack.
+        It must keep heartbeating, or a reclaim frees those claims as if it
+        had died and another worker redoes the work."""
+        w = self._worker()
+        parent = ScoreCache.encode_subset(BRANCH)
+        w.queue.create_branch(parent, len(BRANCH), w.n_candidates,
+                              budget=ROOT_BUDGET)
+        self.assertIsNotNone(w.queue.claim_next_bundle(
+            parent, w.name, w.n_candidates, list(range(w.n_candidates)),
+            [0.0] * w.n_candidates, small_count=1, count_cap=1))
+        w.queue._conn.execute(
+            "UPDATE candidate_claims SET claimed_at = claimed_at - 3600")
+        words = BRANCH[:3]
+        key = ScoreCache.encode_subset(words)
+        w.queue.create_branch(key, len(words), w.n_candidates,
+                              budget=ROOT_BUDGET)
+        self.assertIsNotNone(self._rival_claims(w, key, count_cap=1))
+        with mock.patch.object(erd_swarm, "MAX_HELP_RECURSION_DEPTH", 0), \
+                mock.patch.object(w, "_idle_wait",
+                                  side_effect=lambda *_a: w.request_stop()):
+            w.cooperative_solve(words, ROOT_BUDGET)
+        self.assertEqual(w.queue.reclaim_stale_claims(30), 0)
+
     def test_losing_the_finalize_race_is_attributed_as_blocked(self):
         """The commonest wait: every candidate done, a rival finalizing."""
         w = self._worker()
