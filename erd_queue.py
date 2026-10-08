@@ -5356,7 +5356,11 @@ class ERDQueue:
         pattern_start = len(spine_prefix) + 2
         low, high = self._spine_subtree_bounds(spine_prefix)
         descendants = spine_prefix + " %"
-        epoch_condition = "AND epoch = ?" if epoch is not None else ""
+        # +epoch keeps the planner off the (epoch, recorded_at) index, which
+        # it would otherwise prefer for the equality and use to scan the
+        # whole epoch; the spine range is the narrow side, and the epoch is
+        # checked on the subtree's rows.
+        epoch_condition = "AND +epoch = ?" if epoch is not None else ""
         group_rows = self._conn.execute(f"""
             SELECT SUBSTR(spine, ?, 5) AS pattern,
                    COUNT(*) AS branch_count,

@@ -111,6 +111,20 @@ class TestSpineSubtreeRollup(_Log):
         self.assertEveryLookupUsesTheSpineIndex(
             lambda: self.q.report_root_progress("CRANE", None, 600))
 
+    def test_root_progress_for_one_epoch_still_uses_the_spine_index(self):
+        # An epoch equality would otherwise win the planner over the range,
+        # and a whole epoch of the sweep is millions of rows.
+        self._finalized("CRANE -----", 100)
+        self.assertEveryLookupUsesTheSpineIndex(
+            lambda: self.q.report_root_progress("CRANE", self.q.epoch, 600))
+
+    def test_an_epoch_still_narrows_root_progress(self):
+        self._finalized("CRANE -----", 100)
+        own = self.q.report_root_progress("CRANE", self.q.epoch, 600)
+        other = self.q.report_root_progress("CRANE", self.q.epoch + 1, 600)
+        self.assertEqual(own["groups"]["-----"]["search_node_count"], 100)
+        self.assertEqual(other["groups"], {})
+
 
 class TestCompletedOpenerSummaryColumns(unittest.TestCase):
 
