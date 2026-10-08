@@ -15,7 +15,6 @@ version violation — check the target version by hand, or on the box itself.
 
 from __future__ import annotations
 
-import bisect
 import collections
 import json
 import logging
@@ -1482,6 +1481,8 @@ class ERDQueue:
             ("branch_finalize_log", {"finalized_at", "id"},
              "idx_branch_finalize_log_finalized_at",
              "finalized_at DESC, id DESC"),
+            ("branch_finalize_log", {"spine"},
+             "idx_branch_finalize_log_spine", "spine"),
             ("cut_reuse_misses", {"branch_key", "recorded_at"},
              "idx_cut_reuse_misses_branch_recorded_at",
              "branch_key, recorded_at"),
@@ -2606,22 +2607,37 @@ class ERDQueue:
         return self.openers_ready_to_complete()
 
     def completed_opener_timing(self, opener):
-        """Return durable-opener timing from every telemetry epoch.
+        """Return durable-opener timing and cost from every telemetry epoch.
 
         Opener ownership can attach a request to an already-existing branch.
         Its finalization record predates that request, so ownership joins are
-        not an opener timing boundary.  The opener in each recorded spine is.
+        not an opener timing boundary.  The opener in each recorded spine is,
+        and every spine begins with its opener in capitals, so the opener's
+        branches are an index range over idx_branch_finalize_log_spine.
+
+        evaluation_time_millis and coordination_time_millis are None unless
+        every one of the opener's branches recorded them: a partial sum would
+        read as a cheaper opener than it was.
         """
+        low, high = self._spine_subtree_bounds(opener.upper())
         return self._conn.execute("""
-            SELECT MIN(log.created_at) AS first_created_at,
-                   MAX(log.finalized_at) AS completed_at,
-                   SUM(COALESCE(log.total_bundle_wall_time_millis, 0)) AS worker_time_millis,
-                   GROUP_CONCAT(DISTINCT log.epoch) AS telemetry_epochs
-            FROM telemetry.branch_finalize_log AS log
-            WHERE lower(substr(log.spine, 1, 5)) = lower(?)
-              AND log.created_at IS NOT NULL
-              AND log.finalized_at IS NOT NULL
-        """, (opener,)).fetchone()
+            SELECT MIN(created_at) AS first_created_at,
+                   MAX(finalized_at) AS completed_at,
+                   SUM(COALESCE(total_bundle_wall_time_millis, 0))
+                       AS worker_time_millis,
+                   COALESCE(SUM(nodes_spent), 0) AS search_node_count,
+                   CASE WHEN COUNT(evaluation_time_millis) = COUNT(*)
+                        THEN SUM(evaluation_time_millis) END
+                       AS evaluation_time_millis,
+                   CASE WHEN COUNT(coordination_time_millis) = COUNT(*)
+                        THEN SUM(coordination_time_millis) END
+                       AS coordination_time_millis,
+                   GROUP_CONCAT(DISTINCT epoch) AS telemetry_epochs
+            FROM telemetry.branch_finalize_log
+            WHERE spine >= ? AND spine < ?
+              AND created_at IS NOT NULL
+              AND finalized_at IS NOT NULL
+        """, (low, high)).fetchone()
 
     def _demote_orphaned_owned_branches(self) -> list[int]:
         """Demote open branches whose only opener ownership has been lost.
@@ -5291,9 +5307,9 @@ class ERDQueue:
         prefix, so every descendant's cost is attributed to the group it sits
         under.  With an explicit epoch, the rollup is limited to that epoch;
         otherwise it includes historical telemetry from every epoch.  The
-        rollup is a scan over the selected rows
-        (branch_finalize_log carries no spine index), so callers should treat
-        it as a seconds-scale query.
+        prefix is in the case spines are stored in -- words capitalized,
+        patterns as written -- so the rollup is a range over
+        idx_branch_finalize_log_spine and costs the subtree, not the log.
 
         Branches are selected by spine prefix alone rather than by opener word.
         A opener word identifies the root a branch was requested under, which
@@ -5338,6 +5354,7 @@ class ERDQueue:
         since = now - recent_window_seconds
         # The response pattern follows one space past the prefix.
         pattern_start = len(spine_prefix) + 2
+        low, high = self._spine_subtree_bounds(spine_prefix)
         descendants = spine_prefix + " %"
         epoch_condition = "AND epoch = ?" if epoch is not None else ""
         group_rows = self._conn.execute(f"""
@@ -5349,9 +5366,10 @@ class ERDQueue:
                    MAX(finalized_at) AS last_finalized_at,
                    GROUP_CONCAT(DISTINCT epoch) AS telemetry_epochs
             FROM telemetry.branch_finalize_log
-            WHERE spine LIKE ? {epoch_condition}
+            WHERE spine >= ? AND spine < ? {epoch_condition}
             GROUP BY pattern
-        """, (pattern_start, descendants, *(() if epoch is None else (epoch,)))).fetchall()
+        """, (pattern_start, low, high,
+              *(() if epoch is None else (epoch,)))).fetchall()
         groups = {}
         telemetry_epochs = set()
         work_started_at = None
@@ -5469,61 +5487,41 @@ class ERDQueue:
                 spines[branch_key] = row["spine"]
         return spines
 
+    @staticmethod
+    def _spine_subtree_bounds(spine):
+        """[low, high) bounds holding every spine strictly beneath `spine`.
+
+        A descendant's spine is `spine` followed by a space and more tokens,
+        so the descendants are exactly the spines in this range once ordered,
+        and idx_branch_finalize_log_spine answers it as an index range.
+        """
+        return spine + " ", spine + " " + chr(0x10FFFF)
+
     def roll_up_spine_subtrees(self, spines) -> dict:
         """Finalized branches, nodes and worker-time under each spine.
 
         The cost of an inherited group is its whole subtree, not the one
         branch that names it: everything the first opener finalized beneath
-        that spine is work this opener did not repeat.
-
-        `branch_finalize_log` carries no spine index, so a `LIKE` scan is
-        linear in the log -- and a root has up to 243 response groups to
-        attribute.  One pass sorted into prefix ranges answers all of them
-        instead, since the descendants of a spine are contiguous once spines
-        are ordered.  Cost is therefore the single scan, not a multiple of it.
-
-        The summed figures come from running totals, so a range costs a
-        subtraction.  The timestamps do not subtract and are read by walking
-        the range, which stays bounded by the log only while the requested
-        spines name disjoint subtrees; one that is an ancestor of another
-        re-traverses the overlap.  That has not been observed, and an index on
-        `spine` would retire the whole arrangement -- see the open issue.
+        that spine is work this opener did not repeat.  Each spine is the
+        branch itself plus an index range over its descendants, so the cost
+        is in the subtrees asked about rather than in the whole log.
         """
-        requested = [spine for spine in dict.fromkeys(spines) if spine]
-        if not requested:
-            return {}
-        rows = self._conn.execute("""
-            SELECT spine, nodes_spent, total_bundle_wall_time_millis,
-                   created_at, finalized_at
-            FROM telemetry.branch_finalize_log
-            ORDER BY spine
-        """).fetchall()
-        ordered = [row["spine"] or "" for row in rows]
-        # Running totals so a summed range costs a subtraction rather than a
-        # walk.  The two timestamps are a min and a max, which do not
-        # subtract, so they are read by walking the range.
-        node_totals, wall_totals = [0], [0]
-        for row in rows:
-            node_totals.append(node_totals[-1] + (row["nodes_spent"] or 0))
-            wall_totals.append(
-                wall_totals[-1] + (row["total_bundle_wall_time_millis"] or 0))
         rollups = {}
-        for spine in requested:
-            start = bisect.bisect_left(ordered, spine)
-            # A spine's descendants all begin with it followed by a space, so
-            # they end below the same prefix carrying the highest code point.
-            stop = bisect.bisect_left(ordered, spine + " " + chr(0x10FFFF))
-            created = [rows[index]["created_at"] for index in range(start, stop)
-                       if rows[index]["created_at"] is not None]
-            finalized = [rows[index]["finalized_at"] for index in range(start, stop)
-                         if rows[index]["finalized_at"] is not None]
-            rollups[spine] = {
-                "branch_count": stop - start,
-                "search_node_count": node_totals[stop] - node_totals[start],
-                "wall_time_millis": wall_totals[stop] - wall_totals[start],
-                "first_created_at": min(created) if created else None,
-                "last_finalized_at": max(finalized) if finalized else None,
-            }
+        for spine in dict.fromkeys(spines):
+            if not spine:
+                continue
+            low, high = self._spine_subtree_bounds(spine)
+            row = self._conn.execute("""
+                SELECT COUNT(*) AS branch_count,
+                       COALESCE(SUM(nodes_spent), 0) AS search_node_count,
+                       COALESCE(SUM(total_bundle_wall_time_millis), 0)
+                           AS wall_time_millis,
+                       MIN(created_at) AS first_created_at,
+                       MAX(finalized_at) AS last_finalized_at
+                FROM telemetry.branch_finalize_log
+                WHERE spine = ? OR (spine >= ? AND spine < ?)
+            """, (spine, low, high)).fetchone()
+            rollups[spine] = dict(row)
         return rollups
 
     def opener_work_requests_for_word(self, word) -> list:

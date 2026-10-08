@@ -82,8 +82,9 @@ first-call JIT compile would land inside the measurement.
 
 ### dependency_wait says what a stuck worker was waiting for
 
-`worker_time.wait_dependency_time_millis` totals the time workers sleep on a
-dependency without saying which one or why — and waiting on dependencies is the
+`worker_time.wait_dependency_time_millis` totals the time workers spend in
+`cooperative_solve` waiting on a dependency, less what they evaluate, scan and
+claim while there, without saying which dependency or why — and waiting on dependencies is the
 swarm's largest single cost (61.5% of all worker time on epoch 21, against 3.4%
 for the scan and 2.3% for lock waits).
 
@@ -145,8 +146,12 @@ directly.
 **Each span is charged to the innermost open activity and nothing else.**
 `_WorkerTimeAccount` keeps a stack; `_charged_to` puts a whole method on it
 (`claim_one` and `_help_other_branch` are scheduling, `_claim_bundle` is
-claiming, `maybe_finalize` is finalizing) and `evaluate_claim` wraps the
-engine call as evaluation. **Every sleep names its reason**:
+claiming, `maybe_finalize` is finalizing, `cooperative_solve` is
+`wait_dependency`) and `evaluate_claim` wraps the engine call as evaluation.
+`cooperative_solve` runs inside the evaluation of the candidate that promoted
+the dependency, so without its own activity every poll of its wait loop would
+be charged to that candidate as evaluation, and to its branch's evaluation
+time. **Every sleep names its reason**:
 `_idle_wait(seconds, reason)` charges `wait_<reason>`, so a new wait needs a
 reason with a column of its own. Time no activity covers is `other_time_millis`;
 durations are floored to milliseconds and `other_time_millis` takes the remainder,

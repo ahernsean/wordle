@@ -3413,7 +3413,9 @@ class TestFinalizeTelemetryFailureIsolation(unittest.TestCase):
 
 
 _TIMING = {"first_created_at": 100, "completed_at": 160,
-           "worker_time_millis": 2_000, "telemetry_epochs": "3"}
+           "worker_time_millis": 2_000, "telemetry_epochs": "3",
+           "search_node_count": 900, "evaluation_time_millis": 1_500,
+           "coordination_time_millis": 80}
 
 
 def _reduction(state, **overrides):
@@ -3459,7 +3461,9 @@ class TestCompletingOpeners(unittest.TestCase):
         worker.score_cache.write_opener_erd.assert_called_once_with(
             "salet", erd_swarm.ERD_ALL, 3.5, 6, 2)
         worker.score_cache.write_completed_opener_summary.assert_called_once_with(
-            "salet", erd_swarm.ERD_ALL, 160, 60_000, 2_000, (3,))
+            "salet", erd_swarm.ERD_ALL, 160, 60_000, 2_000, (3,),
+            search_node_count=900, evaluation_time_millis=1_500,
+            coordination_time_millis=80)
         worker.queue.mark_openers_complete.assert_called_once_with(["salet"])
 
     def test_a_failed_store_leaves_the_opener_not_done(self):

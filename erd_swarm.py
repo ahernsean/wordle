@@ -2058,7 +2058,10 @@ class _BranchWorker:
         self.score_cache.write_completed_opener_summary(
             opener, ERD_ALL, timing["completed_at"],
             (timing["completed_at"] - timing["first_created_at"]) * 1000,
-            timing["worker_time_millis"] or 0, telemetry_epochs)
+            timing["worker_time_millis"] or 0, telemetry_epochs,
+            search_node_count=timing["search_node_count"],
+            evaluation_time_millis=timing["evaluation_time_millis"],
+            coordination_time_millis=timing["coordination_time_millis"])
 
     def _finish_bundle(self, branch_key, bundle_id, nodes_at_start, wall_t0,
                        censored):
@@ -2581,6 +2584,7 @@ class _BranchWorker:
             blocks_other=wait.other_blocks(),
             help_depth=wait.help_depth, outcome=wait.outcome)
 
+    @_charged_to("wait_dependency")
     def cooperative_solve(self, words, budget, ceiling=float('inf')):
         """Solve sub-branch `words` at `budget` cooperatively, returning the
         engine's (status, cost, max_depth, floor) tuple.

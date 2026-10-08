@@ -559,6 +559,15 @@ class ScoreCache:
             self._conn.execute(
                 "ALTER TABLE completed_opener_summaries "
                 "ADD COLUMN telemetry_epochs TEXT NOT NULL DEFAULT ''")
+        # An opener's search nodes and the worker time spent evaluating and
+        # coordinating its branches.  NULL on a row written before they were
+        # recorded, and on one whose branches did not all record them.
+        for column in ("search_node_count", "evaluation_time_millis",
+                       "coordination_time_millis"):
+            if column not in summary_columns:
+                self._conn.execute(
+                    f"ALTER TABLE completed_opener_summaries "
+                    f"ADD COLUMN {column} INTEGER")
         # An opener's own ERD, reduced over its top-level response groups once
         # every one of them holds a reusable exact result.  Unlike a candidate's
         # ERD at an arbitrary branch, this is bounded at one row per candidate
@@ -1574,14 +1583,18 @@ class ScoreCache:
     def completed_opener_summary_map(self, policy):
         return {row["opener"].lower(): dict(row) for row in self._conn.execute("""
             SELECT opener, completed_at, elapsed_time_millis, worker_time_millis,
-                   telemetry_epochs
+                   telemetry_epochs, search_node_count, evaluation_time_millis,
+                   coordination_time_millis
             FROM completed_opener_summaries
             WHERE policy = ? AND answer_list_id = ?
         """, (policy, self.answer_list_id))}
 
     def write_completed_opener_summary(self, opener, policy, completed_at,
                                        elapsed_time_millis, worker_time_millis,
-                                       telemetry_epochs=()):
+                                       telemetry_epochs=(), *,
+                                       search_node_count=None,
+                                       evaluation_time_millis=None,
+                                       coordination_time_millis=None):
         """Record when an opener finished and what it cost.
 
         A failed write raises, disk errors included.  The swarm records this
@@ -1592,11 +1605,15 @@ class ScoreCache:
         self._conn.execute("""
             INSERT OR REPLACE INTO completed_opener_summaries
                 (opener, policy, answer_list_id, completed_at,
-                 elapsed_time_millis, worker_time_millis, telemetry_epochs)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                 elapsed_time_millis, worker_time_millis, telemetry_epochs,
+                 search_node_count, evaluation_time_millis,
+                 coordination_time_millis)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (opener.lower(), policy, self.answer_list_id, completed_at,
               elapsed_time_millis, worker_time_millis,
-              ",".join(str(epoch) for epoch in sorted(set(telemetry_epochs)))))
+              ",".join(str(epoch) for epoch in sorted(set(telemetry_epochs))),
+              search_node_count, evaluation_time_millis,
+              coordination_time_millis))
 
     def add_opener_response_group_summary(self, opener, response_pattern,
                                           policy, nodes, worker_time_millis,

@@ -663,3 +663,30 @@ class TestCheckpointPausesAreRecorded(_QueueTest):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDependencyWaitIsNotEvaluation(unittest.TestCase):
+
+    def test_time_inside_cooperative_solve_is_charged_to_waiting(self):
+        # cooperative_solve runs inside the evaluation of the candidate that
+        # promoted the dependency.  Its own polling is waiting, so neither
+        # that candidate nor its branch may be charged for it.
+        clock = _SteppingClock()
+        worker = _bare_worker()
+        worker._time_account = _account(clock)
+
+        def cache_read_taking_50_millis(*args, **kwargs):
+            clock.advance(50)
+            return (2.0, 3)
+
+        with mock.patch("erd_swarm._cache_reuse",
+                        side_effect=cache_read_taking_50_millis):
+            with worker._time_account.activity("evaluation", owner="outer"):
+                clock.advance(5)
+                result = worker.cooperative_solve(BRANCH[:3], 4)
+        self.assertEqual(result[0], SOLVED)
+        self.assertEqual(worker._time_account.take_owned_time_millis("outer"), 5)
+        _started_at, _interval, figures = worker._time_account.close_interval(
+            0, (0, 0, 0, 0))
+        self.assertEqual(figures["wait_dependency_time_millis"], 50)
+        self.assertEqual(figures["evaluation_time_millis"], 5)
