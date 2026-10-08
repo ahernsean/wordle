@@ -361,6 +361,26 @@ class TestWorkerTimeIsWrittenOnTheHeartbeat(unittest.TestCase):
         self.assertEqual(figures["evaluation_millis"], 30)
         self.assertEqual(figures["candidates_evaluated"], 1)
 
+    def test_heartbeat_writes_inside_an_evaluation_are_not_evaluation(self):
+        clock = _SteppingClock()
+        worker = self._worker(clock)
+        clock.advance(erd_swarm.WORKER_TIME_INTERVAL_SECONDS * 1000)
+        worker.queue.heartbeat.side_effect = lambda *a, **k: clock.advance(20)
+        worker.queue.add_worker_time.side_effect = (
+            lambda *a, **k: clock.advance(7))
+        with worker._time_account.activity("evaluation"):
+            self._tick(worker)
+        _started_at, _interval, figures = worker._time_account.close_interval(
+            0, (0, 0, 0, 0))
+        # The row insert lands in the interval that follows the one it closes.
+        self.assertEqual(figures["evaluation_millis"], 0)
+        self.assertEqual(figures["other_millis"], 7)
+        _worker_id, _started_at, _interval, written = (
+            worker.queue.add_worker_time.call_args.args)
+        self.assertEqual(written["evaluation_millis"], 0)
+        self.assertEqual(written["other_millis"],
+                         erd_swarm.WORKER_TIME_INTERVAL_SECONDS * 1000 + 20)
+
     def test_closing_the_worker_writes_the_partial_interval(self):
         worker = self._worker(_SteppingClock())
         worker._maybe_write_worker_time(force=True)
@@ -534,6 +554,25 @@ class TestCheckpointPausesAreRecorded(_QueueTest):
             queue.add_checkpoint_pause.call_args.args)
         self.assertEqual((started_at, wal_bytes, truncated),
                          (0, erd_search.QUEUE_WAL_QUIESCE_BYTES, False))
+
+    def test_the_retry_budget_starts_once_the_flag_has_landed(self):
+        queue = mock.Mock()
+        queue.wal_size_bytes.return_value = erd_search.QUEUE_WAL_QUIESCE_BYTES
+        clock = [100.0]
+        queue.set_checkpoint_pause.side_effect = (
+            lambda paused: clock.__setitem__(0, clock[0] + 20.0)
+            if paused else None)
+        outcomes = iter([(1, 0, 0), (0, 0, 0)])
+        queue.checkpoint.side_effect = lambda mode: next(outcomes)
+        with mock.patch.object(erd_search.time, "time",
+                               side_effect=lambda: clock[0]), \
+                mock.patch.object(erd_search.time, "sleep"):
+            erd_search._maybe_quiesce_truncate(queue)
+        self.assertEqual(queue.checkpoint.call_count, 2)
+        started_at, _pause_millis, _wal_bytes, truncated = (
+            queue.add_checkpoint_pause.call_args.args)
+        self.assertEqual(started_at, 120.0)
+        self.assertTrue(truncated)
 
     def test_a_pause_that_cannot_be_recorded_still_ends(self):
         queue = mock.Mock()

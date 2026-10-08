@@ -1455,6 +1455,18 @@ class _BranchWorker:
         if not force and now - self._last_hb < HB_SECONDS:
             return
         self._time_account.note_tick()
+        # The heartbeat and telemetry writes below are bookkeeping, whatever
+        # activity is open around them, and under queue contention their lock
+        # waits would otherwise be reported as evaluation.
+        with self._time_account.activity("other"):
+            self._publish_liveness(now, branch_key, n_words, claim_idx,
+                                   claim_started_at, best_guess, best_erd,
+                                   force, bound_erd)
+
+    def _publish_liveness(self, now, branch_key, n_words, claim_idx,
+                          claim_started_at, best_guess, best_erd, force,
+                          bound_erd):
+        """The writes a liveness tick that passed the throttle makes."""
         # Per-heartbeat-window WAL backstop: an evaluation deep in the engine
         # passes through here even when it never reaches a bundle boundary,
         # so a runaway writer stops itself instead of relying on the

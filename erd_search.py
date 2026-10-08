@@ -1070,10 +1070,13 @@ def _maybe_quiesce_truncate(queue):
         return
     logger.info('Queue WAL at %.2f GB — quiescing workers for TRUNCATE.',
                 wal_bytes / 1e9)
-    started_at = time.time()
-    pause_t0 = time.perf_counter()
     truncated = False
     queue.set_checkpoint_pause(True)
+    # Both clocks start once the flag has landed: the write can wait on the
+    # queue lock, and neither the retry budget nor the recorded pause should
+    # include time before any worker could see it.
+    started_at = time.time()
+    pause_t0 = time.perf_counter()
     try:
         deadline = started_at + TRUNCATE_RETRY_SECONDS
         while True:
