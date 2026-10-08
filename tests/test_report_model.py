@@ -76,8 +76,6 @@ class ReportModelTest(unittest.TestCase):
         cases = (
             (ReportRequest(report_kind="cache", tree=True), "cannot be used"),
             (ReportRequest(tree_parent="RAISE -----"), "require tree"),
-            (ReportRequest(raw_row_offset=1), "requires an accuracy"),
-            (ReportRequest(report_kind="accuracy", raw_row_offset=-1), "cannot be negative"),
             (ReportRequest(worker_id="w1"), "workers report"),
             (ReportRequest(report_kind="root_progress", branch_target=root), "requires a target"),
         )
@@ -114,7 +112,6 @@ class ReportModelTest(unittest.TestCase):
             (ReportRequest(filters=ReportFilters(opener_offset=0)), "opener_offset"),
             (ReportRequest(filters=ReportFilters(sort="word")), "requires an opener"),
             (ReportRequest(branch_target=branch, filters=ReportFilters(branch_statuses=("unqueued",))), "unqueued"),
-            (ReportRequest(report_kind="hotspots", hotspot_field="coordination", branch_target=word), "coordination"),
             (ReportRequest(report_kind="openers", branch_target=branch), "accepts only"),
         )
         for request, message in cases:
@@ -273,31 +270,7 @@ class ReportModelTest(unittest.TestCase):
             "", rows, set(ANSWERS))
         self.assertEqual(second_page["paging"]["returned_group_count"], 1)
 
-    def test_accuracy_report_normalizes_each_calibration_collection(self):
-        branch_key = ScoreCache.encode_subset(["salet"])
-        queue = Mock(epoch=9)
-        queue.report_candidate_accuracy.return_value = {
-            "rows": [{"branch_key": branch_key}],
-            "largest_under_predicted": [{"branch_key": branch_key}],
-            "largest_over_predicted": [{"branch_key": branch_key}],
-            "requested_sample_size": 2,
-        }
-        request = ReportRequest(report_kind="accuracy", sample_size=2)
-        with patch("report_model._open_report_queue", return_value=queue):
-            report = report_model.collect_accuracy_report(self.sources, request)
-        self.assertTrue(report["sources"]["queue"]["ok"])
-        self.assertEqual(report["data"]["rows"][0]["branch_key_hex"], branch_key.hex())
-        self.assertIn("branch_reference", report["data"]["largest_under_predicted"][0])
-        queue.close.assert_called_once()
-
-    def test_accuracy_and_historical_hotspot_reports_surface_queue_errors(self):
-        queue = Mock(epoch=9)
-        queue.report_candidate_accuracy.side_effect = sqlite3.OperationalError("offline")
-        with patch("report_model._open_report_queue", return_value=queue):
-            accuracy = report_model.collect_accuracy_report(
-                self.sources, ReportRequest(report_kind="accuracy"))
-        self.assertEqual(accuracy["sources"]["queue"]["error"], "offline")
-
+    def test_historical_hotspot_reports_normalize_branch_keys(self):
         branch_key = ScoreCache.encode_subset(["salet"])
         queue = Mock(epoch=9)
         queue.report_hotspots.return_value = {
@@ -672,7 +645,7 @@ class ReportModelTest(unittest.TestCase):
             self.assertEqual(collect_report(self.sources, request), {"kind": "queue"})
         for kind, function_name in (
             ("workers", "collect_workers_report"), ("cache", "collect_cache_report"),
-            ("hotspots", "collect_hotspot_report"), ("accuracy", "collect_accuracy_report"),
+            ("hotspots", "collect_hotspot_report"),
             ("work_distribution", "collect_work_distribution_report"),
             ("leaderboard", "collect_leaderboard_report"), ("openers", "collect_opener_report"),
             ("root_progress", "collect_root_progress_report"),
@@ -1473,17 +1446,9 @@ class ReportModelTest(unittest.TestCase):
             report_model._score_cache_file_signature(missing), (None, None)
         )
 
-    def test_hotspot_and_accuracy_reports_scope_and_survive_queue_errors(self):
+    def test_hotspot_reports_survive_queue_errors(self):
         requests = (
             ReportRequest(report_kind="hotspots", hotspot_field="nodes"),
-            ReportRequest(
-                report_kind="accuracy",
-                branch_target=parse_report_branch_target("salet -----"),
-            ),
-            ReportRequest(
-                report_kind="accuracy",
-                branch_target=parse_report_branch_target("salet"),
-            ),
         )
         for request in requests:
             with self.subTest(kind=request.report_kind,
@@ -4720,7 +4685,7 @@ class WorkerWorkPositionTest(unittest.TestCase):
 
 
 class WorkDistributionReportTest(unittest.TestCase):
-    """Bands over the sampled claim population, and the shares priced on them."""
+    """Bands over the epoch's finalized branches, and the shares priced on them."""
 
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -4745,10 +4710,12 @@ class WorkDistributionReportTest(unittest.TestCase):
 
     def _claims(self, branch_key, count, nodes, evaluation_millis,
                 coordination_millis=10):
-        for idx in range(count):
-            self.queue.add_claim_telemetry(
-                10, coordination_millis, nodes, 2, branch_key=branch_key,
-                idx=idx, candidate_evaluation_millis=evaluation_millis)
+        """Finalize a branch that took `count` claims of these sizes each."""
+        now = int(time.time())
+        self.queue.add_branch_finalize_log(
+            branch_key, None, 10, 4, now, now, count * nodes, count,
+            n_bundles=1, total_bundle_wall_millis=count * evaluation_millis,
+            coordination_millis=count * coordination_millis)
 
     def _report(self, **overrides):
         request = ReportRequest(report_kind="work_distribution", **overrides)
@@ -4874,7 +4841,7 @@ class WorkDistributionReportTest(unittest.TestCase):
 
         data = self._report()["data"]
 
-        self.assertEqual(data["population"], "epoch_claims_by_branch")
+        self.assertEqual(data["population"], "epoch_finalized_branches")
         # No window given means the whole epoch, which is what makes a branch's
         # lifetime worker time the band key rather than a recent slice of it.
         self.assertIsNone(data["since_seconds"])
@@ -4932,16 +4899,13 @@ class WorkDistributionReportTest(unittest.TestCase):
     def test_an_answer_count_range_scopes_the_bands_and_is_reported(self):
         small = ScoreCache.encode_subset(["salet", "crane"])
         large = ScoreCache.encode_subset(["salet", "crane", "nurdy"])
-        self.queue.create_branch(small, 2, 2)
-        self.queue.create_branch(large, 3, 2)
-        for idx in range(6):
-            self.queue.add_claim_telemetry(
-                4, 10, 1, 2, branch_key=small, idx=idx,
-                candidate_evaluation_millis=50)
-        for idx in range(2):
-            self.queue.add_claim_telemetry(
-                80, 10, 500_000, 2, branch_key=large, idx=idx,
-                candidate_evaluation_millis=400_000)
+        now = int(time.time())
+        self.queue.add_branch_finalize_log(
+            small, None, 4, 4, now, now, 6, 6, n_bundles=1,
+            total_bundle_wall_millis=300, coordination_millis=60)
+        self.queue.add_branch_finalize_log(
+            large, None, 80, 4, now, now, 1_000_000, 2, n_bundles=1,
+            total_bundle_wall_millis=800_000, coordination_millis=20)
 
         data = self._report(
             filters=ReportFilters(minimum_answer_count=50))["data"]

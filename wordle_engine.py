@@ -1566,8 +1566,8 @@ def evaluate_candidate(branch_words, candidate, cache, score_cache, *,
     # It fires exactly once per candidate.
     #
     # The bound reported is the closed form `3 - (G + has_self)/n` and not the
-    # tighter two-level bound the gate below may act on.  analyze_swarm_telemetry
-    # inverts that identity to recover has_self from the stored value, so a
+    # tighter two-level bound the gate below may act on.  A consumer can invert
+    # that identity to recover has_self from the reported value, so a
     # tighter number in this field decodes as a different candidate: at n=40
     # with 17 groups and has_self true, 2.55 is the closed form and reads back
     # correctly, while the effective 2.575 reads back as has_self false.

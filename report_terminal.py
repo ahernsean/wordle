@@ -1605,7 +1605,6 @@ def _render_work_distribution_sections(report, width):
         scope = f"  answers {low}-{high}"
     header = _semantic_header(
         report, "Work distribution by worker time" + scope, width)
-    unattributed = data["unattributed"]
     unmeasured = data.get("unmeasured") or {}
     since_seconds = data.get("since_seconds")
     window_text = ("whole epoch" if since_seconds is None
@@ -1619,8 +1618,7 @@ def _render_work_distribution_sections(report, width):
             width,
         ),
         _fit(
-            f"  {totals['branch_count']:,} branches "
-            f"({totals['unfinished_branch_count']:,} still open), "
+            f"  {totals['branch_count']:,} finalized branches, "
             f"{totals['claim_count']:,} claims, "
             f"{_format_node_count(totals['search_node_count'])} nodes",
             width,
@@ -1633,14 +1631,6 @@ def _render_work_distribution_sections(report, width):
             width,
         ),
     ]
-    unattributed_count = unattributed["claim_count"]
-    if unattributed_count:
-        lines.append(_fit(
-            f"  plus {unattributed_count:,} "
-            f"claim{'' if unattributed_count == 1 else 's'} with no recorded "
-            f"branch attribution, belonging to no band",
-            width,
-        ))
     # A branch whose worker time was never recorded cannot be banded at all.
     # Naming it keeps the bands a statement about measured branches rather than
     # a distribution with unknown cost quietly seated in its cheapest row.
@@ -1649,13 +1639,13 @@ def _render_work_distribution_sections(report, width):
         lines.append(_fit(
             f"  plus {unmeasured_branches:,} "
             f"branch{'' if unmeasured_branches == 1 else 'es'} with unrecorded "
-            f"worker time, excluded from every band "
+            f"worker or coordination time, excluded from every band "
             f"({_format_node_count(unmeasured.get('search_node_count', 0))} nodes)",
             width,
         ))
     # Coord/work is the column the report exists for, so it sits immediately
     # after the band and cannot be the first thing an 80-column terminal drops.
-    rows = [f"{'Band':<10} {'Coord/work':>10} {'Branches':>9} {'Open':>5}"
+    rows = [f"{'Band':<10} {'Coord/work':>10} {'Branches':>9}"
             f" {'Worker':>7} {'%Work':>6} {'Nodes':>7} {'%Nodes':>7}"
             f" {'Claims':>9} {'%Claims':>8}"]
     for band in data["bands"]:
@@ -1663,7 +1653,7 @@ def _render_work_distribution_sections(report, width):
         rows.append(_fit(
             f"{band['band_label']:<10}"
             f" {('—' if ratio is None else f'{ratio:.2f}'):>10}"
-            f" {band['branch_count']:>9,} {band['unfinished_branch_count']:>5,}"
+            f" {band['branch_count']:>9,}"
             f" {_abbreviate_duration(band['worker_millis'] / 1000):>7}"
             f" {_percent_text(band['worker_time_share']):>6}"
             f" {_format_node_count(band['search_node_count']):>7}"
@@ -2156,8 +2146,6 @@ def _report_sections(report, previous_report, color, width, display_order):
         return _render_hotspot_sections(report, width, display_order)
     if report["report_kind"] == "work_distribution":
         return _render_work_distribution_sections(report, width)
-    if report["report_kind"] == "accuracy":
-        return _render_accuracy_sections(report, width)
     if report["report_kind"] == "leaderboard":
         return _render_leaderboard_sections(report, width)
     if report["report_kind"] == "openers":
@@ -2166,56 +2154,6 @@ def _report_sections(report, previous_report, color, width, display_order):
         return _render_root_progress_sections(report, width, display_order)
     raise ValueError(f"unsupported report kind: {report['report_kind']}")
 
-
-def _render_accuracy_sections(report, width):
-    data = report["data"]
-    calibration = data.get("calibration", {})
-    ratio = calibration.get("actual_predicted_ratio", {})
-    summary = [
-        _fit(f"Candidate-level accuracy  epoch={data.get('epoch')}", width),
-        _fit(f"  population "
-             f"{('not counted' if data.get('population_row_count') is None else format(data['population_row_count'], ','))}; "
-             f"random sample {data.get('sampled_row_count', 0):,}/"
-             f"{data.get('requested_sample_size', 0):,} requested; ERD-pruned "
-             f"{data.get('erd_pruned_row_count', 0):,}; non-ERD-pruned "
-             f"{data.get('non_erd_pruned_row_count', 0):,}", width),
-        _fit(f"  no prediction {data.get('no_prediction_row_count', 0):,}; "
-             f"non-pruned calibration rows {calibration.get('row_count', 0):,}",
-             width),
-        _fit("  actual/predicted ratio " + " ".join(
-            f"{name}={value:.2f}" for name, value in ratio.items()
-            if value is not None), width),
-    ]
-    rows = ["Largest under-predicted in sample  candidate  answers budget predicted actual ratio"]
-    for row in data.get("largest_under_predicted", [])[:5]:
-        ratio_value = row.get("actual_predicted_ratio")
-        ratio_text = "—" if ratio_value is None else f"{ratio_value:.2f}"
-        budget = row.get("budget")
-        predicted = row.get("predicted_work")
-        budget_text = "—" if budget is None else str(budget)
-        predicted_text = "—" if predicted is None else f"{predicted:.1f}"
-        rows.append(_fit(
-            f"  {row.get('candidate_word') or '—':<9} {row['n_words']:>7,} "
-            f"{budget_text:>6} {predicted_text:>9} "
-            f"{row['actual_nodes']:>6,} {ratio_text:>5}", width))
-    raw_rows = data.get("rows", [])
-    if raw_rows:
-        raw_offset = data.get("raw_row_offset", 0)
-        rows.append("")
-        rows.append(f"Raw rows (offset {raw_offset:,})")
-        for row in raw_rows:
-            candidate = row.get("candidate_word") or "—"
-            worker = row.get("worker_id") or "—"
-            bundle = row.get("bundle_id") or "—"
-            outcome = row.get("outcome") or "unknown"
-            elapsed = row.get("evaluation_millis")
-            elapsed_text = "—" if elapsed is None else f"{elapsed:,}ms"
-            rows.append(_fit(
-                f"  {candidate.upper()} idx={row.get('idx', '—')} "
-                f"worker={worker} bundle={bundle} {outcome} "
-                f"elapsed={elapsed_text} republished="
-                f"{row.get('republish_count', '—')}", width))
-    return [("header", summary), ("accuracy", rows)]
 
 
 def render_report(
@@ -2275,8 +2213,6 @@ class WatchSession:
             since_seconds=getattr(self.args, "since_seconds", None),
             sample_size=getattr(self.args, "sample_size", None),
             inherited_cost=getattr(self.args, "inherited_cost", False),
-            opener=getattr(self.args, "opener", None),
-            raw_row_offset=getattr(self.args, "accuracy_offset", 0),
         )
 
     @property

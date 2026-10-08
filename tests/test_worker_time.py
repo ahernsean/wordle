@@ -250,18 +250,14 @@ class TestWorkerChargesItsActivities(unittest.TestCase):
         self.assertGreater(row["candidates_evaluated"], 0)
         self.assertEqual(row["nodes"], worker._nodes)
 
-    def test_candidates_evaluated_matches_the_claims_recorded(self):
+    def test_candidates_evaluated_matches_the_claims_completed(self):
         worker = self._worker(small_count=2, count_cap=2)
         try:
             worker.solve_branch_focused(self.branch_key)
         finally:
             worker.close()
         [row] = self._rows()
-        queue = ERDQueue(self.queue_path)
-        claims = queue._conn.execute(
-            "SELECT COUNT(*) FROM telemetry.claim_telemetry").fetchone()[0]
-        queue.close()
-        self.assertEqual(row["candidates_evaluated"], claims)
+        self.assertEqual(row["candidates_evaluated"], worker.claims_done)
 
     def test_work_selection_is_charged_to_scheduling(self):
         worker = self._worker()
@@ -405,26 +401,33 @@ class TestBranchCoordinationReachesTheFinalizeLog(unittest.TestCase):
     def setUp(self):
         TestWorkerChargesItsActivities.setUp(self)
 
-    def test_the_branch_total_is_the_sum_of_its_claims(self):
+    def test_the_branch_total_is_the_sum_of_its_bundles(self):
         worker = _BranchWorker(0, self.cache_path, self.queue_path, None,
                                small_count=2, count_cap=2)
+        recorded = []
+        record_bundle_stats = worker.queue.record_bundle_stats
+
+        def recording(*args, coordination_millis=None, **kwargs):
+            recorded.append(coordination_millis)
+            return record_bundle_stats(
+                *args, coordination_millis=coordination_millis, **kwargs)
+
+        worker.queue.record_bundle_stats = recording
         try:
             worker.solve_branch_focused(self.branch_key)
         finally:
             worker.close()
         self.assertEqual(worker._bundle_coordination_millis, {})
+        self.assertTrue(recorded)
+        self.assertNotIn(None, recorded)
         queue = ERDQueue(self.queue_path)
         try:
             [logged] = queue._conn.execute(
                 "SELECT coordination_millis "
                 "FROM telemetry.branch_finalize_log").fetchone()
-            claimed = queue._conn.execute(
-                "SELECT SUM(coordination_millis) "
-                "FROM telemetry.claim_telemetry").fetchone()[0]
         finally:
             queue.close()
-        self.assertIsNotNone(logged)
-        self.assertEqual(logged, claimed)
+        self.assertEqual(logged, sum(recorded))
 
     def test_each_bundle_carries_only_its_own_members(self):
         worker = _bare_worker()
@@ -508,18 +511,12 @@ class TestReclaimsAreRecorded(_QueueTest):
 
 class TestClaimTimingTotals(_QueueTest):
 
-    def test_totals_survive_what_clears_the_claim_attribution(self):
-        with mock.patch("erd_queue.time.perf_counter",
-                        side_effect=[0.0, 0.005]):
-            self.queue._begin_immediate_timed()
-        self.queue._conn.execute("COMMIT")
-        self.queue.discard_claim_attribution()
-        self.assertEqual(self.queue.claim_timing_totals(), (5, 0, 0, 0))
-        with mock.patch("erd_queue.time.perf_counter",
-                        side_effect=[0.0, 0.003]):
-            self.queue._begin_immediate_timed()
-        self.queue._conn.execute("COMMIT")
-        self.queue.add_claim_telemetry(5, 0, 0, 1)
+    def test_lock_waits_accumulate(self):
+        for wait in (0.005, 0.003):
+            with mock.patch("erd_queue.time.perf_counter",
+                            side_effect=[0.0, wait]):
+                self.queue._begin_immediate_timed()
+            self.queue._conn.execute("COMMIT")
         self.assertEqual(self.queue.claim_timing_totals(), (8, 0, 0, 0))
 
     def test_a_claim_adds_its_transaction_and_commit(self):

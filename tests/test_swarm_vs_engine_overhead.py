@@ -134,8 +134,9 @@ class TestSwarmVsDirectEngineOverhead(unittest.TestCase):
 
         queue = ERDQueue(queue_path)
         claims, coordination_millis = queue._conn.execute(
-            "SELECT COUNT(*), COALESCE(SUM(coordination_millis), 0) "
-            "FROM telemetry.claim_telemetry").fetchone()
+            "SELECT COALESCE(SUM(n_claims), 0), "
+            "COALESCE(SUM(coordination_millis), 0) "
+            "FROM telemetry.branch_finalize_log").fetchone()
         queue.close()
         return wall, erd, nodes, claims, coordination_millis
 

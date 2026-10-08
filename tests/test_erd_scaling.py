@@ -937,11 +937,10 @@ class TestSingleBranchDoesNotConcentrateWorkers(unittest.TestCase):
         """The invariant, sampled while six workers contend for one branch.
 
         Occupancy is read from unfinished claims — the signal the scheduler
-        itself enforces on — not from claim_telemetry.branch_worker_count.
-        That column counts heartbeats, which name the branch a worker was last
-        seen on rather than one it still holds work for, so it reads high for
-        a worker that has already moved on; it is reporting state, and it
-        overstates this invariant by design.
+        itself enforces on — not from heartbeats.  Heartbeats name the branch
+        a worker was last seen on rather than one it still holds work for, so
+        a count of them reads high for a worker that has already moved on;
+        they are reporting state, and overstate this invariant by design.
 
         Structural rather than timed, so it states the rule exactly and does
         not depend on the machine being idle.  Sampling is sound here because

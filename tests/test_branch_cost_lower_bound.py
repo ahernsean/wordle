@@ -669,9 +669,9 @@ class TestGatesAreObservedOnce(_VocabularyMixin, unittest.TestCase):
         self.assertEqual(len(seen), 1)
         bound, pruned = seen[0]
         self.assertTrue(pruned, "the second gate cut it, so it must read as pruned")
-        # The reported bound stays the closed form: analyze_swarm_telemetry
-        # inverts 3 - (G + has_self)/n from this field to recover has_self, so
-        # storing the tighter effective bound here would corrupt that.
+        # The reported bound stays the closed form: a consumer can invert
+        # 3 - (G + has_self)/n from this field to recover has_self, so
+        # reporting the tighter effective bound here would corrupt that.
         self.assertEqual(bound, closed_form)
 
     def test_two_level_erd_prune_bound_is_the_engine_entry_gate(self):

@@ -128,7 +128,7 @@ SCHEDULING_ROLES = (SCHEDULING_ROLE_PREFERRED, SCHEDULING_ROLE_FALLBACK,
                     SCHEDULING_ROLE_DIRECT)
 # Per-attempt busy_timeout (ms) while probing for claim_next_bundle's write
 # lock.  Short enough that each failed attempt is a real, countable retry
-# (claim_telemetry.claim_retries) rather than one long internal SQLite wait
+# (worker_time.claim_retries) rather than one long internal SQLite wait
 # indistinguishable from a single slow claim.
 _BUNDLE_CLAIM_RETRY_MILLIS = 100
 
@@ -494,6 +494,14 @@ CREATE TABLE IF NOT EXISTS candidate_claims (
     -- is freed, so the packer can reissue the earliest outstanding position
     -- without knowing the order itself (the order lives in the worker).
     best_first_position INTEGER,
+    -- Set when a worker evaluates the candidate to completion: the solver
+    -- time, the bound the evaluation started against, and how many live
+    -- workers the branch had.  The branch view's ETA reads them while the
+    -- branch is open; they go with the row when it finalizes.  NULL on a row
+    -- completed any other way.
+    evaluation_millis   INTEGER,
+    evaluation_bound_erd REAL,
+    branch_worker_count INTEGER,
     PRIMARY KEY (branch_id, idx)
 );
 -- idx_candidate_claims_bundle is created in _migrate(), after the bundle_id
@@ -576,8 +584,8 @@ PRAGMA telemetry.journal_size_limit=524288000;
 
 -- One row per bundle a worker has reported on: the nodes actually spent and
 -- the wall-clock span of evaluating it (straggler/reclaim-window diagnostic
--- — NOT claim-handout coordination overhead, which is claim_telemetry's
--- busy_wait_millis), aggregated into branch_finalize_log at finalize and
+-- — NOT claim-handout coordination overhead, which is coordination_millis),
+-- aggregated into branch_finalize_log at finalize and
 -- dropped with the rest of the branch's transient state by delete_branch.
 -- censored=1 marks a bundle that hit its node/wall cap and republished an
 -- unfinished remainder (see ERDQueue.republish_remainder) — nodes is then a
@@ -633,84 +641,6 @@ CREATE TABLE IF NOT EXISTS telemetry.cost_samples (
     source      TEXT,        -- 'finalize' or 'censored'
     epoch       INTEGER NOT NULL DEFAULT 0,
     recorded_at INTEGER NOT NULL
-);
-
--- Outbound-only coordination telemetry for offline clustering-decision analysis.
--- Never read by any runtime control path; freely droppable.  busy_wait_millis is
--- the wall time spent acquiring the claim's write lock (the direct contention
--- signal); claim_retries counts application-level BEGIN IMMEDIATE retries.
--- branch_id/spine attribute a row to the branch its claim belonged to (bulk
--- lower-bound proofs and other branch-less callers leave both NULL).
--- branch_id is the branches registry surrogate (see _intern_branch), not the
--- branch_key BLOB itself: the registry is append-only, so a branch_id stays
--- resolvable to its branch_key/word-list forever, even long after the branch
--- itself is finalized and deleted from active_branches.  Resolving it back
--- means joining against branches, which lives in the main queue file, not
--- this attached one — cross-file for a live ERDQueue (branches is already
--- attached on the same connection); an explicit ATTACH when querying the
--- telemetry file standalone.  worker_id/bundle_id/idx identify which worker
--- evaluated which candidate,
--- with bundle_start_idx/bundle_end_idx the claiming bundle's full index range
--- (bundle_id and both range columns are NULL for a claim taken outside a
--- bundle).  claim_transaction_millis + claim_commit_millis split
--- coordination_millis's claim-handout portion into the scan/write phase and
--- the COMMIT itself; busy_wait_millis is the write-lock wait across the claim
--- paths taken while coordinating; scheduling_millis is the work-selection scan
--- that chose this branch (opener-work ordering, pending promotion, joining an
--- in-progress branch) excluding the phases already counted; idle_millis is
--- what is left over.  Those five partition coordination_millis exactly, and
--- idle_millis means genuinely unaccounted wait -- scheduling work is called
--- out separately so a large idle_millis cannot be misread as starved workers
--- when it is really scan cost.  All five span time BETWEEN candidate
--- evaluations.
---
--- fruitless_scan_millis is NOT one of those five and must not be added to
--- them.  It measures the scans since the previous row that selected no branch
--- at all, and those lie OUTSIDE every coordination window: each is followed by
--- an idle wait, which restarts the window, so their cost was never inside any
--- row's coordination_millis and subtracting it would drive idle_millis to its
--- clamp.  It is separate worker time, reported here because it belongs to no
--- claim and would otherwise be recorded nowhere.  fruitless_scans counts them,
--- making the fraction of scans that select nothing measurable from this table.
--- scan_openers_walked and fruitless_scan_openers_walked are the opener-work
--- requests each kind of scan examined: an exhausted scan's cost is linear in
--- them, so the millis are uninterpretable without them.  candidate_evaluation_millis is the elapsed solver work for this
--- candidate.  Queue work done
--- during a candidate's own evaluation (sub-branch promotion taking the write
--- lock) sits inside the evaluation span that coordination_millis excludes and
--- is deliberately not counted, since counting it would make the parts exceed
--- the whole.  Every row here is one candidate evaluation:
--- finalize cost is NOT recorded here (it belongs to a branch, not to any
--- claim, and lands on branch_finalize_log.cache_write_millis instead) so
--- COUNT(*) over this table is a true claim count.
-CREATE TABLE IF NOT EXISTS telemetry.claim_telemetry (
-    id                        INTEGER PRIMARY KEY AUTOINCREMENT,
-    n_words                   INTEGER NOT NULL,
-    coordination_millis       INTEGER NOT NULL,
-    candidate_evaluation_millis INTEGER,
-    work_nodes                INTEGER NOT NULL,
-    claim_retries             INTEGER,
-    busy_wait_millis          INTEGER,
-    worker_count              INTEGER,
-    branch_worker_count       INTEGER,
-    evaluation_bound_erd      REAL,
-    branch_id                 INTEGER,
-    spine                     TEXT,
-    worker_id                 TEXT,
-    bundle_id                 TEXT,
-    idx                       INTEGER,
-    bundle_start_idx          INTEGER,
-    bundle_end_idx            INTEGER,
-    claim_transaction_millis  INTEGER,
-    claim_commit_millis       INTEGER,
-    scheduling_millis         INTEGER,
-    scan_openers_walked       INTEGER,
-    fruitless_scan_millis     INTEGER,
-    fruitless_scans           INTEGER,
-    fruitless_scan_openers_walked INTEGER,
-    idle_millis               INTEGER,
-    epoch                     INTEGER NOT NULL DEFAULT 0,
-    recorded_at               INTEGER NOT NULL
 );
 
 -- Durable per-branch timing/cost record, written at finalize BEFORE delete_branch
@@ -807,51 +737,6 @@ CREATE TABLE IF NOT EXISTS telemetry.cut_reuse_misses (
     recorded_at     INTEGER NOT NULL
 );
 
--- Per-candidate predicted-vs-actual work, collected under single-candidate
--- claiming (epoch 0) where one claim == one candidate so actual_nodes IS that
--- candidate's true cost.  Validates the packer's work metric: predicted_work is
--- estimate_candidate_work(c | bound_erd); erd_lower_bound_pruned =
--- (candidate_cost_lower_bound >= bound_erd) means the candidate was provably
--- cut for free (predicted_work 0).  bound_erd and candidate_cost_lower_bound
--- are logged so an ERD-pruned candidate's near-zero cost reads as a correct
--- prediction, not a wild miss.  The §10 go/no-go gate is computed from this.
--- group_sizes is the candidate's response-group sizes ('-'-joined), the
--- sufficient statistic to recompute ANY work metric offline (uncut, cutoff-aware,
--- ...) against the logged bound_erd without re-running the swarm.  Written only
--- for non-ERD-pruned rows (an ERD-pruned row's predicted work is exactly 0).
-CREATE TABLE IF NOT EXISTS telemetry.candidate_accuracy (
-    id                         INTEGER PRIMARY KEY AUTOINCREMENT,
-    branch_key                 BLOB,
-    -- branch_id/worker_id/bundle_id/idx use the same identity names as
-    -- claim_telemetry, so an accuracy point joins to its claim without
-    -- reconstructing transient queue state.  candidate_word preserves the
-    -- candidate identity after its ordering changes.
-    branch_id                  INTEGER,
-    candidate_word             TEXT,
-    worker_id                  TEXT,
-    bundle_id                  TEXT,
-    idx                        INTEGER,
-    n_words                    INTEGER NOT NULL,
-    budget                     INTEGER,
-    predicted_work             REAL,
-    bound_erd                  REAL,
-    candidate_cost_lower_bound REAL,
-    erd_lower_bound_pruned     INTEGER NOT NULL,
-    actual_nodes               INTEGER NOT NULL,
-    group_sizes                TEXT,
-    opener                TEXT,
-    -- started_at is the beginning of evaluation; recorded_at remains the
-    -- completion time so existing readers retain their timestamp contract.
-    started_at                 INTEGER,
-    evaluation_millis          INTEGER,
-    -- exact, cut, loss, or cancelled.  NULL means the row predates outcome
-    -- recording rather than any particular outcome.
-    outcome                    TEXT,
-    republish_count            INTEGER,
-    epoch                      INTEGER NOT NULL DEFAULT 0,
-    recorded_at                INTEGER NOT NULL
-);
-
 -- One row per wall-clock backstop firing: a frame handed off its remainder
 -- because it ran longer than COLD_BACKSTOP_SECONDS rather than because the
 -- node-proportionate overrun check tripped.  Exists to tune COLD_BACKSTOP_SECONDS
@@ -874,9 +759,8 @@ CREATE TABLE IF NOT EXISTS telemetry.backstop_telemetry (
 -- needed a sub-branch it could not simply claim, and spent time in the wait
 -- loop before the branch produced an answer.
 --
--- claim_telemetry's idle_millis is a RESIDUAL — the part of a coordination
--- window left after the four measured phases — so it says how much waiting
--- happened but nothing about what was waited on.  This table is the
+-- worker_time's wait_dependency_millis says how much time workers spent stuck
+-- on dependencies but nothing about which ones.  This table is the
 -- attribution: which branch, for how long, and what the worker's alternatives
 -- were at the moment it stalled.
 --
@@ -884,7 +768,7 @@ CREATE TABLE IF NOT EXISTS telemetry.backstop_telemetry (
 -- to claim the branch alone, then to help anywhere else, then to pair onto the
 -- branch, and only then sleeps.  blocked_millis covers that last state alone,
 -- and the blocks_* counters say WHY each sleep happened.  Those are different
--- problems with different fixes, and idle_millis cannot tell them apart.
+-- problems with different fixes, and a total cannot tell them apart.
 --
 -- Every reason is reported by the code that decided it rather than sampled
 -- afterwards: blocks_worker_cap and blocks_no_candidates come from the claim
@@ -1023,8 +907,8 @@ CREATE TABLE IF NOT EXISTS telemetry.claim_reclaim (
 # Every table _TELEMETRY_SCHEMA_SQL creates, used to detect a queue file that
 # predates the telemetry split (see _absorb_legacy_telemetry_tables).
 _TELEMETRY_TABLES = (
-    "bundle_stats", "cost_samples", "claim_telemetry",
-    "branch_finalize_log", "candidate_accuracy", "backstop_telemetry",
+    "bundle_stats", "cost_samples",
+    "branch_finalize_log", "backstop_telemetry",
     "cut_reuse_misses", "dependency_wait", "worker_time",
     "checkpoint_pause", "claim_reclaim",
 )
@@ -1099,15 +983,8 @@ class ERDQueue:
         # stamped run_meta.epoch, and are restarted across a cutover, so caching
         # here is safe and keeps every telemetry insert off a per-row SELECT.
         self.epoch = int(self.get_meta('epoch') or 0)
-        # Per-claim contention metrics, refreshed by the claim path and read by
-        # the next add_claim_telemetry without changing claim_* return shapes.
-        self._last_claim_busy_millis = 0
-        self._last_claim_retries = 0
-        self._last_claim_transaction_millis = 0
-        self._last_claim_commit_millis = 0
-        # The same four figures as running totals over this connection's
-        # life, never reset, so a reader can take the difference across any
-        # interval without consuming what claim telemetry reads.
+        # Claim-path contention over this connection's life, never reset, so a
+        # reader can take the difference across any interval.
         self._claim_lock_wait_millis_total = 0
         self._claim_retries_total = 0
         self._claim_transaction_millis_total = 0
@@ -1332,12 +1209,6 @@ class ERDQueue:
             self._conn.execute(
                 "ALTER TABLE worker_heartbeat RENAME COLUMN "
                 "source_work_id TO opener_work_id")
-        telemetry_columns = {r["name"] for r in self._conn.execute(
-            "PRAGMA telemetry.table_info(candidate_accuracy)")}
-        if "source_word" in telemetry_columns:
-            self._conn.execute(
-                "ALTER TABLE telemetry.candidate_accuracy "
-                "RENAME COLUMN source_word TO opener")
         if not already_applied:
             self._conn.execute(
                 "INSERT OR IGNORE INTO schema_migrations (name, completed_at) "
@@ -1491,62 +1362,16 @@ class ERDQueue:
                 "INSERT INTO schema_migrations (name, completed_at) "
                 "VALUES (?, ?)", (provenance_migration, int(time.time())))
 
-        # Branch-attributed claim telemetry and coordination phase breakdown
-        # (issue #197): additive/nullable, so an existing row simply keeps
-        # NULL in every new column — it predates per-branch attribution and
-        # the phase split, not an attribution failure.  The finalize phase
-        # lands on branch_finalize_log, since it belongs to a branch rather
-        # than to any single claim.
-        self._add_columns("claim_telemetry", {
-            "candidate_evaluation_millis": "INTEGER",
-            "branch_id": "INTEGER",
-            "spine": "TEXT",
-            "worker_id": "TEXT",
-            "bundle_id": "TEXT",
-            "idx": "INTEGER",
-            "bundle_start_idx": "INTEGER",
-            "bundle_end_idx": "INTEGER",
-            "claim_transaction_millis": "INTEGER",
-            "claim_commit_millis": "INTEGER",
-            "scheduling_millis": "INTEGER",
-            "idle_millis": "INTEGER",
-            "branch_worker_count": "INTEGER",
-            "evaluation_bound_erd": "REAL",
-        }, schema="telemetry")
-
-        # Fruitless-scan attribution.  A row predating these columns holds
-        # NULL rather than 0: its fruitless-scan cost was folded into
-        # idle_millis and cannot be recovered, so NULL states that the split
-        # is unknown for that row while 0 would assert there was none.
-        self._add_columns("claim_telemetry", {
-            "scan_openers_walked": "INTEGER",
-            "fruitless_scan_millis": "INTEGER",
-            "fruitless_scans": "INTEGER",
-            "fruitless_scan_openers_walked": "INTEGER",
-        }, schema="telemetry")
-
-        # Candidate-accuracy identity and lifecycle fields (issue #223).
-        # Existing rows retain NULL for every added field: they record a
-        # calibration point, but cannot identify its candidate or outcome.
-        candidate_accuracy_migration = "candidate_accuracy_identity_lifecycle"
-        if self._conn.execute(
-                "SELECT 1 FROM schema_migrations WHERE name = ?",
-                (candidate_accuracy_migration,)).fetchone() is None:
-            self._add_columns("candidate_accuracy", {
-                "branch_id": "INTEGER",
-                "candidate_word": "TEXT",
-                "worker_id": "TEXT",
-                "bundle_id": "TEXT",
-                "idx": "INTEGER",
-                "started_at": "INTEGER",
-                "evaluation_millis": "INTEGER",
-                "outcome": "TEXT",
-                "republish_count": "INTEGER",
-            }, schema="telemetry")
-            self._conn.execute(
-                "INSERT INTO schema_migrations (name, completed_at) "
-                "VALUES (?, ?)",
-                (candidate_accuracy_migration, int(time.time())))
+        # The per-claim tables, claim_telemetry and candidate_accuracy, are
+        # dropped on every writable open rather than once behind a migration
+        # flag: a process still running code that writes them recreates them,
+        # and a one-shot migration that has recorded itself would never look
+        # again.  secure_delete is off for the drop because this SQLite build
+        # defaults it on, which would zero every freed page through the WAL --
+        # as many bytes again as the tables hold.
+        self._conn.execute("PRAGMA telemetry.secure_delete = OFF")
+        for table in ("claim_telemetry", "candidate_accuracy"):
+            self._conn.execute(f"DROP TABLE IF EXISTS telemetry.{table}")
         self._add_columns("branch_finalize_log", {
             "cache_write_millis": "INTEGER",
         }, schema="telemetry")
@@ -1588,19 +1413,6 @@ class ERDQueue:
              "branch_key, recorded_at"),
             ("cut_reuse_misses", {"epoch", "recorded_at", "id"},
              "idx_cut_reuse_misses_epoch_recorded_id",
-             "epoch, recorded_at DESC, id DESC"),
-            ("claim_telemetry", {"epoch", "id"},
-             "idx_claim_telemetry_epoch_id", "epoch, id"),
-            ("claim_telemetry", {"epoch", "recorded_at", "id"},
-             "idx_claim_telemetry_epoch_recorded_id",
-             "epoch, recorded_at DESC, id DESC"),
-            ("claim_telemetry", {"branch_id", "recorded_at"},
-             "idx_claim_telemetry_branch_recorded_at",
-             "branch_id, recorded_at"),
-            ("candidate_accuracy", {"epoch", "id"},
-             "idx_candidate_accuracy_epoch_id", "epoch, id"),
-            ("candidate_accuracy", {"epoch", "recorded_at", "id"},
-             "idx_candidate_accuracy_epoch_recorded_id",
              "epoch, recorded_at DESC, id DESC"),
         )
         for table, required_columns, index_name, indexed_columns in report_indexes:
@@ -1913,6 +1725,11 @@ class ERDQueue:
         # position is known.
         self._add_columns("candidate_claims",
                           {"best_first_position": "INTEGER"})
+        self._add_columns("candidate_claims", {
+            "evaluation_millis": "INTEGER",
+            "evaluation_bound_erd": "REAL",
+            "branch_worker_count": "INTEGER",
+        })
 
         # cut_results.tainted: after the branch_key rebuild above so the column
         # lands whether the table is fresh, upgraded, or already migrated.
@@ -3102,47 +2919,34 @@ class ERDQueue:
             (branch_id,)).fetchone()
 
     def _begin_immediate_timed(self):
-        """BEGIN IMMEDIATE, adding the wait for the write lock to
-        _last_claim_busy_millis.
+        """BEGIN IMMEDIATE, adding the wait for the write lock to the
+        connection's claim lock-wait total.
 
         For the write paths that let SQLite's own busy_timeout do the waiting
         rather than running claim_next_bundle's application-level retry probe:
         the wait is the same contention signal either way, so it belongs in
-        the same accumulator.  Those paths make no application-level retries,
-        so they leave claim_retries alone.
-
-        Only for locks taken while the worker is coordinating between
-        candidates.  A lock taken during candidate evaluation (sub-branch
-        promotion, e.g. attach_branch_opener_work) must NOT use this: that
-        time sits inside the evaluation span which evaluate_claim subtracts
-        from coordination_millis, so counting it would push the phase parts
-        above the whole they are supposed to partition.
+        the same total.  Those paths make no application-level retries, so
+        they leave the retry total alone.
         """
         _acquire_t0 = time.perf_counter()
         self._conn.execute("BEGIN IMMEDIATE")
-        lock_wait_millis = int((time.perf_counter() - _acquire_t0) * 1e3)
-        self._last_claim_busy_millis += lock_wait_millis
-        self._claim_lock_wait_millis_total += lock_wait_millis
+        self._claim_lock_wait_millis_total += int(
+            (time.perf_counter() - _acquire_t0) * 1e3)
 
     def _commit_claim_transaction(self, txn_t0):
         """COMMIT a claim_next_bundle transaction, timing scan/write vs COMMIT.
 
         txn_t0 is a time.perf_counter() reading taken right after the write
-        lock was acquired (BEGIN IMMEDIATE succeeded).  Populates
-        _last_claim_transaction_millis (scan and write statements before this
-        call) and _last_claim_commit_millis (the COMMIT itself), consumed and
-        reset by the next add_claim_telemetry the same way as
-        _last_claim_busy_millis/_last_claim_retries.
+        lock was acquired (BEGIN IMMEDIATE succeeded).  The scan and write
+        statements before this call and the COMMIT itself are added to the
+        connection's separate totals.
         """
-        self._last_claim_transaction_millis = int(
+        self._claim_transaction_millis_total += int(
             (time.perf_counter() - txn_t0) * 1e3)
         _commit_t0 = time.perf_counter()
         self._conn.execute("COMMIT")
-        self._last_claim_commit_millis = int(
+        self._claim_commit_millis_total += int(
             (time.perf_counter() - _commit_t0) * 1e3)
-        self._claim_transaction_millis_total += (
-            self._last_claim_transaction_millis)
-        self._claim_commit_millis_total += self._last_claim_commit_millis
 
     def _count_one_level_erd_prunes(self, branch_id, n):
         """Fold n one-level ERD prunes into a branch's completion counters.
@@ -3408,10 +3212,8 @@ class ERDQueue:
                     retries += 1
         finally:
             self._conn.execute(f"PRAGMA busy_timeout = {int(self._timeout * 1000)}")
-        lock_wait_millis = int((time.perf_counter() - _acquire_t0) * 1e3)
-        self._last_claim_busy_millis += lock_wait_millis
-        self._last_claim_retries += retries
-        self._claim_lock_wait_millis_total += lock_wait_millis
+        self._claim_lock_wait_millis_total += int(
+            (time.perf_counter() - _acquire_t0) * 1e3)
         self._claim_retries_total += retries
         _txn_t0 = time.perf_counter()
         try:
@@ -3698,11 +3500,10 @@ class ERDQueue:
         """Record one bundle's actual node cost and evaluation wall span.
 
         wall_millis is the bundle's own evaluation wall time (straggler/
-        reclaim-window diagnostic) — NOT claim-handout coordination overhead;
-        that is claim_telemetry's busy_wait_millis, measured separately in
-        claim_next_bundle.  coordination_millis is the coordination time of
-        the bundle's evaluated members.  Aggregated into branch_finalize_log
-        at finalize (see finalize_bundle_stats) and dropped along with the rest of the
+        reclaim-window diagnostic) — NOT claim-handout coordination overhead,
+        which is coordination_millis, the coordination time of the bundle's
+        evaluated members.  Aggregated into branch_finalize_log at finalize
+        (see finalize_bundle_stats) and dropped along with the rest of the
         branch's transient state by delete_branch.  censored=1 marks a bundle
         that hit its node/wall cap and republished an unfinished remainder —
         nodes is then a lower bound on what the bundle's original member set
@@ -3800,7 +3601,8 @@ class ERDQueue:
     def apply_candidate_result(self, branch_key, idx, *, claimed_by=None,
                                bundle_id=None, budget=None, nodes_spent=0,
                                infeasible=False, tainted=False, best=None,
-                               cut=False):
+                               cut=False, evaluation_millis=None,
+                               evaluation_bound_erd=None):
         """Apply every write one candidate evaluation produces, or none.
 
         Returns True when the result was applied.
@@ -3821,7 +3623,8 @@ class ERDQueue:
 
         `best` is (best_guess, best_erd, max_depth) or None.  Each write keeps
         its own guard as well: they cost nothing here and they still hold for
-        the callers that use them directly.
+        the callers that use them directly.  evaluation_millis and
+        evaluation_bound_erd go on the completed claim for the branch ETA.
         """
         opened_transaction = not self._conn.in_transaction
         if opened_transaction:
@@ -3843,9 +3646,10 @@ class ERDQueue:
                                             max_remaining_depth, budget=budget)
                 if cut:
                     self.mark_branch_cut(branch_key)
-                self.complete_candidate(branch_key, idx,
-                                        claimed_by=claimed_by,
-                                        bundle_id=bundle_id)
+                self.complete_candidate(
+                    branch_key, idx, claimed_by=claimed_by,
+                    bundle_id=bundle_id, evaluation_millis=evaluation_millis,
+                    evaluation_bound_erd=evaluation_bound_erd)
                 applied = True
         except Exception:
             if opened_transaction:
@@ -3856,7 +3660,8 @@ class ERDQueue:
         return applied
 
     def complete_candidate(self, branch_key, idx, claimed_by=None,
-                           bundle_id=None):
+                           bundle_id=None, evaluation_millis=None,
+                           evaluation_bound_erd=None):
         """Mark a candidate claim authoritatively complete (done=1).
 
         Returns True when the row completed was the caller's own claim.
@@ -3875,15 +3680,25 @@ class ERDQueue:
         bundle id is unique to one claim call and settles the case where the
         same worker re-claimed the same index, and claimed_by carries a bare
         claim that has no bundle.  Passing neither asks for no check.
+
+        evaluation_millis, when given, records a worker's evaluation on the
+        row with the bound it started against and the branch's live worker
+        count, for the branch ETA.
         """
         now = int(time.time())
         branch_id = self._intern_branch(branch_key, create=True)
+        branch_worker_count = (
+            None if evaluation_millis is None
+            else self._branch_worker_count(branch_id, claimed_by, now))
         self._conn.execute("""
-            UPDATE candidate_claims SET done = 1, done_at = ?
+            UPDATE candidate_claims
+            SET done = 1, done_at = ?, evaluation_millis = ?,
+                evaluation_bound_erd = ?, branch_worker_count = ?
             WHERE branch_id = ? AND idx = ?
               AND (? IS NULL OR claimed_by = ?)
               AND (? IS NULL OR bundle_id = ?)
-        """, (now, branch_id, idx, claimed_by, claimed_by,
+        """, (now, evaluation_millis, evaluation_bound_erd,
+              branch_worker_count, branch_id, idx, claimed_by, claimed_by,
               bundle_id, bundle_id))
         n = self._conn.execute("SELECT changes()").fetchone()[0]
         self._tally_wal_traffic(
@@ -5361,23 +5176,23 @@ class ERDQueue:
             """, (branch_id, branch_row["best_erd"], branch_row["best_erd"],
                   since, now)).fetchone()
             evaluation_row = self._conn.execute("""
-            SELECT COUNT(candidate_evaluation_millis) AS evaluated_candidate_count,
-                   COALESCE(SUM(candidate_evaluation_millis), 0)
+            SELECT COUNT(evaluation_millis) AS evaluated_candidate_count,
+                   COALESCE(SUM(evaluation_millis), 0)
                        AS evaluation_worker_millis,
-                   CASE WHEN SUM(candidate_evaluation_millis) > 0
-                        THEN SUM(branch_worker_count * candidate_evaluation_millis) * 1.0
-                             / SUM(candidate_evaluation_millis) END
+                   CASE WHEN SUM(evaluation_millis) > 0
+                        THEN SUM(branch_worker_count * evaluation_millis) * 1.0
+                             / SUM(evaluation_millis) END
                        AS evaluation_worker_count,
                    MIN(branch_worker_count) AS evaluation_worker_count_min,
                    MAX(branch_worker_count) AS evaluation_worker_count_max,
-                   SUM(CASE WHEN candidate_evaluation_millis IS NOT NULL
+                   SUM(CASE WHEN evaluation_millis IS NOT NULL
                                  AND branch_worker_count IS NULL
                             THEN 1 ELSE 0 END)
                        AS evaluation_unknown_worker_count
-                FROM telemetry.claim_telemetry
-                WHERE branch_id = ?
+                FROM candidate_claims
+                WHERE branch_id = ? AND evaluation_millis IS NOT NULL
                   AND (evaluation_bound_erd = ? OR ? IS NULL)
-                  AND recorded_at >= ? AND recorded_at <= ?
+                  AND done_at >= ? AND done_at <= ?
             """, (branch_id, branch_row["best_erd"], branch_row["best_erd"],
                   since, now)).fetchone()
         except sqlite3.OperationalError:
@@ -5716,8 +5531,6 @@ class ERDQueue:
                 "sample_truncated": result["matched_rows"] > len(result["rows"]),
                 "rows": result["rows"],
             }
-        if field == "coordination" and spine_prefix:
-            raise ValueError("coordination hotspots cannot be attributed to a spine")
         if field == "cut-reuse" and spine_prefix and branch_key is None:
             raise ValueError(
                 "cut-reuse hotspots require a singular branch target"
@@ -5728,7 +5541,6 @@ class ERDQueue:
             "one-level-erd-prunes": "branch_finalize_log",
             "two-level-erd-prunes": "branch_finalize_log",
             "cut-reuse": "cut_reuse_misses",
-            "coordination": "claim_telemetry",
         }.get(field)
         if table is None:
             raise ValueError(f"unsupported hotspot field: {field}")
@@ -5780,7 +5592,7 @@ class ERDQueue:
                 "recorded_at": row["recorded_at"],
             } for row in rows]
             population = "recent_branch_finalizations"
-        elif field == "cut-reuse":
+        else:
             branch_condition = " AND branch_key = ?" if branch_key is not None else ""
             parameters = [epoch, since]
             if branch_key is not None:
@@ -5813,30 +5625,6 @@ class ERDQueue:
                 "recorded_at": row["recorded_at"],
             } for row in rows]
             population = "recent_cut_reuse_misses"
-        else:
-            rows = self._conn.execute("""
-                WITH sample AS (
-                    SELECT * FROM telemetry.claim_telemetry
-                    WHERE epoch = ? AND recorded_at >= ?
-                    ORDER BY recorded_at DESC, id DESC LIMIT ?
-                )
-                SELECT n_words, worker_count, COUNT(*) AS claim_count,
-                       SUM(coordination_millis) AS coordination_millis,
-                       SUM(COALESCE(claim_retries, 0)) AS claim_retry_count,
-                       SUM(COALESCE(busy_wait_millis, 0)) AS busy_wait_millis
-                FROM sample GROUP BY n_words, worker_count
-                ORDER BY coordination_millis DESC, n_words, worker_count LIMIT ?
-            """, (epoch, since, sample_size, limit)).fetchall()
-            normalized_rows = [{
-                "row_id": f"coordination:{row['n_words']}:{row['worker_count']}",
-                "answer_count": row["n_words"],
-                "worker_count": row["worker_count"],
-                "claim_count": row["claim_count"],
-                "coordination_millis": row["coordination_millis"],
-                "claim_retry_count": row["claim_retry_count"],
-                "busy_wait_millis": row["busy_wait_millis"],
-            } for row in rows]
-            population = "recent_claim_coordination_buckets"
         return {
             "population": population,
             "epoch": epoch,
@@ -5847,53 +5635,42 @@ class ERDQueue:
             "rows": normalized_rows,
         }
 
-    # Group keys the band CASE cannot produce, so one pass over the claim rows
-    # yields the bands and the two populations that are not bands.
-    UNATTRIBUTED_BAND_INDEX = -1
-    UNMEASURED_BAND_INDEX = -2
+    # The group key the band CASE cannot produce, so one pass over the
+    # finalize rows yields the bands and the population that is not a band.
+    UNMEASURED_BAND_INDEX = -1
 
     def report_work_distribution(self, epoch, since, band_edge_millis,
                                  minimum_answer_count=None,
                                  maximum_answer_count=None) -> dict:
-        """Aggregate claim telemetry into per-branch bands of worker time.
+        """Aggregate finalized branches into bands of worker time.
 
         The whole epoch is aggregated, not a bounded sample of its most recent
-        rows.  A branch is banded by its lifetime worker time, so a sample that
-        keeps only recent claims clips the long-lived branches hardest and bands
-        them far below where they belong -- on epoch 17 the six branches holding
-        57.8% of all node work contributed no claims at all to the last hour.
-        This is a GROUP BY returning a handful of rows rather than a row
-        listing, so the cost is one linear pass and there is no output to bound.
+        rows.  A sample that keeps only recent rows clips the long-lived
+        branches hardest -- on epoch 17 the six branches holding 57.8% of all
+        node work finished outside the last hour.  This is a GROUP BY returning
+        a handful of rows rather than a row listing, so the cost is one linear
+        pass and there is no output to bound.
 
-        The band key is the branch's own summed candidate_evaluation_millis,
-        never the span between its creation and finalization: a parent that
-        waits on promoted children accumulates wall time it did not work, and
-        banding on that span would file it among the expensive branches for
-        having done nothing.
+        One branch_finalize_log row is one finalized branch, banded by
+        total_bundle_wall_millis: the time workers spent evaluating its
+        bundles, never the span between its creation and finalization.  A
+        parent that waits on promoted children accumulates wall time it did
+        not work, and banding on that span would file it among the expensive
+        branches for having done nothing.  A promoted child's work is its own
+        row, so summing across bands counts each node once.
 
-        Every row of claim_telemetry is one candidate evaluation attributed to
-        one branch, so a promoted child's nodes land under the child's own
-        branch_id rather than the parent's.  Summing across bands therefore
-        counts each node once.
+        A branch whose worker or coordination time was not recorded is counted
+        apart from the bands rather than folded into them.  Treating its time
+        as zero would seat a branch of unknown -- possibly very large -- cost
+        in the cheapest band while still counting its nodes, which is a
+        confidently wrong distribution rather than an admitted gap.  Rows
+        written before per-branch coordination was recorded are all of this
+        kind.
 
-        Two populations are counted apart from the bands rather than folded
-        into them.  A claim with branch_id NULL has no recorded branch
-        attribution: most such rows were taken outside any branch context, but
-        the migration that added branch_id also leaves it NULL on every claim
-        recorded before per-branch attribution existed, and the two cases are
-        indistinguishable here -- so this population is named by what is
-        missing, not by an assumed cause.  A branch holding any claim whose
-        candidate_evaluation_millis is NULL has no measurable worker time at
-        all: treating that as zero would seat a branch of unknown -- possibly
-        very large -- cost in the cheapest band while still counting its nodes,
-        which is a confidently wrong distribution rather than an admitted gap.
-
-        Bands come from claims, not from finalizations, so a branch still being
-        solved is present with the totals it has accumulated so far;
-        unfinished_branch_count reports how many of a band's branches those are.
-
-        An answer-count range narrows the claim rows before they are banded, so
-        the totals and every share are of the branches in that size region.
+        Branches still being solved are absent: their totals are written when
+        they finalize.  An answer-count range narrows the rows before they are
+        banded, so the totals and every share are of the branches in that size
+        region.
         """
         band_case = " ".join(
             f"WHEN worker_millis <= {int(edge)} THEN {index}"
@@ -5907,74 +5684,56 @@ class ERDQueue:
         if since is not None:
             parameters.append(since)
         parameters.extend(answer_count_parameters)
-        # SQLite groups NULL branch_id together, so the claims belonging to no
-        # branch arrive as one group and are recognised by their key rather than
-        # by a second pass over the same rows.
         rows = self._conn.execute(f"""
             WITH branch AS (
-                SELECT branch_id,
-                       COUNT(*) AS claim_count,
-                       SUM(work_nodes) AS search_node_count,
-                       SUM(coordination_millis) AS coordination_millis,
-                       SUM(COALESCE(candidate_evaluation_millis, 0))
-                           AS worker_millis,
-                       SUM(CASE WHEN candidate_evaluation_millis IS NULL
-                                THEN 1 ELSE 0 END) AS unmeasured_claim_count
-                FROM telemetry.claim_telemetry
+                SELECT COALESCE(n_claims, 0) AS claim_count,
+                       COALESCE(nodes_spent, 0) AS search_node_count,
+                       coordination_millis,
+                       total_bundle_wall_millis AS worker_millis
+                FROM telemetry.branch_finalize_log
                 WHERE epoch = ? {since_condition}
                 {answer_count_condition}
-                GROUP BY branch_id
             )
             SELECT CASE
-                       WHEN branch.branch_id IS NULL
-                           THEN {self.UNATTRIBUTED_BAND_INDEX}
-                       WHEN branch.unmeasured_claim_count > 0
+                       WHEN worker_millis IS NULL
+                            OR coordination_millis IS NULL
                            THEN {self.UNMEASURED_BAND_INDEX}
                        {band_case}
                        ELSE {len(band_edge_millis)}
                    END AS band_index,
                    COUNT(*) AS branch_count,
-                   SUM(branch.claim_count) AS claim_count,
-                   SUM(branch.search_node_count) AS search_node_count,
-                   SUM(branch.coordination_millis) AS coordination_millis,
-                   SUM(branch.worker_millis) AS worker_millis,
-                   SUM(CASE WHEN active_branches.branch_id IS NOT NULL
-                            THEN 1 ELSE 0 END) AS unfinished_branch_count
+                   SUM(claim_count) AS claim_count,
+                   SUM(search_node_count) AS search_node_count,
+                   SUM(COALESCE(coordination_millis, 0))
+                       AS coordination_millis,
+                   SUM(COALESCE(worker_millis, 0)) AS worker_millis
             FROM branch
-            LEFT JOIN active_branches USING (branch_id)
             GROUP BY band_index ORDER BY band_index
         """, parameters).fetchall()
 
         def totals(row):
             return {
+                "branch_count": row["branch_count"],
                 "claim_count": row["claim_count"],
                 "search_node_count": row["search_node_count"],
                 "coordination_millis": row["coordination_millis"],
                 "worker_millis": row["worker_millis"],
             }
 
-        empty = {"claim_count": 0, "search_node_count": 0,
-                 "coordination_millis": 0, "worker_millis": 0}
-        unattributed, unmeasured = dict(empty), dict(empty, branch_count=0)
+        unmeasured = {"branch_count": 0, "claim_count": 0,
+                      "search_node_count": 0, "coordination_millis": 0,
+                      "worker_millis": 0}
         bands = []
         for row in rows:
-            if row["band_index"] == self.UNATTRIBUTED_BAND_INDEX:
-                unattributed = totals(row)
-            elif row["band_index"] == self.UNMEASURED_BAND_INDEX:
-                unmeasured = dict(totals(row), branch_count=row["branch_count"])
+            if row["band_index"] == self.UNMEASURED_BAND_INDEX:
+                unmeasured = totals(row)
             else:
-                bands.append({
-                    "band_index": row["band_index"],
-                    "branch_count": row["branch_count"],
-                    "unfinished_branch_count": row["unfinished_branch_count"],
-                    **totals(row),
-                })
+                bands.append({"band_index": row["band_index"], **totals(row)})
         return {
-            "population": "epoch_claims_by_branch",
+            "population": "epoch_finalized_branches",
             "epoch": epoch,
             "since": since,
             "bands": bands,
-            "unattributed": unattributed,
             "unmeasured": unmeasured,
         }
 
@@ -6953,147 +6712,13 @@ class ERDQueue:
         """(lock wait millis, transaction millis, commit millis, retries) this
         connection's claim paths have spent over its whole life.
 
-        Running totals, unaffected by add_claim_telemetry and
-        discard_claim_attribution, so an interval's share is the difference
+        Running totals, never reset, so an interval's share is the difference
         between two readings.
         """
         return (self._claim_lock_wait_millis_total,
                 self._claim_transaction_millis_total,
                 self._claim_commit_millis_total,
                 self._claim_retries_total)
-
-    def discard_claim_attribution(self):
-        """Drop the claim attribution accumulated since the last telemetry row.
-
-        These counters are consumed by add_claim_telemetry and are otherwise
-        never cleared, so they outlive any window a caller restarts.  A caller
-        that moves its coordination window forward past the work they describe
-        must call this: left in place they are reported inside a window that no
-        longer contains them, and the phases then exceed coordination_millis
-        and pin idle_millis to its clamp.
-
-        Discarding is the correct outcome rather than a loss.  The restarted
-        window has already excluded the span these measure, so reporting them
-        as zero is what keeps the row self-consistent; a caller that wants to
-        keep the figure must read it before restarting the window.
-        """
-        self._last_claim_busy_millis = 0
-        self._last_claim_retries = 0
-        self._last_claim_transaction_millis = 0
-        self._last_claim_commit_millis = 0
-
-    def add_claim_telemetry(self, n_words: int, coordination_millis: int,
-                            work_nodes: int, worker_count: int,
-                            branch_key: bytes = None, spine: str = None,
-                            worker_id: str = None, bundle_id: str = None,
-                            idx: int = None, bundle_start_idx: int = None,
-                            bundle_end_idx: int = None,
-                            scheduling_millis: int = 0,
-                            scan_openers_walked: int = 0,
-                            fruitless_scan_millis: int = 0,
-                            fruitless_scans: int = 0,
-                            fruitless_scan_openers_walked: int = 0,
-                            candidate_evaluation_millis: int = None,
-                            evaluation_bound_erd: float = None):
-        """Append a claim coordination record to claim_telemetry for offline analysis.
-
-        claim_retries / busy_wait_millis / claim_transaction_millis /
-        claim_commit_millis come from the most recent claim path on this
-        connection (set by claim_next_bundle), the direct lock-contention and
-        transaction-phase signal; the row is stamped with the active epoch.
-
-        branch_key/spine attribute this row to the branch the claim belonged
-        to.  branch_key is interned to its branches-registry branch_id before
-        storage (see _intern_branch) rather than stored as the raw BLOB: the
-        registry already carries the durable branch_key <-> branch_id mapping
-        for every branch that has ever been created, so duplicating the BLOB
-        onto every one of a branch's candidate rows would be pure size with
-        no independent information — a size difference that matters here,
-        since this is the highest-volume table in the schema.  A caller with
-        no branch context passes branch_key=None, which stores branch_id
-        NULL, not 0 or an interned NULL-key row.  worker_id/bundle_id/idx/
-        bundle_start_idx/bundle_end_idx identify which worker evaluated which
-        candidate of which bundle (all default to NULL for a caller with no
-        branch/bundle context).
-        candidate_evaluation_millis is the elapsed solver work for this
-        candidate.  It
-        is separate from coordination_millis, which spans only the gap between
-        candidates.
-
-        scheduling_millis is the caller's work-selection scan for this claim
-        (opener-work ordering, pending promotion, joining an in-progress
-        branch), already net of any lock wait and claim transaction it
-        contained so the phases stay disjoint.
-
-        idle_millis is coordination_millis minus every other timed phase, so
-        those five partition it exactly and idle_millis means genuinely
-        unaccounted wait rather than unattributed scan work.
-
-        fruitless_scan_millis is deliberately NOT part of that partition.  It
-        measures the scans since the previous row that selected nothing, which
-        the caller carries forward because they belong to no claim -- and each
-        of them is followed by an idle wait that restarts the coordination
-        window, so their cost lies outside every window rather than inside
-        this row's.  Subtracting it would make the parts exceed the whole and
-        pin idle_millis to its clamp.  fruitless_scans counts those scans, and
-        scan_openers_walked / fruitless_scan_openers_walked report the
-        opener-work requests each kind of scan examined -- the quantity an
-        exhausted scan's cost is linear in.
-
-        Every row is one candidate evaluation, so COUNT(*) over the table is a
-        claim count.  Branch finalize cost is deliberately not recorded here —
-        it belongs to a branch rather than to a claim, and goes to
-        branch_finalize_log.cache_write_millis instead.
-
-        Consumed values are reset to 0 immediately after this INSERT reads
-        them, so they are attributed to exactly the next telemetry row and
-        never repeat on a later, unrelated candidate's row.  This matters
-        under bundling: a candidate's own within-candidate sub-branch
-        promotion can trigger a nested claim_next_bundle call on this same
-        connection before this candidate's own add_claim_telemetry call —
-        without the reset, that nested claim's contention numbers would
-        otherwise still be sitting here (unconsumed) for whichever LATER,
-        unrelated bundle member logs telemetry next.
-        """
-        now = int(time.time())
-        branch_id = (None if branch_key is None
-                    else self._intern_branch(branch_key))
-        branch_worker_count = (None if branch_id is None else
-                               self._branch_worker_count(
-                                   branch_id, worker_id, now))
-        idle_millis = max(0, coordination_millis
-                          - self._last_claim_transaction_millis
-                          - self._last_claim_commit_millis
-                          - self._last_claim_busy_millis
-                          - scheduling_millis)
-        self._conn.execute("""
-            INSERT INTO telemetry.claim_telemetry
-                (n_words, coordination_millis, candidate_evaluation_millis,
-                 work_nodes, claim_retries,
-                 busy_wait_millis, worker_count, branch_id, spine, worker_id,
-                 branch_worker_count, evaluation_bound_erd, bundle_id, idx, bundle_start_idx,
-                 bundle_end_idx,
-                 claim_transaction_millis, claim_commit_millis,
-                 scheduling_millis, scan_openers_walked,
-                 fruitless_scan_millis, fruitless_scans,
-                 fruitless_scan_openers_walked,
-                 idle_millis, epoch, recorded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?)
-        """, (n_words, coordination_millis, candidate_evaluation_millis, work_nodes,
-              self._last_claim_retries,
-              self._last_claim_busy_millis, worker_count, branch_id, spine,
-              worker_id, branch_worker_count, evaluation_bound_erd, bundle_id, idx, bundle_start_idx,
-              bundle_end_idx,
-              self._last_claim_transaction_millis, self._last_claim_commit_millis,
-              scheduling_millis, scan_openers_walked,
-              fruitless_scan_millis, fruitless_scans,
-              fruitless_scan_openers_walked,
-              idle_millis, self.epoch, now))
-        self._last_claim_retries = 0
-        self._last_claim_busy_millis = 0
-        self._last_claim_transaction_millis = 0
-        self._last_claim_commit_millis = 0
 
     SCHEDULE_DIAGNOSTIC_FIELDS = (
         "winner_best_first_position",
@@ -7208,11 +6833,9 @@ class ERDQueue:
         the exact solved line at finalize time so later reports do not need to
         infer it from mutable cache state.  If a one-level ERD-prune sweep
         supersedes an in-flight claim that later finishes, n_claims excludes
-        that overlap even though its per-claim telemetry row still exists.
-        cache_write_millis is the wall time the finalizing worker spent
-        publishing the result (score-cache/loss/cut writes and the cost-model
-        fold) — the finalize phase of the coordination breakdown, kept here
-        rather than on claim_telemetry because it belongs to the branch.
+        that overlap.  cache_write_millis is the wall time the finalizing
+        worker spent publishing the result (score-cache/loss/cut writes and
+        the cost-model fold).
         schedule_diagnostics is candidate_schedule_diagnostics' mapping, which
         carries the branch's best-first scheduling evidence past the claim
         rows that are about to be deleted; None leaves every one of its
@@ -7278,7 +6901,7 @@ class ERDQueue:
                             blocks_other=0, help_depth=None, outcome=None):
         """Record one cooperative_solve wait episode.
 
-        Attributes what claim_telemetry's idle_millis can only total: which
+        Attributes what worker_time's wait_dependency_millis can only total: which
         dependency the worker waited on, how much of the episode it was asleep
         rather than helping or claiming, and why each sleep happened.  A caller
         that never blocked has nothing to attribute and should not write a row.
@@ -7359,172 +6982,6 @@ class ERDQueue:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (branch_key, n_words, budget, wanted_ceiling, available_bound,
               available_budget, self.epoch, now))
-
-    def add_candidate_accuracy(self, branch_key, n_words, budget, predicted_work,
-                               bound_erd, candidate_cost_lower_bound,
-                               erd_lower_bound_pruned, actual_nodes,
-                               group_sizes=None, opener=None,
-                               candidate_word=None, worker_id=None,
-                               bundle_id=None, idx=None, started_at=None,
-                               evaluation_millis=None, outcome=None,
-                               republish_count=None):
-        """Log one predicted-vs-actual work point for the §10 metric-validation gate.
-
-        Under single-candidate claiming a claim is exactly one candidate, so
-        actual_nodes is that candidate's true cost.  group_sizes ('-'-joined
-        response-group sizes) is the sufficient statistic for recomputing any work
-        metric offline; logged only for non-ERD-pruned rows.  opener is the
-        root opener of the branch's spine, so a multi-day corpus can be
-        segmented per opener (different openers reach differently-shaped
-        answer sets).  The claim identity fields match claim_telemetry, while
-        candidate_word removes dependence on the candidate order that produced
-        idx.  started_at is the evaluation start; evaluation_millis preserves
-        its subsecond duration while recorded_at remains the completion time.
-        """
-        now = int(time.time())
-        branch_id = self._intern_branch(branch_key)
-        if republish_count is None and branch_id is not None and idx is not None:
-            republish = self._conn.execute(
-                "SELECT count FROM candidate_republish "
-                "WHERE branch_id = ? AND idx = ?", (branch_id, idx)).fetchone()
-            republish_count = 0 if republish is None else republish["count"]
-        self._conn.execute("""
-            INSERT INTO telemetry.candidate_accuracy
-                (branch_key, branch_id, candidate_word, worker_id, bundle_id, idx,
-                 n_words, budget, predicted_work, bound_erd,
-                 candidate_cost_lower_bound, erd_lower_bound_pruned,
-                 actual_nodes, group_sizes, opener, started_at,
-                 evaluation_millis, outcome, republish_count, epoch, recorded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (branch_key, branch_id, candidate_word, worker_id, bundle_id, idx,
-              n_words, budget, predicted_work, bound_erd,
-              candidate_cost_lower_bound, 1 if erd_lower_bound_pruned else 0,
-              actual_nodes, group_sizes, opener, started_at,
-              evaluation_millis, outcome, republish_count, self.epoch, now))
-
-    @staticmethod
-    def _accuracy_percentiles(values):
-        values = sorted(values)
-        if not values:
-            return {f"p{percentile}": None
-                    for percentile in (1, 10, 50, 90, 99)}
-        return {
-            f"p{percentile}": values[min(
-                len(values) - 1, int(percentile / 100 * len(values)))]
-            for percentile in (1, 10, 50, 90, 99)
-        }
-
-    def report_candidate_accuracy(self, epoch=None, budget=None,
-                                  minimum_answer_count=None,
-                                  maximum_answer_count=None, opener=None,
-                                  branch_key=None, since=None, limit=None,
-                                  sample_size=50_000, raw_row_offset=0):
-        """Return a bounded candidate-level calibration sample.
-
-        Candidate telemetry is one row per claim.  Sampling random ids across
-        an epoch avoids both a full aggregate and treating a few recent minutes
-        from one opener as representative of a multi-day epoch.  The seed is
-        derived from the epoch and requested size, so a report is reproducible;
-        a different requested size is an independent sample.  Requested and
-        achieved counts make a selective-filter shortfall explicit.
-        """
-        epoch = self.epoch if epoch is None else epoch
-        where, parameters = ["epoch = ?"], [epoch]
-        for condition, value in (
-                ("budget = ?", budget),
-                ("n_words >= ?", minimum_answer_count),
-                ("n_words <= ?", maximum_answer_count),
-                ("opener = ?", opener),
-                ("branch_key = ?", branch_key),
-                ("recorded_at >= ?", since)):
-            if value is not None:
-                where.append(condition)
-                parameters.append(value)
-        condition = " WHERE " + " AND ".join(where)
-        sampling_condition = " WHERE epoch = ?"
-        sampling_parameters = [epoch]
-        if since is not None:
-            sampling_condition += " AND recorded_at >= ?"
-            sampling_parameters.append(since)
-        id_bounds = self._conn.execute(
-            "SELECT MIN(id), MAX(id) FROM telemetry.candidate_accuracy"
-            + sampling_condition, sampling_parameters).fetchone()
-        minimum_id, maximum_id = id_bounds
-        sampled_rows = []
-        if minimum_id is not None:
-            # Candidate-accuracy ids are append-only and dense.  Batched point
-            # lookups keep the random sample bounded by the epoch/id index.
-            random_generator = random.Random(f"{epoch}:{sample_size}")
-            sample_ids = random_generator.sample(
-                range(minimum_id, maximum_id + 1),
-                min(sample_size, maximum_id - minimum_id + 1))
-            for start in range(0, len(sample_ids), 500):
-                batch = sample_ids[start:start + 500]
-                placeholders = ", ".join("?" for _ in batch)
-                sampled_rows.extend(dict(row) for row in self._conn.execute(
-                    "SELECT * FROM telemetry.candidate_accuracy" + condition
-                    + f" AND id IN ({placeholders})", [*parameters, *batch]))
-        raw_rows = []
-        if limit is not None:
-            raw_rows = [dict(row) for row in self._conn.execute(
-                "SELECT * FROM telemetry.candidate_accuracy" + condition
-                + " ORDER BY id DESC LIMIT ? OFFSET ?",
-                [*parameters, limit, raw_row_offset])]
-        for row in sampled_rows + raw_rows:
-            predicted = row["predicted_work"]
-            actual = row["actual_nodes"]
-            row["actual_predicted_ratio"] = (
-                actual / predicted if predicted is not None and predicted > 0
-                else None)
-        non_pruned = [row for row in sampled_rows
-                      if not row["erd_lower_bound_pruned"]]
-
-        def calibration(group_rows):
-            return {
-                "row_count": len(group_rows),
-                "predicted_work": self._accuracy_percentiles(
-                    [row["predicted_work"] for row in group_rows
-                     if row["predicted_work"] is not None]),
-                "actual_nodes": self._accuracy_percentiles(
-                    [row["actual_nodes"] for row in group_rows]),
-                "actual_predicted_ratio": self._accuracy_percentiles(
-                    [row["actual_predicted_ratio"] for row in group_rows
-                     if row["actual_predicted_ratio"] is not None]),
-            }
-
-        buckets = {}
-        for row in non_pruned:
-            buckets.setdefault(
-                (cost_size_bucket(row["n_words"]), row["budget"]), []).append(row)
-        ratio_rows = [row for row in non_pruned
-                      if row["actual_predicted_ratio"] is not None]
-        ordered = sorted(ratio_rows, key=lambda row: row["actual_predicted_ratio"])
-        population_row_count = None
-        if len(where) == 1 or (len(where) == 2 and since is not None):
-            population_row_count = self._conn.execute(
-                "SELECT COUNT(*) FROM telemetry.candidate_accuracy"
-                + sampling_condition, sampling_parameters).fetchone()[0]
-        return {
-            "epoch": epoch,
-            "requested_sample_size": sample_size,
-            "sampled_row_count": len(sampled_rows),
-            "population_row_count": population_row_count,
-            "erd_pruned_row_count": sum(
-                row["erd_lower_bound_pruned"] for row in sampled_rows),
-            "non_erd_pruned_row_count": len(non_pruned),
-            "no_prediction_row_count": sum(
-                row["predicted_work"] is None or row["predicted_work"] <= 0
-                for row in sampled_rows),
-            "raw_row_offset": raw_row_offset,
-            "calibration": calibration(non_pruned),
-            "answer_count_budget_calibration": [
-                {"answer_count_bucket_start": key[0], "budget": key[1],
-                 **calibration(group_rows)}
-                for key, group_rows in sorted(buckets.items())],
-            "largest_over_predicted": ordered[:10],
-            "largest_under_predicted": list(reversed(ordered[-10:])),
-            "rows": raw_rows,
-        }
 
     def set_epoch(self, epoch: int, label: str = None, git_sha: str = None,
                   notes: str = None):

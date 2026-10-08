@@ -128,7 +128,7 @@ class TestSchemaMigration(unittest.TestCase):
                                       "old_queue_telemetry.sqlite3")
         conn = sqlite3.connect(telemetry_path)
         conn.execute("""
-            CREATE TABLE claim_telemetry (
+            CREATE TABLE cost_samples (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 recorded_at INTEGER
             )
@@ -137,7 +137,7 @@ class TestSchemaMigration(unittest.TestCase):
         conn.close()
         with self.assertRaises(RuntimeError) as raised:
             ERDQueue(self.path)
-        self.assertIn("telemetry.claim_telemetry", str(raised.exception))
+        self.assertIn("telemetry.cost_samples", str(raised.exception))
         self.assertIn("n_words", str(raised.exception))
 
     def test_extra_column_warns_but_opens(self):
@@ -145,7 +145,7 @@ class TestSchemaMigration(unittest.TestCase):
         telemetry_path = os.path.join(self._tmp.name,
                                       "old_queue_telemetry.sqlite3")
         conn = sqlite3.connect(telemetry_path)
-        conn.execute("ALTER TABLE claim_telemetry ADD COLUMN stray INTEGER")
+        conn.execute("ALTER TABLE cost_samples ADD COLUMN stray INTEGER")
         conn.commit()
         conn.close()
         with self.assertLogs("erd_queue", level="WARNING") as captured:
@@ -193,19 +193,38 @@ class TestSchemaMigration(unittest.TestCase):
         # its data must be archived deliberately, never ignored silently.
         conn = sqlite3.connect(self.path)
         conn.execute("""
-            CREATE TABLE claim_telemetry (
+            CREATE TABLE cost_samples (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 n_words INTEGER
             )
         """)
-        conn.execute("INSERT INTO claim_telemetry (n_words) VALUES (42)")
+        conn.execute("INSERT INTO cost_samples (n_words) VALUES (42)")
         conn.commit()
         conn.close()
 
         with self.assertRaises(RuntimeError) as raised:
             ERDQueue(self.path)
         self.assertIn("predates the telemetry split", str(raised.exception))
-        self.assertIn("claim_telemetry", str(raised.exception))
+        self.assertIn("cost_samples", str(raised.exception))
+
+    def test_per_claim_tables_are_dropped_on_open(self):
+        ERDQueue(self.path).close()
+        telemetry_path = os.path.join(self._tmp.name,
+                                      "old_queue_telemetry.sqlite3")
+        conn = sqlite3.connect(telemetry_path)
+        for table in ("claim_telemetry", "candidate_accuracy"):
+            conn.execute(f"CREATE TABLE {table} (id INTEGER PRIMARY KEY, "
+                         f"n_words INTEGER)")
+            conn.execute(f"INSERT INTO {table} (n_words) VALUES (5)")
+        conn.commit()
+        conn.close()
+        ERDQueue(self.path).close()
+        conn = sqlite3.connect(telemetry_path)
+        names = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        conn.close()
+        self.assertNotIn("claim_telemetry", names)
+        self.assertNotIn("candidate_accuracy", names)
 
     def test_telemetry_file_is_created_alongside_queue(self):
         ERDQueue(self.path).close()
@@ -218,8 +237,7 @@ class TestSchemaMigration(unittest.TestCase):
             "AND name NOT LIKE 'sqlite_%'")}
         conn.close()
         self.assertEqual(names, {
-            "bundle_stats", "cost_samples", "claim_telemetry",
-            "branch_finalize_log", "candidate_accuracy",
+            "bundle_stats", "cost_samples", "branch_finalize_log",
             "backstop_telemetry", "cut_reuse_misses",
             "two_level_prune_telemetry", "dependency_wait", "worker_time",
             "checkpoint_pause", "claim_reclaim"})
@@ -401,8 +419,10 @@ class TestClaimNextBundle(_TmpQueue):
         finally:
             t.join(timeout=5)
         self.assertIsNotNone(claim)
-        self.assertGreater(self.q._last_claim_retries, 0)
-        self.assertGreater(self.q._last_claim_busy_millis, 0)
+        lock_wait, _transaction, _commit, retries = (
+            self.q.claim_timing_totals())
+        self.assertGreater(retries, 0)
+        self.assertGreater(lock_wait, 0)
 
     def test_no_two_calls_return_overlapping_indices(self):
         seen = set()
@@ -1077,32 +1097,6 @@ class TestBundleIdUniqueAcrossRespawn(unittest.TestCase):
             q2.close()
 
         self.assertNotEqual(bundle_id_1, bundle_id_2)
-
-
-class TestClaimTelemetryContentionAttribution(_TmpQueue):
-    """claim_retries/busy_wait_millis must attribute to exactly the claim
-    that produced them, never repeat on a later, unrelated candidate's row
-    -- the failure mode a nested claim_next_bundle call (within-candidate
-    sub-branch promotion, on the same connection) can otherwise trigger."""
-
-    def test_contention_values_reset_after_being_logged_once(self):
-        self.q._last_claim_busy_millis = 250
-        self.q._last_claim_retries = 3
-        self.q._last_claim_transaction_millis = 40
-        self.q._last_claim_commit_millis = 10
-        self.q.add_claim_telemetry(10, 5, 1, 4)
-        self.q.add_claim_telemetry(10, 1, 1, 4)   # a later, unrelated candidate
-        rows = self.q._conn.execute(
-            "SELECT busy_wait_millis, claim_retries, claim_transaction_millis, "
-            "claim_commit_millis FROM claim_telemetry ORDER BY id").fetchall()
-        self.assertEqual(
-            (rows[0]["busy_wait_millis"], rows[0]["claim_retries"],
-             rows[0]["claim_transaction_millis"], rows[0]["claim_commit_millis"]),
-            (250, 3, 40, 10))
-        self.assertEqual(
-            (rows[1]["busy_wait_millis"], rows[1]["claim_retries"],
-             rows[1]["claim_transaction_millis"], rows[1]["claim_commit_millis"]),
-            (0, 0, 0, 0))
 
 
 class TestMultiWorkerNoOverlap(unittest.TestCase):
