@@ -41,7 +41,7 @@ from wordle_engine import ERD_ALL, GAME_GUESSES, ResponseCache, load_word_list
 from wordle_ui import fmt_pattern, parse_pattern
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 WORKER_STALE_SECONDS = 20
 DEFAULT_TREE_PAGE_SIZE = 10
 # A tree page groups sibling nodes by the guess word on their spine, and a page

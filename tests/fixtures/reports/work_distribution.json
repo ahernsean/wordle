@@ -124,7 +124,7 @@
  },
  "generated_at": 1771000000,
  "report_kind": "work_distribution",
- "schema_version": 4,
+ "schema_version": 5,
  "sources": {
   "cache": {
    "error": null,
