@@ -127,6 +127,41 @@ it afterwards is reading a system that has already moved, and a holder count
 from one instant beside an availability count from another does not blur the
 answer, it inverts it. An episode that never reached the loop writes no row.
 
+### Worker time is a partition; the per-claim rows are not
+
+`telemetry.worker_time` holds one row per worker per
+`WORKER_TIME_INTERVAL_SECONDS` (60): the worker's whole wall time over the
+interval, split by what it was doing. The activity columns sum to
+`interval_millis` exactly, so a share read from them is a share of real time.
+That is what the per-claim rows cannot give: each candidate's evaluation span
+contains every candidate evaluated inside it (a dependency wait that helps
+elsewhere), so summing them counts nested work twice, and every real sleep
+restarts the coordination window, so no claim row holds a sleep at all.
+
+**Each span is charged to the innermost open activity and nothing else.**
+`_WorkerTimeAccount` keeps a stack; `_charged_to` puts a whole method on it
+(`claim_one` and `_help_other_branch` are scheduling, `_claim_bundle` is
+claiming, `maybe_finalize` is finalizing) and `evaluate_claim` wraps the
+engine call as evaluation. **Every sleep names its reason**:
+`_idle_wait(seconds, reason)` charges `wait_<reason>`, so a new wait needs a
+reason with a column of its own. Time no activity covers is `other_millis`;
+durations are floored to milliseconds and `other_millis` takes the remainder,
+so the integers partition with no rounding residue.
+
+The same rows carry what #379 needs to test its hypothesis:
+`max_heartbeat_gap_millis` (the longest interval between heartbeat rows
+actually written, which is what stale-claim reclaim reads),
+`heartbeats_deferred` (writes skipped for a checkpoint pause), and
+`max_tick_gap_millis` with the activity it opened in. Alongside them,
+`telemetry.checkpoint_pause` records every supervisor quiesce and how long it
+held, and `telemetry.claim_reclaim` records every worker whose claims a
+reclaim freed, with its heartbeat age at that moment.
+
+A branch's coordination time travels with its other costs:
+`bundle_stats.coordination_millis` sums each bundle's members and
+`branch_finalize_log.coordination_millis` sums the bundles, so coordination
+per unit of work is readable per branch without the per-claim rows.
+
 ### Priority ladders, and the fan-out they prevent
 
 **Openers tied at one priority all become eligible at once, and the swarm

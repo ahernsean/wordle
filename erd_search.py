@@ -1070,12 +1070,19 @@ def _maybe_quiesce_truncate(queue):
         return
     logger.info('Queue WAL at %.2f GB — quiescing workers for TRUNCATE.',
                 wal_bytes / 1e9)
+    truncated = False
     queue.set_checkpoint_pause(True)
+    # Both clocks start once the flag has landed: the write can wait on the
+    # queue lock, and neither the retry budget nor the recorded pause should
+    # include time before any worker could see it.
+    started_at = time.time()
+    pause_t0 = time.perf_counter()
     try:
-        deadline = time.time() + TRUNCATE_RETRY_SECONDS
+        deadline = started_at + TRUNCATE_RETRY_SECONDS
         while True:
             result = queue.checkpoint('TRUNCATE')
             if result is not None and result[0] == 0:
+                truncated = True
                 logger.info('Queue WAL truncated (%.2f GB reclaimed).',
                             wal_bytes / 1e9)
                 return
@@ -1088,6 +1095,13 @@ def _maybe_quiesce_truncate(queue):
             time.sleep(0.5)
     finally:
         queue.set_checkpoint_pause(False)
+        pause_millis = int((time.perf_counter() - pause_t0) * 1000)
+        logger.info('Checkpoint pause lasted %.1fs.', pause_millis / 1000)
+        try:
+            queue.add_checkpoint_pause(started_at, pause_millis, wal_bytes,
+                                       truncated)
+        except sqlite3.OperationalError as exc:
+            logger.warning('Could not record the checkpoint pause: %s', exc)
 
 
 def _dump_worker_stacks(procs):

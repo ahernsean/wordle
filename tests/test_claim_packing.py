@@ -221,7 +221,8 @@ class TestSchemaMigration(unittest.TestCase):
             "bundle_stats", "cost_samples", "claim_telemetry",
             "branch_finalize_log", "candidate_accuracy",
             "backstop_telemetry", "cut_reuse_misses",
-            "two_level_prune_telemetry", "dependency_wait"})
+            "two_level_prune_telemetry", "dependency_wait", "worker_time",
+            "checkpoint_pause", "claim_reclaim"})
 
 
 N_CANDIDATES = 40
@@ -1012,22 +1013,31 @@ class TestBundleStatsAndFinalizeLog(_TmpQueue):
         self.assertEqual(row["bulk_done_candidates"], 37)
 
     def test_finalize_bundle_stats_aggregates_and_clears(self):
-        self.q.record_bundle_stats(self.key, "b1", nodes=10, wall_millis=5)
+        self.q.record_bundle_stats(self.key, "b1", nodes=10, wall_millis=5,
+                                   coordination_millis=3)
         self.q.record_bundle_stats(self.key, "b2", nodes=40, wall_millis=7,
-                                   censored=True)
-        n_bundles, max_bundle_nodes, total_bundle_wall_millis, censored_units = (
-            self.q.finalize_bundle_stats(self.key))
+                                   censored=True, coordination_millis=11)
+        (n_bundles, max_bundle_nodes, total_bundle_wall_millis, censored_units,
+         coordination_millis) = self.q.finalize_bundle_stats(self.key)
         self.assertEqual(n_bundles, 2)
         self.assertEqual(max_bundle_nodes, 40)
         self.assertEqual(total_bundle_wall_millis, 12)
         self.assertEqual(censored_units, 1)
+        self.assertEqual(coordination_millis, 14)
         # Cleared: a second call sees nothing.
         self.assertEqual(self.q.finalize_bundle_stats(self.key),
-                         (None, None, None, None))
+                         (None, None, None, None, None))
 
     def test_finalize_bundle_stats_empty_when_branch_never_claimed_a_bundle(self):
         self.assertEqual(self.q.finalize_bundle_stats(self.key),
-                         (None, None, None, None))
+                         (None, None, None, None, None))
+
+    def test_branch_coordination_reaches_the_finalize_log(self):
+        self.q.add_branch_finalize_log(
+            self.key, None, 5, 4, 10, 20, 30, 3, coordination_millis=14)
+        self.assertEqual(self.q._conn.execute(
+            "SELECT coordination_millis FROM telemetry.branch_finalize_log"
+        ).fetchone()[0], 14)
 
     def test_record_bundle_stats_is_a_noop_once_branch_is_deleted(self):
         # A worker's own record_bundle_stats call can race behind another

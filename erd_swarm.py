@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import collections
 import faulthandler
+import functools
 import logging
 import math
 import os
@@ -105,6 +106,10 @@ WAL_CEILING_CHECK_SECONDS = 5.0
 # and is reopened by a waiting sibling.
 FINALIZE_TAKEOVER_SECONDS = 60
 PROGRESS_LOG_SECONDS = 120   # log a mid-candidate progress line this often
+# Length of one worker_time accounting interval.  A row is written at the first
+# heartbeat write after the interval ends, so six workers write about 8,600
+# rows a day.
+WORKER_TIME_INTERVAL_SECONDS = 60
 RAM_WARN_MB = 1024            # log warning when free RAM drops below this
 RAM_CRIT_MB = 512             # force checkpoint when free RAM drops below this
 
@@ -671,6 +676,141 @@ class _DependencyWait:
         return self.iterations > 0
 
 
+def _charged_to(activity):
+    """Charge a _BranchWorker method's time to `activity` in its
+    _WorkerTimeAccount."""
+    def decorate(method):
+        @functools.wraps(method)
+        def charged(self, *args, **kwargs):
+            with self._time_account.activity(activity):
+                return method(self, *args, **kwargs)
+        return charged
+    return decorate
+
+
+class _WorkerTimeAccount:
+    """One worker's wall time, partitioned by what it was doing.
+
+    Activities nest: an evaluation can wait on a dependency, which helps on
+    another branch, which claims and evaluates.  Every span is charged to the
+    innermost activity open at the time and to nothing else, so the activity
+    totals sum to the interval exactly, which a sum of per-claim figures
+    cannot do (each candidate's span contains every candidate evaluated
+    inside it).  Time no named activity covers is charged to "other".
+
+    Durations come from a monotonic nanosecond clock and are floored to
+    milliseconds, with "other" taking the remainder, so the integers written
+    partition interval_millis with no rounding residue.
+    """
+
+    #: Every activity, in worker_time column order.  A wait is named for the
+    #: reason the code that slept gave for it.
+    ACTIVITIES = (
+        "evaluation", "scheduling", "claiming", "finalizing",
+        "wait_no_work", "wait_checkpoint_pause", "wait_rival_finalize",
+        "wait_help_capped", "wait_dependency", "wait_branch_claimed", "other",
+    )
+
+    def __init__(self, clock=time.perf_counter_ns, wall_clock=time.time):
+        self._clock = clock
+        self._wall_clock = wall_clock
+        self._stack = ["other"]
+        now = clock()
+        self._since = now
+        self._open_interval(now)
+        self._last_tick = None
+        self._last_tick_activity = None
+        self._last_heartbeat = None
+
+    def _open_interval(self, now):
+        self._interval_started = now
+        self.started_at = self._wall_clock()
+        self._nanoseconds = dict.fromkeys(self.ACTIVITIES, 0)
+        self.candidates_evaluated = 0
+        self.fruitless_scans = 0
+        self.heartbeats_deferred = 0
+        self._max_tick_gap = None
+        self._max_tick_gap_activity = None
+        self._max_heartbeat_gap = None
+
+    def _charge(self, now):
+        self._nanoseconds[self._stack[-1]] += now - self._since
+        self._since = now
+
+    @property
+    def current(self):
+        """The innermost open activity."""
+        return self._stack[-1]
+
+    @contextmanager
+    def activity(self, name):
+        """Charge the time inside this block to `name`, less any activity
+        opened inside it."""
+        if name not in self._nanoseconds:
+            raise ValueError(f"unknown worker activity {name!r}")
+        self._charge(self._clock())
+        self._stack.append(name)
+        try:
+            yield
+        finally:
+            self._charge(self._clock())
+            self._stack.pop()
+
+    def interval_elapsed_seconds(self):
+        return (self._clock() - self._interval_started) / 1e9
+
+    def note_tick(self):
+        """A liveness tick passed the heartbeat throttle."""
+        now = self._clock()
+        if self._last_tick is not None:
+            gap = now - self._last_tick
+            if self._max_tick_gap is None or gap > self._max_tick_gap:
+                self._max_tick_gap = gap
+                self._max_tick_gap_activity = self._last_tick_activity
+        self._last_tick = now
+        self._last_tick_activity = self.current
+
+    def note_heartbeat_written(self):
+        now = self._clock()
+        if self._last_heartbeat is not None:
+            gap = now - self._last_heartbeat
+            if self._max_heartbeat_gap is None or gap > self._max_heartbeat_gap:
+                self._max_heartbeat_gap = gap
+        self._last_heartbeat = now
+
+    def close_interval(self, nodes, claim_timing):
+        """End the interval and return (started_at, interval_millis,
+        figures) for ERDQueue.add_worker_time, then open the next one.
+
+        nodes and claim_timing are this interval's differences in the worker's
+        node counter and in ERDQueue.claim_timing_totals().
+        """
+        now = self._clock()
+        self._charge(now)
+        interval_millis = (now - self._interval_started) // 1_000_000
+        figures = {f"{activity}_millis": nanoseconds // 1_000_000
+                   for activity, nanoseconds in self._nanoseconds.items()
+                   if activity != "other"}
+        figures["other_millis"] = interval_millis - sum(figures.values())
+        lock_wait, transaction, commit, retries = claim_timing
+        figures.update(
+            claim_lock_wait_millis=lock_wait,
+            claim_transaction_millis=transaction,
+            claim_commit_millis=commit, claim_retries=retries,
+            candidates_evaluated=self.candidates_evaluated, nodes=nodes,
+            fruitless_scans=self.fruitless_scans,
+            max_tick_gap_millis=(None if self._max_tick_gap is None
+                                 else self._max_tick_gap // 1_000_000),
+            max_tick_gap_activity=self._max_tick_gap_activity,
+            max_heartbeat_gap_millis=(
+                None if self._max_heartbeat_gap is None
+                else self._max_heartbeat_gap // 1_000_000),
+            heartbeats_deferred=self.heartbeats_deferred)
+        started_at = self.started_at
+        self._open_interval(now)
+        return started_at, interval_millis, figures
+
+
 class _BranchWorker:
     """One worker process's state and operations on branches and candidates."""
 
@@ -847,6 +987,15 @@ class _BranchWorker:
         # Nesting depth of _help_other_branch calls on this worker's stack —
         # see MAX_HELP_RECURSION_DEPTH.
         self._help_recursion_depth = 0
+        # Where this worker's wall time goes, written to worker_time once per
+        # WORKER_TIME_INTERVAL_SECONDS, with the node counter and the queue's
+        # claim timing as they stood when the open interval began.
+        self._time_account = _WorkerTimeAccount()
+        self._time_account_nodes = self._nodes
+        self._time_account_claim_timing = self.queue.claim_timing_totals()
+        # Coordination time of each open bundle's evaluated members, by
+        # bundle id, recorded with the bundle's stats when it finishes.
+        self._bundle_coordination_millis = {}
 
     def _restart_coordination_window(self, origin=None):
         """Move the coordination window to `origin` (now by default) and drop
@@ -891,9 +1040,12 @@ class _BranchWorker:
         # added to it as phases of the same row.
         self._scan_attributed_baseline = 0
 
-    def _idle_wait(self, seconds):
+    def _idle_wait(self, seconds, reason):
         """Sleep while this worker has no claimable work, then reopen the
         handoff window.
+
+        reason names the wait in the worker's time account, as the
+        wait_<reason> activity.
 
         Every wait in this class is starvation rather than coordination: a
         checkpoint pause, a rival's finalize, a full recursion stack, a scan
@@ -906,8 +1058,30 @@ class _BranchWorker:
         reopen the defect silently, so test_every_worker_wait_restarts_the_
         coordination_window refuses one.
         """
-        time.sleep(seconds)
+        with self._time_account.activity(f"wait_{reason}"):
+            time.sleep(seconds)
         self._restart_coordination_window()
+
+    def _maybe_write_worker_time(self, force=False):
+        """Write the open accounting interval once it has run
+        WORKER_TIME_INTERVAL_SECONDS, or now when `force`.
+
+        Called only where the worker is already writing to the queue, so a row
+        never lands during a checkpoint pause.
+        """
+        if (not force and self._time_account.interval_elapsed_seconds()
+                < WORKER_TIME_INTERVAL_SECONDS):
+            return
+        claim_timing = self.queue.claim_timing_totals()
+        started_at, interval_millis, figures = (
+            self._time_account.close_interval(
+                self._nodes - self._time_account_nodes,
+                tuple(now - before for now, before in zip(
+                    claim_timing, self._time_account_claim_timing))))
+        self._time_account_nodes = self._nodes
+        self._time_account_claim_timing = claim_timing
+        self.queue.add_worker_time(self.name, started_at, interval_millis,
+                                   figures)
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -916,6 +1090,7 @@ class _BranchWorker:
         # even when a hard-ceiling trip terminates the worker between periodic
         # logs (the ceiling stops the swarm via SIGTERM -> request_stop -> this).
         self._log_wal_traffic(time.time(), force=True)
+        self._maybe_write_worker_time(force=True)
         self.queue.clear_heartbeat(self.name)
         if self.hint_cache is not None:
             logger.info('%s hint totals: %s', self.name,
@@ -1212,7 +1387,7 @@ class _BranchWorker:
         if not self._checkpoint_pause_active():
             return
         while not self.cancel() and self.queue.checkpoint_paused():
-            self._idle_wait(PAUSE_POLL_SECONDS)
+            self._idle_wait(PAUSE_POLL_SECONDS, "checkpoint_pause")
         self._pause_active = False
 
     def _check_disk(self):
@@ -1279,6 +1454,19 @@ class _BranchWorker:
         now = time.time()
         if not force and now - self._last_hb < HB_SECONDS:
             return
+        self._time_account.note_tick()
+        # The heartbeat and telemetry writes below are bookkeeping, whatever
+        # activity is open around them, and under queue contention their lock
+        # waits would otherwise be reported as evaluation.
+        with self._time_account.activity("other"):
+            self._publish_liveness(now, branch_key, n_words, claim_idx,
+                                   claim_started_at, best_guess, best_erd,
+                                   force, bound_erd)
+
+    def _publish_liveness(self, now, branch_key, n_words, claim_idx,
+                          claim_started_at, best_guess, best_erd, force,
+                          bound_erd):
+        """The writes a liveness tick that passed the throttle makes."""
         # Per-heartbeat-window WAL backstop: an evaluation deep in the engine
         # passes through here even when it never reaches a bundle boundary,
         # so a runaway writer stops itself instead of relying on the
@@ -1295,6 +1483,7 @@ class _BranchWorker:
         if not force and self._checkpoint_pause_active():
             self._last_hb = now
             self._nodes_at_last_hb = self._nodes
+            self._time_account.heartbeats_deferred += 1
             return
         dt = now - self._last_hb
         node_rate = (self._nodes - self._nodes_at_last_hb) / dt if dt > 0 else 0.0
@@ -1320,6 +1509,8 @@ class _BranchWorker:
             cur_help_depth=self._help_recursion_depth,
             opener_work_id=self._work_context.opener_work_id,
             scheduling_role=self._work_context.scheduling_role)
+        self._time_account.note_heartbeat_written()
+        self._maybe_write_worker_time()
         self._hb_max_spine = {}
         if self._cur_candidate and now - self._last_progress_log >= PROGRESS_LOG_SECONDS:  # pragma: no cover
             self._last_progress_log = now
@@ -1457,6 +1648,7 @@ class _BranchWorker:
             return order
         return [idx] + order[:position] + order[position + 1:]
 
+    @_charged_to("claiming")
     def _claim_bundle(self, branch_key, n_candidates, words, budget,
                       expected_opener_work_id=None,
                       expected_opener_priority=None,
@@ -1606,24 +1798,25 @@ class _BranchWorker:
             metric['group_sizes'] = (None if erd_lower_bound_pruned else
                                      '-'.join(str(k) for k in group_sizes))
 
-        status, cost, cand_md, budget_tainted = evaluate_candidate(
-            words, candidate, self.rcache, self.score_cache,
-            n=n_words, best_erd=float('inf'), guesses=self.all_words,
-            policy=ERD_ALL, cancel_check=self.cancel,
-            note_depth=self._note_depth, budget=budget,
-            subbranch_solver=self._subbranch_solver,
-            bound_provider=_bound_provider,
-            mid_loop_publisher=self._mid_loop_publisher,
-            metric_observer=_metric_observer if self._adaptive else None,
-            pattern_matrix=self.pattern_matrix,
-            branch_floor_table=self.branch_floor_table,
-            hint_cache=self.hint_cache,
-            heartbeat=lambda: self._heartbeat(
-                branch_key, n_words, idx, claim_started,
-                local_candidate, local_best, bound_erd=_eff_bound()),
-            liveness_tick=lambda: self._liveness_tick(
-                branch_key, n_words, idx, claim_started,
-                local_candidate, local_best, bound_erd=_eff_bound()))
+        with self._time_account.activity("evaluation"):
+            status, cost, cand_md, budget_tainted = evaluate_candidate(
+                words, candidate, self.rcache, self.score_cache,
+                n=n_words, best_erd=float('inf'), guesses=self.all_words,
+                policy=ERD_ALL, cancel_check=self.cancel,
+                note_depth=self._note_depth, budget=budget,
+                subbranch_solver=self._subbranch_solver,
+                bound_provider=_bound_provider,
+                mid_loop_publisher=self._mid_loop_publisher,
+                metric_observer=_metric_observer if self._adaptive else None,
+                pattern_matrix=self.pattern_matrix,
+                branch_floor_table=self.branch_floor_table,
+                hint_cache=self.hint_cache,
+                heartbeat=lambda: self._heartbeat(
+                    branch_key, n_words, idx, claim_started,
+                    local_candidate, local_best, bound_erd=_eff_bound()),
+                liveness_tick=lambda: self._liveness_tick(
+                    branch_key, n_words, idx, claim_started,
+                    local_candidate, local_best, bound_erd=_eff_bound()))
         cand_elapsed = time.time() - cand_t0
         self._eval_seconds += cand_elapsed
         if cand_elapsed > 10:  # pragma: no cover
@@ -1720,6 +1913,11 @@ class _BranchWorker:
         full_coord_seconds = max(
             0.0, (now_complete - self._last_claim_complete) - cand_elapsed)
         self._last_claim_complete = now_complete
+        self._time_account.candidates_evaluated += 1
+        if bundle_id is not None:
+            self._bundle_coordination_millis[bundle_id] = (
+                self._bundle_coordination_millis.get(bundle_id, 0)
+                + int(full_coord_seconds * 1e3))
         if self._adaptive:
             # The break-even is the cost of handing work to another worker, so
             # the coordination term is the whole inter-claim span — the same
@@ -1781,6 +1979,7 @@ class _BranchWorker:
             return False
         return True
 
+    @_charged_to("evaluation")
     def _complete_bundle_two_level_erd_prunes(
             self, branch_key, words, n_words, bundle_id, candidate_indices):
         """Complete two-level ERD prunes before ordinary evaluation.
@@ -2017,15 +2216,19 @@ class _BranchWorker:
         overhead (that is claim_telemetry's busy_wait_millis, measured in
         claim_next_bundle).
         """
+        coordination_millis = self._bundle_coordination_millis.pop(
+            bundle_id, None)
         if bundle_id is None or not self._adaptive:
             return
         nodes = self._nodes - nodes_at_start
         wall_millis = int((time.time() - wall_t0) * 1000)
         self.queue.record_bundle_stats(branch_key, bundle_id, nodes,
-                                       wall_millis, censored=censored)
+                                       wall_millis, censored=censored,
+                                       coordination_millis=coordination_millis)
 
     # -- finalize -----------------------------------------------------------
 
+    @_charged_to("finalizing")
     def maybe_finalize(self, branch_key, words, n_candidates) -> bool:
         """If every candidate is done, finalize the branch exactly once.
 
@@ -2135,7 +2338,7 @@ class _BranchWorker:
         # Persist the branch's timing/cost before delete_branch destroys it, so
         # "how long / how much did branch X cost" stays answerable offline.
         # finalize_bundle_stats aggregates and clears this branch's bundle_stats
-        # rows; (None, None, None, None) when it never claimed a bundle (fully
+        # rows; all None when it never claimed a bundle (fully
         # solved from reused cache entries).
         # Telemetry failure must not kill the worker or skip the cleanup
         # below: the branch result is already published to the score cache,
@@ -2147,7 +2350,8 @@ class _BranchWorker:
         cache_write_millis = int((time.time() - finalize_t0) * 1000)
         try:
             (n_bundles, max_bundle_nodes, total_bundle_wall_millis,
-             censored_units) = self.queue.finalize_bundle_stats(branch_key)
+             censored_units, coordination_millis) = (
+                self.queue.finalize_bundle_stats(branch_key))
             # Read while the branch's claim rows still exist: delete_branch
             # below drops the per-candidate record this evidence comes from.
             winner_idx = (None if best_guess is None or self._word_idx is None
@@ -2172,6 +2376,7 @@ class _BranchWorker:
                 schedule_diagnostics=schedule_diagnostics,
                 first_best_at=first_best_at,
                 nodes_at_first_best=nodes_at_first_best,
+                coordination_millis=coordination_millis,
                 **self._hint_outcome(branch_key, best_guess, budget),
                 outcome='loss' if ceiling_proves_loss else ('cut' if cut else
                         ('exact' if best_guess is not None else 'loss')))
@@ -2278,11 +2483,12 @@ class _BranchWorker:
                            'mid-finalize', self.name, n_words)
             self.maybe_finalize(branch_key, words, n_candidates)
             return False
-        self._idle_wait(0.05)
+        self._idle_wait(0.05, "rival_finalize")
         return True
 
     # -- recursive cooperative solving --------------------------------------
 
+    @_charged_to("scheduling")
     def _help_other_branch(self, exclude_branch_key: bytes) -> bool:
         """Evaluate one bundle of candidate claims from any open branch other
         than exclude_branch_key — promoting a higher-priority pending-only
@@ -2713,7 +2919,7 @@ class _BranchWorker:
                     # promises its callers.
                     self._cur_candidate = None
                     blocked_at = time.perf_counter()
-                    self._idle_wait(0.05)
+                    self._idle_wait(0.05, "help_capped")
                     wait.note_blocked(
                         BLOCK_HELP_CAPPED,
                         int((time.perf_counter() - blocked_at) * 1000))
@@ -2769,7 +2975,7 @@ class _BranchWorker:
                             # is the decision itself rather than a re-read of
                             # the state it was made against.
                             blocked_at = time.perf_counter()
-                            self._idle_wait(0.05)   # let claims land
+                            self._idle_wait(0.05, "dependency")
                             wait.note_blocked(
                                 self.queue.last_claim_decline(),
                                 int((time.perf_counter() - blocked_at) * 1000))
@@ -2858,6 +3064,7 @@ class _BranchWorker:
         """Workers other than this one holding unfinished claims, per branch."""
         return self.queue.claim_holders_by_branch(exclude_worker_id=self.name)
 
+    @_charged_to("scheduling")
     def claim_one(self):
         """Return (context, branch, bundle_id, indices, forced) for the next
         bundle of candidates, or None if there is nothing to do right now.
@@ -2919,6 +3126,7 @@ class _BranchWorker:
                     # the single owner of that clearing.
                     self._pending_fruitless_scan_millis += scan_millis
                     self._pending_fruitless_scans += 1
+                    self._time_account.fruitless_scans += 1
                     self._pending_fruitless_scan_openers_walked += (
                         self._scan_openers_walked)
             else:
@@ -3195,7 +3403,7 @@ class _BranchWorker:
                 self._cur_candidate = None      # idle, no candidate in flight
                 self._heartbeat(None, None, None, None,
                                 None, None, force=True)
-                self._idle_wait(0.5)
+                self._idle_wait(0.5, "no_work")
                 continue
             idle_since = None
             context, branch, bundle_id, indices, forced = work
@@ -3269,7 +3477,7 @@ class _BranchWorker:
                 self._heartbeat(branch_key, branch['n_words'], None, None,
                                 None, None, force=True)
                 self.queue.reclaim_stale_claims(HB_TIMEOUT_SECONDS)
-                self._idle_wait(0.1)
+                self._idle_wait(0.1, "branch_claimed")
                 continue
             bundle_id, indices, forced = claim
             if self.evaluate_bundle(branch_key, words, branch['n_words'], bundle_id,
