@@ -233,7 +233,13 @@ jobs:
           path: .coverage.*
           include-hidden-files: true
 
-  test:
+  # The one check the main branch ruleset requires: every suite passed and
+  # their combined coverage meets the gate.  The ruleset matches this display
+  # name, so renaming the job means changing the ruleset's required check in
+  # the same switchover, or every pull request waits on a check that never
+  # reports.
+  all-tests:
+    name: all tests
     if: always()
     needs: [unit, chromium, webkit, scaling]
     runs-on: ubuntu-latest
