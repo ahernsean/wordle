@@ -604,6 +604,11 @@ CREATE TABLE IF NOT EXISTS telemetry.bundle_stats (
     -- span from the previous claim this worker completed, less its own
     -- evaluation.  Summed into branch_finalize_log.coordination_millis.
     coordination_millis INTEGER,
+    -- The worker time spent evaluating the bundle's members, charged to the
+    -- innermost bundle being evaluated: a nested bundle's evaluation and every
+    -- wait are excluded, and a forced member is included.  Summed into
+    -- branch_finalize_log.evaluation_time_millis.
+    evaluation_time_millis INTEGER,
     PRIMARY KEY (branch_key, bundle_id)
 );
 
@@ -717,6 +722,10 @@ CREATE TABLE IF NOT EXISTS telemetry.branch_finalize_log (
     -- bundle_stats: beside total_bundle_wall_millis it is the branch's
     -- coordination per unit of work.  NULL when no bundle reported one.
     coordination_millis     INTEGER,
+    -- The worker time spent evaluating this branch's own candidates, from
+    -- bundle_stats.  Nested branches' evaluation is theirs, so summing this
+    -- over branches counts each span once.  NULL when no bundle reported one.
+    evaluation_time_millis  INTEGER,
     recorded_at             INTEGER NOT NULL
 );
 
@@ -1362,16 +1371,6 @@ class ERDQueue:
                 "INSERT INTO schema_migrations (name, completed_at) "
                 "VALUES (?, ?)", (provenance_migration, int(time.time())))
 
-        # The per-claim tables, claim_telemetry and candidate_accuracy, are
-        # dropped on every writable open rather than once behind a migration
-        # flag: a process still running code that writes them recreates them,
-        # and a one-shot migration that has recorded itself would never look
-        # again.  secure_delete is off for the drop because this SQLite build
-        # defaults it on, which would zero every freed page through the WAL --
-        # as many bytes again as the tables hold.
-        self._conn.execute("PRAGMA telemetry.secure_delete = OFF")
-        for table in ("claim_telemetry", "candidate_accuracy"):
-            self._conn.execute(f"DROP TABLE IF EXISTS telemetry.{table}")
         self._add_columns("branch_finalize_log", {
             "cache_write_millis": "INTEGER",
         }, schema="telemetry")
@@ -1393,9 +1392,11 @@ class ERDQueue:
         # coordination was recorded only per claim.
         self._add_columns("bundle_stats", {
             "coordination_millis": "INTEGER",
+            "evaluation_time_millis": "INTEGER",
         }, schema="telemetry")
         self._add_columns("branch_finalize_log", {
             "coordination_millis": "INTEGER",
+            "evaluation_time_millis": "INTEGER",
         }, schema="telemetry")
 
         report_indexes = (
@@ -3496,7 +3497,8 @@ class ERDQueue:
             raise
 
     def record_bundle_stats(self, branch_key, bundle_id, nodes, wall_millis,
-                            censored=False, coordination_millis=None):
+                            censored=False, coordination_millis=None,
+                            evaluation_time_millis=None):
         """Record one bundle's actual node cost and evaluation wall span.
 
         wall_millis is the bundle's own evaluation wall time (straggler/
@@ -3529,18 +3531,19 @@ class ERDQueue:
         self._conn.execute("""
             INSERT OR REPLACE INTO telemetry.bundle_stats
                 (branch_key, bundle_id, nodes, wall_millis, censored,
-                 coordination_millis)
-            SELECT ?, ?, ?, ?, ?, ?
+                 coordination_millis, evaluation_time_millis)
+            SELECT ?, ?, ?, ?, ?, ?, ?
             WHERE EXISTS (SELECT 1 FROM active_branches WHERE branch_id = ?)
         """, (branch_key, bundle_id, nodes, wall_millis,
-              1 if censored else 0, coordination_millis, branch_id))
+              1 if censored else 0, coordination_millis,
+              evaluation_time_millis, branch_id))
 
     def finalize_bundle_stats(self, branch_key):
         """Aggregate and clear a branch's bundle_stats rows at finalize.
 
         Returns (n_bundles, max_bundle_nodes, total_bundle_wall_millis,
-        censored_units, coordination_millis) for branch_finalize_log — all
-        None if no bundle
+        censored_units, coordination_millis, evaluation_time_millis) for
+        branch_finalize_log — all None if no bundle
         recorded any stats (e.g. a branch solved entirely from reused cache
         entries).  Deletes the rows so bundle_stats stays bounded to
         currently-open branches, matching delete_branch's candidate_claims
@@ -3550,17 +3553,18 @@ class ERDQueue:
             SELECT COUNT(*) AS n_bundles, MAX(nodes) AS max_bundle_nodes,
                    SUM(wall_millis) AS total_bundle_wall_millis,
                    SUM(censored) AS censored_units,
-                   SUM(coordination_millis) AS coordination_millis
+                   SUM(coordination_millis) AS coordination_millis,
+                   SUM(evaluation_time_millis) AS evaluation_time_millis
             FROM telemetry.bundle_stats WHERE branch_key = ?
         """, (branch_key,)).fetchone()
         self._conn.execute(
             "DELETE FROM telemetry.bundle_stats WHERE branch_key = ?",
             (branch_key,))
         if row["n_bundles"] == 0:
-            return (None, None, None, None, None)
+            return (None, None, None, None, None, None)
         return (row["n_bundles"], row["max_bundle_nodes"],
                 row["total_bundle_wall_millis"], row["censored_units"],
-                row["coordination_millis"])
+                row["coordination_millis"], row["evaluation_time_millis"])
 
     def claim_is_current(self, branch_key, idx, claimed_by=None,
                          bundle_id=None, budget=None):
@@ -5652,12 +5656,14 @@ class ERDQueue:
         pass and there is no output to bound.
 
         One branch_finalize_log row is one finalized branch, banded by
-        total_bundle_wall_millis: the time workers spent evaluating its
-        bundles, never the span between its creation and finalization.  A
-        parent that waits on promoted children accumulates wall time it did
-        not work, and banding on that span would file it among the expensive
-        branches for having done nothing.  A promoted child's work is its own
-        row, so summing across bands counts each node once.
+        evaluation_time_millis: the worker time spent evaluating its own
+        candidates, charged to the innermost branch being evaluated.  Neither
+        the span between its creation and finalization nor its bundles' wall
+        time will do: a parent that helps or waits on promoted children
+        accumulates both while the children do the work, and banding on either
+        would file it among the expensive branches for work that is theirs.  A
+        promoted child's work is its own row, so summing across bands counts
+        each node and each millisecond once.
 
         A branch whose worker or coordination time was not recorded is counted
         apart from the bands rather than folded into them.  Treating its time
@@ -5689,7 +5695,7 @@ class ERDQueue:
                 SELECT COALESCE(n_claims, 0) AS claim_count,
                        COALESCE(nodes_spent, 0) AS search_node_count,
                        coordination_millis,
-                       total_bundle_wall_millis AS worker_millis
+                       evaluation_time_millis AS worker_millis
                 FROM telemetry.branch_finalize_log
                 WHERE epoch = ? {since_condition}
                 {answer_count_condition}
@@ -6818,7 +6824,8 @@ class ERDQueue:
                                 schedule_diagnostics=None,
                                 hint_word=None, hint_was_winner=None,
                                 first_best_at=None, nodes_at_first_best=None,
-                                coordination_millis=None):
+                                coordination_millis=None,
+                                evaluation_time_millis=None):
         """Persist a branch's timing/cost the moment before delete_branch drops it.
 
         The bundle-diagnostic columns (n_bundles, max_bundle_nodes,
@@ -6870,9 +6877,9 @@ class ERDQueue:
                  republished_candidates, max_candidate_republish_count,
                  hint_word, hint_was_winner, first_best_at,
                  nodes_at_first_best, coordination_millis,
-                 recorded_at)
+                 evaluation_time_millis, recorded_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (branch_key, spine, n_words, budget, self.epoch, created_at,
               finalized_at, nodes_spent, n_claims, n_bundles, max_bundle_nodes,
               total_bundle_wall_millis, censored_units, ceiling, outcome,
@@ -6890,7 +6897,7 @@ class ERDQueue:
               hint_word,
               None if hint_was_winner is None else int(hint_was_winner),
               first_best_at, nodes_at_first_best, coordination_millis,
-              now))
+              evaluation_time_millis, now))
 
     def add_dependency_wait(self, worker_id, spine, n_words, budget,
                             episode_millis, blocked_millis, iterations,

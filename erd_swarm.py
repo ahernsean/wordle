@@ -691,6 +691,12 @@ class _WorkerTimeAccount:
     Durations come from a monotonic nanosecond clock and are floored to
     milliseconds, with "other" taking the remainder, so the integers written
     partition interval_millis with no rounding residue.
+
+    An activity can also name an owner, and the time charged to it is then
+    totalled for that owner as well, across intervals, until taken.  The
+    worker names a bundle as the owner of its evaluations, which makes each
+    bundle's total its own evaluation time with every nested bundle's
+    evaluation, and every wait, excluded.
     """
 
     #: Every activity, in worker_time column order.  A wait is named for the
@@ -704,7 +710,8 @@ class _WorkerTimeAccount:
     def __init__(self, clock=time.perf_counter_ns, wall_clock=time.time):
         self._clock = clock
         self._wall_clock = wall_clock
-        self._stack = ["other"]
+        self._stack = [("other", None)]
+        self._owned_nanoseconds = {}
         now = clock()
         self._since = now
         self._open_interval(now)
@@ -724,27 +731,38 @@ class _WorkerTimeAccount:
         self._max_heartbeat_gap = None
 
     def _charge(self, now):
-        self._nanoseconds[self._stack[-1]] += now - self._since
+        name, owner = self._stack[-1]
+        elapsed = now - self._since
+        self._nanoseconds[name] += elapsed
+        if owner is not None:
+            self._owned_nanoseconds[owner] = (
+                self._owned_nanoseconds.get(owner, 0) + elapsed)
         self._since = now
 
     @property
     def current(self):
         """The innermost open activity."""
-        return self._stack[-1]
+        return self._stack[-1][0]
 
     @contextmanager
-    def activity(self, name):
-        """Charge the time inside this block to `name`, less any activity
-        opened inside it."""
+    def activity(self, name, owner=None):
+        """Charge the time inside this block to `name`, and to `owner` when
+        one is given, less any activity opened inside it."""
         if name not in self._nanoseconds:
             raise ValueError(f"unknown worker activity {name!r}")
         self._charge(self._clock())
-        self._stack.append(name)
+        self._stack.append((name, owner))
         try:
             yield
         finally:
             self._charge(self._clock())
             self._stack.pop()
+
+    def take_owned_millis(self, owner):
+        """The time charged to `owner` so far, which is then forgotten; None
+        if nothing was."""
+        nanoseconds = self._owned_nanoseconds.pop(owner, None)
+        return None if nanoseconds is None else nanoseconds // 1_000_000
 
     def interval_elapsed_seconds(self):
         return (self._clock() - self._interval_started) / 1e9
@@ -1704,7 +1722,7 @@ class _BranchWorker:
         self._cand_max_depth = 0
         nodes_before = self._nodes
         cand_t0 = time.time()
-        with self._time_account.activity("evaluation"):
+        with self._time_account.activity("evaluation", owner=bundle_id):
             status, cost, cand_md, budget_tainted = evaluate_candidate(
                 words, candidate, self.rcache, self.score_cache,
                 n=n_words, best_erd=float('inf'), guesses=self.all_words,
@@ -1825,7 +1843,6 @@ class _BranchWorker:
             return False
         return True
 
-    @_charged_to("evaluation")
     def _complete_bundle_two_level_erd_prunes(
             self, branch_key, words, n_words, bundle_id, candidate_indices):
         """Complete two-level ERD prunes before ordinary evaluation.
@@ -1931,10 +1948,11 @@ class _BranchWorker:
         claimed_candidate_indices = indices
         prune_nodes_at_start = self._nodes
         prune_wall_t0 = time.time()
-        pruned_candidate_indices, cancelled = (
-            self._complete_bundle_two_level_erd_prunes(
-                branch_key, words, n_words, bundle_id,
-                claimed_candidate_indices))
+        with self._time_account.activity("evaluation", owner=bundle_id):
+            pruned_candidate_indices, cancelled = (
+                self._complete_bundle_two_level_erd_prunes(
+                    branch_key, words, n_words, bundle_id,
+                    claimed_candidate_indices))
         if cancelled:
             self._finish_bundle(branch_key, bundle_id, prune_nodes_at_start,
                                 prune_wall_t0, censored=True)
@@ -2055,13 +2073,17 @@ class _BranchWorker:
         """
         coordination_millis = self._bundle_coordination_millis.pop(
             bundle_id, None)
+        evaluation_time_millis = (
+            None if bundle_id is None
+            else self._time_account.take_owned_millis(bundle_id))
         if bundle_id is None or not self._adaptive:
             return
         nodes = self._nodes - nodes_at_start
         wall_millis = int((time.time() - wall_t0) * 1000)
-        self.queue.record_bundle_stats(branch_key, bundle_id, nodes,
-                                       wall_millis, censored=censored,
-                                       coordination_millis=coordination_millis)
+        self.queue.record_bundle_stats(
+            branch_key, bundle_id, nodes, wall_millis, censored=censored,
+            coordination_millis=coordination_millis,
+            evaluation_time_millis=evaluation_time_millis)
 
     # -- finalize -----------------------------------------------------------
 
@@ -2187,7 +2209,8 @@ class _BranchWorker:
         cache_write_millis = int((time.time() - finalize_t0) * 1000)
         try:
             (n_bundles, max_bundle_nodes, total_bundle_wall_millis,
-             censored_units, coordination_millis) = (
+             censored_units, coordination_millis,
+             evaluation_time_millis) = (
                 self.queue.finalize_bundle_stats(branch_key))
             # Read while the branch's claim rows still exist: delete_branch
             # below drops the per-candidate record this evidence comes from.
@@ -2214,6 +2237,7 @@ class _BranchWorker:
                 first_best_at=first_best_at,
                 nodes_at_first_best=nodes_at_first_best,
                 coordination_millis=coordination_millis,
+                evaluation_time_millis=evaluation_time_millis,
                 **self._hint_outcome(branch_key, best_guess, budget),
                 outcome='loss' if ceiling_proves_loss else ('cut' if cut else
                         ('exact' if best_guess is not None else 'loss')))

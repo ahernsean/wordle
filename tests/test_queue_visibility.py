@@ -772,7 +772,7 @@ class WorkDistributionTests(unittest.TestCase):
             ScoreCache.encode_subset(_words(tag, 4)), f"{tag.upper()} -----",
             size, 3, finalized_at if created_at is None else created_at,
             finalized_at, nodes, claims, n_bundles=1,
-            total_bundle_wall_millis=worker_millis,
+            evaluation_time_millis=worker_millis,
             coordination_millis=coordination_millis)
 
     def _report(self, since=None, **answer_count_range):

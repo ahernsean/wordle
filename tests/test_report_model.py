@@ -4714,7 +4714,7 @@ class WorkDistributionReportTest(unittest.TestCase):
         now = int(time.time())
         self.queue.add_branch_finalize_log(
             branch_key, None, 10, 4, now, now, count * nodes, count,
-            n_bundles=1, total_bundle_wall_millis=count * evaluation_millis,
+            n_bundles=1, evaluation_time_millis=count * evaluation_millis,
             coordination_millis=count * coordination_millis)
 
     def _report(self, **overrides):
@@ -4902,10 +4902,10 @@ class WorkDistributionReportTest(unittest.TestCase):
         now = int(time.time())
         self.queue.add_branch_finalize_log(
             small, None, 4, 4, now, now, 6, 6, n_bundles=1,
-            total_bundle_wall_millis=300, coordination_millis=60)
+            evaluation_time_millis=300, coordination_millis=60)
         self.queue.add_branch_finalize_log(
             large, None, 80, 4, now, now, 1_000_000, 2, n_bundles=1,
-            total_bundle_wall_millis=800_000, coordination_millis=20)
+            evaluation_time_millis=800_000, coordination_millis=20)
 
         data = self._report(
             filters=ReportFilters(minimum_answer_count=50))["data"]

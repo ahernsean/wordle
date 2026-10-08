@@ -161,11 +161,16 @@ actually written, which is what stale-claim reclaim reads),
 held, and `telemetry.claim_reclaim` records every worker whose claims a
 reclaim freed, with its heartbeat age at that moment.
 
-A branch's coordination time travels with its other costs:
-`bundle_stats.coordination_millis` sums each bundle's members and
-`branch_finalize_log.coordination_millis` sums the bundles, so coordination
-per unit of work is readable per branch; `view --work-distribution` bands
-finalized branches by it.
+A branch's coordination and evaluation time travel with its other costs:
+`bundle_stats` records both per bundle and `branch_finalize_log` sums them per
+branch, and `view --work-distribution` bands finalized branches by evaluation
+time. **A branch's evaluation time is the account's own evaluation charge,
+owned by the bundle being evaluated** (`activity("evaluation",
+owner=bundle_id)`), never its bundles' wall time. A parent bundle's clock runs
+on while its candidate helps a child branch, and restarts after a forced
+member, so wall time counts the child's work twice and the forced member's
+never. Owned time is the innermost charge, so the branches' evaluation times
+sum to the workers' `evaluation_millis` exactly.
 
 The branch view's ETA needs evaluation times while a branch is still open, so
 they live on the branch's own `candidate_claims` rows (`evaluation_millis`,

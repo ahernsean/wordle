@@ -434,7 +434,7 @@ class TestCancelPath(unittest.TestCase):
         self.assertFalse(result)
         w.queue.record_bundle_stats.assert_called_once_with(
             branch_key, "bundle-1", 0, mock.ANY, censored=True,
-            coordination_millis=None)
+            coordination_millis=None, evaluation_time_millis=mock.ANY)
 
     def test_evaluate_bundle_returns_false_when_evaluate_claim_fails_mid_bundle(self):
         # Not cancelled at the loop level, but evaluate_claim itself reports
@@ -448,7 +448,7 @@ class TestCancelPath(unittest.TestCase):
         w.evaluate_claim.assert_called_once()
         w.queue.record_bundle_stats.assert_called_once_with(
             branch_key, "bundle-2", 0, mock.ANY, censored=True,
-            coordination_millis=None)
+            coordination_millis=None, evaluation_time_millis=mock.ANY)
 
     def test_forced_candidate_cost_does_not_leak_into_sibling_cap_check(self):
         # A (forced) does 5000 nodes of work; B (not forced) does 1. The
@@ -522,7 +522,7 @@ class TestCancelPath(unittest.TestCase):
         w.queue.republish_remainder.assert_not_called()
         w.queue.record_bundle_stats.assert_called_once_with(
             branch_key, "bundle-5", 5000, mock.ANY, censored=True,
-            coordination_millis=None)
+            coordination_millis=None, evaluation_time_millis=mock.ANY)
 
 
 class TestEvaluateClaimPatternMatrix(unittest.TestCase):
@@ -3369,7 +3369,7 @@ class TestFinalizeTelemetryFailureIsolation(unittest.TestCase):
             "spine": "SALET -g-g-",
         }
         w.queue.finalize_bundle_stats.return_value = (
-            None, None, None, None, None)
+            None, None, None, None, None, None)
         return w
 
     def test_telemetry_insert_failure_still_runs_cleanup(self):
@@ -3746,7 +3746,7 @@ class TestMaybeFinalizeTriage(unittest.TestCase):
         }
         w.queue.get_pending_branch.return_value = None
         w.queue.finalize_bundle_stats.return_value = (
-            None, None, None, None, None)
+            None, None, None, None, None, None)
         return w
 
     def test_cut_publishes_bound_and_never_caches(self):

@@ -3293,10 +3293,10 @@ class WorkDistributionCommandEndToEndTest(unittest.TestCase):
         # Twenty claims of 20 ms each, and two of 350 s each.
         queue.add_branch_finalize_log(
             cheap, "CRANE -----", 2, 2, now, now, 20, 20, n_bundles=1,
-            total_bundle_wall_millis=400, coordination_millis=500)
+            evaluation_time_millis=400, coordination_millis=500)
         queue.add_branch_finalize_log(
             costly, "CRANE ----y", 3, 2, now, now, 800_000, 2, n_bundles=1,
-            total_bundle_wall_millis=700_000, coordination_millis=50)
+            evaluation_time_millis=700_000, coordination_millis=50)
         queue.close()
 
     def _run(self, *args):

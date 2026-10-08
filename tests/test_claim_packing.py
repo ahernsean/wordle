@@ -207,25 +207,6 @@ class TestSchemaMigration(unittest.TestCase):
         self.assertIn("predates the telemetry split", str(raised.exception))
         self.assertIn("cost_samples", str(raised.exception))
 
-    def test_per_claim_tables_are_dropped_on_open(self):
-        ERDQueue(self.path).close()
-        telemetry_path = os.path.join(self._tmp.name,
-                                      "old_queue_telemetry.sqlite3")
-        conn = sqlite3.connect(telemetry_path)
-        for table in ("claim_telemetry", "candidate_accuracy"):
-            conn.execute(f"CREATE TABLE {table} (id INTEGER PRIMARY KEY, "
-                         f"n_words INTEGER)")
-            conn.execute(f"INSERT INTO {table} (n_words) VALUES (5)")
-        conn.commit()
-        conn.close()
-        ERDQueue(self.path).close()
-        conn = sqlite3.connect(telemetry_path)
-        names = {row[0] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table'")}
-        conn.close()
-        self.assertNotIn("claim_telemetry", names)
-        self.assertNotIn("candidate_accuracy", names)
-
     def test_telemetry_file_is_created_alongside_queue(self):
         ERDQueue(self.path).close()
         telemetry_path = os.path.join(self._tmp.name,
@@ -1034,30 +1015,35 @@ class TestBundleStatsAndFinalizeLog(_TmpQueue):
 
     def test_finalize_bundle_stats_aggregates_and_clears(self):
         self.q.record_bundle_stats(self.key, "b1", nodes=10, wall_millis=5,
-                                   coordination_millis=3)
+                                   coordination_millis=3,
+                                   evaluation_time_millis=4)
         self.q.record_bundle_stats(self.key, "b2", nodes=40, wall_millis=7,
-                                   censored=True, coordination_millis=11)
+                                   censored=True, coordination_millis=11,
+                                   evaluation_time_millis=6)
         (n_bundles, max_bundle_nodes, total_bundle_wall_millis, censored_units,
-         coordination_millis) = self.q.finalize_bundle_stats(self.key)
+         coordination_millis, evaluation_time_millis) = (
+            self.q.finalize_bundle_stats(self.key))
         self.assertEqual(n_bundles, 2)
         self.assertEqual(max_bundle_nodes, 40)
         self.assertEqual(total_bundle_wall_millis, 12)
         self.assertEqual(censored_units, 1)
         self.assertEqual(coordination_millis, 14)
+        self.assertEqual(evaluation_time_millis, 10)
         # Cleared: a second call sees nothing.
         self.assertEqual(self.q.finalize_bundle_stats(self.key),
-                         (None, None, None, None, None))
+                         (None, None, None, None, None, None))
 
     def test_finalize_bundle_stats_empty_when_branch_never_claimed_a_bundle(self):
         self.assertEqual(self.q.finalize_bundle_stats(self.key),
-                         (None, None, None, None, None))
+                         (None, None, None, None, None, None))
 
-    def test_branch_coordination_reaches_the_finalize_log(self):
+    def test_branch_coordination_and_evaluation_time_reach_the_finalize_log(self):
         self.q.add_branch_finalize_log(
-            self.key, None, 5, 4, 10, 20, 30, 3, coordination_millis=14)
-        self.assertEqual(self.q._conn.execute(
-            "SELECT coordination_millis FROM telemetry.branch_finalize_log"
-        ).fetchone()[0], 14)
+            self.key, None, 5, 4, 10, 20, 30, 3, coordination_millis=14,
+            evaluation_time_millis=9)
+        self.assertEqual(tuple(self.q._conn.execute(
+            "SELECT coordination_millis, evaluation_time_millis "
+            "FROM telemetry.branch_finalize_log").fetchone()), (14, 9))
 
     def test_record_bundle_stats_is_a_noop_once_branch_is_deleted(self):
         # A worker's own record_bundle_stats call can race behind another

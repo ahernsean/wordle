@@ -109,6 +109,32 @@ class TestWorkerTimeAccount(unittest.TestCase):
         self.assertEqual(figures["finalizing_millis"], 3)
         self.assertEqual(figures["other_millis"], 7)
 
+    def test_an_owner_is_charged_only_its_innermost_time(self):
+        # A parent bundle's candidate waits on a dependency and helps by
+        # evaluating a child bundle; the parent owns only its own evaluation.
+        clock = _SteppingClock()
+        account = _account(clock)
+        with account.activity("evaluation", owner="parent"):
+            clock.advance(10)
+            with account.activity("wait_dependency"):
+                clock.advance(5)
+                with account.activity("evaluation", owner="child"):
+                    clock.advance(30)
+                clock.advance(5)
+            clock.advance(2)
+        self.assertEqual(account.take_owned_millis("parent"), 12)
+        self.assertEqual(account.take_owned_millis("child"), 30)
+        self.assertIsNone(account.take_owned_millis("parent"))
+
+    def test_an_owner_is_totalled_across_intervals(self):
+        clock = _SteppingClock()
+        account = _account(clock)
+        with account.activity("evaluation", owner="bundle"):
+            clock.advance(4)
+            account.close_interval(0, (0, 0, 0, 0))
+            clock.advance(6)
+        self.assertEqual(account.take_owned_millis("bundle"), 10)
+
     def test_an_unknown_activity_is_refused(self):
         account = _account(_SteppingClock())
         with self.assertRaises(ValueError):
@@ -396,6 +422,57 @@ class TestWorkerTimeIsWrittenOnTheHeartbeat(unittest.TestCase):
         self.assertEqual(figures["wait_rival_finalize_millis"], 50)
 
 
+class TestBranchEvaluationTime(unittest.TestCase):
+    """A branch's evaluation time is the innermost time spent evaluating it.
+
+    Bundle wall time is not: a parent bundle's clock keeps running while its
+    candidate helps a child branch, and it restarts after a forced member.
+    """
+
+    def setUp(self):
+        TestWorkerChargesItsActivities.setUp(self)
+
+    def test_the_branches_partition_the_workers_evaluation_time(self):
+        worker = _BranchWorker(0, self.cache_path, self.queue_path, None,
+                               small_count=2, count_cap=2)
+        worker._time_account = _account(_SteppingClock(step_millis=1))
+        try:
+            worker.solve_branch_focused(self.branch_key)
+        finally:
+            worker.close()
+        queue = ERDQueue(self.queue_path)
+        try:
+            [branches] = queue._conn.execute(
+                "SELECT SUM(evaluation_time_millis) "
+                "FROM telemetry.branch_finalize_log").fetchone()
+            [worker_total] = queue._conn.execute(
+                "SELECT SUM(evaluation_millis) "
+                "FROM telemetry.worker_time").fetchone()
+        finally:
+            queue.close()
+        self.assertGreater(branches, 0)
+        self.assertEqual(branches, worker_total)
+
+    def test_a_forced_member_counts_toward_its_bundle(self):
+        clock = _SteppingClock()
+        worker = _bare_worker()
+        worker._time_account = _account(clock)
+
+        def evaluation_taking_10_millis(branch_key, words, n_words, idx,
+                                        budget=None, bundle_id=None):
+            with worker._time_account.activity("evaluation", owner=bundle_id):
+                clock.advance(10)
+            return True
+
+        worker.evaluate_claim = evaluation_taking_10_millis
+        self.assertTrue(worker.evaluate_bundle(
+            ScoreCache.encode_subset(BRANCH), BRANCH, len(BRANCH), "b1",
+            [0, 1, 2], forced=frozenset({0})))
+        self.assertEqual(
+            worker.queue.record_bundle_stats.call_args.kwargs[
+                "evaluation_time_millis"], 30)
+
+
 class TestBranchCoordinationReachesTheFinalizeLog(unittest.TestCase):
 
     def setUp(self):
@@ -435,7 +512,8 @@ class TestBranchCoordinationReachesTheFinalizeLog(unittest.TestCase):
         worker._bundle_coordination_millis = {"b1": 7, "b2": 4}
         worker._finish_bundle(b"key", "b1", 0, time.time(), censored=False)
         worker.queue.record_bundle_stats.assert_called_once_with(
-            b"key", "b1", 0, mock.ANY, censored=False, coordination_millis=7)
+            b"key", "b1", 0, mock.ANY, censored=False, coordination_millis=7,
+            evaluation_time_millis=None)
         self.assertEqual(worker._bundle_coordination_millis, {"b2": 4})
 
 

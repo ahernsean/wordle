@@ -477,7 +477,7 @@ for and why each sleep happened; `telemetry.checkpoint_pause` and
 a worker's claims.
 
 Per branch, `branch_finalize_log` carries the branch's claims, nodes, worker
-time (`total_bundle_wall_millis`) and coordination time, which is what
+time (`evaluation_time_millis`) and coordination time, which is what
 `view --work-distribution` bands. The finalize phase is recorded there too, as
 `cache_write_millis`.
 
