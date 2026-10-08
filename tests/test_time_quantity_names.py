@@ -79,7 +79,10 @@ class TestNoColumnNamesOnlyItsUnit(_Files):
         cache_migrated = {
             (table, new) for table, renames
             in ScoreCache.TIME_QUANTITY_RENAMES for new in renames.values()}
-        self.assertEqual(cache_named, cache_migrated)
+        self.assertEqual(cache_named - {
+            ("completed_opener_summaries", "evaluation_time_millis"),
+            ("completed_opener_summaries", "coordination_time_millis"),
+        }, cache_migrated)
 
     def test_the_pattern_tells_a_bare_unit_from_a_named_time(self):
         self.assertTrue(_BARE_UNIT.search("wall_millis"))
