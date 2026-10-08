@@ -82,7 +82,7 @@ first-call JIT compile would land inside the measurement.
 
 ### dependency_wait says what a stuck worker was waiting for
 
-`worker_time.wait_dependency_millis` totals the time workers sleep on a
+`worker_time.wait_dependency_time_millis` totals the time workers sleep on a
 dependency without saying which one or why — and waiting on dependencies is the
 swarm's largest single cost (61.5% of all worker time on epoch 21, against 3.4%
 for the scan and 2.3% for lock waits).
@@ -110,7 +110,7 @@ them apart.
 **Every sleep increments exactly one counter, so the five sum to the episode's
 sleep count.** That is what `blocks_other` is for — a claim transaction can
 decline for reasons with no column of their own, and dropping those would leave
-`blocked_millis` holding time no counter accounts for. A counter that is a
+`blocked_time_millis` holding time no counter accounts for. A counter that is a
 partition can be audited; a counter that is a selection cannot.
 
 **Every reason is reported by the code that decided it, never sampled
@@ -131,7 +131,7 @@ answer, it inverts it. An episode that never reached the loop writes no row.
 `telemetry.worker_time` holds one row per worker per
 `WORKER_TIME_INTERVAL_SECONDS` (60): the worker's whole wall time over the
 interval, split by what it was doing. The activity columns sum to
-`interval_millis` exactly, so a share read from them is a share of real time.
+`interval_time_millis` exactly, so a share read from them is a share of real time.
 A sum of per-candidate spans cannot give that: each candidate's evaluation
 span contains every candidate evaluated inside it (a dependency wait that helps
 elsewhere), so the sum counts nested work twice, and a sleep falls between
@@ -148,15 +148,15 @@ directly.
 claiming, `maybe_finalize` is finalizing) and `evaluate_claim` wraps the
 engine call as evaluation. **Every sleep names its reason**:
 `_idle_wait(seconds, reason)` charges `wait_<reason>`, so a new wait needs a
-reason with a column of its own. Time no activity covers is `other_millis`;
-durations are floored to milliseconds and `other_millis` takes the remainder,
+reason with a column of its own. Time no activity covers is `other_time_millis`;
+durations are floored to milliseconds and `other_time_millis` takes the remainder,
 so the integers partition with no rounding residue.
 
 The same rows carry what #379 needs to test its hypothesis:
-`max_heartbeat_gap_millis` (the longest interval between heartbeat rows
+`max_heartbeat_gap_time_millis` (the longest interval between heartbeat rows
 actually written, which is what stale-claim reclaim reads),
 `heartbeats_deferred` (writes skipped for a checkpoint pause), and
-`max_tick_gap_millis` with the activity it opened in. Alongside them,
+`max_tick_gap_time_millis` with the activity it opened in. Alongside them,
 `telemetry.checkpoint_pause` records every supervisor quiesce and how long it
 held, and `telemetry.claim_reclaim` records every worker whose claims a
 reclaim freed, with its heartbeat age at that moment.
@@ -170,10 +170,10 @@ owner=bundle_id)`), never its bundles' wall time. A parent bundle's clock runs
 on while its candidate helps a child branch, and restarts after a forced
 member, so wall time counts the child's work twice and the forced member's
 never. Owned time is the innermost charge, so the branches' evaluation times
-sum to the workers' `evaluation_millis` exactly.
+sum to the workers' `evaluation_time_millis` exactly.
 
 The branch view's ETA needs evaluation times while a branch is still open, so
-they live on the branch's own `candidate_claims` rows (`evaluation_millis`,
+they live on the branch's own `candidate_claims` rows (`evaluation_time_millis`,
 `evaluation_bound_erd`, `branch_worker_count`), written by the transaction that
 completes each candidate. Those rows go when the branch finalizes, so nothing
 there accumulates.
@@ -249,7 +249,7 @@ common case as a guarantee for the whole scheduler.
 
 **A scan that selects nothing is counted in `worker_time.fruitless_scans`**,
 so the fallback rate is measured rather than inferred; its duration is already
-in `scheduling_millis` with every other scan.
+in `scheduling_time_millis` with every other scan.
 
 **Returning None is not the same as selecting nothing.** A scan that promotes a
 branch and loses its bundle to a racing worker returns None from the short
@@ -262,7 +262,7 @@ so it stays out of the count.
 window**: a claim's coordination is the span from the previous claim's
 completion to its own, less its evaluation. It feeds `_coord_ema`, which
 `_publish_threshold` reads on every promotion decision, and
-`bundle_stats.coordination_millis`, which carries it to the branch's finalize
+`bundle_stats.coordination_time_millis`, which carries it to the branch's finalize
 row. It restarts at every wait, after every finalize, and around a helped
 sub-branch, through `_restart_coordination_window`, because none of those spans
 is the cost of handing work from one claim to the next.
@@ -781,6 +781,22 @@ introduce it elsewhere.
 
 The same principle applies everywhere: a name must be self-describing without
 external context.
+
+**A duration names the time it measures, and keeps its unit.** A name that
+ends in a bare unit says how a quantity is measured and never what it is:
+`wall_millis` could be anything counted in milliseconds. Name the quantity and
+the unit: `wall_time_millis`, `coordination_time_millis`,
+`wait_dependency_time_millis`. A configured span names what kind of span it is
+(`ARRIVE_DURATION_MILLIS`, `STUCK_REQUEST_TIMEOUT_MILLIS`,
+`CLIENT_POLL_INTERVAL_MILLIS`), and `duration_millis` already names the time.
+
+The unit stays because durations here are kept in both seconds and
+milliseconds, and they meet: reports divide millisecond totals by 1,000 before
+formatting them beside second-based windows. A bare `coordination_time` leaves
+the reader of a column, a JSON key or a SQL query no way to tell whether to
+divide, and a wrong guess is off by 1,000 while still looking plausible. A bare
+`_time` can also read as a timestamp, which this codebase names `_at`.
+`test_every_schema_names_its_time_quantities` refuses a bare-unit column.
 
 **Scoring method names** — use these and no others:
 

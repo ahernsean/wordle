@@ -180,11 +180,11 @@ class TestSchemaMigration(unittest.TestCase):
             q.add_branch_finalize_log(
                 b"key", "SALET -g-g-", 87, 4, 100, 200, 12345, 87,
                 n_bundles=3, max_bundle_nodes=999,
-                total_bundle_wall_millis=5000, censored_units=0)
+                total_bundle_wall_time_millis=5000, censored_units=0)
             row = q._conn.execute(
-                "SELECT total_bundle_wall_millis "
+                "SELECT total_bundle_wall_time_millis "
                 "FROM telemetry.branch_finalize_log").fetchone()
-            self.assertEqual(row["total_bundle_wall_millis"], 5000)
+            self.assertEqual(row["total_bundle_wall_time_millis"], 5000)
         finally:
             q.close()
 
@@ -379,7 +379,7 @@ class TestClaimNextBundle(_TmpQueue):
     def test_counts_real_busy_retries_under_write_lock_contention(self):
         # Hold the write lock from a second connection just long enough that
         # claim_next_bundle's short per-attempt busy_timeout
-        # (_BUNDLE_CLAIM_RETRY_MILLIS) must fail and retry at least once
+        # (_BUNDLE_CLAIM_RETRY_TIMEOUT_MILLIS) must fail and retry at least once
         # before the lock is released.
         # check_same_thread=False: released from the timer thread below, not
         # the thread that opened it — sqlite3 forbids that by default.
@@ -495,7 +495,7 @@ class TestTwoLevelERDPruneCompletion(_TmpQueue):
             self.q.get_branch(self.key)["nodes_spent"], len(candidate_indices))
         telemetry_row = self.q._conn.execute("""
             SELECT inspected_candidate_count, pruned_candidate_count, bound_erd,
-                   wall_millis
+                   wall_time_millis
             FROM telemetry.two_level_prune_telemetry
         """).fetchone()
         self.assertEqual(tuple(telemetry_row), (len(candidate_indices), 3, None, 0))
@@ -1014,20 +1014,20 @@ class TestBundleStatsAndFinalizeLog(_TmpQueue):
         self.assertEqual(row["bulk_done_candidates"], 37)
 
     def test_finalize_bundle_stats_aggregates_and_clears(self):
-        self.q.record_bundle_stats(self.key, "b1", nodes=10, wall_millis=5,
-                                   coordination_millis=3,
+        self.q.record_bundle_stats(self.key, "b1", nodes=10, wall_time_millis=5,
+                                   coordination_time_millis=3,
                                    evaluation_time_millis=4)
-        self.q.record_bundle_stats(self.key, "b2", nodes=40, wall_millis=7,
-                                   censored=True, coordination_millis=11,
+        self.q.record_bundle_stats(self.key, "b2", nodes=40, wall_time_millis=7,
+                                   censored=True, coordination_time_millis=11,
                                    evaluation_time_millis=6)
-        (n_bundles, max_bundle_nodes, total_bundle_wall_millis, censored_units,
-         coordination_millis, evaluation_time_millis) = (
+        (n_bundles, max_bundle_nodes, total_bundle_wall_time_millis, censored_units,
+         coordination_time_millis, evaluation_time_millis) = (
             self.q.finalize_bundle_stats(self.key))
         self.assertEqual(n_bundles, 2)
         self.assertEqual(max_bundle_nodes, 40)
-        self.assertEqual(total_bundle_wall_millis, 12)
+        self.assertEqual(total_bundle_wall_time_millis, 12)
         self.assertEqual(censored_units, 1)
-        self.assertEqual(coordination_millis, 14)
+        self.assertEqual(coordination_time_millis, 14)
         self.assertEqual(evaluation_time_millis, 10)
         # Cleared: a second call sees nothing.
         self.assertEqual(self.q.finalize_bundle_stats(self.key),
@@ -1039,10 +1039,10 @@ class TestBundleStatsAndFinalizeLog(_TmpQueue):
 
     def test_branch_coordination_and_evaluation_time_reach_the_finalize_log(self):
         self.q.add_branch_finalize_log(
-            self.key, None, 5, 4, 10, 20, 30, 3, coordination_millis=14,
+            self.key, None, 5, 4, 10, 20, 30, 3, coordination_time_millis=14,
             evaluation_time_millis=9)
         self.assertEqual(tuple(self.q._conn.execute(
-            "SELECT coordination_millis, evaluation_time_millis "
+            "SELECT coordination_time_millis, evaluation_time_millis "
             "FROM telemetry.branch_finalize_log").fetchone()), (14, 9))
 
     def test_record_bundle_stats_is_a_noop_once_branch_is_deleted(self):
@@ -1050,7 +1050,7 @@ class TestBundleStatsAndFinalizeLog(_TmpQueue):
         # worker's finalize_bundle_stats + delete_branch for the same
         # branch: the insert must not resurrect an orphaned row.
         self.q.delete_branch(self.key)
-        self.q.record_bundle_stats(self.key, "late-bundle", nodes=99, wall_millis=1)
+        self.q.record_bundle_stats(self.key, "late-bundle", nodes=99, wall_time_millis=1)
         row = self.q._conn.execute(
             "SELECT * FROM bundle_stats WHERE branch_key = ?", (self.key,)).fetchone()
         self.assertIsNone(row)

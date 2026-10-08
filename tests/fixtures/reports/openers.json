@@ -22,7 +22,7 @@
     "direct_branch_count": 12,
     "direct_done_branch_count": 3,
     "done_branch_count": 37,
-    "elapsed_millis": 120000,
+    "elapsed_time_millis": 120000,
     "erd_summary": {
      "erd": null,
      "infeasible_group_count": 0,
@@ -40,7 +40,7 @@
     "started_at": null,
     "state": "queued",
     "worker_count": 3,
-    "worker_millis": 240000
+    "worker_time_millis": 240000
    },
    {
     "branch_count": 96,
@@ -48,7 +48,7 @@
     "direct_branch_count": 4,
     "direct_done_branch_count": 4,
     "done_branch_count": 88,
-    "elapsed_millis": 180000,
+    "elapsed_time_millis": 180000,
     "erd_summary": {
      "erd": 3.4207,
      "infeasible_group_count": 0,
@@ -66,7 +66,7 @@
     "started_at": null,
     "state": "queued",
     "worker_count": 1,
-    "worker_millis": 360000
+    "worker_time_millis": 360000
    },
    {
     "branch_count": 40,
@@ -74,7 +74,7 @@
     "direct_branch_count": 2,
     "direct_done_branch_count": 2,
     "done_branch_count": 40,
-    "elapsed_millis": 480000,
+    "elapsed_time_millis": 480000,
     "erd_summary": {
      "erd": 3.3891,
      "infeasible_group_count": 0,
@@ -92,7 +92,7 @@
     "started_at": null,
     "state": "complete",
     "worker_count": 0,
-    "worker_millis": 600000
+    "worker_time_millis": 600000
    }
   ],
   "summary_groups": [
@@ -112,7 +112,7 @@
       "direct_branch_count": 12,
       "direct_done_branch_count": 3,
       "done_branch_count": 37,
-      "elapsed_millis": 120000,
+      "elapsed_time_millis": 120000,
       "erd_summary": {
        "erd": null,
        "infeasible_group_count": 0,
@@ -129,7 +129,7 @@
       "requested_priority": 5,
       "state": "queued",
       "worker_count": 3,
-      "worker_millis": 240000
+      "worker_time_millis": 240000
      },
      {
       "branch_count": 96,
@@ -137,7 +137,7 @@
       "direct_branch_count": 4,
       "direct_done_branch_count": 4,
       "done_branch_count": 88,
-      "elapsed_millis": 180000,
+      "elapsed_time_millis": 180000,
       "erd_summary": {
        "erd": 3.4207,
        "infeasible_group_count": 0,
@@ -154,7 +154,7 @@
       "requested_priority": 3,
       "state": "queued",
       "worker_count": 1,
-      "worker_millis": 360000
+      "worker_time_millis": 360000
      }
     ]
    },
@@ -174,7 +174,7 @@
       "direct_branch_count": 2,
       "direct_done_branch_count": 2,
       "done_branch_count": 40,
-      "elapsed_millis": 480000,
+      "elapsed_time_millis": 480000,
       "erd_summary": {
        "erd": 3.3891,
        "infeasible_group_count": 0,
@@ -191,7 +191,7 @@
       "requested_priority": 1,
       "state": "complete",
       "worker_count": 0,
-      "worker_millis": 600000
+      "worker_time_millis": 600000
      }
     ]
    }

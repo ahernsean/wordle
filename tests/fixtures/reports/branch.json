@@ -33,7 +33,7 @@
    "censored_unit_count": 1,
    "maximum_bundle_node_count": 5000,
    "node_count": 9000,
-   "wall_millis": 800
+   "wall_time_millis": 800
   },
   "cache": {
    "best_erd": 2.1,
@@ -141,7 +141,7 @@
     "search_node_count": 12000,
     "spine": "SLATE g---- CRIMP -----",
     "two_level_erd_pruned_candidate_count": 1,
-    "wall_millis": 1000
+    "wall_time_millis": 1000
    },
    {
     "answer_count": 8,
@@ -162,7 +162,7 @@
     "search_node_count": 9000,
     "spine": "SLATE g---- DUCHY -----",
     "two_level_erd_pruned_candidate_count": 0,
-    "wall_millis": 800
+    "wall_time_millis": 800
    },
    {
     "answer_count": 8,
@@ -183,7 +183,7 @@
     "search_node_count": 6000,
     "spine": "SLATE g---- WRUNG -----",
     "two_level_erd_pruned_candidate_count": 0,
-    "wall_millis": 700
+    "wall_time_millis": 700
    }
   ],
   "republished_candidates": [

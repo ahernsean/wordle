@@ -457,15 +457,15 @@ cutover; restart every worker immediately afterward.
 `telemetry.worker_time` (in the attached telemetry file, see "Schema
 coordination" in AGENTS.md) holds one row per worker per minute, splitting
 that worker's wall time between evaluation, scheduling, claiming, finalizing,
-six named waits and `other`. The activity columns sum to `interval_millis`, so
+six named waits and `other`. The activity columns sum to `interval_time_millis`, so
 a share of their total is a share of real worker time. To see where an epoch's
 time went:
 
 ```sql
-SELECT SUM(evaluation_millis) * 1.0 / SUM(interval_millis) AS evaluation,
-       SUM(wait_dependency_millis) * 1.0 / SUM(interval_millis) AS dependency,
-       SUM(scheduling_millis) * 1.0 / SUM(interval_millis) AS scheduling,
-       SUM(wait_no_work_millis) * 1.0 / SUM(interval_millis) AS no_work
+SELECT SUM(evaluation_time_millis) * 1.0 / SUM(interval_time_millis) AS evaluation,
+       SUM(wait_dependency_time_millis) * 1.0 / SUM(interval_time_millis) AS dependency,
+       SUM(scheduling_time_millis) * 1.0 / SUM(interval_time_millis) AS scheduling,
+       SUM(wait_no_work_time_millis) * 1.0 / SUM(interval_time_millis) AS no_work
 FROM worker_time WHERE epoch = :epoch;
 ```
 
@@ -479,7 +479,7 @@ a worker's claims.
 Per branch, `branch_finalize_log` carries the branch's claims, nodes, worker
 time (`evaluation_time_millis`) and coordination time, which is what
 `view --work-distribution` bands. The finalize phase is recorded there too, as
-`cache_write_millis`.
+`cache_write_time_millis`.
 
 ---
 

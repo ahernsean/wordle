@@ -16,7 +16,7 @@ from erd_swarm import _BranchWorker, _WorkerTimeAccount, ROOT_BUDGET
 from wordle_engine import SOLVED
 from tests.test_erd_swarm_unit import BRANCH, CANDIDATES, _bare_worker
 
-ACTIVITY_COLUMNS = tuple(f"{activity}_millis"
+ACTIVITY_COLUMNS = tuple(f"{activity}_time_millis"
                          for activity in _WorkerTimeAccount.ACTIVITIES)
 
 
@@ -24,9 +24,9 @@ class _SteppingClock:
     """A nanosecond clock that moves only when told to, or by `step` on
     every read."""
 
-    def __init__(self, step_millis=0):
+    def __init__(self, step_time_millis=0):
         self.now = 0
-        self.step = int(step_millis * 1_000_000)
+        self.step = int(step_time_millis * 1_000_000)
 
     def __call__(self):
         self.now += self.step
@@ -55,15 +55,15 @@ class TestWorkerTimeAccount(unittest.TestCase):
                 clock.advance(5)
             clock.advance(30)
         clock.advance(2)
-        _started_at, interval_millis, figures = account.close_interval(
+        _started_at, interval_time_millis, figures = account.close_interval(
             0, (0, 0, 0, 0))
-        self.assertEqual(interval_millis, 112)
-        self.assertEqual(figures["evaluation_millis"], 70)
-        self.assertEqual(figures["wait_dependency_millis"], 25)
-        self.assertEqual(figures["scheduling_millis"], 5)
-        self.assertEqual(figures["other_millis"], 12)
+        self.assertEqual(interval_time_millis, 112)
+        self.assertEqual(figures["evaluation_time_millis"], 70)
+        self.assertEqual(figures["wait_dependency_time_millis"], 25)
+        self.assertEqual(figures["scheduling_time_millis"], 5)
+        self.assertEqual(figures["other_time_millis"], 12)
         self.assertEqual(sum(figures[c] for c in ACTIVITY_COLUMNS),
-                         interval_millis)
+                         interval_time_millis)
 
     def test_sub_millisecond_spans_still_partition_the_interval(self):
         # Each span floors to 0 ms on its own; their total does not.
@@ -73,13 +73,13 @@ class TestWorkerTimeAccount(unittest.TestCase):
             with account.activity("claiming"):
                 clock.advance(0.7)
             clock.advance(0.2)
-        _started_at, interval_millis, figures = account.close_interval(
+        _started_at, interval_time_millis, figures = account.close_interval(
             0, (0, 0, 0, 0))
-        self.assertEqual(interval_millis, 8)
-        self.assertEqual(figures["claiming_millis"], 6)
-        self.assertEqual(figures["other_millis"], 2)
+        self.assertEqual(interval_time_millis, 8)
+        self.assertEqual(figures["claiming_time_millis"], 6)
+        self.assertEqual(figures["other_time_millis"], 2)
         self.assertEqual(sum(figures[c] for c in ACTIVITY_COLUMNS),
-                         interval_millis)
+                         interval_time_millis)
 
     def test_other_absorbs_the_flooring_and_never_goes_negative(self):
         # Two 0.6 ms spans and nothing else: rounding each would claim 2 ms
@@ -89,10 +89,10 @@ class TestWorkerTimeAccount(unittest.TestCase):
         for activity in ("claiming", "finalizing"):
             with account.activity(activity):
                 clock.advance(0.6)
-        _started_at, interval_millis, figures = account.close_interval(
+        _started_at, interval_time_millis, figures = account.close_interval(
             0, (0, 0, 0, 0))
-        self.assertEqual(interval_millis, 1)
-        self.assertEqual(figures["other_millis"], 1)
+        self.assertEqual(interval_time_millis, 1)
+        self.assertEqual(figures["other_time_millis"], 1)
         self.assertTrue(all(figures[c] >= 0 for c in ACTIVITY_COLUMNS))
 
     def test_an_activity_left_by_an_exception_stops_charging(self):
@@ -106,8 +106,8 @@ class TestWorkerTimeAccount(unittest.TestCase):
         self.assertEqual(account.current, "other")
         _started_at, _interval, figures = account.close_interval(
             0, (0, 0, 0, 0))
-        self.assertEqual(figures["finalizing_millis"], 3)
-        self.assertEqual(figures["other_millis"], 7)
+        self.assertEqual(figures["finalizing_time_millis"], 3)
+        self.assertEqual(figures["other_time_millis"], 7)
 
     def test_an_owner_is_charged_only_its_innermost_time(self):
         # A parent bundle's candidate waits on a dependency and helps by
@@ -122,9 +122,9 @@ class TestWorkerTimeAccount(unittest.TestCase):
                     clock.advance(30)
                 clock.advance(5)
             clock.advance(2)
-        self.assertEqual(account.take_owned_millis("parent"), 12)
-        self.assertEqual(account.take_owned_millis("child"), 30)
-        self.assertIsNone(account.take_owned_millis("parent"))
+        self.assertEqual(account.take_owned_time_millis("parent"), 12)
+        self.assertEqual(account.take_owned_time_millis("child"), 30)
+        self.assertIsNone(account.take_owned_time_millis("parent"))
 
     def test_an_owner_is_totalled_across_intervals(self):
         clock = _SteppingClock()
@@ -133,7 +133,7 @@ class TestWorkerTimeAccount(unittest.TestCase):
             clock.advance(4)
             account.close_interval(0, (0, 0, 0, 0))
             clock.advance(6)
-        self.assertEqual(account.take_owned_millis("bundle"), 10)
+        self.assertEqual(account.take_owned_time_millis("bundle"), 10)
 
     def test_an_unknown_activity_is_refused(self):
         account = _account(_SteppingClock())
@@ -156,10 +156,10 @@ class TestWorkerTimeAccount(unittest.TestCase):
             clock.advance(9)
         account.close_interval(0, (0, 0, 0, 0))
         clock.advance(3)
-        _started_at, interval_millis, figures = account.close_interval(
+        _started_at, interval_time_millis, figures = account.close_interval(
             0, (0, 0, 0, 0))
-        self.assertEqual(interval_millis, 3)
-        self.assertEqual(figures["evaluation_millis"], 0)
+        self.assertEqual(interval_time_millis, 3)
+        self.assertEqual(figures["evaluation_time_millis"], 0)
         self.assertEqual(figures["candidates_evaluated"], 0)
         self.assertEqual(figures["fruitless_scans"], 0)
         self.assertEqual(figures["heartbeats_deferred"], 0)
@@ -178,7 +178,7 @@ class TestWorkerTimeAccount(unittest.TestCase):
             account.note_tick()
         _started_at, _interval, figures = account.close_interval(
             0, (0, 0, 0, 0))
-        self.assertEqual(figures["max_tick_gap_millis"], 41_000)
+        self.assertEqual(figures["max_tick_gap_time_millis"], 41_000)
         self.assertEqual(figures["max_tick_gap_activity"], "evaluation")
 
     def test_a_gap_is_reported_in_the_interval_it_closes(self):
@@ -189,15 +189,15 @@ class TestWorkerTimeAccount(unittest.TestCase):
         clock.advance(35_000)
         _started_at, _interval, first = account.close_interval(
             0, (0, 0, 0, 0))
-        self.assertIsNone(first["max_tick_gap_millis"])
-        self.assertIsNone(first["max_heartbeat_gap_millis"])
+        self.assertIsNone(first["max_tick_gap_time_millis"])
+        self.assertIsNone(first["max_heartbeat_gap_time_millis"])
         clock.advance(5_000)
         account.note_tick()
         account.note_heartbeat_written()
         _started_at, _interval, second = account.close_interval(
             0, (0, 0, 0, 0))
-        self.assertEqual(second["max_tick_gap_millis"], 40_000)
-        self.assertEqual(second["max_heartbeat_gap_millis"], 40_000)
+        self.assertEqual(second["max_tick_gap_time_millis"], 40_000)
+        self.assertEqual(second["max_heartbeat_gap_time_millis"], 40_000)
 
     def test_counters_and_claim_timing_are_reported_as_given(self):
         account = _account(_SteppingClock())
@@ -209,13 +209,13 @@ class TestWorkerTimeAccount(unittest.TestCase):
         self.assertEqual(
             {name: figures[name] for name in (
                 "candidates_evaluated", "fruitless_scans",
-                "heartbeats_deferred", "nodes", "claim_lock_wait_millis",
-                "claim_transaction_millis", "claim_commit_millis",
+                "heartbeats_deferred", "nodes", "claim_lock_wait_time_millis",
+                "claim_transaction_time_millis", "claim_commit_time_millis",
                 "claim_retries")},
             {"candidates_evaluated": 12, "fruitless_scans": 3,
              "heartbeats_deferred": 2, "nodes": 987,
-             "claim_lock_wait_millis": 5, "claim_transaction_millis": 6,
-             "claim_commit_millis": 7, "claim_retries": 8})
+             "claim_lock_wait_time_millis": 5, "claim_transaction_time_millis": 6,
+             "claim_commit_time_millis": 7, "claim_retries": 8})
 
 
 class TestWorkerChargesItsActivities(unittest.TestCase):
@@ -249,7 +249,7 @@ class TestWorkerChargesItsActivities(unittest.TestCase):
     def _worker(self, **kwargs):
         worker = _BranchWorker(0, self.cache_path, self.queue_path, None,
                                **kwargs)
-        worker._time_account = _account(_SteppingClock(step_millis=1))
+        worker._time_account = _account(_SteppingClock(step_time_millis=1))
         return worker
 
     def _rows(self):
@@ -267,11 +267,11 @@ class TestWorkerChargesItsActivities(unittest.TestCase):
         finally:
             worker.close()
         [row] = self._rows()
-        self.assertGreater(row["evaluation_millis"], 0)
-        self.assertGreater(row["claiming_millis"], 0)
-        self.assertGreater(row["finalizing_millis"], 0)
+        self.assertGreater(row["evaluation_time_millis"], 0)
+        self.assertGreater(row["claiming_time_millis"], 0)
+        self.assertGreater(row["finalizing_time_millis"], 0)
         self.assertEqual(sum(row[c] for c in ACTIVITY_COLUMNS),
-                         row["interval_millis"])
+                         row["interval_time_millis"])
         self.assertEqual(row["worker_id"], "worker-0")
         self.assertGreater(row["candidates_evaluated"], 0)
         self.assertEqual(row["nodes"], worker._nodes)
@@ -292,8 +292,8 @@ class TestWorkerChargesItsActivities(unittest.TestCase):
         finally:
             worker.close()
         [row] = self._rows()
-        self.assertGreater(row["scheduling_millis"], 0)
-        self.assertGreater(row["claiming_millis"], 0)
+        self.assertGreater(row["scheduling_time_millis"], 0)
+        self.assertGreater(row["claiming_time_millis"], 0)
 
     def test_a_scan_that_selects_nothing_is_counted(self):
         worker = self._worker()
@@ -330,16 +330,16 @@ class TestWorkerTimeIsWrittenOnTheHeartbeat(unittest.TestCase):
         clock.advance(erd_swarm.WORKER_TIME_INTERVAL_SECONDS * 1000)
         self._tick(worker)
         worker.queue.add_worker_time.assert_called_once()
-        worker_id, _started_at, interval_millis, figures = (
+        worker_id, _started_at, interval_time_millis, figures = (
             worker.queue.add_worker_time.call_args.args)
         self.assertEqual(worker_id, "worker-0")
-        self.assertEqual(interval_millis,
+        self.assertEqual(interval_time_millis,
                          erd_swarm.WORKER_TIME_INTERVAL_SECONDS * 1000)
         self.assertEqual(figures["nodes"], 500)
         self.assertEqual(
-            (figures["claim_lock_wait_millis"],
-             figures["claim_transaction_millis"],
-             figures["claim_commit_millis"], figures["claim_retries"]),
+            (figures["claim_lock_wait_time_millis"],
+             figures["claim_transaction_time_millis"],
+             figures["claim_commit_time_millis"], figures["claim_retries"]),
             (9, 18, 27, 3))
         self.assertEqual(worker._time_account_nodes, 500)
         self.assertEqual(worker._time_account_claim_timing, (10, 20, 30, 4))
@@ -362,9 +362,9 @@ class TestWorkerTimeIsWrittenOnTheHeartbeat(unittest.TestCase):
         self._tick(worker)
         _worker_id, _started_at, _interval, figures = (
             worker.queue.add_worker_time.call_args.args)
-        self.assertEqual(figures["max_tick_gap_millis"], 61_000)
+        self.assertEqual(figures["max_tick_gap_time_millis"], 61_000)
         self.assertEqual(figures["max_tick_gap_activity"], "other")
-        self.assertEqual(figures["max_heartbeat_gap_millis"], 61_000)
+        self.assertEqual(figures["max_heartbeat_gap_time_millis"], 61_000)
 
     def test_a_candidate_evaluation_is_charged_to_evaluation(self):
         clock = _SteppingClock()
@@ -380,7 +380,7 @@ class TestWorkerTimeIsWrittenOnTheHeartbeat(unittest.TestCase):
                 ScoreCache.encode_subset(BRANCH), BRANCH, len(BRANCH), idx=0))
         _started_at, _interval, figures = worker._time_account.close_interval(
             0, (0, 0, 0, 0))
-        self.assertEqual(figures["evaluation_millis"], 30)
+        self.assertEqual(figures["evaluation_time_millis"], 30)
         self.assertEqual(figures["candidates_evaluated"], 1)
 
     def test_heartbeat_writes_inside_an_evaluation_are_not_evaluation(self):
@@ -395,12 +395,12 @@ class TestWorkerTimeIsWrittenOnTheHeartbeat(unittest.TestCase):
         _started_at, _interval, figures = worker._time_account.close_interval(
             0, (0, 0, 0, 0))
         # The row insert lands in the interval that follows the one it closes.
-        self.assertEqual(figures["evaluation_millis"], 0)
-        self.assertEqual(figures["other_millis"], 7)
+        self.assertEqual(figures["evaluation_time_millis"], 0)
+        self.assertEqual(figures["other_time_millis"], 7)
         _worker_id, _started_at, _interval, written = (
             worker.queue.add_worker_time.call_args.args)
-        self.assertEqual(written["evaluation_millis"], 0)
-        self.assertEqual(written["other_millis"],
+        self.assertEqual(written["evaluation_time_millis"], 0)
+        self.assertEqual(written["other_time_millis"],
                          erd_swarm.WORKER_TIME_INTERVAL_SECONDS * 1000 + 20)
 
     def test_closing_the_worker_writes_the_partial_interval(self):
@@ -418,8 +418,8 @@ class TestWorkerTimeIsWrittenOnTheHeartbeat(unittest.TestCase):
             worker._idle_wait(0.05, "rival_finalize")
         _started_at, _interval, figures = worker._time_account.close_interval(
             0, (0, 0, 0, 0))
-        self.assertEqual(figures["wait_no_work_millis"], 500)
-        self.assertEqual(figures["wait_rival_finalize_millis"], 50)
+        self.assertEqual(figures["wait_no_work_time_millis"], 500)
+        self.assertEqual(figures["wait_rival_finalize_time_millis"], 50)
 
 
 class TestBranchEvaluationTime(unittest.TestCase):
@@ -435,7 +435,7 @@ class TestBranchEvaluationTime(unittest.TestCase):
     def test_the_branches_partition_the_workers_evaluation_time(self):
         worker = _BranchWorker(0, self.cache_path, self.queue_path, None,
                                small_count=2, count_cap=2)
-        worker._time_account = _account(_SteppingClock(step_millis=1))
+        worker._time_account = _account(_SteppingClock(step_time_millis=1))
         try:
             worker.solve_branch_focused(self.branch_key)
         finally:
@@ -446,7 +446,7 @@ class TestBranchEvaluationTime(unittest.TestCase):
                 "SELECT SUM(evaluation_time_millis) "
                 "FROM telemetry.branch_finalize_log").fetchone()
             [worker_total] = queue._conn.execute(
-                "SELECT SUM(evaluation_millis) "
+                "SELECT SUM(evaluation_time_millis) "
                 "FROM telemetry.worker_time").fetchone()
         finally:
             queue.close()
@@ -484,23 +484,23 @@ class TestBranchCoordinationReachesTheFinalizeLog(unittest.TestCase):
         recorded = []
         record_bundle_stats = worker.queue.record_bundle_stats
 
-        def recording(*args, coordination_millis=None, **kwargs):
-            recorded.append(coordination_millis)
+        def recording(*args, coordination_time_millis=None, **kwargs):
+            recorded.append(coordination_time_millis)
             return record_bundle_stats(
-                *args, coordination_millis=coordination_millis, **kwargs)
+                *args, coordination_time_millis=coordination_time_millis, **kwargs)
 
         worker.queue.record_bundle_stats = recording
         try:
             worker.solve_branch_focused(self.branch_key)
         finally:
             worker.close()
-        self.assertEqual(worker._bundle_coordination_millis, {})
+        self.assertEqual(worker._bundle_coordination_time_millis, {})
         self.assertTrue(recorded)
         self.assertNotIn(None, recorded)
         queue = ERDQueue(self.queue_path)
         try:
             [logged] = queue._conn.execute(
-                "SELECT coordination_millis "
+                "SELECT coordination_time_millis "
                 "FROM telemetry.branch_finalize_log").fetchone()
         finally:
             queue.close()
@@ -509,12 +509,12 @@ class TestBranchCoordinationReachesTheFinalizeLog(unittest.TestCase):
     def test_each_bundle_carries_only_its_own_members(self):
         worker = _bare_worker()
         worker.queue = mock.Mock()
-        worker._bundle_coordination_millis = {"b1": 7, "b2": 4}
+        worker._bundle_coordination_time_millis = {"b1": 7, "b2": 4}
         worker._finish_bundle(b"key", "b1", 0, time.time(), censored=False)
         worker.queue.record_bundle_stats.assert_called_once_with(
-            b"key", "b1", 0, mock.ANY, censored=False, coordination_millis=7,
+            b"key", "b1", 0, mock.ANY, censored=False, coordination_time_millis=7,
             evaluation_time_millis=None)
-        self.assertEqual(worker._bundle_coordination_millis, {"b2": 4})
+        self.assertEqual(worker._bundle_coordination_time_millis, {"b2": 4})
 
 
 class _QueueTest(unittest.TestCase):
@@ -612,9 +612,9 @@ class TestCheckpointPausesAreRecorded(_QueueTest):
         with mock.patch.object(erd_search, "QUEUE_WAL_QUIESCE_BYTES", 0):
             erd_search._maybe_quiesce_truncate(self.queue)
         [pause] = self.queue._conn.execute(
-            "SELECT pause_millis, wal_bytes, truncated "
+            "SELECT pause_time_millis, wal_bytes, truncated "
             "FROM telemetry.checkpoint_pause").fetchall()
-        self.assertGreaterEqual(pause["pause_millis"], 0)
+        self.assertGreaterEqual(pause["pause_time_millis"], 0)
         self.assertEqual(pause["truncated"], 1)
         self.assertFalse(self.queue.checkpoint_paused())
 
@@ -625,7 +625,7 @@ class TestCheckpointPausesAreRecorded(_QueueTest):
         with mock.patch.object(erd_search.time, "time",
                                side_effect=[0, 1_000]):
             erd_search._maybe_quiesce_truncate(queue)
-        started_at, _pause_millis, wal_bytes, truncated = (
+        started_at, _pause_time_millis, wal_bytes, truncated = (
             queue.add_checkpoint_pause.call_args.args)
         self.assertEqual((started_at, wal_bytes, truncated),
                          (0, erd_search.QUEUE_WAL_QUIESCE_BYTES, False))
@@ -644,7 +644,7 @@ class TestCheckpointPausesAreRecorded(_QueueTest):
                 mock.patch.object(erd_search.time, "sleep"):
             erd_search._maybe_quiesce_truncate(queue)
         self.assertEqual(queue.checkpoint.call_count, 2)
-        started_at, _pause_millis, _wal_bytes, truncated = (
+        started_at, _pause_time_millis, _wal_bytes, truncated = (
             queue.add_checkpoint_pause.call_args.args)
         self.assertEqual(started_at, 120.0)
         self.assertTrue(truncated)

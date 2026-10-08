@@ -2078,7 +2078,7 @@ class TestCostModel(_TmpQueue):
         self.assertIsNotNone(row)
         self.assertEqual(row['n_words'], 8)
         self.assertEqual(row['budget'], 2)
-        self.assertEqual(row['elapsed_millis'], 65000)
+        self.assertEqual(row['elapsed_time_millis'], 65000)
         self.assertEqual(row['nodes'], 500)
         self.assertIsNone(row['predicted_nodes'])
         self.assertEqual(row['remaining_candidates'], 6)
@@ -2387,31 +2387,31 @@ class TestCeilingTelemetry(_TmpQueue):
         ])
         self.q.add_branch_finalize_log(
             old_branch_key, "SALET -----", 2, 4, 100, 200, 10, 1,
-            total_bundle_wall_millis=1_000)
+            total_bundle_wall_time_millis=1_000)
         self.q.add_branch_finalize_log(
             new_branch_key, "TRACE -----", 2, 4, 120, 180, 10, 1,
-            total_bundle_wall_millis=2_000)
+            total_bundle_wall_time_millis=2_000)
 
         timing = self.q.completed_opener_timing("trace")
 
         self.assertEqual(timing["first_created_at"], 120)
         self.assertEqual(timing["completed_at"], 180)
-        self.assertEqual(timing["worker_millis"], 2_000)
+        self.assertEqual(timing["worker_time_millis"], 2_000)
 
     def test_completed_opener_timing_includes_every_epoch(self):
         self.q.add_branch_finalize_log(
             self.key, "TRACE -----", 2, 4, 10, 20, 10, 1,
-            total_bundle_wall_millis=1_000)
+            total_bundle_wall_time_millis=1_000)
         self.q.set_epoch(1)
         self.q.add_branch_finalize_log(
             self.key, "TRACE -----", 2, 4, 100, 160, 10, 1,
-            total_bundle_wall_millis=2_000)
+            total_bundle_wall_time_millis=2_000)
 
         timing = self.q.completed_opener_timing("trace")
 
         self.assertEqual(timing["first_created_at"], 10)
         self.assertEqual(timing["completed_at"], 160)
-        self.assertEqual(timing["worker_millis"], 3_000)
+        self.assertEqual(timing["worker_time_millis"], 3_000)
         self.assertEqual(set(timing["telemetry_epochs"].split(",")), {"0", "1"})
 
     def test_cut_reuse_miss_row(self):
@@ -2473,10 +2473,10 @@ class TestPackerUsesCeilingBound(_TmpQueue):
 class TestSpineAttribution(_TmpQueue):
     """Who first finalized a branch, and what their whole subtree cost."""
 
-    def _log(self, branch_key, spine, nodes, wall_millis, finalized_at):
+    def _log(self, branch_key, spine, nodes, wall_time_millis, finalized_at):
         self.q.add_branch_finalize_log(
             branch_key, spine, 2, 4, 10, finalized_at, nodes, 1,
-            total_bundle_wall_millis=wall_millis)
+            total_bundle_wall_time_millis=wall_time_millis)
 
     def test_first_finalizing_spine_is_the_earliest_not_the_latest(self):
         other = ScoreCache.encode_subset(WORDS[:1])
@@ -2510,7 +2510,7 @@ class TestSpineAttribution(_TmpQueue):
         rollups = self.q.roll_up_spine_subtrees(["TARSE -y-g-"])
 
         self.assertEqual(rollups["TARSE -y-g-"]["search_node_count"], 1_025)
-        self.assertEqual(rollups["TARSE -y-g-"]["wall_millis"], 10_250)
+        self.assertEqual(rollups["TARSE -y-g-"]["wall_time_millis"], 10_250)
         self.assertEqual(rollups["TARSE -y-g-"]["branch_count"], 3)
 
     def test_subtree_rollup_reads_every_spine_from_one_scan(self):

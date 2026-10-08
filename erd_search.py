@@ -1095,10 +1095,10 @@ def _maybe_quiesce_truncate(queue):
             time.sleep(0.5)
     finally:
         queue.set_checkpoint_pause(False)
-        pause_millis = int((time.perf_counter() - pause_t0) * 1000)
-        logger.info('Checkpoint pause lasted %.1fs.', pause_millis / 1000)
+        pause_time_millis = int((time.perf_counter() - pause_t0) * 1000)
+        logger.info('Checkpoint pause lasted %.1fs.', pause_time_millis / 1000)
         try:
-            queue.add_checkpoint_pause(started_at, pause_millis, wal_bytes,
+            queue.add_checkpoint_pause(started_at, pause_time_millis, wal_bytes,
                                        truncated)
         except sqlite3.OperationalError as exc:
             logger.warning('Could not record the checkpoint pause: %s', exc)

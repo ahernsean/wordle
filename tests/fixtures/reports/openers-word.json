@@ -95,7 +95,7 @@
     "direct_branch_count": 12,
     "direct_done_branch_count": 3,
     "done_branch_count": 37,
-    "elapsed_millis": 120000,
+    "elapsed_time_millis": 120000,
     "erd_summary": {
      "erd": null,
      "infeasible_group_count": 0,
@@ -113,7 +113,7 @@
     "started_at": null,
     "state": "queued",
     "worker_count": 3,
-    "worker_millis": 240000
+    "worker_time_millis": 240000
    }
   ],
   "total_opener_count": 1

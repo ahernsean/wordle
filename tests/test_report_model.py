@@ -455,7 +455,7 @@ class ReportModelTest(unittest.TestCase):
         queue.opener_membership_rows.return_value = []
         queue.completed_opener_timing.return_value = {
             "completed_at": 20, "first_created_at": 10,
-            "worker_millis": 4, "telemetry_epochs": "2,4",
+            "worker_time_millis": 4, "telemetry_epochs": "2,4",
         }
         queue.distinct_branch_count_for_words.return_value = 0
         timing_cache = Mock()
@@ -489,16 +489,16 @@ class ReportModelTest(unittest.TestCase):
                "started_at": 10}
         payload = report_model._opener_summary_payload(
             row, {"open_branch_count": 2, "worker_count": 1},
-            {"completed_at": None, "elapsed_millis": None, "worker_millis": None},
+            {"completed_at": None, "elapsed_time_millis": None, "worker_time_millis": None},
             20, set(ANSWERS))
         self.assertEqual(payload["state"], "active")
-        self.assertEqual(payload["elapsed_millis"], 10_000)
+        self.assertEqual(payload["elapsed_time_millis"], 10_000)
         # "raise" is not in ANSWERS: a queued opener need not itself be a
         # possible answer, and the payload must say so rather than guess.
         self.assertFalse(payload["opener_is_answer"])
         answer_payload = report_model._opener_summary_payload(
             {**row, "opener": "salet"}, {"open_branch_count": 2, "worker_count": 1},
-            {"completed_at": None, "elapsed_millis": None, "worker_millis": None},
+            {"completed_at": None, "elapsed_time_millis": None, "worker_time_millis": None},
             20, set(ANSWERS))
         self.assertTrue(answer_payload["opener_is_answer"])
         self.assertEqual(report_model._opener_erd_sort_key({"opener": "raise"})[0], 3)
@@ -507,7 +507,7 @@ class ReportModelTest(unittest.TestCase):
             {"worker_count": 0}, "worker_presence", 0), (1, "no workers"))
         self.assertEqual(report_model._completed_at_group_key(None, 0), (5, "not completed"))
         self.assertEqual(report_model._opener_group_key(
-            {"elapsed_millis": None}, "elapsed", 0), (5, "not completed"))
+            {"elapsed_time_millis": None}, "elapsed", 0), (5, "not completed"))
 
     def test_opener_rollups_and_membership_payload_preserve_shared_branch_context(self):
         branch_key = ScoreCache.encode_subset(["salet"])
@@ -700,9 +700,9 @@ class ReportModelTest(unittest.TestCase):
                 "window_started_at": 900,
                 "inspected_candidate_count": 200,
                 "pruned_candidate_count": 150,
-                "inspection_worker_millis": 20_000,
+                "inspection_worker_time_millis": 20_000,
                 "evaluated_candidate_count": 50,
-                "evaluation_worker_millis": 50_000,
+                "evaluation_worker_time_millis": 50_000,
             },
             live_worker_count=2,
             now=1_600,
@@ -716,9 +716,9 @@ class ReportModelTest(unittest.TestCase):
         base = {
             "best_updated_at": 900, "window_started_at": 900,
             "inspected_candidate_count": 200, "pruned_candidate_count": 150,
-            "inspection_worker_millis": 20_000,
+            "inspection_worker_time_millis": 20_000,
             "evaluated_candidate_count": 50,
-            "evaluation_worker_millis": 50_000,
+            "evaluation_worker_time_millis": 50_000,
         }
         work = {"candidate_count": 1_000, "completed_candidate_count": 400}
 
@@ -735,7 +735,7 @@ class ReportModelTest(unittest.TestCase):
         # A timing the sample never observed would divide by zero, so the
         # estimate is withheld instead.
         for sample in (
-            {"inspection_worker_millis": 0},
+            {"inspection_worker_time_millis": 0},
             {"evaluated_candidate_count": 0},
             {"inspected_candidate_count": 0, "pruned_candidate_count": 0,
              "evaluated_candidate_count": 0},
@@ -750,9 +750,9 @@ class ReportModelTest(unittest.TestCase):
                 "best_updated_at": 900, "window_started_at": 900,
                 "inspected_candidate_count": 200,
                 "pruned_candidate_count": 200,
-                "inspection_worker_millis": 20_000,
+                "inspection_worker_time_millis": 20_000,
                 "evaluated_candidate_count": 50,
-                "evaluation_worker_millis": 50_000,
+                "evaluation_worker_time_millis": 50_000,
             },
             live_worker_count=2, now=1_600,
         )
@@ -767,9 +767,9 @@ class ReportModelTest(unittest.TestCase):
                 "window_started_at": 1_000,
                 "inspected_candidate_count": 99,
                 "pruned_candidate_count": 99,
-                "inspection_worker_millis": 9_900,
+                "inspection_worker_time_millis": 9_900,
                 "evaluated_candidate_count": 0,
-                "evaluation_worker_millis": 0,
+                "evaluation_worker_time_millis": 0,
             },
             live_worker_count=2,
             now=1_119,
@@ -784,9 +784,9 @@ class ReportModelTest(unittest.TestCase):
                 "window_started_at": 1_000,
                 "inspected_candidate_count": 0,
                 "pruned_candidate_count": 0,
-                "inspection_worker_millis": 0,
+                "inspection_worker_time_millis": 0,
                 "evaluated_candidate_count": 10,
-                "evaluation_worker_millis": 20_000,
+                "evaluation_worker_time_millis": 20_000,
             },
             live_worker_count=2,
             now=1_200,
@@ -804,9 +804,9 @@ class ReportModelTest(unittest.TestCase):
                 "window_started_at": 1_000,
                 "inspected_candidate_count": 0,
                 "pruned_candidate_count": 0,
-                "inspection_worker_millis": 0,
+                "inspection_worker_time_millis": 0,
                 "evaluated_candidate_count": 10,
-                "evaluation_worker_millis": 24_000,
+                "evaluation_worker_time_millis": 24_000,
                 "evaluation_worker_count": 1,
                 "evaluation_worker_count_min": 1,
                 "evaluation_worker_count_max": 1,
@@ -827,9 +827,9 @@ class ReportModelTest(unittest.TestCase):
                 "window_started_at": 1_000,
                 "inspected_candidate_count": 0,
                 "pruned_candidate_count": 0,
-                "inspection_worker_millis": 0,
+                "inspection_worker_time_millis": 0,
                 "evaluated_candidate_count": 10,
-                "evaluation_worker_millis": 24_000,
+                "evaluation_worker_time_millis": 24_000,
                 "evaluation_unknown_worker_count": 10,
             },
             live_worker_count=2,
@@ -3431,11 +3431,11 @@ class OpenerReportTest(unittest.TestCase):
         crane_key = ScoreCache.encode_subset(ANSWERS[:2] + ["crane0000"])
         queue.add_branch_finalize_log(
             salet_key, "SALET -----", 3, 3, 10, 40, 100, 1,
-            total_bundle_wall_millis=2_000,
+            total_bundle_wall_time_millis=2_000,
         )
         queue.add_branch_finalize_log(
             crane_key, "CRANE -----", 3, 3, 20, 30, 100, 1,
-            total_bundle_wall_millis=5_000,
+            total_bundle_wall_time_millis=5_000,
         )
         queue.mark_done(salet_key)
         queue.mark_done(crane_key)
@@ -3447,13 +3447,13 @@ class OpenerReportTest(unittest.TestCase):
         cache.close()
 
         rows = {row["opener"]: row for row in self._openers()["summary"]}
-        self.assertEqual(rows["salet"]["elapsed_millis"], 30_000)
-        self.assertEqual(rows["salet"]["worker_millis"], 2_000)
-        self.assertEqual(rows["crane"]["elapsed_millis"], 10_000)
-        self.assertEqual(rows["crane"]["worker_millis"], 5_000)
+        self.assertEqual(rows["salet"]["elapsed_time_millis"], 30_000)
+        self.assertEqual(rows["salet"]["worker_time_millis"], 2_000)
+        self.assertEqual(rows["crane"]["elapsed_time_millis"], 10_000)
+        self.assertEqual(rows["crane"]["worker_time_millis"], 5_000)
         self.assertEqual(rows["crane"]["completed_at"], 30)
-        self.assertIsNone(rows["nurdy"]["elapsed_millis"])
-        self.assertIsNone(rows["nurdy"]["worker_millis"])
+        self.assertIsNone(rows["nurdy"]["elapsed_time_millis"])
+        self.assertIsNone(rows["nurdy"]["worker_time_millis"])
         self.assertEqual(
             [row["opener"] for row in
              self._openers(sort="elapsed")["summary"]],
@@ -3483,8 +3483,8 @@ class OpenerReportTest(unittest.TestCase):
             row = self._openers()["summary"][0]
 
         self.assertEqual(row["started_at"], 100)
-        self.assertEqual(row["elapsed_millis"], 30_000)
-        self.assertIsNone(row["worker_millis"])
+        self.assertEqual(row["elapsed_time_millis"], 30_000)
+        self.assertIsNone(row["worker_time_millis"])
 
     def test_opener_report_keeps_erd_summary_shape_when_cache_unavailable(self):
         self._queue_words(("salet", 5, 1))
@@ -3510,8 +3510,8 @@ class OpenerReportTest(unittest.TestCase):
 
         self.assertEqual(row["state"], "queued")
         self.assertIsNone(row["completed_at"])
-        self.assertIsNone(row["elapsed_millis"])
-        self.assertIsNone(row["worker_millis"])
+        self.assertIsNone(row["elapsed_time_millis"])
+        self.assertIsNone(row["worker_time_millis"])
 
     def test_opener_erd_summary_cache_invalidates_for_wal_writes(self):
         self.addCleanup(report_model._OPENER_ERD_SUMMARY_CACHE.clear)
@@ -3712,14 +3712,14 @@ class OpenerReportTest(unittest.TestCase):
         generated_at = 1_787_270_400  # 21 Aug 2026 00:00 UTC (Friday)
         base_row = {"state": "complete", "worker_count": 0,
                     "requested_priority": 0, "completed_at": generated_at,
-                    "elapsed_millis": 0, "worker_millis": 0,
+                    "elapsed_time_millis": 0, "worker_time_millis": 0,
                     "requested_at": generated_at}
         completed = lambda seconds_ago: _opener_group_key(
             {**base_row, "completed_at": generated_at - seconds_ago},
             "completed", generated_at)[1]
         duration = lambda field, millis: _opener_group_key(
             {**base_row, field: millis},
-            "elapsed" if field == "elapsed_millis" else "worker_time",
+            "elapsed" if field == "elapsed_time_millis" else "worker_time",
             generated_at)[1]
 
         self.assertEqual(completed(0), "today")
@@ -3728,7 +3728,7 @@ class OpenerReportTest(unittest.TestCase):
         self.assertEqual(completed(31 * 24 * 60 * 60), "earlier this year")
         self.assertEqual(completed(366 * 24 * 60 * 60), "older")
         self.assertEqual(
-            [duration("elapsed_millis", millis) for millis in
+            [duration("elapsed_time_millis", millis) for millis in
              (0, 60 * 60 * 1000, 24 * 60 * 60 * 1000,
               7 * 24 * 60 * 60 * 1000, 30 * 24 * 60 * 60 * 1000)],
             ["[0, 1 hour)", "[1 hour, 1 day)", "[1 day, 1 week)",
@@ -3742,8 +3742,8 @@ class OpenerReportTest(unittest.TestCase):
         )
         self.assertEqual(
             _opener_group_key(
-                {**base_row, "completed_at": None, "elapsed_millis": None,
-                 "worker_millis": None},
+                {**base_row, "completed_at": None, "elapsed_time_millis": None,
+                 "worker_time_millis": None},
                 "completed", generated_at)[1],
             "not completed",
         )
@@ -3912,14 +3912,14 @@ class RootProgressReportTest(unittest.TestCase):
 
     NOW = 1_800_000_000
 
-    def _finalize(self, queue, spine, n_words, nodes, wall_millis,
+    def _finalize(self, queue, spine, n_words, nodes, wall_time_millis,
                   created_at, finalized_at, epoch=0, branch_key=None):
         queue.add_branch_finalize_log(
             ScoreCache.encode_subset(ANSWERS[:1]) if branch_key is None
             else branch_key,
             spine, n_words, 3,
             created_at, finalized_at, nodes, 1,
-            total_bundle_wall_millis=wall_millis)
+            total_bundle_wall_time_millis=wall_time_millis)
         queue._conn.execute(
             "UPDATE telemetry.branch_finalize_log SET epoch = ? "
             "WHERE spine = ?", (epoch, spine))
@@ -4052,7 +4052,7 @@ class RootProgressReportTest(unittest.TestCase):
         self.assertTrue(row["inherited_cost_known"])
         # The payer's own branch plus its descendant, not the branch alone.
         self.assertEqual(row["inherited_search_node_count"], 1_000)
-        self.assertEqual(row["inherited_wall_millis"], 10_000)
+        self.assertEqual(row["inherited_wall_time_millis"], 10_000)
         self.assertEqual(row["inherited_branch_count"], 2)
         totals = data["totals"]
         self.assertEqual(totals["inherited_search_node_count"], 1_000)
@@ -4151,7 +4151,7 @@ class RootProgressReportTest(unittest.TestCase):
         self.assertEqual(len(rows), 4)
         self.assertFalse(rows["-y-y-"]["started"])
         self.assertEqual(rows["-y-y-"]["search_node_count"], 0)
-        self.assertIsNone(rows["-y-y-"]["elapsed_millis"])
+        self.assertIsNone(rows["-y-y-"]["elapsed_time_millis"])
 
     def test_rollup_reports_elapsed_and_worker_time_separately(self):
         queue = self._open_queue()
@@ -4164,8 +4164,8 @@ class RootProgressReportTest(unittest.TestCase):
 
         row = next(row for row in report["data"]["response_groups"]
                    if row["pattern"] == "-y---")
-        self.assertEqual(row["elapsed_millis"], 100_000)
-        self.assertEqual(row["wall_millis"], 400_000)
+        self.assertEqual(row["elapsed_time_millis"], 100_000)
+        self.assertEqual(row["wall_time_millis"], 400_000)
 
     def test_completed_root_reports_its_finalization_time(self):
         queue = self._open_queue()
@@ -4376,7 +4376,7 @@ class RootProgressReportTest(unittest.TestCase):
         # finalize-derived span is unknown, not zero.
         self.assertEqual(row["branch_count"], 0)
         self.assertEqual(row["search_node_count"], 0)
-        self.assertIsNone(row["elapsed_millis"])
+        self.assertIsNone(row["elapsed_time_millis"])
         self.assertEqual(data["totals"]["started_response_group_count"], 1)
 
     def test_open_branches_can_start_the_clock_before_any_finalization(self):
@@ -4708,14 +4708,14 @@ class WorkDistributionReportTest(unittest.TestCase):
         ScoreCache(self.sources.cache_path, ANSWERS,
                    checkpoint_on_close=False).close()
 
-    def _claims(self, branch_key, count, nodes, evaluation_millis,
-                coordination_millis=10):
+    def _claims(self, branch_key, count, nodes, evaluation_time_millis,
+                coordination_time_millis=10):
         """Finalize a branch that took `count` claims of these sizes each."""
         now = int(time.time())
         self.queue.add_branch_finalize_log(
             branch_key, None, 10, 4, now, now, count * nodes, count,
-            n_bundles=1, evaluation_time_millis=count * evaluation_millis,
-            coordination_millis=count * coordination_millis)
+            n_bundles=1, evaluation_time_millis=count * evaluation_time_millis,
+            coordination_time_millis=count * coordination_time_millis)
 
     def _report(self, **overrides):
         request = ReportRequest(report_kind="work_distribution", **overrides)
@@ -4755,8 +4755,8 @@ class WorkDistributionReportTest(unittest.TestCase):
         costly = ScoreCache.encode_subset(["salet", "crane", "nurdy"])
         self.queue.create_branch(cheap, 2, 2)
         self.queue.create_branch(costly, 3, 2)
-        self._claims(cheap, 30, 1, 10, coordination_millis=30)
-        self._claims(costly, 2, 500_000, 400_000, coordination_millis=30)
+        self._claims(cheap, 30, 1, 10, coordination_time_millis=30)
+        self._claims(costly, 2, 500_000, 400_000, coordination_time_millis=30)
 
         bands = self._report()["data"]["bands"]
         cheap_band, costly_band = bands[0], bands[3]
@@ -4781,8 +4781,8 @@ class WorkDistributionReportTest(unittest.TestCase):
         costly = ScoreCache.encode_subset(["salet", "crane", "nurdy"])
         self.queue.create_branch(cheap, 2, 2)
         self.queue.create_branch(costly, 3, 2)
-        self._claims(cheap, 30, 1, 10, coordination_millis=30)
-        self._claims(costly, 2, 500_000, 400_000, coordination_millis=500)
+        self._claims(cheap, 30, 1, 10, coordination_time_millis=30)
+        self._claims(costly, 2, 500_000, 400_000, coordination_time_millis=500)
 
         bands = self._report()["data"]["bands"]
 
@@ -4902,10 +4902,10 @@ class WorkDistributionReportTest(unittest.TestCase):
         now = int(time.time())
         self.queue.add_branch_finalize_log(
             small, None, 4, 4, now, now, 6, 6, n_bundles=1,
-            evaluation_time_millis=300, coordination_millis=60)
+            evaluation_time_millis=300, coordination_time_millis=60)
         self.queue.add_branch_finalize_log(
             large, None, 80, 4, now, now, 1_000_000, 2, n_bundles=1,
-            evaluation_time_millis=800_000, coordination_millis=20)
+            evaluation_time_millis=800_000, coordination_time_millis=20)
 
         data = self._report(
             filters=ReportFilters(minimum_answer_count=50))["data"]

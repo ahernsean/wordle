@@ -461,7 +461,7 @@
   <script>
   (() => {
     "use strict";
-    const SCHEMA_VERSION=4, DEFAULT_POLL=2000, STUCK_REQUEST_MILLIS=60000;
+    const SCHEMA_VERSION=4, DEFAULT_POLL=2000, STUCK_REQUEST_TIMEOUT_MILLIS=60000;
     const branchStatusNames=["unqueued","queued","evaluating","finalizing","done"];
     const branchWorkerStatusNames=["active","waiting"];
     // The overview answers what the swarm is doing right now, so it offers
@@ -511,7 +511,7 @@
     // without redrawing anything.  Both would otherwise reach a detached node,
     // and nothing afterwards repairs it -- a 304 poll draws nothing at all.
     let openerLookupRedraw=null;
-    const COMPLETED_BRANCH_HOLD_MILLIS=5000;
+    const COMPLETED_BRANCH_HOLD_DURATION_MILLIS=5000;
     const recentOverviewCompletionRows=new Map();
     let completionExpiryTimer=null;
     let currentState, lastReport=null, lastContext=null, displayedState=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,shownBranchTarget=null,rootProgressOpen=true,rootProgressSort="tree_nodes",leaderboardReportWidth=null;
@@ -878,15 +878,15 @@
         const identity=String(row.branch_key_hex),key=context+"|"+identity;
         if(present.has(identity))continue;
         const finalizedAt=Number(row.finalized_at),generatedAt=Number(report.generated_at);
-        const remainingMillis=Number.isFinite(finalizedAt)&&Number.isFinite(generatedAt)
-          ?Math.max(0,((finalizedAt+COMPLETED_BRANCH_HOLD_MILLIS/1000)-generatedAt)*1000)
-          :COMPLETED_BRANCH_HOLD_MILLIS;
-        recentOverviewCompletionRows.set(key,{context,identity,expires_at:now+remainingMillis,row});
+        const remainingTimeMillis=Number.isFinite(finalizedAt)&&Number.isFinite(generatedAt)
+          ?Math.max(0,((finalizedAt+COMPLETED_BRANCH_HOLD_DURATION_MILLIS/1000)-generatedAt)*1000)
+          :COMPLETED_BRANCH_HOLD_DURATION_MILLIS;
+        recentOverviewCompletionRows.set(key,{context,identity,expires_at:now+remainingTimeMillis,row});
       }
       for(const row of (previous?.data?.branches||[])){
         const identity=String(row.branch_key_hex),key=context+"|"+identity;
         if(!present.has(identity)&&completedOverviewBranch(row)&&!recentOverviewCompletionRows.has(key)){
-          recentOverviewCompletionRows.set(key,{context,identity,expires_at:now+COMPLETED_BRANCH_HOLD_MILLIS,row:{...row,branch_status:"done",branch_worker_status:null,recently_completed:true}});
+          recentOverviewCompletionRows.set(key,{context,identity,expires_at:now+COMPLETED_BRANCH_HOLD_DURATION_MILLIS,row:{...row,branch_status:"done",branch_worker_status:null,recently_completed:true}});
         }
       }
       const completedRows=[...recentOverviewCompletionRows.values()].filter(entry=>entry.context===context).map(entry=>entry.row);
@@ -1482,7 +1482,7 @@
             .map(state=>metric(state,(totals.display_state_counts||{})[state])),
         metric("branches evaluating",totals.open_branch_count),
         metric("nodes",formatNodeCount(totals.search_node_count)),
-        metric("worker-time",formatDuration((totals.wall_millis||0)/1000)));
+        metric("worker-time",formatDuration((totals.wall_time_millis||0)/1000)));
       fragment.append(metrics);
       // A group solved by another opener first is finished without this one
       // having done the work, so its cost is reported apart from the measured
@@ -1494,9 +1494,9 @@
           const inheritedMetrics=element("div","metrics");
           inheritedMetrics.append(
             metric("inherited nodes",formatNodeCount(totals.inherited_search_node_count)),
-            metric("inherited worker-time",formatDuration((totals.inherited_wall_millis||0)/1000)),
+            metric("inherited worker-time",formatDuration((totals.inherited_wall_time_millis||0)/1000)),
             metric("tree total nodes",formatNodeCount((totals.search_node_count||0)+(totals.inherited_search_node_count||0))),
-            metric("tree total worker-time",formatDuration(((totals.wall_millis||0)+(totals.inherited_wall_millis||0))/1000)));
+            metric("tree total worker-time",formatDuration(((totals.wall_time_millis||0)+(totals.inherited_wall_time_millis||0))/1000)));
           fragment.append(inheritedMetrics);
         }else{
           fragment.append(element("p","dim","Measuring what other openers spent on the "+numText(inheritedGroups)+" inherited groups\u2026"));
@@ -1568,8 +1568,8 @@
           element("td","",row.shown_cost_is_inherited||!row.started?"—":numText(row.open_branch_count)),
           element("td","",costText(row,()=>formatNodeCount(row.shown_search_node_count))),
           element("td","",costText(row,()=>(100*row.search_node_share).toFixed(1)+"%")),
-          element("td","",costText(row,()=>row.shown_elapsed_millis===null?"—":formatDuration(row.shown_elapsed_millis/1000))),
-          element("td","",costText(row,()=>row.shown_branch_count?formatDuration(row.shown_wall_millis/1000):"—")),
+          element("td","",costText(row,()=>row.shown_elapsed_time_millis===null?"—":formatDuration(row.shown_elapsed_time_millis/1000))),
+          element("td","",costText(row,()=>row.shown_branch_count?formatDuration(row.shown_wall_time_millis/1000):"—")),
           paidByCell(row,state));
         body.append(line);
       }
@@ -1831,7 +1831,7 @@
       }
       fragment.append(spineSection?sectionPair(spineSection,identitySection):identitySection);
       const bundleSummary=data.bundle_summary||{};
-      const queueFacts=data.queue?[["status",data.queue.branch_status],["worker",data.queue.branch_worker_status],["priority",data.queue.priority],["budget",data.queue.budget],["best",bestGuessCell(data.queue,branch.answer_count)||"none yet"],["ERD ceiling",erdValue(data.queue.ceiling,branch.answer_count,{ceiling:true})],["nodes",data.queue.search_node_count],...(bundleSummary.wall_millis?[['wall time',formatDuration(bundleSummary.wall_millis/1000)]]:[])]:null;
+      const queueFacts=data.queue?[["status",data.queue.branch_status],["worker",data.queue.branch_worker_status],["priority",data.queue.priority],["budget",data.queue.budget],["best",bestGuessCell(data.queue,branch.answer_count)||"none yet"],["ERD ceiling",erdValue(data.queue.ceiling,branch.answer_count,{ceiling:true})],["nodes",data.queue.search_node_count],...(bundleSummary.wall_time_millis?[['wall time',formatDuration(bundleSummary.wall_time_millis/1000)]]:[])]:null;
       fragment.append(section("Queue",queueFacts?labeledFacts(queueFacts):element("p","empty","No current queue state")));
       const claimSummary=data.claim_summary||{};
       if(data.queue&&data.queue.candidate_count){const liveWorkers=(data.workers||[]).filter(worker=>worker.is_live);const candidateFacts=[["candidates",formatInteger(data.queue.completed_candidate_count)+"/"+formatInteger(data.queue.candidate_count)+" ="],["evaluated",claimSummary.evaluated_count||0],["+ one-level ERD prunes",data.queue.one_level_erd_pruned_candidate_count??data.queue.bulk_completed_candidate_count],["+ two-level ERD prunes",data.queue.two_level_erd_pruned_candidate_count??0],...(claimSummary.provenance_unknown_count?[["+ unattributed",claimSummary.provenance_unknown_count]]:[])];const candidateStatusFacts=[...(claimSummary.in_flight_count?[["in flight",claimSummary.in_flight_count]]:[])],candidateETAFacts=[];const candidateETA=data.candidate_eta;if(candidateETA?.state==="ready"||candidateETA?.state==="rough"){const etaDataMinutes=Math.round(candidateETA.sample_duration_seconds/60),etaWorkers=candidateETA.worker_count_changed?"; scaling "+candidateETA.sample_worker_count+"→"+candidateETA.current_worker_count+" workers":"";candidateETAFacts.push([(candidateETA.state==="rough"?"Rough ETA":"ETA")+" ("+etaDataMinutes+" min data"+etaWorkers+")","~"+formatDuration(candidateETA.estimated_seconds)]);candidateETAFacts.push(["ETA work remaining","checks "+numText(candidateETA.remaining_inspection_count)+" · full evals ~"+numText(candidateETA.expected_full_evaluation_count)]);}else if(candidateETA?.state==="learning")candidateETAFacts.push(["ETA","learning: first 3 min of current work sample"]);const republishedList=data.republished_candidates||[];if(republishedList.length)candidateStatusFacts.push(["candidates re-queued",numText(republishedList.length)+" (up to "+Math.max(...republishedList.map(row=>row.republish_count))+"× each)"]);if(claimSummary.worker_contributions?.length)candidateStatusFacts.push(["worker evals",claimSummary.worker_contributions.map(row=>workerName({worker_id:row.worker_id})+":"+numText(row.done_count)).join(" ")]);const candidates=element("div");candidates.append(sweepStrip(data.queue.candidate_count,data.completed_candidate_bitmap,liveWorkers,previousBy(previous,"workers","worker_id")),labeledFacts(candidateFacts));if(candidateStatusFacts.length)candidates.append(labeledFacts(candidateStatusFacts));for(const fact of candidateETAFacts)candidates.append(labeledFacts([fact]));fragment.append(section("Candidates",candidates));}
@@ -1840,7 +1840,7 @@
       // chance to share one scrolled page.
       if(data.workers?.length){const workers=gridElement("workers","workers"),previousWorkers=previousBy(previous,"workers","worker_id");for(const worker of data.workers)workers.append(workerCard(worker,previousWorkers.get(String(worker.worker_id)),report.generated_at));fragment.append(section("Live workers",workers));}
       const bundleLabels={bundle_count:"bundles",censored_unit_count:"capped bundles",maximum_bundle_node_count:"max bundle nodes"};
-      const bundlePairs=Object.entries(bundleSummary).filter(([key])=>key!=="node_count"&&key!=="wall_millis").map(([key,value])=>[bundleLabels[key]||label(key),value]);
+      const bundlePairs=Object.entries(bundleSummary).filter(([key])=>key!=="node_count"&&key!=="wall_time_millis").map(([key,value])=>[bundleLabels[key]||label(key),value]);
       const bundlesSection=bundlePairs.length?section("Bundles",labeledFacts(bundlePairs)):null;
       const cacheEntries=candidateErdKvEntries(data.cache,branch.answer_count,report.generated_at).map(([key,value])=>[key,value==="missing"?"not cached":value]);
       const cacheSection=section("Cache",labeledFacts(cacheEntries));
@@ -1880,7 +1880,7 @@
           else if(row.ceiling!==null&&row.ceiling!==undefined)facts.push("ERD ceiling "+erdValue(row.ceiling,row.answer_count,{ceiling:true}));
           facts.push(numText(row.evaluated_candidate_count)+" evaluated",numText(row.one_level_erd_pruned_candidate_count??row.bulk_completed_candidate_count)+" one-level ERD prunes",numText(row.two_level_erd_pruned_candidate_count??0)+" two-level ERD prunes",numText(row.search_node_count)+" nodes");
           if(row.bundle_count)facts.push(numText(row.bundle_count)+" bundles");
-          if(row.wall_millis)facts.push(formatDuration(row.wall_millis/1000));
+          if(row.wall_time_millis)facts.push(formatDuration(row.wall_time_millis/1000));
           card.append(statLine(facts));
           const scheduleFacts=[];
           if(row.winner_best_first_rank!==null&&row.winner_best_first_rank!==undefined){
@@ -2066,8 +2066,8 @@
         numText(row.done_branch_count)+" done",
         numText(row.direct_branch_count)+" direct",
         row.worker_count?numText(row.worker_count)+(row.worker_count===1?" worker":" workers"):null,
-        row.elapsed_millis===null||row.elapsed_millis===undefined?null:"elapsed "+formatDuration(row.elapsed_millis/1000),
-        row.worker_millis===null||row.worker_millis===undefined?null:"worker time "+formatDuration(row.worker_millis/1000),
+        row.elapsed_time_millis===null||row.elapsed_time_millis===undefined?null:"elapsed "+formatDuration(row.elapsed_time_millis/1000),
+        row.worker_time_millis===null||row.worker_time_millis===undefined?null:"worker time "+formatDuration(row.worker_time_millis/1000),
         row.completed_at===null||row.completed_at===undefined?null:"completed "+relativeAge(row.completed_at,generatedAt),
         row.requested_at===null||row.requested_at===undefined?null:"requested "+relativeAge(row.requested_at,generatedAt),
       ]));
@@ -2571,7 +2571,7 @@
     //
     // A pinch has already moved the old chart under the reader's fingers, so
     // the zoom starts from where the pinch left it rather than from rest.
-    const HISTOGRAM_ZOOM_MILLIS=800;
+    const HISTOGRAM_ZOOM_DURATION_MILLIS=800;
     // The chart moves with the fingers on it, keeping the ERD values under
     // each finger beneath it: one finger dragged sideways pans, two spread
     // apart zoom in, pinched together zoom out, and slid together pan.
@@ -2603,7 +2603,7 @@
         settle=({offset,scale})=>{
           bars.style.transform="";
           if((offset===0&&scale===1)||matchMedia("(prefers-reduced-motion: reduce)").matches||!bars.animate)return;
-          bars.animate([{transform:"translateX("+offset*bars.clientWidth+"px) scale("+scale+",1)"},{transform:"none"}],{duration:HISTOGRAM_ZOOM_MILLIS/2,easing:"cubic-bezier(.4,0,.2,1)"});
+          bars.animate([{transform:"translateX("+offset*bars.clientWidth+"px) scale("+scale+",1)"},{transform:"none"}],{duration:HISTOGRAM_ZOOM_DURATION_MILLIS/2,easing:"cubic-bezier(.4,0,.2,1)"});
         },
         // A finger landing on a chart still zooming takes it where it is
         // drawn, so the values it holds are the ones it is seen to hold.
@@ -2695,7 +2695,7 @@
         rise=!(from.tallest>0&&to.tallest>0&&standing>0)?1
           :zoomingIn?standing/from.tallest:to.tallest/standing,
         offset=start?.offset??0,scale=start?.scale??1,
-        timing={duration:HISTOGRAM_ZOOM_MILLIS,easing:"cubic-bezier(.4,0,.2,1)"};
+        timing={duration:HISTOGRAM_ZOOM_DURATION_MILLIS,easing:"cubic-bezier(.4,0,.2,1)"};
       requestAnimationFrame(()=>{
         if(!bars.isConnected)return;
         const width=bars.clientWidth;
@@ -3117,7 +3117,7 @@
         row.append(element("td","",band.band_label));
         row.append(element("td","",formatInteger(band.branch_count)));
         row.append(element("td","",percentText(band.branch_share)));
-        row.append(element("td","",formatDuration((band.worker_millis||0)/1000)));
+        row.append(element("td","",formatDuration((band.worker_time_millis||0)/1000)));
         row.append(element("td","",percentText(band.worker_time_share)));
         row.append(element("td","",formatInteger(band.search_node_count)));
         row.append(element("td","",percentText(band.search_node_share)));
@@ -3145,7 +3145,7 @@
           .map(node=>[node.dataset.identity,{node,rect:node.getBoundingClientRect()}])),
       }]));
     }
-    const DEPART_MILLIS=400,SETTLE_MILLIS=500,ARRIVE_MILLIS=400,SETTLE_STAGGER_MILLIS=20,SETTLE_STAGGER_LIMIT=8;
+    const DEPART_DURATION_MILLIS=400,SETTLE_DURATION_MILLIS=500,ARRIVE_DURATION_MILLIS=400,SETTLE_STAGGER_DELAY_MILLIS=20,SETTLE_STAGGER_LIMIT=8;
     // For the length of a transition the grid stops being a grid.  Its cards are
     // pinned to their final boxes with absolute positions and moved by transform
     // alone, and the grid carries one explicit height animating from what it was
@@ -3216,10 +3216,10 @@
       const settling=placements.filter(placement=>placement.dx||placement.dy);
       const resizing=before.rect.height!==gridRect.height;
       if(!leaving.length&&!arriving.length&&!settling.length&&!resizing)return;
-      const departMillis=leaving.length?DEPART_MILLIS:0;
-      const settleMillis=settling.length||resizing?SETTLE_MILLIS:0;
-      const staggerMillis=settling.length?Math.min(settling.length-1,SETTLE_STAGGER_LIMIT)*SETTLE_STAGGER_MILLIS:0;
-      const settleEnd=departMillis+settleMillis,arriveStart=settleEnd+staggerMillis,total=arriveStart+ARRIVE_MILLIS;
+      const departDurationMillis=leaving.length?DEPART_DURATION_MILLIS:0;
+      const settleDurationMillis=settling.length||resizing?SETTLE_DURATION_MILLIS:0;
+      const staggerDelayMillis=settling.length?Math.min(settling.length-1,SETTLE_STAGGER_LIMIT)*SETTLE_STAGGER_DELAY_MILLIS:0;
+      const settleEnd=departDurationMillis+settleDurationMillis,arriveStart=settleEnd+staggerDelayMillis,total=arriveStart+ARRIVE_DURATION_MILLIS;
       const transition=beginGridTransition();
       const pin=(node,left,top,width,height)=>{
         Object.assign(node.style,{position:"absolute",margin:"0",left:left+"px",top:top+"px",width:width+"px",height:height+"px"});
@@ -3233,7 +3233,7 @@
       // laid out normally.
       transition.animate(grid,[
         {height:before.rect.height+"px",offset:0},
-        {height:before.rect.height+"px",offset:departMillis/total,easing:"ease-in-out"},
+        {height:before.rect.height+"px",offset:departDurationMillis/total,easing:"ease-in-out"},
         {height:gridRect.height+"px",offset:settleEnd/total},
         {height:gridRect.height+"px",offset:1},
       ],{duration:total,fill:"backwards"}).onfinish=()=>transition.finish();
@@ -3244,11 +3244,11 @@
         grid.append(node);
         pin(node,rect.left-before.rect.left,rect.top-before.rect.top,rect.width,rect.height);
         transition.onFinish(()=>node.remove());
-        transition.animate(node,[{opacity:1},{opacity:0}],{duration:departMillis,easing:"ease-in",fill:"forwards"});
+        transition.animate(node,[{opacity:1},{opacity:0}],{duration:departDurationMillis,easing:"ease-in",fill:"forwards"});
       }
       settling.forEach((placement,index)=>transition.animate(placement.node,
         [{transform:`translate(${placement.dx}px,${placement.dy}px)`},{transform:"none"}],
-        {duration:settleMillis,delay:departMillis+Math.min(index,SETTLE_STAGGER_LIMIT)*SETTLE_STAGGER_MILLIS,
+        {duration:settleDurationMillis,delay:departDurationMillis+Math.min(index,SETTLE_STAGGER_LIMIT)*SETTLE_STAGGER_DELAY_MILLIS,
          easing:"ease-in-out",fill:"backwards"}));
       for(const placement of arriving)transition.animate(placement.node,[
         {opacity:0,clipPath:"inset(0 0 100% 0)",offset:0},
@@ -3339,7 +3339,7 @@
     async function fetchReport(){
       if(document.hidden)return;
       if(activeRequestController){
-        if(Date.now()-activeRequestStartedAt<STUCK_REQUEST_MILLIS)return;
+        if(Date.now()-activeRequestStartedAt<STUCK_REQUEST_TIMEOUT_MILLIS)return;
         abortActiveRequest();
       }
       const state=normalizeState(currentState),context=contextKey(state),generation=++requestGeneration,controller=new AbortController();

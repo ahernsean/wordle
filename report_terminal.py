@@ -1143,10 +1143,10 @@ def _render_branch_sections(report, previous_report, color, width, display_order
             f"best={queue['best_guess'] or '—'} "
             f"nodes={_abbreviate_number(queue['search_node_count'])}"
         )
-        if bundle_summary.get("wall_millis"):
+        if bundle_summary.get("wall_time_millis"):
             queue_facts += (
                 f" wall-time={_abbreviate_duration(
-                    bundle_summary['wall_millis'] / 1000)}"
+                    bundle_summary['wall_time_millis'] / 1000)}"
             )
         queue_lines = [
             "Queue",
@@ -1310,7 +1310,7 @@ def _render_branch_sections(report, previous_report, color, width, display_order
             + " "
             + (f"{value:,}" if isinstance(value, int) else str(value))
             for key, value in bundle_summary.items()
-            if key not in ("node_count", "wall_millis")
+            if key not in ("node_count", "wall_time_millis")
         ]
         bundle_lines.extend(_inline_section("  summary:", bundle_fields, width))
     else:
@@ -1625,9 +1625,9 @@ def _render_work_distribution_sections(report, width):
         ),
         _fit(
             "  worker-time "
-            f"{_abbreviate_duration(totals['worker_millis'] / 1000)}, "
+            f"{_abbreviate_duration(totals['worker_time_millis'] / 1000)}, "
             "coordination "
-            f"{_abbreviate_duration(totals['coordination_millis'] / 1000)}",
+            f"{_abbreviate_duration(totals['coordination_time_millis'] / 1000)}",
             width,
         ),
     ]
@@ -1654,7 +1654,7 @@ def _render_work_distribution_sections(report, width):
             f"{band['band_label']:<10}"
             f" {('—' if ratio is None else f'{ratio:.2f}'):>10}"
             f" {band['branch_count']:>9,}"
-            f" {_abbreviate_duration(band['worker_millis'] / 1000):>7}"
+            f" {_abbreviate_duration(band['worker_time_millis'] / 1000):>7}"
             f" {_percent_text(band['worker_time_share']):>6}"
             f" {_format_node_count(band['search_node_count']):>7}"
             f" {_percent_text(band['search_node_share']):>7}"
@@ -2002,7 +2002,7 @@ def _render_root_progress_sections(report, width, display_order):
         _fit(
             f"  branches evaluating {totals['open_branch_count']:,}"
             f"   nodes {_format_node_count(totals['search_node_count'])}"
-            f"   worker-time {_abbreviate_duration(totals['wall_millis'] / 1000)}",
+            f"   worker-time {_abbreviate_duration(totals['wall_time_millis'] / 1000)}",
             width,
         ),
     ]
@@ -2014,10 +2014,10 @@ def _render_root_progress_sections(report, width, display_order):
         # rather than summed into one figure that means neither.
         if totals.get("inherited_cost_known"):
             inherited_nodes = totals["inherited_search_node_count"]
-            inherited_millis = totals["inherited_wall_millis"]
+            inherited_time_millis = totals["inherited_wall_time_millis"]
             summary.append(_fit(
                 f"  inherited {_format_node_count(inherited_nodes)} nodes"
-                f"   worker-time {_abbreviate_duration(inherited_millis / 1000)}"
+                f"   worker-time {_abbreviate_duration(inherited_time_millis / 1000)}"
                 f"   from {inherited_group_count:,} groups",
                 width,
             ))
@@ -2025,7 +2025,7 @@ def _render_root_progress_sections(report, width, display_order):
                 "  tree total "
                 f"{_format_node_count(totals['search_node_count'] + inherited_nodes)}"
                 " nodes   worker-time "
-                f"{_abbreviate_duration((totals['wall_millis'] + inherited_millis) / 1000)}",
+                f"{_abbreviate_duration((totals['wall_time_millis'] + inherited_time_millis) / 1000)}",
                 width,
             ))
         else:
@@ -2083,9 +2083,9 @@ def _render_root_progress_sections(report, width, display_order):
             node_text = _format_node_count(row["shown_search_node_count"])
             share_text = f"{100.0 * row['search_node_share']:.1f}%"
             elapsed_text = _abbreviate_duration(
-                row["shown_elapsed_millis"] / 1000
-                if row["shown_elapsed_millis"] is not None else None)
-            worker_text = (_abbreviate_duration(row["shown_wall_millis"] / 1000)
+                row["shown_elapsed_time_millis"] / 1000
+                if row["shown_elapsed_time_millis"] is not None else None)
+            worker_text = (_abbreviate_duration(row["shown_wall_time_millis"] / 1000)
                            if row["shown_branch_count"] else "—")
         elif row["shown_cost_is_inherited"]:
             branch_text = node_text = share_text = "?"
