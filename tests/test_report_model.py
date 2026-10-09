@@ -3636,6 +3636,84 @@ class OpenerReportTest(unittest.TestCase):
              for row in rows},
             {word: len(engine.group_words(word, ANSWERS)) for word in ANSWERS})
 
+    def _branch_of(self, word, item):
+        return ScoreCache.encode_subset(ANSWERS[:2] + [f"{word}{item:04d}"])
+
+    def _finish(self, *words):
+        queue = self._open_queue()
+        for word in words:
+            for row in queue._conn.execute(
+                    "SELECT b.branch_key FROM branch_opener_work m "
+                    "JOIN opener_work s USING (opener_work_id) "
+                    "JOIN branches b ON b.branch_id = m.branch_id "
+                    "WHERE s.opener = ? AND m.resolved_at IS NULL",
+                    (word,)).fetchall():
+                queue.mark_done(bytes(row["branch_key"]))
+        queue.mark_openers_complete(queue.openers_ready_to_complete())
+        queue.close()
+
+    def test_a_finished_word_reads_the_totals_recorded_when_it_finished(self):
+        self._queue_words(("crane", 1, 2))
+        self._finish("crane")
+        # With its memberships gone, only the recorded totals can say what
+        # the word owned.
+        queue = self._open_queue()
+        queue._conn.execute("DELETE FROM branch_opener_work")
+        queue.close()
+
+        row = self._openers()["summary"][0]
+
+        self.assertEqual(row["state"], "complete")
+        self.assertEqual(
+            (row["branch_count"], row["direct_branch_count"],
+             row["direct_done_branch_count"]), (2, 2, 2))
+        self.assertIsNotNone(row["completed_at"])
+
+    def test_a_word_is_counted_live_until_every_request_is_finished(self):
+        self._queue_words(("crane", 1, 2))
+        self._finish("crane")
+        queue = self._open_queue()
+        add_second_request(queue, [(self._branch_of("crane", 2), 3, 1,
+                                    "crane", 2)])
+        queue.close()
+
+        row = self._openers()["summary"][0]
+        self.assertEqual(row["state"], "queued")
+        self.assertEqual((row["branch_count"], row["direct_done_branch_count"]),
+                         (3, 2))
+
+        self._finish("crane")
+        row = self._openers()["summary"][0]
+        self.assertEqual(row["state"], "complete")
+        self.assertEqual(
+            (row["branch_count"], row["direct_branch_count"],
+             row["direct_done_branch_count"]), (3, 3, 3))
+
+    def test_a_withdrawn_request_records_its_totals(self):
+        self._queue_words(("crane", 1, 2))
+        queue = self._open_queue()
+        queue.mark_done(self._branch_of("crane", 0))
+        queue.remove_pending(self._branch_of("crane", 1))
+        stored = queue._conn.execute(
+            "SELECT state, completed_at, completed_branch_count, "
+            "completed_direct_done_branch_count FROM opener_work").fetchone()
+        queue.close()
+
+        self.assertEqual(stored["state"], "complete")
+        self.assertIsNotNone(stored["completed_at"])
+        self.assertEqual((stored["completed_branch_count"],
+                          stored["completed_direct_done_branch_count"]), (1, 1))
+
+    def test_branch_totals_count_only_words_with_unfinished_work(self):
+        self._queue_words(("crane", 1, 2), ("salet", 5, 3))
+        self._finish("crane")
+
+        data = self._openers()
+
+        self.assertEqual(data["matched_opener_count"], 2)
+        self.assertEqual(data["matched_branch_count"], 3)
+        self.assertEqual(data["matched_open_branch_count"], 3)
+
     def test_branch_totals_count_a_shared_branch_once(self):
         # Two different words owning one branch is the case the report exists
         # to show, and it is exactly where summing per-word counts goes wrong.

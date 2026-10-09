@@ -6989,19 +6989,26 @@ class ReportClientContract:
           ungrouped: buildAPIURL(parsePageState({search:'?kind=openers&group_by=none'})),
           elsewhere: buildAPIURL(parsePageState({search:'?kind=queue&opener_state=queued'}))
         })""")
-        self.assertEqual(result["ungrouped"], "/api/view/openers?group_by=none")
+        # The list's own defaults: unfinished words, a page at a time.
+        defaults = "opener_state=queued%2Cactive"
+        self.assertEqual(result["ungrouped"],
+                         f"/api/view/openers?{defaults}&group_by=none&limit=100")
         # URLSearchParams percent-encodes the separator; the server decodes it.
         self.assertEqual(
             result["filtered"],
-            "/api/view/openers?opener_state=queued%2Cactive&group_by=state")
-        self.assertEqual(result["sorted"],
-                         "/api/view/openers?sort=branches&group_by=state")
-        self.assertEqual(result["grouped"], "/api/view/openers?group_by=state")
+            f"/api/view/openers?{defaults}&group_by=state&limit=100")
+        self.assertEqual(
+            result["sorted"],
+            f"/api/view/openers?{defaults}&sort=branches&group_by=state&limit=100")
+        self.assertEqual(result["grouped"],
+                         f"/api/view/openers?{defaults}&group_by=state&limit=100")
         # A sort or grouping this report cannot serve falls back to the
         # default rather than being sent to be rejected, and the source filter
         # never leaks to a report that would reject it.
-        self.assertEqual(result["branchSort"], "/api/view/openers?group_by=state")
-        self.assertEqual(result["branchGroup"], "/api/view/openers?group_by=state")
+        self.assertEqual(result["branchSort"],
+                         f"/api/view/openers?{defaults}&group_by=state&limit=100")
+        self.assertEqual(result["branchGroup"],
+                         f"/api/view/openers?{defaults}&group_by=state&limit=100")
         self.assertEqual(result["elsewhere"], "/api/view/queue")
 
     def test_sources_grouping_marks_visible_cards_as_stale_while_regrouping(self):
@@ -7336,16 +7343,55 @@ class ReportClientContract:
         })""")
         # Grouping by state is the default, and the request says so rather
         # than leaving the server to guess: a pasted URL reproduces the view.
-        self.assertEqual(result["explicit"], "/api/view/openers?group_by=state")
-        self.assertEqual(result["word"],
-                         "/api/view/openers?branch_target=SALET&group_by=state")
-        self.assertEqual(result["spineToWord"],
-                         "/api/view/openers?branch_target=CRANE&group_by=state")
-        self.assertEqual(result["branch"], "/api/view/openers?group_by=state")
-        self.assertEqual(result["reference"], "/api/view/openers?group_by=state")
-        self.assertEqual(result["filtered"], "/api/view/openers?group_by=state")
-        self.assertEqual(result["limited"],
-                         "/api/view/openers?group_by=state&limit=2")
+        # The list of every opener defaults to the unfinished ones; a named
+        # word's view has no state default.  Both are paged by default.
+        listed = "/api/view/openers?opener_state=queued%2Cactive&group_by=state"
+        self.assertEqual(result["explicit"], listed + "&limit=100")
+        self.assertEqual(
+            result["word"],
+            "/api/view/openers?branch_target=SALET&group_by=state&limit=100")
+        self.assertEqual(
+            result["spineToWord"],
+            "/api/view/openers?branch_target=CRANE&group_by=state&limit=100")
+        self.assertEqual(result["branch"], listed + "&limit=100")
+        self.assertEqual(result["reference"], listed + "&limit=100")
+        self.assertEqual(result["filtered"], listed + "&limit=100")
+        self.assertEqual(result["limited"], listed + "&limit=2")
+
+    def test_the_opener_list_opens_on_unfinished_words_a_page_at_a_time(self):
+        self.page.evaluate(
+            "__reportClient.setState(parsePageState({search:'?kind=openers'}))")
+        state = self.page.evaluate("__reportClient.getState()")
+        self.assertEqual(state["opener_state"], ["queued", "active"])
+        self.assertEqual(state["limit"], 100)
+        # The default is the page's own, so its URL does not spell it out.
+        self.assertNotIn("opener_state", self.page.url)
+        checked = self.page.evaluate("""() => [...document.querySelectorAll(
+            '[data-source-state]:checked')].map(input => input.value)""")
+        self.assertEqual(sorted(checked), ["active", "queued"])
+
+    def test_every_opener_state_is_one_choice_away(self):
+        # No state ticked is every state: the request names none, and the
+        # page says so, so a reload does not fall back to the default.
+        result = self.page.evaluate("""() => ({
+          all: buildAPIURL(parsePageState({search:'?kind=openers&opener_state=all'})),
+          state: parsePageState({search:'?kind=openers&opener_state=all'}).opener_state
+        })""")
+        self.assertEqual(result["all"],
+                         "/api/view/openers?group_by=state&limit=100")
+        self.assertEqual(result["state"], [])
+        self.page.evaluate("""__reportClient.setState(
+            parsePageState({search:'?kind=openers&opener_state=all'}))""")
+        self.assertIn("opener_state=all", self.page.url)
+
+    def test_returning_to_openers_restores_its_default_states(self):
+        self.page.evaluate("""__reportClient.setState(
+            parsePageState({search:'?kind=openers&opener_state=complete'}))""")
+        self.page.locator("[data-kind=queue]").click()
+        self.page.locator("[data-kind=openers]").click()
+        self.assertEqual(
+            self.page.evaluate("__reportClient.getState().opener_state"),
+            ["queued", "active"])
 
     def test_worker_cards_name_the_scheduling_role_and_why(self):
         preferred = self.page.locator('.card.worker[data-identity="worker-0"]')
