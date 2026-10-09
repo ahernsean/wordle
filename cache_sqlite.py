@@ -1409,6 +1409,17 @@ class ScoreCache:
             (opener.lower(), policy, self.answer_list_id)).fetchone()
         return None if row is None else (row["erd"], row["max_remaining_depth"])
 
+    def stored_opener_erds(self, policy):
+        """Every stored opener's (erd, max_remaining_depth, response_group_count)."""
+        return {row["opener"]: (row["erd"], row["max_remaining_depth"],
+                                row["response_group_count"])
+                for row in self._conn.execute(
+                    """SELECT opener, erd, max_remaining_depth,
+                              response_group_count
+                         FROM opener_erd_by_policy
+                        WHERE policy = ? AND answer_list_id = ?""",
+                    (policy, self.answer_list_id))}
+
     def ranked_openers(self, policy, limit=None):
         """Stored openers in ranking order: (erd, max_remaining_depth, opener).
 

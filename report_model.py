@@ -57,11 +57,6 @@ BRANCH_ETA_STABLE_SAMPLE_SECONDS = 10 * 60
 BRANCH_ETA_SPEEDUP = {1: 1.0, 2: 1.64, 3: 1.97, 4: 1.97}
 OVERVIEW_COMPLETION_DISPLAY_SECONDS = 5
 
-# Opener ERD summaries are immutable until the score cache changes.  The
-# Openers view polls frequently, so retain the completed reductions between
-# polls.
-_OPENER_ERD_SUMMARY_CACHE = {}
-
 RichSpineStep = Tuple[Optional[int], Optional[str], Optional[str], str]
 
 
@@ -3988,78 +3983,88 @@ def _grouped_openers(rows, group_by, branch_totals, generated_at):
     return [grouped[key] for key in sorted(grouped)]
 
 
-def _opener_erd_summaries(sources, openers, report, cache,
-                               all_answers):
-    """Reduce each word's own ERD, reusing summaries until the cache changes.
+def _opener_erd_summaries(sources, rows, report, cache, all_answers):
+    """Each word's own ERD as the swarm stored it, or its progress toward one.
 
-    An opener's ERD is the whole point of queueing it.  It is derived from
-    the cached result of each of the word's response groups, the same way the
-    word report derives it for one word.  ERD order requires every visible
-    opener's summary, so the reduction is held in `_OPENER_ERD_SUMMARY_CACHE`
-    for the life of one cache generation — keyed on the cache file's signature,
-    including its WAL, so any write at all discards the whole set rather than
-    outliving the branch rows it reduced.
+    A finished opener's ERD is stored by the worker that finished it, so this
+    reads it.  An unfinished opener has no ERD yet, and its progress is the
+    queue's: every response group the queue never took needs no work, and
+    each one it took is solved when that branch is done.  Nothing here reduces
+    an ERD.  A finished opener with no stored row (one `reconcile-opener-erds`
+    has not reached) reports no summary.
     """
     summaries = {}
-    if not openers:
+    if not rows:
         return summaries
     try:
-        response_cache = ResponseCache(all_answers, score_cache=None)
-        cache_version = _score_cache_file_signature(sources.cache_path)
-        cache_identity = (sources.cache_path, cache.answer_list_id)
-        cached_version, cached_summaries = _OPENER_ERD_SUMMARY_CACHE.get(
-            cache_identity, (None, {})
-        )
-        if cached_version != cache_version:
-            cached_summaries = {}
-            _OPENER_ERD_SUMMARY_CACHE[cache_identity] = (
-                cache_version, cached_summaries)
-        # An opener spends the first guess, leaving the rest for its groups.
-        group_budget = GAME_GUESSES - 1
-        for word in openers:
+        stored = cache.stored_opener_erds(ERD_ALL)
+        unfinished = [row["opener"] for row in rows
+                      if row["opener"] is not None
+                      and row["state"] != "complete"]
+        group_counts = _opener_response_group_counts(
+            sources, all_answers, cache, unfinished)
+        for row in rows:
+            word = row["opener"]
             if word is None:
                 continue
-            cached_summary = cached_summaries.get(word)
-            if cached_summary is not None:
-                summaries[word] = cached_summary
-                continue
-            groups = response_cache.group_words(word, all_answers)
-            group_rows = []
-            branch_keys = []
-            for pattern_code, answer_words in sorted(groups.items()):
-                if not answer_words:
+            if row["state"] == "complete":
+                if word not in stored:
                     continue
-                branch_key = ScoreCache.encode_subset(answer_words)
-                branch_keys.append(branch_key)
-                group_rows.append({
-                    "pattern": fmt_pattern(pattern_code),
-                    "answer_count": len(answer_words),
-                    "branch_key": branch_key,
-                })
-            states = cache.report_branch_states(
-                branch_keys, ERD_ALL, group_budget
-            )
-            summary = reduce_candidate_erd(
-                [
-                    {
-                        "pattern": row["pattern"],
-                        "answer_count": row["answer_count"],
-                        "best_erd": states[bytes(row["branch_key"])]["best_erd"],
-                        "max_remaining_depth":
-                            states[bytes(row["branch_key"])]["max_remaining_depth"],
-                        "cache_state":
-                            states[bytes(row["branch_key"])]["cache_state"],
-                    }
-                    for row in group_rows
-                ],
-                group_budget,
-            )
-            cached_summaries[word] = summary
-            summaries[word] = summary
+                erd, max_remaining_depth, response_group_count = stored[word]
+                summaries[word] = {
+                    "state": "complete",
+                    "erd": erd,
+                    "max_remaining_depth": max_remaining_depth,
+                    "resolved_group_count": response_group_count,
+                    "infeasible_group_count": 0,
+                    "response_group_count": response_group_count,
+                }
+                continue
+            response_group_count = group_counts[word]
+            unqueued_group_count = max(
+                0, response_group_count - row["direct_branch_count"])
+            summaries[word] = {
+                "state": "pending",
+                "erd": None,
+                "max_remaining_depth": None,
+                "resolved_group_count": min(
+                    response_group_count,
+                    unqueued_group_count + row["direct_done_branch_count"]),
+                "infeasible_group_count": 0,
+                "response_group_count": response_group_count,
+            }
         report["sources"]["cache"]["ok"] = True
     except (sqlite3.Error, OSError) as error:
         report["sources"]["cache"]["error"] = str(error)
     return summaries
+
+
+# How many response groups a word splits the answers into depends on nothing
+# but the word and the answer list, so each word is counted once per list
+# generation, never per poll.
+_opener_response_group_count_memo = None
+
+
+def _opener_response_group_counts(sources, all_answers, cache, words):
+    """{word: the number of response groups it splits every answer into}.
+
+    Counted from the word's stored response decomposition, which the cache
+    holds for every candidate; a word without one is computed and not stored,
+    since the report's cache is read-only.
+    """
+    global _opener_response_group_count_memo
+    memo_key = (sources.answer_list_path,
+                os.path.getmtime(sources.answer_list_path))
+    if (_opener_response_group_count_memo is None
+            or _opener_response_group_count_memo[0] != memo_key):
+        _opener_response_group_count_memo = (memo_key, {})
+    counted = _opener_response_group_count_memo[1]
+    uncounted = [word for word in words if word not in counted]
+    if uncounted:
+        response_cache = ResponseCache(all_answers, score_cache=cache)
+        for word in uncounted:
+            counted[word] = len(response_cache.group_counts(word, all_answers))
+    return {word: counted[word] for word in words}
 
 
 def opener_completion_signal(sources):
@@ -4098,18 +4103,6 @@ def opener_completion_signal(sources):
         return None
     finally:
         connection.close()
-
-
-def _score_cache_file_signature(cache_path):
-    """Identify the cache generation, including uncheckpointed WAL writes."""
-    def file_signature(path):
-        try:
-            stat_result = os.stat(path)
-        except OSError:
-            return None
-        return stat_result.st_mtime_ns, stat_result.st_size
-
-    return file_signature(cache_path), file_signature(cache_path + "-wal")
 
 
 def _opener_rollups(membership_rows):
@@ -4243,15 +4236,13 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
         if opener_states:
             collapsed = [row for row in collapsed
                          if row["state"] in opener_states]
-        if opener_sort in ("default", "erd"):
-            erd_summaries = (
-                _opener_erd_summaries(
-                    sources, [row["opener"] for row in collapsed], report,
-                    timing_cache, all_answers,
-                ) if timing_cache is not None else {}
-            )
-            for row in collapsed:
-                row["erd_summary"] = erd_summaries.get(row["opener"])
+        erd_summaries = (
+            _opener_erd_summaries(
+                sources, collapsed, report, timing_cache, all_answers,
+            ) if timing_cache is not None else {}
+        )
+        for row in collapsed:
+            row["erd_summary"] = erd_summaries.get(row["opener"])
         collapsed = _sorted_openers(collapsed, opener_sort)
         data["matched_opener_count"] = len(collapsed)
         # Counted with each branch counted once: two words can own the same
@@ -4285,16 +4276,6 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
             collapsed[offset:offset + limit] if limit is not None
             else collapsed[offset:]
         )
-        # Reduced for the page only, and attached to the rows it describes.
-        if opener_sort not in ("default", "erd"):
-            erd_summaries = (
-                _opener_erd_summaries(
-                    sources, [row["opener"] for row in data["summary"]], report,
-                    timing_cache, all_answers,
-                ) if timing_cache is not None else {}
-            )
-            for row in data["summary"]:
-                row["erd_summary"] = erd_summaries.get(row["opener"])
         group_by = request.filters.group_by
         if group_by is not None and group_by != "none":
             data["summary_groups"] = _grouped_openers(
