@@ -663,6 +663,10 @@
       // Defaulted once the target is settled: only the list of every opener has
       // a default state, never one named word's view.
       if(normalized.opener_state===undefined)normalized.opener_state=normalized.kind==="openers"&&normalized.branch_target===""?[...OPENER_LIST_DEFAULT_STATES]:[];
+      // A grouped opener list pages each group on its own, and only it does.
+      const groupedOpeners=normalized.kind==="openers"&&normalized.group_by!=="none";
+      normalized.group_offsets=groupedOpeners?Object.fromEntries(Object.entries(state.group_offsets||{}).map(([label,offset])=>[label,intOrNull(offset)]).filter(([,offset])=>offset>0)):{};
+      if(groupedOpeners)normalized.opener_offset=null;
       if(normalized.kind!=="hotspots")normalized.by="";
       if(normalized.kind!=="hotspots"&&normalized.kind!=="work_distribution"){normalized.epoch=null;normalized.since_seconds=null;normalized.sample_size=null;}
       // The distribution describes a whole sampled population; a filter
@@ -688,7 +692,7 @@
     function parsePageState(locationObject){
       const query=new URLSearchParams(locationObject.search||"");
       const parseFilter=name=>query.has(name)?(query.get(name)==="all"?[]:query.get(name).split(",")):undefined;
-      return normalizeState({kind:query.get("kind")||"auto",branch_target:query.get("branch_target")||"",tree:bool(query.get("tree")),branch_status:parseFilter("branch_status"),branch_worker_status:parseFilter("branch_worker_status"),opener_state:parseFilter("opener_state"),opener_offset:query.get("opener_offset"),branch_row_offset:query.get("branch_row_offset"),minimum_answer_count:query.get("minimum_answer_count"),maximum_answer_count:query.get("maximum_answer_count"),budget:query.get("budget"),priority:query.get("priority"),sort:query.get("sort"),group_by:query.get("group_by"),limit:query.get("limit"),by:query.get("by"),epoch:query.get("epoch"),since_seconds:query.get("since_seconds"),sample_size:query.get("sample_size"),poll:query.get("poll"),answers:bool(query.get("answers")),claims:bool(query.get("claims")),worker_id:query.get("worker"),finalization_cursor:query.get("finalization_cursor"),tree_cursor:query.get("tree_cursor"),erd_numerator_range:query.get("erd_numerator_range")});
+      return normalizeState({kind:query.get("kind")||"auto",branch_target:query.get("branch_target")||"",tree:bool(query.get("tree")),branch_status:parseFilter("branch_status"),branch_worker_status:parseFilter("branch_worker_status"),opener_state:parseFilter("opener_state"),group_offsets:Object.fromEntries(query.getAll("group_offset").map(value=>{const separator=value.indexOf(":");return [value.slice(separator+1),value.slice(0,separator)];}).filter(([label,offset])=>label&&offset)),opener_offset:query.get("opener_offset"),branch_row_offset:query.get("branch_row_offset"),minimum_answer_count:query.get("minimum_answer_count"),maximum_answer_count:query.get("maximum_answer_count"),budget:query.get("budget"),priority:query.get("priority"),sort:query.get("sort"),group_by:query.get("group_by"),limit:query.get("limit"),by:query.get("by"),epoch:query.get("epoch"),since_seconds:query.get("since_seconds"),sample_size:query.get("sample_size"),poll:query.get("poll"),answers:bool(query.get("answers")),claims:bool(query.get("claims")),worker_id:query.get("worker"),finalization_cursor:query.get("finalization_cursor"),tree_cursor:query.get("tree_cursor"),erd_numerator_range:query.get("erd_numerator_range")});
     }
     function stateQuery(state,includeClient=true){
       const query=new URLSearchParams();
@@ -708,6 +712,8 @@
         const value=name==="limit"&&!includeClient&&state.kind==="openers"?openerPageSize(state):state[name];
         if(value!==null&&value!=="")query.set(name,String(value));
       }
+      // "<offset>:<label>": a label can hold a comma, so it is the remainder.
+      for(const label of Object.keys(state.group_offsets||{}).sort())query.append("group_offset",state.group_offsets[label]+":"+label);
       if(state.worker_id)query.set("worker",state.worker_id);
       if(state.finalization_cursor)query.set("finalization_cursor",state.finalization_cursor);
       if(state.tree_cursor)query.set("tree_cursor",state.tree_cursor);
@@ -794,7 +800,7 @@
       byId("limit").placeholder=isSources?String(OPENER_PAGE_SIZE):"";
       byId("limit-field").hidden=currentState.tree||isDistribution;
     }
-    function readControls(){return {...currentState,branch_target:byId("branch-target-input").value,branch_status:[...document.querySelectorAll("[data-branch-status]:checked")].map(input=>input.value),branch_worker_status:[...document.querySelectorAll("[data-branch-worker-status]:checked")].map(input=>input.value),opener_state:[...document.querySelectorAll("[data-source-state]:checked")].map(input=>input.value),minimum_answer_count:byId("minimum-answer-count").value,maximum_answer_count:byId("maximum-answer-count").value,budget:byId("budget").value,priority:byId("priority").value,sort:byId("sort").value,group_by:byId("group-by").value,limit:currentState.tree?currentState.limit:byId("limit").value,opener_offset:null,branch_row_offset:null,by:byId("by").value,epoch:byId("epoch").value,since_seconds:byId("since-seconds").value,poll:byId("poll").value,finalization_cursor:"",tree_cursor:null};}
+    function readControls(){return {...currentState,branch_target:byId("branch-target-input").value,branch_status:[...document.querySelectorAll("[data-branch-status]:checked")].map(input=>input.value),branch_worker_status:[...document.querySelectorAll("[data-branch-worker-status]:checked")].map(input=>input.value),opener_state:[...document.querySelectorAll("[data-source-state]:checked")].map(input=>input.value),minimum_answer_count:byId("minimum-answer-count").value,maximum_answer_count:byId("maximum-answer-count").value,budget:byId("budget").value,priority:byId("priority").value,sort:byId("sort").value,group_by:byId("group-by").value,limit:currentState.tree?currentState.limit:byId("limit").value,opener_offset:null,branch_row_offset:null,group_offsets:{},by:byId("by").value,epoch:byId("epoch").value,since_seconds:byId("since-seconds").value,poll:byId("poll").value,finalization_cursor:"",tree_cursor:null};}
 
     function ordered(rows,identityName,orderName,state){
       const key=contextKey(state)+"|"+orderName, incoming=rows.map(row=>String(row[identityName]));
@@ -2145,7 +2151,8 @@
     // page size set there is nothing to page and no pager is drawn.
     // Both of this view's lists page the same way, so they share one pager:
     // the words, and the branch rows a named word owns.
-    function sourceListPager({state,offset,shownCount,matchedCount,noun,offsetField,className}){
+    function sourceListPager({state,offset,shownCount,matchedCount,noun,offsetField,className,page}){
+      page=page||(nextOffset=>setState({...state,[offsetField]:nextOffset}));
       const pageSize=openerPageSize(state);
       if(matchedCount<=pageSize)return null;
       const pager=element("div","status-line "+className);
@@ -2154,10 +2161,10 @@
         :"No "+noun+" on this page, of "+numText(matchedCount)));
       const previousButton=element("button","","Prev");
       previousButton.disabled=offset<=0;
-      previousButton.addEventListener("click",()=>setState({...state,[offsetField]:Math.max(0,offset-pageSize)}));
+      previousButton.addEventListener("click",()=>page(Math.max(0,offset-pageSize)));
       const nextButton=element("button","","Next");
       nextButton.disabled=offset+shownCount>=matchedCount;
-      nextButton.addEventListener("click",()=>setState({...state,[offsetField]:offset+pageSize}));
+      nextButton.addEventListener("click",()=>page(offset+pageSize));
       pager.append(previousButton,nextButton);
       return pager;
     }
@@ -2199,6 +2206,12 @@
           const grid=gridElement("source-words/"+group.label);
           for(const row of ordered(group.rows,"opener","source-words/"+group.label,state))grid.append(wordCard(row));
           details.append(summaryEl,grid);
+          const groupPager=sourceListPager({
+            state,offset:group.offset??0,shownCount:group.rows.length,
+            matchedCount:rollup.opener_count,noun:"words",
+            className:"source-word-pager",
+            page:offset=>setState({...state,group_offsets:{...state.group_offsets,[group.label]:offset}})});
+          if(groupPager)details.append(groupPager);
           container.append(details);
         }
         fragment.append(container);
@@ -2207,7 +2220,7 @@
         for(const row of ordered(sourceWords,"opener","source-words",state))wordGrid.append(wordCard(row));
         fragment.append(wordGrid);
       }
-      const wordPager=sourceListPager({
+      const wordPager=data.summary_groups?null:sourceListPager({
         state,offset:data.opener_offset??0,shownCount:sourceWords.length,
         matchedCount:matchedWords,noun:"words",offsetField:"opener_offset",
         className:"source-word-pager"});

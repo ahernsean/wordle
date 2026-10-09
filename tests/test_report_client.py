@@ -7058,8 +7058,9 @@ class ReportClientContract:
               report.data.total_opener_count = 12;
               report.data.opener_offset = offset;
               report.data.summary = report.data.summary.slice(0, shown);
+              delete report.data.summary_groups;
               applyReport(report, null,
-                parsePageState({search:'?kind=openers&limit=3'}));
+                parsePageState({search:'?kind=openers&limit=3&group_by=none'}));
             }""", [offset, shown])
         apply_page(0, 3)
         pager = self.page.locator(".source-word-pager")
@@ -7075,6 +7076,51 @@ class ReportClientContract:
                       " ".join(pager.inner_text().split()))
         self.assertFalse(pager.locator("button", has_text="Prev").is_disabled())
         self.assertTrue(pager.locator("button", has_text="Next").is_disabled())
+
+    def test_each_group_pages_on_its_own(self):
+        self.open_sources()
+        self.page.evaluate("""async () => {
+          const report = await (await fetch('/api/view/openers')).json();
+          const rows = report.data.summary;
+          const rollup = count => ({opener_count: count,
+            unfinished_opener_count: count, active_opener_count: 0,
+            branch_count: 0, open_branch_count: 0, done_branch_count: 0,
+            worker_count: 0});
+          report.data.summary_groups = [
+            {label: 'active', offset: 0, rows: rows.slice(0, 1), rollup: rollup(1)},
+            {label: 'queued', offset: 0, rows: rows.slice(0, 2), rollup: rollup(5)},
+          ];
+          applyReport(report, null, parsePageState(
+            {search: '?kind=openers&limit=2&group_by=state'}));
+        }""")
+        groups = self.page.locator(".source-word-groups > details")
+        # A group that fits on one page has no pager.
+        self.assertEqual(groups.nth(0).locator(".source-word-pager").count(), 0)
+        pager = groups.nth(1).locator(".source-word-pager")
+        self.assertIn("Showing 1–2 of 5 words", " ".join(pager.inner_text().split()))
+        self.assertEqual(self.page.locator(
+            ".source-words-pager, #report > .source-word-pager").count(), 0)
+        pager.locator("button", has_text="Next").click()
+        state = self.page.evaluate("__reportClient.getState()")
+        self.assertEqual(state["group_offsets"], {"queued": 2})
+        self.assertIn("group_offset=2%3Aqueued", self.page.url)
+        self.assertIn("group_offset=2%3Aqueued", self.page.evaluate(
+            "buildAPIURL(__reportClient.getState())"))
+        # Changing a control returns every group to its first page.
+        self.page.evaluate(
+            "__reportClient.setState({...__reportClient.getState(), group_offsets: {}})")
+        self.assertNotIn("group_offset", self.page.url)
+
+    def test_a_group_offset_survives_a_reload_whatever_its_label_holds(self):
+        state = self.page.evaluate("""() => parsePageState(
+            {search: '?kind=openers&group_by=elapsed&group_offset=100%3A%5B0%2C%201%20hour%29'})""")
+        self.assertEqual(state["group_offsets"], {"[0, 1 hour)": 100})
+        self.assertIn("group_offset=100%3A%5B0%2C+1+hour%29",
+                      self.page.evaluate("""() => buildAPIURL(parsePageState(
+            {search: '?kind=openers&group_by=elapsed&group_offset=100%3A%5B0%2C%201%20hour%29'}))"""))
+        # Ungrouped, there is nothing for a group offset to page.
+        self.assertEqual(self.page.evaluate("""() => parsePageState(
+            {search: '?kind=openers&group_by=none&group_offset=3%3Aqueued'}).group_offsets"""), {})
 
     def test_sources_branch_rows_have_their_own_pager(self):
         # The branch list pages like the word list: a named word can own

@@ -231,12 +231,24 @@ class ReportModelTest(unittest.TestCase):
             (ReportFilters(opener_offset=-1), "cannot be negative"),
             (ReportFilters(branch_row_offset=-1), "cannot be negative"),
             (ReportFilters(sort="nope"), "must be one"),
+            (ReportFilters(group_offsets=(("queued", 1),)),
+             "requires a grouped opener report"),
+            (ReportFilters(group_by="state", opener_offset=0),
+             "pages each group with group_offset"),
         ):
             with self.subTest(filters=filters):
                 with self.assertRaisesRegex(ValueError, message):
                     validate_report_request(ReportRequest(report_kind="openers", filters=filters))
         allowed = ReportFilters(opener_offset=0, branch_row_offset=0, sort="word")
         validate_report_request(ReportRequest(report_kind="openers", filters=allowed))
+        validate_report_request(ReportRequest(
+            report_kind="openers",
+            filters=ReportFilters(group_by="state",
+                                  group_offsets=(("queued", 1),))))
+        with self.assertRaisesRegex(ValueError, "grouped opener report"):
+            validate_report_request(ReportRequest(
+                report_kind="queue",
+                filters=ReportFilters(group_offsets=(("queued", 1),))))
 
     def test_tree_layout_handles_empty_legacy_and_paged_topology(self):
         request = ReportRequest(
@@ -3806,7 +3818,8 @@ class OpenerReportTest(unittest.TestCase):
 
         data = self._openers(group_by="state")
 
-        group = data["summary_groups"][0]
+        group = next(group for group in data["summary_groups"]
+                     if group["label"] == "queued")
         self.assertEqual(group["rollup"]["opener_count"], 2)
         self.assertEqual(
             sum(row["branch_count"] for row in group["rows"]), 3)
@@ -3863,9 +3876,9 @@ class OpenerReportTest(unittest.TestCase):
             sum(len(group["rows"]) for group in groups),
             len(self._openers()["summary"]))
 
-    def test_a_grouped_list_is_paged_in_group_order(self):
-        # ZONAL is the only active word and sorts last by every default, so a
-        # page cut before grouping would show it nowhere near the top.
+    def test_each_group_pages_on_its_own(self):
+        # ZONAL is the only active word and sorts last by every default; a
+        # single page cut across the whole list would leave it off the first.
         self._queue_words(("abbey", 5, 1), ("crane", 3, 1), ("zonal", 1, 1))
         queue = self._open_queue()
         queue._conn.execute(
@@ -3873,25 +3886,46 @@ class OpenerReportTest(unittest.TestCase):
         queue._conn.commit()
         queue.close()
 
-        def page(offset):
-            data = self._openers(group_by="state", limit=2,
-                                 opener_offset=offset, sort="word")
-            return [[(group["label"], [row["opener"] for row in group["rows"]])
-                     for group in data["summary_groups"]]]
+        def groups(**filters):
+            data = self._openers(group_by="state", limit=1, sort="word",
+                                 **filters)
+            self.assertEqual(
+                [row["opener"] for row in data["summary"]],
+                [row["opener"] for group in data["summary_groups"]
+                 for row in group["rows"]])
+            return [(group["label"], group["offset"],
+                     [row["opener"] for row in group["rows"]],
+                     group["rollup"]["opener_count"],
+                     group["rollup"]["unfinished_opener_count"],
+                     group["rollup"]["active_opener_count"])
+                    for group in data["summary_groups"]]
 
-        self.assertEqual(page(0), [[("active", ["zonal"]),
-                                    ("queued", ["abbey"])]])
-        # The chosen sort still orders the words within a group.
-        self.assertEqual(page(2), [[("queued", ["crane"])]])
+        self.assertEqual(groups(), [
+            ("active", 0, ["zonal"], 1, 1, 1),
+            ("queued", 0, ["abbey"], 2, 2, 0),
+            ("complete", 0, [], 0, 0, 0),
+        ])
+        # Paging one group leaves every other where it was.
+        self.assertEqual(groups(group_offsets=(("queued", 1),)), [
+            ("active", 0, ["zonal"], 1, 1, 1),
+            ("queued", 1, ["crane"], 2, 2, 0),
+            ("complete", 0, [], 0, 0, 0),
+        ])
 
-        # A group's header covers the whole group, not the page it is on.
-        groups = {group["label"]: group["rollup"] for group in self._openers(
-            group_by="state", limit=2, sort="word")["summary_groups"]}
-        self.assertEqual(
-            {label: (rollup["opener_count"], rollup["unfinished_opener_count"],
-                     rollup["active_opener_count"], rollup["branch_count"])
-             for label, rollup in groups.items()},
-            {"active": (1, 1, 1, 1), "queued": (2, 2, 0, 2)})
+    def test_a_state_with_no_words_still_heads_its_group(self):
+        self._queue_words(("abbey", 5, 1), ("crane", 3, 1))
+
+        def labels(**filters):
+            return [(group["label"], group["rollup"]["opener_count"])
+                    for group in self._openers(
+                        group_by="state", **filters)["summary_groups"]]
+
+        self.assertEqual(labels(opener_states=("active", "queued")),
+                         [("active", 0), ("queued", 2)])
+        self.assertEqual(labels(),
+                         [("active", 0), ("queued", 2), ("complete", 0)])
+        # A state the filter leaves out heads nothing.
+        self.assertEqual(labels(opener_states=("queued",)), [("queued", 2)])
 
     def test_opener_time_grouping_boundaries(self):
         generated_at = 1_787_270_400  # 21 Aug 2026 00:00 UTC (Friday)
