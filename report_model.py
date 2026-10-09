@@ -4297,20 +4297,28 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
         data["matched_opener_count"] = len(collapsed)
         # Counted with each branch counted once: two words can own the same
         # branch, so summing their per-word counts double-counts precisely the
-        # shared ownership this report exists to show.
-        def branch_totals(words):
-            word_set = set(words)
-            open_branch_ids = {
-                row["branch_id"] for row in all_membership_rows
-                if (_row_value(row, "opener") or "").lower() in word_set
-                and branch_status_and_worker_status(
+        # shared ownership this report exists to show.  Only words with
+        # unfinished work are counted: a finished word's branches are history,
+        # and counting every branch ever owned would grow with the whole sweep.
+        unfinished_words = {row["opener"] for row in collapsed
+                            if row["state"] != "complete"}
+        open_branch_ids_by_word = collections.defaultdict(set)
+        for row in all_membership_rows:
+            if branch_status_and_worker_status(
                     _row_value(row, "pending_status"),
                     _row_value(row, "active_status"),
-                    _row_value(row, "worker_count", 0),
-                )[0] != "done"
-            }
-            return (queue.distinct_branch_count_for_words(words),
-                    len(open_branch_ids))
+                    _row_value(row, "worker_count", 0))[0] != "done":
+                open_branch_ids_by_word[
+                    (_row_value(row, "opener") or "").lower()].add(
+                        row["branch_id"])
+
+        def branch_totals(words):
+            words = [word for word in words if word in unfinished_words]
+            return (
+                queue.distinct_branch_count_for_words(words),
+                len(set().union(*(open_branch_ids_by_word.get(word, ())
+                                  for word in words))),
+            )
 
         matched_words = [row["opener"] for row in collapsed]
         (data["matched_branch_count"],

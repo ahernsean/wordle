@@ -472,6 +472,15 @@
     // A source word's lifecycle, which is not a branch's: queued until a
     // worker picks one of its requests up, complete once every request is.
     const sourceStateNames=["queued","active","complete"];
+    // The Openers list opens on the work still owed, a page at a time: a
+    // finished opener's ERD is the leaderboard's, and a sweep finishes
+    // thousands of them, which no page should render at once.  Every state
+    // ticked, or none, shows them all.
+    const OPENER_LIST_DEFAULT_STATES=["queued","active"],OPENER_PAGE_SIZE=100;
+    // The page size is the report's own default, never written into the
+    // shared limit: a word report reached from an opener card would read
+    // that limit as a cap on its response groups.
+    const openerPageSize=state=>state.limit??OPENER_PAGE_SIZE;
     // iOS Safari's native <select> picker ignores the "hidden" attribute on
     // <option> elements, so context-dependent choices are rebuilt into the
     // DOM rather than toggled — an absent option can't appear in any picker.
@@ -621,17 +630,16 @@
     const isOverviewState=(kind,branchTarget,tree)=>kind==="auto"&&String(branchTarget||"").trim()===""&&!tree;
 
     function normalizeState(state){
-      const normalized={kind:explicitKinds.has(state.kind)?state.kind:"auto",branch_target:(state.branch_target||"").trim(),tree:!!state.tree,branch_status:branchValues(state.branch_status,branchStatusNames),branch_worker_status:branchValues(state.branch_worker_status,branchWorkerStatusNames),opener_state:branchValues(state.opener_state,sourceStateNames)||[],opener_offset:intOrNull(state.opener_offset),branch_row_offset:intOrNull(state.branch_row_offset),minimum_answer_count:intOrNull(state.minimum_answer_count),maximum_answer_count:intOrNull(state.maximum_answer_count),budget:intOrNull(state.budget),priority:intOrNull(state.priority),sort:state.sort||"",group_by:state.group_by||"",limit:intOrNull(state.limit),by:state.by||"",epoch:intOrNull(state.epoch),since_seconds:intOrNull(state.since_seconds),sample_size:intOrNull(state.sample_size),poll:Math.max(200,intOrNull(state.poll)||DEFAULT_POLL),answers:!!state.answers,claims:!!state.claims,worker_id:state.worker_id||null,finalization_cursor:String(state.finalization_cursor||""),tree_cursor:state.tree_cursor||null,erd_numerator_range:erdNumeratorRangeText(state.erd_numerator_range)};
+      const normalized={kind:explicitKinds.has(state.kind)?state.kind:"auto",branch_target:(state.branch_target||"").trim(),tree:!!state.tree,branch_status:branchValues(state.branch_status,branchStatusNames),branch_worker_status:branchValues(state.branch_worker_status,branchWorkerStatusNames),opener_state:branchValues(state.opener_state,sourceStateNames),opener_offset:intOrNull(state.opener_offset),branch_row_offset:intOrNull(state.branch_row_offset),minimum_answer_count:intOrNull(state.minimum_answer_count),maximum_answer_count:intOrNull(state.maximum_answer_count),budget:intOrNull(state.budget),priority:intOrNull(state.priority),sort:state.sort||"",group_by:state.group_by||"",limit:intOrNull(state.limit),by:state.by||"",epoch:intOrNull(state.epoch),since_seconds:intOrNull(state.since_seconds),sample_size:intOrNull(state.sample_size),poll:Math.max(200,intOrNull(state.poll)||DEFAULT_POLL),answers:!!state.answers,claims:!!state.claims,worker_id:state.worker_id||null,finalization_cursor:String(state.finalization_cursor||""),tree_cursor:state.tree_cursor||null,erd_numerator_range:erdNumeratorRangeText(state.erd_numerator_range)};
       const overviewState=normalized.kind==="auto"&&normalized.branch_target===""&&!normalized.tree;
       if(normalized.branch_status===undefined)normalized.branch_status=overviewState?[...overviewBranchStatusNames]:[];
       if(normalized.branch_worker_status===undefined)normalized.branch_worker_status=overviewState?[...overviewBranchWorkerStatusNames]:[];
       if(overviewState)normalized.branch_status=normalized.branch_status.filter(value=>overviewBranchStatusNames.includes(value));
-      if(normalized.opener_state===undefined)normalized.opener_state=[];
       if(normalized.kind!=="openers")normalized.opener_state=[];
       if(normalized.kind!=="openers"&&OPENER_ONLY_SORT_VALUES.has(normalized.sort))normalized.sort="";
-      // Paging is meaningless without a page size, and only this report pages.
-      if(normalized.kind!=="openers"||normalized.limit===null||!normalized.opener_offset)normalized.opener_offset=null;
-      if(normalized.kind!=="openers"||normalized.limit===null||!normalized.branch_row_offset)normalized.branch_row_offset=null;
+      // Only this report pages, and it always has a page size.
+      if(normalized.kind!=="openers"||!normalized.opener_offset)normalized.opener_offset=null;
+      if(normalized.kind!=="openers"||!normalized.branch_row_offset)normalized.branch_row_offset=null;
       if(treelessKinds.has(normalized.kind))normalized.tree=false;
       if(normalized.tree&&normalized.limit!==null&&![10,25,50,100].includes(normalized.limit))normalized.limit=10;
       if(normalized.kind==="cache"){normalized.branch_status=[];normalized.branch_worker_status=[];normalized.minimum_answer_count=null;normalized.maximum_answer_count=null;normalized.priority=null;normalized.sort="";}
@@ -652,6 +660,9 @@
         // which is the first cut an operator makes by eye anyway.  "none" is
         // an explicit choice rather than the absence of one.
         if(!GROUP_BY_OPTIONS_OPENERS.some(([value])=>value===normalized.group_by))normalized.group_by="state";normalized.branch_target=isWordTarget(normalized.branch_target)?normalized.branch_target.split(/\s+/).filter(Boolean).pop():"";}
+      // Defaulted once the target is settled: only the list of every opener has
+      // a default state, never one named word's view.
+      if(normalized.opener_state===undefined)normalized.opener_state=normalized.kind==="openers"&&normalized.branch_target===""?[...OPENER_LIST_DEFAULT_STATES]:[];
       if(normalized.kind!=="hotspots")normalized.by="";
       if(normalized.kind!=="hotspots"&&normalized.kind!=="work_distribution"){normalized.epoch=null;normalized.since_seconds=null;normalized.sample_size=null;}
       // The distribution describes a whole sampled population; a filter
@@ -689,8 +700,14 @@
       const addBranchFilter=(name,values,defaults)=>{if(JSON.stringify(values)===JSON.stringify(defaults))return;query.set(name,values.length?values.join(","):"all");};
       addBranchFilter("branch_status",state.branch_status,defaultStatuses);
       addBranchFilter("branch_worker_status",state.branch_worker_status,defaultWorkerStatuses);
-      addBranchFilter("opener_state",state.opener_state,[]);
-      for(const name of ["minimum_answer_count","maximum_answer_count","budget","priority","sort","group_by","limit","opener_offset","branch_row_offset","by","epoch","since_seconds","sample_size"])if(state[name]!==null&&state[name]!=="")query.set(name,String(state[name]));
+      // The server has no default state, so a request always names the
+      // states the list defaults to; only the page's own URL leaves them out.
+      addBranchFilter("opener_state",state.opener_state,includeClient&&state.kind==="openers"&&!state.branch_target?OPENER_LIST_DEFAULT_STATES:[]);
+      for(const name of ["minimum_answer_count","maximum_answer_count","budget","priority","sort","group_by","limit","opener_offset","branch_row_offset","by","epoch","since_seconds","sample_size"]){
+        // The Openers report's request always carries its page size.
+        const value=name==="limit"&&!includeClient&&state.kind==="openers"?openerPageSize(state):state[name];
+        if(value!==null&&value!=="")query.set(name,String(value));
+      }
       if(state.worker_id)query.set("worker",state.worker_id);
       if(state.finalization_cursor)query.set("finalization_cursor",state.finalization_cursor);
       if(state.tree_cursor)query.set("tree_cursor",state.tree_cursor);
@@ -774,6 +791,7 @@
       byId("by-field").hidden=!isHotspots;
       byId("epoch-field").hidden=byId("since-seconds-field").hidden=!isHotspots&&!isDistribution;
       byId("limit-label").textContent=currentState.tree?"Items per page":isSources?"Words per page":kind==="auto"?"Branches shown":"Rows shown";
+      byId("limit").placeholder=isSources?String(OPENER_PAGE_SIZE):"";
       byId("limit-field").hidden=currentState.tree||isDistribution;
     }
     function readControls(){return {...currentState,branch_target:byId("branch-target-input").value,branch_status:[...document.querySelectorAll("[data-branch-status]:checked")].map(input=>input.value),branch_worker_status:[...document.querySelectorAll("[data-branch-worker-status]:checked")].map(input=>input.value),opener_state:[...document.querySelectorAll("[data-source-state]:checked")].map(input=>input.value),minimum_answer_count:byId("minimum-answer-count").value,maximum_answer_count:byId("maximum-answer-count").value,budget:byId("budget").value,priority:byId("priority").value,sort:byId("sort").value,group_by:byId("group-by").value,limit:currentState.tree?currentState.limit:byId("limit").value,opener_offset:null,branch_row_offset:null,by:byId("by").value,epoch:byId("epoch").value,since_seconds:byId("since-seconds").value,poll:byId("poll").value,finalization_cursor:"",tree_cursor:null};}
@@ -2116,8 +2134,8 @@
     // Both of this view's lists page the same way, so they share one pager:
     // the words, and the branch rows a named word owns.
     function sourceListPager({state,offset,shownCount,matchedCount,noun,offsetField,className}){
-      const pageSize=state.limit;
-      if(!pageSize||matchedCount<=pageSize)return null;
+      const pageSize=openerPageSize(state);
+      if(matchedCount<=pageSize)return null;
       const pager=element("div","status-line "+className);
       pager.append(element("span","dim",shownCount
         ?"Showing "+numText(offset+1)+"–"+numText(offset+shownCount)+" of "+numText(matchedCount)+" "+noun
@@ -2144,7 +2162,7 @@
       // The branch totals come from the model, which counts each branch once
       // across the matched words; summing the per-word counts here would
       // double-count a branch two words own.
-      metrics.append(metric("openers",matchedWords),metric("branches",data.matched_branch_count),metric("open",data.matched_open_branch_count));
+      metrics.append(metric("openers",matchedWords),metric("branches (unfinished)",data.matched_branch_count),metric("open",data.matched_open_branch_count));
       fragment.append(metrics,element("h2","","Openers"));
       if(matchedWords!==totalWords)fragment.append(element("p","dim",numText(matchedWords)+" of "+numText(totalWords)+" words match this state filter."));
       const namedWord=(state.branch_target||"").trim();
@@ -3479,7 +3497,7 @@
       connDot.addEventListener("keydown",event=>{if(event.key==="Enter"||event.key===" "){event.preventDefault();setRefreshOpen(!connWrap.classList.contains("open"));}});
       document.addEventListener("click",event=>{if(!connWrap.contains(event.target))setRefreshOpen(false);});
       document.addEventListener("keydown",event=>{if(event.key==="Escape")setRefreshOpen(false);});
-      document.querySelectorAll("[data-kind]").forEach(button=>button.addEventListener("click",()=>{const overview=button.dataset.overview;setState({...readControls(),kind:button.dataset.kind,branch_target:overview?"":currentState.branch_target,tree:false,branch_status:overview?[...overviewBranchStatusNames]:currentState.branch_status,branch_worker_status:overview?[...overviewBranchWorkerStatusNames]:currentState.branch_worker_status,minimum_answer_count:overview?null:currentState.minimum_answer_count,maximum_answer_count:overview?null:currentState.maximum_answer_count,budget:overview?null:currentState.budget,priority:overview?null:currentState.priority,sort:overview?"":currentState.sort,limit:overview?null:currentState.limit,answers:false,claims:false,finalization_cursor:""});}));
+      document.querySelectorAll("[data-kind]").forEach(button=>button.addEventListener("click",()=>{const overview=button.dataset.overview;setState({...readControls(),kind:button.dataset.kind,opener_state:button.dataset.kind===currentState.kind?readControls().opener_state:undefined,branch_target:overview?"":currentState.branch_target,tree:false,branch_status:overview?[...overviewBranchStatusNames]:currentState.branch_status,branch_worker_status:overview?[...overviewBranchWorkerStatusNames]:currentState.branch_worker_status,minimum_answer_count:overview?null:currentState.minimum_answer_count,maximum_answer_count:overview?null:currentState.maximum_answer_count,budget:overview?null:currentState.budget,priority:overview?null:currentState.priority,sort:overview?"":currentState.sort,limit:overview?null:currentState.limit,answers:false,claims:false,finalization_cursor:""});}));
       installSpineCopy();
       matchMedia("(prefers-color-scheme: dark)").addEventListener("change",refreshWorkerMarkerColors);
       measureStickyTop();
