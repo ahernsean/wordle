@@ -36,7 +36,7 @@ except ImportError:  # pragma: no cover - Pythonista and other non-POSIX console
 import wordle_engine
 import pattern_matrix as pattern_matrix_module
 from cache_sqlite import ScoreCache, MemoryScoreCache
-from wordle_ui import _is_gray_char
+from wordle_ui import _is_gray_char, count_noun
 from wordle_engine import (
     Solution, ScoringMethod, GuessUniverse, ComplianceFilter, ResponseCache,
     load_word_list, calculate_response,
@@ -65,7 +65,7 @@ ANSWER_FILE = DEFAULT_ANSWER_LIST_PATH
 WORDS_FILE = DEFAULT_CANDIDATE_LIST_PATH
 ENGINE_PATH = wordle_engine.__file__
 LOG_FILE = DEFAULT_DEBUG_LOG_PATH
-BUILD = "b140"
+BUILD = "b141"
 
 # Diagnostic log for background solver threads (ERDSolver,
 # BranchPrecacheSolver) — periodic progress, lifecycle events, and any
@@ -870,7 +870,7 @@ class GameState:
         self._start_new_game()
 
     def reset_all(self):
-        """Abandon the current game(s) and start fresh — same word lists,
+        """Abandon every current game and start fresh — same word lists,
         same persistent caches, but every other piece of per-game state
         (solutions, mode, ERD progress/cache) goes back to its initial value.
 
@@ -2167,7 +2167,7 @@ def cmd_test(gs, inline=''):
     if inline:
         line = inline
     else:
-        print("Word(s) to test? ", end="")
+        print("Words to test? ", end="")
         line = input().strip()
 
     # Derive step-2 pool and hard-mode flag from the current grid selection
@@ -2458,7 +2458,8 @@ def cmd_verify_erd(gs):
     for r in report:
         counts[r['status']] = counts.get(r['status'], 0) + 1
     summary = ", ".join(f"{n} {s}" for s, n in counts.items())
-    print(f"  checked {len(report)} cached subtree node(s): {summary}")
+    print(f"  checked {count_noun(len(report), 'cached subtree node')}: "
+          f"{summary}")
 
     mismatches = [r for r in report if r['status'] == 'mismatch']
     for r in mismatches[:5]:  # pragma: no cover - integrity report; only on a corrupted cache

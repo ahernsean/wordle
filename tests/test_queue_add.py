@@ -10,7 +10,6 @@ import re
 import tempfile
 import types
 import unittest
-from collections import namedtuple
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from unittest.mock import patch
@@ -51,25 +50,16 @@ def _make_args(tmp_dir, **overrides):
     return args
 
 
-SummaryCounts = namedtuple(
-    'SummaryCounts', ['new', 'already_queued', 'already_solved', 'total'])
-
-_SUMMARY_LINE_RE = re.compile(
-    r'branch\(es\) queued across [\d,]+ word\(s\): '
-    r'([\d,]+) new, ([\d,]+) already queued, '
-    r'([\d,]+) already solved\.\s+'
-    r'Queue total: ([\d,]+)')
+_QUEUED_RE = re.compile(
+    r'^Queued ([\d,]+) words? \(([\d,]+) branch(?:es)?\)', re.M)
 
 
-def _parse_summary_counts(output):
-    """Extract counts from cmd_queue_add's closing summary line specifically
-    (not any per-word line, which shares the same "N new (...), M already
-    queued (...)" shape but reports one word's counts instead of the run's
-    totals) -- anchored on the "processed across ... Queue total:" text that
-    only the closing line contains."""
-    match = _SUMMARY_LINE_RE.search(output)
-    return SummaryCounts(*(int(group.replace(',', ''))
-                           for group in match.groups()))
+def _queued(output):
+    """(words, branches) the run queued, read from its closing summary."""
+    if re.search(r'^Queued no new words\.$', output, re.M):
+        return (0, 0)
+    match = _QUEUED_RE.search(output)
+    return tuple(int(group.replace(',', '')) for group in match.groups())
 
 
 class TestQueueAddMaxBranchSize(unittest.TestCase):
@@ -146,7 +136,7 @@ class TestQueueAddMaxBranchSize(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, 2)
         self.assertIn(
-            f'invalid candidate word(s): {NON_CANDIDATE_ENGLISH_WORD}',
+            f'invalid candidate word: {NON_CANDIDATE_ENGLISH_WORD}',
             error_output.getvalue())
         self.assertFalse(os.path.exists(args.queue))
 
@@ -180,16 +170,20 @@ class TestQueueAddMaxBranchSize(unittest.TestCase):
         first_run_output = StringIO()
         with redirect_stdout(first_run_output):
             erd_search.cmd_queue_add(args)
-        first_summary = _parse_summary_counts(first_run_output.getvalue())
-        self.assertGreater(first_summary.new, 0)
+        words, branches = _queued(first_run_output.getvalue())
+        self.assertEqual(words, 1)
+        self.assertGreater(branches, 0)
 
         second_run_output = StringIO()
         with redirect_stdout(second_run_output):
             erd_search.cmd_queue_add(args)
 
-        second_summary = _parse_summary_counts(second_run_output.getvalue())
-        self.assertEqual(second_summary.new, 0)
-        self.assertEqual(second_summary.already_queued, first_summary.new)
+        second = second_run_output.getvalue()
+        self.assertEqual(_queued(second), (0, 0))
+        self.assertIn('Unchanged: 1 word already queued, left in place.',
+                      second)
+        self.assertIn(f'{LARGE_BRANCH_WORD.upper()}: already queued at '
+                      f'priority', second)
 
     def test_already_cached_branch_is_not_queued(self):
         # A reusable result is terminal work, not a new queue request.
@@ -207,9 +201,8 @@ class TestQueueAddMaxBranchSize(unittest.TestCase):
         with redirect_stdout(output):
             erd_search.cmd_queue_add(args)
 
-        summary = _parse_summary_counts(output.getvalue())
-        self.assertEqual(summary.already_solved, 1)
-        self.assertEqual(summary.new + summary.already_queued, summary.total)
+        self.assertIn('(1 response group already solved)', output.getvalue())
+        self.assertEqual(_queued(output.getvalue())[0], 1)
         queue = ERDQueue(args.queue)
         self.addCleanup(queue.close)
         self.assertIsNone(queue.get_pending_branch(branch_key))
@@ -229,11 +222,10 @@ class TestQueueAddMaxBranchSize(unittest.TestCase):
         with redirect_stdout(output):
             erd_search.cmd_queue_add(args)
 
-        self.assertIn(
-            f'{LARGE_BRANCH_WORD.upper()}: already solved — 1 response '
-            'group already cached; nothing queued.', output.getvalue())
-        summary = _parse_summary_counts(output.getvalue())
-        self.assertEqual(summary, SummaryCounts(0, 0, 1, 0))
+        self.assertIn(f'{LARGE_BRANCH_WORD.upper()}: already solved.',
+                      output.getvalue())
+        self.assertEqual(_queued(output.getvalue()), (0, 0))
+        self.assertIn('Unchanged: 1 word already solved.', output.getvalue())
         queue = ERDQueue(args.queue)
         self.addCleanup(queue.close)
         self.assertEqual(queue.total_branches(), 0)
@@ -466,7 +458,7 @@ class TestQueueAddDeleteErdCache(unittest.TestCase):
 
         output = self._add(delete_erd_cache=True)
 
-        self.assertIn('1 completed branch(es) cleared for recompute', output)
+        self.assertIn('1 completed branch cleared for recompute', output)
 
     def test_without_the_flag_a_completed_branch_stays_done(self):
         queue, _ = self._finalize_as_the_swarm_does()
@@ -681,7 +673,7 @@ class TestQueueAddPriorityLadder(unittest.TestCase):
             self._requested_priority_by_word(args.queue),
             {LARGE_BRANCH_WORD: OPENER_PRIORITY_MAX,
              SECOND_WORD: OPENER_PRIORITY_MAX - 5})
-        self.assertIn('across 2 word(s)', output.getvalue())
+        self.assertIn('Queued 2 words (2 branches)', output.getvalue())
 
     def test_overflowing_ladder_warns_that_the_tail_starts_together(self):
         # An empty queue tops the append out at 5, which seats only one word
@@ -1104,9 +1096,9 @@ class TestAnOpenerIsRequestedOnce(unittest.TestCase):
 
         self.assertEqual(self._requests(), before)
         self.assertEqual(len(before), 2)
-        self.assertIn(f'{SECOND_WORD.upper()} was already queued at priority',
+        self.assertIn(f'{SECOND_WORD.upper()}: already queued at priority',
                       output)
-        self.assertIn('2 word(s) were already queued and kept their place.',
+        self.assertIn('Unchanged: 2 words already queued, left in place.',
                       output)
 
     def test_a_wider_list_queues_only_the_new_words_and_appends_them(self):
@@ -1179,8 +1171,8 @@ class TestAnOpenerIsRequestedOnce(unittest.TestCase):
         [(_state, requeued_priority)] = [
             entry for entry in crane_requests if entry[0] == 'queued']
         self.assertLess(requeued_priority, requests[SECOND_WORD])
-        self.assertIn('CRANE finished while this ran', output)
-        self.assertNotIn('CRANE was already queued', output)
+        self.assertIn('it finished while this ran', output)
+        self.assertNotIn('CRANE: already queued', output)
 
     def test_a_finished_opener_queued_again_gets_a_new_request(self):
         self._add([SECOND_WORD], pattern='-----')
@@ -1196,3 +1188,71 @@ class TestAnOpenerIsRequestedOnce(unittest.TestCase):
 
         self.assertEqual([state for _opener, _priority, state
                           in self._requests()], ['complete', 'queued'])
+
+
+class TestEachWordIsReportedOnce(unittest.TestCase):
+    """One line per word, decided at the word, and a summary of the change."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+
+    def _add(self, words, **overrides):
+        output = StringIO()
+        with redirect_stdout(output):
+            erd_search.cmd_queue_add(
+                _make_args(self._tmp.name, word=words, pattern='-----',
+                           **overrides))
+        return output.getvalue()
+
+    def _solve(self, word):
+        all_answers = load_word_list(erd_search.ANSWER_FILE)
+        cache = ScoreCache(os.path.join(self._tmp.name, 'cache.sqlite3'),
+                           all_answers)
+        try:
+            rcache = ResponseCache(all_answers, cache)
+            cache.write(encode_subset(rcache.group_words(word, all_answers)[0]),
+                        ERD_ALL, 'salet', 3.5, max_depth=GAME_GUESSES - 2,
+                        solve_budget=None)
+            cache.checkpoint()
+        finally:
+            cache.close()
+
+    def test_a_solved_word_takes_no_rung_and_is_not_named_on_the_ladder(self):
+        self._solve(LARGE_BRANCH_WORD)
+
+        output = self._add([LARGE_BRANCH_WORD, SECOND_WORD])
+
+        self.assertIn(f'{LARGE_BRANCH_WORD.upper()}: already solved.', output)
+        self.assertIn(f'{SECOND_WORD.upper()} first at priority '
+                      f'{OPENER_PRIORITY_MAX:,}', output)
+        self.assertIn(f'{SECOND_WORD.upper()}: queued at priority '
+                      f'{OPENER_PRIORITY_MAX:,}: 1 branch to solve.', output)
+        self.assertIn(f'Queued 1 word (1 branch) at priority '
+                      f'{OPENER_PRIORITY_MAX:,}.', output)
+        self.assertIn('Unchanged: 1 word already solved.', output)
+
+    def test_each_word_gets_exactly_one_line(self):
+        self._add([SECOND_WORD])
+        self._solve(LARGE_BRANCH_WORD)
+
+        output = self._add([SECOND_WORD, LARGE_BRANCH_WORD, 'crane'])
+
+        for word in (SECOND_WORD, LARGE_BRANCH_WORD, 'crane'):
+            with self.subTest(word=word):
+                self.assertEqual(
+                    sum(line.startswith(f'{word.upper()}: ')
+                        for line in output.splitlines()), 1)
+        self.assertIn('Unchanged: 1 word already queued, left in place; '
+                      '1 word already solved.', output)
+
+
+class TestCountNoun(unittest.TestCase):
+
+    def test_the_noun_agrees_with_the_count(self):
+        from wordle_ui import count_noun
+        self.assertEqual(count_noun(1, 'branch', 'branches'), '1 branch')
+        self.assertEqual(count_noun(0, 'branch', 'branches'), '0 branches')
+        self.assertEqual(count_noun(50_931, 'branch', 'branches'),
+                         '50,931 branches')
+        self.assertEqual(count_noun(2, 'word'), '2 words')

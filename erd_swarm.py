@@ -61,7 +61,7 @@ from erd_queue import (ERDQueue, decode_subset, encode_subset,
                        SCHEDULING_ROLE_PREFERRED, SCHEDULING_ROLE_FALLBACK,
                        SCHEDULING_ROLE_DIRECT,
                        CLAIM_DECLINE_WORKER_CAP, CLAIM_DECLINE_NO_CANDIDATES)
-from wordle_ui import fmt_pattern
+from wordle_ui import count_noun, fmt_pattern
 
 from runtime_paths import (
     DEFAULT_ANSWER_LIST_PATH,
@@ -874,9 +874,10 @@ class _BranchWorker:
         self.hint_cache = open_hint_cache(
             hint_cache_path, self.all_answers, cache_path)
         if self.hint_cache is not None:
-            logger.info('%s hint cache %s: %d branch row(s) in this answer '
-                        'list', self.name, self.hint_cache.db_path,
-                        self.hint_cache.namespace_branch_count)
+            logger.info('%s hint cache %s: %s in this answer list',
+                        self.name, self.hint_cache.db_path,
+                        count_noun(self.hint_cache.namespace_branch_count,
+                                   'branch row'))
         self.pattern_matrix = pattern_matrix_module.PatternMatrix.load_or_build(
             cache_path, self.all_words, self.all_answers, self.score_cache)
         # One table for the worker's whole lifetime: every claim draws its

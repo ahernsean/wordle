@@ -61,6 +61,8 @@ for the SQLite write lock, though the 30s timeout makes concurrent use safe.
 
 from __future__ import annotations
 
+from wordle_ui import count_noun
+
 import argparse
 import os
 import sqlite3
@@ -350,7 +352,8 @@ def _conflicting_exact_results(conn, src_tables, limit=20):
 
 
 def _report_conflicts(conflicts) -> None:
-    print(f'\n{len(conflicts):,} colliding exact result(s) are not the same '
+    print(f'\n{count_noun(len(conflicts), "colliding exact result")} '
+          f'{"is" if len(conflicts) == 1 else "are"} not the same '
           f'certificate:', file=sys.stderr)
     for scope, reference, policy, budget, target, incoming in conflicts:
         print(f'  {reference} {scope} policy={policy} budget={budget}: '

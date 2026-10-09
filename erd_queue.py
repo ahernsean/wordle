@@ -28,7 +28,7 @@ from urllib.parse import quote
 
 from cache_sqlite import ScoreCache
 from erd_lattice import erd_ge
-from wordle_ui import fmt_pattern
+from wordle_ui import count_noun, fmt_pattern
 
 logger = logging.getLogger(__name__)
 
@@ -2014,7 +2014,8 @@ class ERDQueue:
                     if missing:
                         raise RuntimeError(
                             f"queue database schema mismatch: table "
-                            f"{schema}.{table} is missing column(s) "
+                            f"{schema}.{table} is missing "
+                            f"{'a column' if len(missing) == 1 else 'columns'} "
                             f"{sorted(missing)} after migration. The table "
                             f"was likely created by code from a different "
                             f"commit; add a rule to ERDQueue._migrate() for "
@@ -2024,9 +2025,11 @@ class ERDQueue:
                     if extra:
                         logger.warning(
                             "queue database table %s.%s has unexpected "
-                            "column(s) %s — schema drift, harmless to "
+                            "%s %s — schema drift, harmless to "
                             "current statements",
-                            schema, table, sorted(extra))
+                            schema, table,
+                            "column" if len(extra) == 1 else "columns",
+                            sorted(extra))
         finally:
             expected_conn.close()
 
@@ -6569,7 +6572,7 @@ class ERDQueue:
             membership = ("with live membership" if row["has_live_membership"]
                           else "without live membership")
             violations.append(
-                f"{row['branch_count']} open branch(es) at or above legacy "
+                f"{count_noun(row['branch_count'], 'open branch', 'open branches')} at or above legacy "
                 f"priority {LEGACY_PROMOTED_PRIORITY_MIN:,}: {opener} "
                 f"{membership}"
             )

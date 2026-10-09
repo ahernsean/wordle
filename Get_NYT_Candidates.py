@@ -79,7 +79,8 @@ def _validate_against_answer_list(candidate_words: list[str]) -> None:
     missing = sorted(set(answer_words) - set(candidate_words))
     if missing:
         raise RuntimeError(
-            f"{len(missing)} known answer word(s) are missing from the "
+            f"{len(missing):,} known answer "
+            f"{'word is' if len(missing) == 1 else 'words are'} missing from the "
             f"scraped candidate dictionary (e.g. {missing[:5]}) — treating "
             "this as a corrupted or partial extraction rather than writing it."
         )

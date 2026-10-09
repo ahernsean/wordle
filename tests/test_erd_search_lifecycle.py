@@ -575,6 +575,7 @@ class QueueOperatorCommandTest(unittest.TestCase):
         queue.recover_active_branches.return_value = (0, 0)
         queue.counts_by_status.side_effect = [{}, {"pending": 0, "in_progress": 0}]
         queue.branches_in_progress.return_value = []
+        queue.reclaim_stale_claims.return_value = 0
         stop_event = Mock()
         stop_event.is_set.side_effect = [False, False, True]
         with (
@@ -606,6 +607,7 @@ class QueueOperatorCommandTest(unittest.TestCase):
         queue.recover_active_branches.return_value = (0, 0)
         queue.counts_by_status.side_effect = [{"pending": 1}, {"pending": 0, "in_progress": 0}]
         queue.branches_in_progress.return_value = []
+        queue.reclaim_stale_claims.return_value = 0
         dead_worker = Mock()
         dead_worker.is_alive.return_value = False
         replacement = Mock()
@@ -663,6 +665,7 @@ class QueueOperatorCommandTest(unittest.TestCase):
         queue.recover_active_branches.return_value = (0, 0)
         queue.counts_by_status.side_effect = [{"pending": 1}, {"pending": 0, "in_progress": 0}]
         queue.branches_in_progress.return_value = []
+        queue.reclaim_stale_claims.return_value = 0
         old_worker = Mock()
         old_worker.is_alive.side_effect = [True, False]
         replacement = Mock()
