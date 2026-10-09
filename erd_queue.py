@@ -2145,6 +2145,12 @@ class ERDQueue:
         transaction, so two callers adding the same opener cannot both create
         one.
 
+        Returns {opener: (opener_work_id, priority, created)} saying which
+        happened to each opener, decided in that transaction.  A caller's
+        earlier look at the queue can be out of date by then -- the swarm
+        finishes openers while a long add runs -- so this, not that look, is
+        what the caller reports.
+
         The pending rows are an UPSERT, so that:
         - A row inserted for the first time is added as 'pending'.
         - A row already present has its priority UPGRADED (never downgraded),
@@ -2179,8 +2185,9 @@ class ERDQueue:
                             (opener, requested_priority, requested_at, state)
                         VALUES (?, ?, ?, 'queued')
                     """, (opener, priority, now))
-                    existing = (cur.lastrowid, priority)
-                requests[opener] = existing
+                    requests[opener] = (cur.lastrowid, priority, True)
+                else:
+                    requests[opener] = (*existing, False)
             prepared = [
                 (branch_id, n_words, requests[opener][1], opener, opener_pattern)
                 for branch_id, n_words, _priority, opener, opener_pattern
@@ -2212,6 +2219,7 @@ class ERDQueue:
         except Exception:  # pragma: no cover
             self._conn.execute("ROLLBACK")
             raise
+        return requests
 
     # ------------------------------------------------------------------
     # Worker claim loop

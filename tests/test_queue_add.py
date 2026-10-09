@@ -1144,6 +1144,44 @@ class TestAnOpenerIsRequestedOnce(unittest.TestCase):
             queue.close()
         self.assertEqual(owned, 2)
 
+    def test_an_opener_that_finishes_mid_add_is_appended_not_restored(self):
+        # The command sees the opener queued, then the swarm finishes it
+        # before its rows are written.  The request created in its place is
+        # an append: below queued work, never at the finished request's rung.
+        self._add(['crane'], pattern='-----')
+        self._add([SECOND_WORD], pattern='-----')
+        requests = {opener: priority
+                    for opener, priority, _state in self._requests()}
+        crane_priority = requests['crane']
+        self.assertGreater(crane_priority, requests[SECOND_WORD])
+
+        add_pending_many = ERDQueue.add_pending_many
+
+        def finish_crane_first(queue, rows):
+            if rows and rows[0][3] == 'crane':
+                [crane_key] = [bytes(row[0]) for row in queue._conn.execute("""
+                    SELECT b.branch_key FROM branch_opener_work m
+                    JOIN opener_work w USING (opener_work_id)
+                    JOIN branches b USING (branch_id)
+                    WHERE w.opener = 'crane'""")]
+                queue.mark_openers_complete(queue.mark_done(crane_key))
+            return add_pending_many(queue, rows)
+
+        with patch.object(ERDQueue, 'add_pending_many', autospec=True,
+                          side_effect=finish_crane_first):
+            output = self._add(['crane'], pattern='-----')
+
+        crane_requests = sorted(
+            (state, priority) for opener, priority, state in self._requests()
+            if opener == 'crane')
+        self.assertEqual([state for state, _priority in crane_requests],
+                         ['complete', 'queued'])
+        [(_state, requeued_priority)] = [
+            entry for entry in crane_requests if entry[0] == 'queued']
+        self.assertLess(requeued_priority, requests[SECOND_WORD])
+        self.assertIn('CRANE finished while this ran', output)
+        self.assertNotIn('CRANE was already queued', output)
+
     def test_a_finished_opener_queued_again_gets_a_new_request(self):
         self._add([SECOND_WORD], pattern='-----')
         queue = ERDQueue(os.path.join(self._tmp.name, 'queue.sqlite3'))

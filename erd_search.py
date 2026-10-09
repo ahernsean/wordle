@@ -514,6 +514,18 @@ def cmd_queue_add(args):
             len(laddered_words))
         ladder = priority_ladder(laddered_words, top_priority,
                                  args.priority_step)
+        # Rungs below the batch for the words already queued.  A word keeps
+        # its request and never uses one, unless that request finishes while
+        # this command runs: then it is queued anew, and as an append it must
+        # land below queued work rather than at the finished request's rung.
+        batch_floor = (min(ladder.values()) if ladder
+                       else top_priority + args.priority_step)
+        fallback_rungs = {
+            word: max(OPENER_PRIORITY_MIN,
+                      batch_floor - args.priority_step * (index + 1))
+            for index, word in enumerate(
+                word for word in words_to_process
+                if word in existing_requests)}
         if laddered_words:
             if shift:
                 print(f'Raised every unfinished opener-work request by '
@@ -556,14 +568,13 @@ def cmd_queue_add(args):
                 continue
 
             rows_to_queue, already_queued_keys, already_solved_keys = plan
-            existing = existing_requests.get(word)
-            priority = (existing[1] if existing is not None
+            priority = (fallback_rungs[word] if word in existing_requests
                         else ladder.get(word, OPENER_PRIORITY_MIN))
             rows_with_priority = [
                 (branch_key, count, priority, word, code)
                 for branch_key, count, code in rows_to_queue]
-            if rows_with_priority:
-                queue.add_pending_many(rows_with_priority)
+            outcome = (queue.add_pending_many(rows_with_priority)[word]
+                       if rows_with_priority else None)
 
             word_already_queued = len(already_queued_keys)
             word_new = len(rows_to_queue) - word_already_queued
@@ -583,11 +594,14 @@ def cmd_queue_add(args):
                       f'— {word_new:,} new, '
                       f'{word_already_queued:,} already queued, '
                       f'{word_already_solved:,} already solved.')
-            if existing is not None:
+            if outcome is not None and not outcome[2]:
                 n_already_requested += 1
                 print(f'  {word.upper()} was already queued at priority '
-                      f'{existing[1]:,}; it stays there.  Use queue '
+                      f'{outcome[1]:,}; it stays there.  Use queue '
                       f'opener-priority to move it.')
+            elif outcome is not None and word in existing_requests:
+                print(f'  {word.upper()} finished while this ran; queued '
+                      f'again at priority {outcome[1]:,}, below queued work.')
 
         total = queue.total_branches()
         n_added = n_new + n_already_queued
