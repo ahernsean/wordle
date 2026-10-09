@@ -157,8 +157,8 @@ GROUP_BY_STRATEGIES = (
     "none", "status", "answer_count", "cache_state", "worker_presence", "priority",
 )
 OPENER_GROUP_BY_STRATEGIES = (
-    "none", "state", "worker_presence", "priority", "completed", "elapsed",
-    "worker_time", "requested",
+    "none", "state", "worker_presence", "queue_position", "completed",
+    "elapsed", "worker_time", "requested",
 )
 OPENER_SORT_FIELDS = (
     "default", "age", "word", "priority", "branches", "open", "done", "workers",
@@ -3958,8 +3958,47 @@ def _opener_group_key(row, group_by, generated_at):
     if group_by == "requested":
         return _duration_group_key(
             max(0, generated_at - row["requested_at"]) * 1000)
-    priority = row["requested_priority"]
-    return (-(priority or 0), f"priority {priority}")
+    return _queue_position_group_key(row)
+
+
+_ACTIVE_QUEUE_POSITION_GROUP = (0, "active")
+_COMPLETE_QUEUE_POSITION_GROUP = (99, "complete")
+
+
+def _queue_position_group_key(row):
+    """Active words, then queued words in bands ten times wider than the last.
+
+    The next 10 words to be started, then the 11th to the 100th, and so on: a
+    priority value says nothing on its own, since each batch is laid on its
+    own ladder, but a word's place in line does.  Finished words have no place
+    and close the list.
+    """
+    if row["state"] == "active":
+        return _ACTIVE_QUEUE_POSITION_GROUP
+    if row["state"] == "complete":
+        return _COMPLETE_QUEUE_POSITION_GROUP
+    # The band is the number of digits in position - 1: 1-10 is band 1,
+    # 11-100 band 2, 101-1,000 band 3.
+    band = len(str(row["queue_position"] - 1))
+    if band == 1:
+        return (band, "next 10")
+    return (band, f"{10 ** (band - 1) + 1:,}–{10 ** band:,}")
+
+
+def _assign_queue_positions(rows):
+    """Number the queued words 1, 2, ... in the order they will be started.
+
+    Highest priority first, as the swarm serves them; ties go to the earlier
+    request, then to the word.  Active and finished words have no position.
+    """
+    queued = sorted(
+        (row for row in rows if row["state"] == "queued"),
+        key=lambda row: (-(row["requested_priority"] or 0),
+                         row["requested_at"] or 0, row["opener"] or ""))
+    for row in rows:
+        row["queue_position"] = None
+    for position, row in enumerate(queued, start=1):
+        row["queue_position"] = position
 
 
 def _grouped_openers(rows, group_by, branch_totals, generated_at, limit,
@@ -4306,6 +4345,7 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
             for row in summary_rows
         ]
         opener_sort = request.filters.sort or "completed"
+        _assign_queue_positions(collapsed)
         data["total_opener_count"] = len(collapsed)
         opener_states = request.filters.opener_states
         if opener_states:
@@ -4361,11 +4401,18 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
         data["opener_offset"] = offset
         if grouped:
             # Grouped by state, every state the filter selects (every state,
-            # when it selects none) heads a group, empty or not.
-            empty_keys = [
-                (_OPENER_STATE_GROUP_ORDER[state], state)
-                for state in (opener_states or _OPENER_STATE_GROUP_ORDER)
-            ] if group_by == "state" else ()
+            # when it selects none) heads a group, empty or not; grouped by
+            # queue position, so do the active and finished bands.
+            selected_states = opener_states or tuple(_OPENER_STATE_GROUP_ORDER)
+            empty_keys = ()
+            if group_by == "state":
+                empty_keys = [(_OPENER_STATE_GROUP_ORDER[state], state)
+                              for state in selected_states]
+            elif group_by == "queue_position":
+                empty_keys = [key for state, key in (
+                    ("active", _ACTIVE_QUEUE_POSITION_GROUP),
+                    ("complete", _COMPLETE_QUEUE_POSITION_GROUP))
+                    if state in selected_states]
             data["summary_groups"] = _grouped_openers(
                 collapsed, group_by, branch_totals, generated_at, limit,
                 group_offsets=request.filters.group_offsets,

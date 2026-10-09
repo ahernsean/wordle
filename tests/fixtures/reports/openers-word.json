@@ -107,6 +107,7 @@
     "open_branch_count": 1203,
     "opener": "salet",
     "opener_is_answer": false,
+    "queue_position": 1,
     "request_count": 2,
     "requested_at": 400,
     "requested_priority": 5,

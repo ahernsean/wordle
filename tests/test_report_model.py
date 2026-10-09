@@ -3859,22 +3859,58 @@ class OpenerReportTest(unittest.TestCase):
     def test_opener_grouping_buckets_words_with_their_own_rollup(self):
         self._queue_words(("salet", 5, 3), ("crane", 5, 1), ("nurdy", 1, 7))
 
-        groups = self._openers(group_by="priority")["summary_groups"]
+        groups = self._openers(group_by="queue_position")["summary_groups"]
 
         self.assertEqual([group["label"] for group in groups],
-                         ["priority 5", "priority 1"])
-        self.assertEqual(groups[0]["rollup"]["opener_count"], 2)
-        # The rollup sums the group's rows, so a collapsed group still says
-        # how much work it holds.
-        self.assertEqual(groups[0]["rollup"]["branch_count"], 4)
-        self.assertEqual(groups[0]["rollup"]["open_branch_count"], 4)
-        self.assertEqual(groups[1]["rollup"]["branch_count"], 7)
-        self.assertEqual(
-            [row["opener"] for row in groups[1]["rows"]], ["nurdy"])
+                         ["active", "next 10", "complete"])
+        self.assertEqual(groups[1]["rollup"]["opener_count"], 3)
+        # The rollup counts the group's branches, so a collapsed group still
+        # says how much work it holds.
+        self.assertEqual(groups[1]["rollup"]["branch_count"], 11)
+        self.assertEqual(groups[1]["rollup"]["open_branch_count"], 11)
         # Every word lands in exactly one group.
         self.assertEqual(
             sum(len(group["rows"]) for group in groups),
             len(self._openers()["summary"]))
+
+    def test_queue_position_bands_widen_tenfold(self):
+        # Twelve queued words on a descending ladder, one of them active and
+        # one finished: positions count only the queued, highest first.
+        words = [f"w{index:02d}" for index in range(14)]
+        self._queue_words(*((word, 100 - index, 1)
+                            for index, word in enumerate(words)))
+        queue = self._open_queue()
+        queue._conn.execute(
+            "UPDATE opener_work SET state = 'active' WHERE opener = 'w05'")
+        queue._conn.commit()
+        queue.close()
+        self._finish("w13")
+
+        data = self._openers(group_by="queue_position", limit=20)
+
+        self.assertEqual(
+            [(group["label"], [row["opener"] for row in group["rows"]])
+             for group in data["summary_groups"]],
+            [("active", ["w05"]),
+             ("next 10", ["w00", "w01", "w02", "w03", "w04", "w06", "w07",
+                          "w08", "w09", "w10"]),
+             ("11–100", ["w11", "w12"]),
+             ("complete", ["w13"])])
+        positions = {row["opener"]: row["queue_position"]
+                     for row in data["summary"]}
+        self.assertEqual((positions["w00"], positions["w06"], positions["w12"]),
+                         (1, 6, 12))
+        self.assertIsNone(positions["w05"])
+        self.assertIsNone(positions["w13"])
+
+    def test_queue_position_bands_name_thousands_with_separators(self):
+        self.assertEqual(
+            [report_model._queue_position_group_key(
+                {"state": "queued", "queue_position": position})
+             for position in (1, 10, 11, 100, 101, 1_000, 1_001, 10_001)],
+            [(1, "next 10"), (1, "next 10"), (2, "11–100"), (2, "11–100"),
+             (3, "101–1,000"), (3, "101–1,000"), (4, "1,001–10,000"),
+             (5, "10,001–100,000")])
 
     def test_each_group_pages_on_its_own(self):
         # ZONAL is the only active word and sorts last by every default; a
