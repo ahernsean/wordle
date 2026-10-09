@@ -401,13 +401,21 @@ class TestERDQueueManagement(_TmpDB, unittest.TestCase):
         self.assertEqual(row["priority"], 2)
         self.assertEqual(row["n_words"], 3)
 
-    def test_priority_upgrade_on_duplicate_add(self):
+    def test_a_branch_shared_with_a_higher_priority_opener_is_upgraded(self):
         q = self._make_queue()
         key = self._add_branch(q, WORDS[:2], priority=0)
-        # add_pending_many upgrades priority on conflict
-        q.add_pending_many([(key, len(WORDS[:2]), 5, "crane", 0)])
+        q.add_pending_many([(key, len(WORDS[:2]), 5, "slate", 0)])
         row = q.get_pending_branch(key)
         self.assertEqual(row["priority"], 5)
+
+    def test_an_opener_queued_again_keeps_its_request_and_priority(self):
+        q = self._make_queue()
+        key = self._add_branch(q, WORDS[:2], priority=0)
+        q.add_pending_many([(key, len(WORDS[:2]), 5, "crane", 0)])
+        self.assertEqual(q.get_pending_branch(key)["priority"], 0)
+        self.assertEqual(
+            [(row["opener"], row["requested_priority"])
+             for row in q.opener_work_rows()], [("crane", 0)])
 
     def test_priority_not_downgraded_on_duplicate_add(self):
         q = self._make_queue()

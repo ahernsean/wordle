@@ -1109,9 +1109,12 @@ class QueueAddReportingTest(unittest.TestCase):
     def setUp(self):
         self.queue = Mock()
         self.queue.lowest_unfinished_opener_priority.return_value = None
+        self.queue.unfinished_opener_request.return_value = None
         self.queue.total_branches.return_value = 0
         self.queue.status_by_branch_keys.return_value = {}
-        self.queue.add_pending_many.return_value = 0
+        # A new request for whichever opener the rows belong to.
+        self.queue.add_pending_many.side_effect = (
+            lambda rows: {rows[0][3]: (1, rows[0][2], True)})
         self.response_cache = Mock()
         self.response_cache.group_words.return_value = {0: ["cigar", "rebut"]}
         self.arguments = SimpleNamespace(

@@ -29,7 +29,7 @@ from erd_queue import (
     cost_size_bucket,
     _COST_MODEL_MIN_WEIGHT,
 )
-from tests.queue_invariants import OpenerWorkInvariantCheckMixin
+from tests.queue_invariants import OpenerWorkInvariantCheckMixin, add_second_request
 
 WORDS = ["crane", "slate", "trace", "stale", "tales"]
 N_CANDIDATES = 20
@@ -2302,7 +2302,7 @@ class TestOpenerCompletion(_TmpQueue):
     def test_a_request_with_work_still_owed_is_not_marked_complete(self):
         self._resolve_only_branch()
         later_key = ScoreCache.encode_subset(WORDS[:3])
-        self.q.add_pending_many([(later_key, 3, 5, "crane", 1)])
+        add_second_request(self.q, [(later_key, 3, 5, "crane", 1)])
 
         # Naming the opener finishes the request that is finished and leaves
         # the one that has work owed.

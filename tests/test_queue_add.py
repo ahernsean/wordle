@@ -1071,3 +1071,128 @@ class TestQueueAddPriorityLadder(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestAnOpenerIsRequestedOnce(unittest.TestCase):
+    """An opener has one unfinished request however often it is added."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+
+    def _add(self, words, **overrides):
+        output = StringIO()
+        with redirect_stdout(output):
+            erd_search.cmd_queue_add(
+                _make_args(self._tmp.name, word=words, **overrides))
+        return output.getvalue()
+
+    def _requests(self):
+        queue = ERDQueue(os.path.join(self._tmp.name, 'queue.sqlite3'))
+        try:
+            return sorted((row['opener'], row['requested_priority'],
+                           row['state'])
+                          for row in queue.opener_work_rows())
+        finally:
+            queue.close()
+
+    def test_adding_the_same_words_again_changes_nothing(self):
+        self._add([SECOND_WORD, LARGE_BRANCH_WORD])
+        before = self._requests()
+
+        output = self._add([SECOND_WORD, LARGE_BRANCH_WORD])
+
+        self.assertEqual(self._requests(), before)
+        self.assertEqual(len(before), 2)
+        self.assertIn(f'{SECOND_WORD.upper()} was already queued at priority',
+                      output)
+        self.assertIn('2 word(s) were already queued and kept their place.',
+                      output)
+
+    def test_a_wider_list_queues_only_the_new_words_and_appends_them(self):
+        # Lines 1000-2000 of a list, then lines 1-2000: only the words the
+        # first run did not have are new, and they go below it.
+        self._add([LARGE_BRANCH_WORD])
+        [(_opener, queued_priority, _state)] = self._requests()
+
+        # The queued word comes first, so if it took a rung the new word
+        # would land a step lower.
+        self._add([LARGE_BRANCH_WORD, 'crane'])
+
+        requests = {opener: priority
+                    for opener, priority, _state in self._requests()}
+        self.assertEqual(sorted(requests), ['crane', LARGE_BRANCH_WORD])
+        self.assertEqual(requests[LARGE_BRANCH_WORD], queued_priority)
+        # The first rung below the queued word: it took no rung of its own,
+        # so the new word's one-word ladder is what an append seats alone.
+        self.assertEqual(requests['crane'], erd_search.ladder_top_priority(
+            queued_priority, None, erd_search.DEFAULT_PRIORITY_STEP, 1))
+
+    def test_a_further_pattern_joins_the_openers_request(self):
+        self._add([SECOND_WORD], pattern='-----')
+        self._add([SECOND_WORD], pattern='----y')
+
+        self.assertEqual(len(self._requests()), 1)
+        queue = ERDQueue(os.path.join(self._tmp.name, 'queue.sqlite3'))
+        try:
+            [request] = queue.opener_work_rows()
+            owned = queue._conn.execute(
+                "SELECT COUNT(*) FROM branch_opener_work "
+                "WHERE opener_work_id = ?",
+                (request['opener_work_id'],)).fetchone()[0]
+        finally:
+            queue.close()
+        self.assertEqual(owned, 2)
+
+    def test_an_opener_that_finishes_mid_add_is_appended_not_restored(self):
+        # The command sees the opener queued, then the swarm finishes it
+        # before its rows are written.  The request created in its place is
+        # an append: below queued work, never at the finished request's rung.
+        self._add(['crane'], pattern='-----')
+        self._add([SECOND_WORD], pattern='-----')
+        requests = {opener: priority
+                    for opener, priority, _state in self._requests()}
+        crane_priority = requests['crane']
+        self.assertGreater(crane_priority, requests[SECOND_WORD])
+
+        add_pending_many = ERDQueue.add_pending_many
+
+        def finish_crane_first(queue, rows):
+            if rows and rows[0][3] == 'crane':
+                [crane_key] = [bytes(row[0]) for row in queue._conn.execute("""
+                    SELECT b.branch_key FROM branch_opener_work m
+                    JOIN opener_work w USING (opener_work_id)
+                    JOIN branches b USING (branch_id)
+                    WHERE w.opener = 'crane'""")]
+                queue.mark_openers_complete(queue.mark_done(crane_key))
+            return add_pending_many(queue, rows)
+
+        with patch.object(ERDQueue, 'add_pending_many', autospec=True,
+                          side_effect=finish_crane_first):
+            output = self._add(['crane'], pattern='-----')
+
+        crane_requests = sorted(
+            (state, priority) for opener, priority, state in self._requests()
+            if opener == 'crane')
+        self.assertEqual([state for state, _priority in crane_requests],
+                         ['complete', 'queued'])
+        [(_state, requeued_priority)] = [
+            entry for entry in crane_requests if entry[0] == 'queued']
+        self.assertLess(requeued_priority, requests[SECOND_WORD])
+        self.assertIn('CRANE finished while this ran', output)
+        self.assertNotIn('CRANE was already queued', output)
+
+    def test_a_finished_opener_queued_again_gets_a_new_request(self):
+        self._add([SECOND_WORD], pattern='-----')
+        queue = ERDQueue(os.path.join(self._tmp.name, 'queue.sqlite3'))
+        try:
+            claimed = queue.claim_next('worker-0')
+            ready = queue.mark_done(bytes(claimed['branch_key']))
+            queue.mark_openers_complete(ready)
+        finally:
+            queue.close()
+
+        self._add([SECOND_WORD], pattern='-----', delete_erd_cache=True)
+
+        self.assertEqual([state for _opener, _priority, state
+                          in self._requests()], ['complete', 'queued'])

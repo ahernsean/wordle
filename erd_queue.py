@@ -2116,10 +2116,42 @@ class ERDQueue:
         self._branch_id_cache[branch_key] = row[0]
         return row[0]
 
+    def unfinished_opener_request(self, opener):
+        """The opener's unfinished request as (opener_work_id,
+        requested_priority), or None when it has none.
+
+        An opener has at most one, because add_pending_many attaches to it
+        rather than creating another.  A queue written before that held can
+        still carry several; the highest-priority one answers, as it is the
+        one the swarm reaches first.
+        """
+        row = self._conn.execute("""
+            SELECT opener_work_id, requested_priority FROM opener_work
+            WHERE opener = ? AND state != 'complete'
+            ORDER BY requested_priority DESC, opener_work_id
+            LIMIT 1
+        """, (opener,)).fetchone()
+        return None if row is None else (row[0], row[1])
+
     def add_pending_many(self, rows):
         """Insert (branch_key, n_words, priority, opener, opener_pattern) rows.
 
-        Uses an UPSERT so that:
+        Each opener's rows belong to its one unfinished request.  If it
+        already has one, they attach to it at that request's priority and the
+        row's priority is not used: an opener is requested once, and moving
+        it is queue opener-priority's job.  Only an opener with no unfinished
+        request -- never queued, or finished -- gets a new request, at the
+        rows' priority.  The lookup and the insert share one write
+        transaction, so two callers adding the same opener cannot both create
+        one.
+
+        Returns {opener: (opener_work_id, priority, created)} saying which
+        happened to each opener, decided in that transaction.  A caller's
+        earlier look at the queue can be out of date by then -- the swarm
+        finishes openers while a long add runs -- so this, not that look, is
+        what the caller reports.
+
+        The pending rows are an UPSERT, so that:
         - A row inserted for the first time is added as 'pending'.
         - A row already present has its priority UPGRADED (never downgraded),
           e.g. a branch first inserted at priority=0 by an earlier opener
@@ -2139,19 +2171,27 @@ class ERDQueue:
         # and keeps the id cache consistent with the database on a rollback.
         prepared = [(self._intern_branch(r[0], create=True), r[1], r[2], r[3],
                      r[4]) for r in rows]
-        self._conn.execute("BEGIN")
+        self._conn.execute("BEGIN IMMEDIATE")
         try:
             now = int(time.time())
-            opener_work_ids = {}
+            requests = {}
             for _branch_id, _n_words, priority, opener, _opener_pattern in prepared:
-                key = (opener, priority)
-                if key not in opener_work_ids:
+                if opener in requests:
+                    continue
+                existing = self.unfinished_opener_request(opener)
+                if existing is None:
                     cur = self._conn.execute("""
                         INSERT INTO opener_work
                             (opener, requested_priority, requested_at, state)
                         VALUES (?, ?, ?, 'queued')
                     """, (opener, priority, now))
-                    opener_work_ids[key] = cur.lastrowid
+                    requests[opener] = (cur.lastrowid, priority, True)
+                else:
+                    requests[opener] = (*existing, False)
+            prepared = [
+                (branch_id, n_words, requests[opener][1], opener, opener_pattern)
+                for branch_id, n_words, _priority, opener, opener_pattern
+                in prepared]
             self._conn.executemany("""
                 INSERT INTO pending_branches
                     (branch_id, n_words, priority, opener, opener_pattern, status)
@@ -2169,8 +2209,8 @@ class ERDQueue:
                     parent_branch_id = NULL,
                     opener_pattern = excluded.opener_pattern,
                     resolved_at = NULL
-            """, [(branch_id, opener_work_ids[(opener, priority)], opener_pattern)
-                  for branch_id, _n_words, priority, opener, opener_pattern
+            """, [(branch_id, requests[opener][0], opener_pattern)
+                  for branch_id, _n_words, _priority, opener, opener_pattern
                   in prepared])
             self._conn.execute("COMMIT")
             self._tally_wal_traffic(
@@ -2179,6 +2219,7 @@ class ERDQueue:
         except Exception:  # pragma: no cover
             self._conn.execute("ROLLBACK")
             raise
+        return requests
 
     # ------------------------------------------------------------------
     # Worker claim loop
