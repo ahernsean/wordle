@@ -533,28 +533,6 @@ class ReportModelTest(unittest.TestCase):
             {**row, "opener": "salet"}, 2, set(ANSWERS))
         self.assertTrue(answer_payload["opener_is_answer"])
 
-    def test_opener_erd_summary_reuses_the_current_cache_generation(self):
-        branch_key = ScoreCache.encode_subset(["salet"])
-        cache = Mock(answer_list_id="answers")
-        cache.report_branch_states.return_value = {
-            branch_key: {"best_erd": 1.0, "max_remaining_depth": 1, "cache_state": "exact"},
-        }
-        response_cache = Mock()
-        response_cache.group_words.return_value = {0: ["salet"]}
-        report_model._OPENER_ERD_SUMMARY_CACHE = {}
-        report = {"sources": {"cache": {"ok": False, "error": None}}}
-        with (
-            patch("report_model.ResponseCache", return_value=response_cache),
-            patch("report_model._score_cache_file_signature", return_value=((1, 1), None)),
-        ):
-            first = report_model._opener_erd_summaries(
-                self.sources, ["raise"], report, cache, ANSWERS)
-            second = report_model._opener_erd_summaries(
-                self.sources, ["raise"], report, cache, ANSWERS)
-        self.assertTrue(report["sources"]["cache"]["ok"])
-        self.assertEqual(first, second)
-        self.assertEqual(response_cache.group_words.call_count, 1)
-
     def test_queue_and_current_hotspot_reports_normalize_rows(self):
         branch_key = ScoreCache.encode_subset(["salet"])
         queue = Mock(epoch=12)
@@ -1440,12 +1418,6 @@ class ReportModelTest(unittest.TestCase):
             [rank("complete", 3.5), rank("pending"),
              rank("infeasible"), rank(None)],
             [0, 1, 2, 3],
-        )
-
-    def test_a_cache_file_that_is_not_there_has_no_signature(self):
-        missing = os.path.join(self.temporary_directory.name, "absent.sqlite3")
-        self.assertEqual(
-            report_model._score_cache_file_signature(missing), (None, None)
         )
 
     def test_hotspot_reports_survive_queue_errors(self):
@@ -3515,84 +3487,154 @@ class OpenerReportTest(unittest.TestCase):
         self.assertIsNone(row["elapsed_time_millis"])
         self.assertIsNone(row["worker_time_millis"])
 
-    def test_opener_erd_summary_cache_invalidates_for_wal_writes(self):
-        self.addCleanup(report_model._OPENER_ERD_SUMMARY_CACHE.clear)
-        self._queue_words(("nurdy", 5, 1))
-        first = self._openers()["summary"][0]["erd_summary"]
-        self.assertEqual(first["state"], "pending")
-
+    def _cache_every_group_of(self, word):
+        # Solves every response group of the word in the cache, so a report
+        # that reduced the word on read would find it complete at 1.75.
         cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
-        response_cache = ResponseCache(ANSWERS, score_cache=None)
-        for _pattern_code, words in response_cache.group_words(
-                "nurdy", ANSWERS).items():
+        now = int(time.time())
+        for _pattern_code, words in ResponseCache(
+                ANSWERS, score_cache=None).group_words(word, ANSWERS).items():
             if words:
-                cache.write(
-                    ScoreCache.encode_subset(words), ERD_ALL, "salet", 1.0,
-                    max_depth=1, solve_budget=GAME_GUESSES - 1,
+                cache._conn.execute(
+                    "INSERT OR REPLACE INTO branch_best_by_policy "
+                    "(branch_key, policy, answer_list_id, best_guess, "
+                    " best_score, max_depth, solve_budget, updated_at) "
+                    "VALUES (?, ?, ?, 'salet', 1.0, 1, ?, ?)",
+                    (ScoreCache.encode_subset(words), ERD_ALL,
+                     cache.answer_list_id, GAME_GUESSES - 1, now),
                 )
         cache._conn.commit()
-
-        second = self._openers()["summary"][0]["erd_summary"]
-
-        self.assertEqual(second["state"], "complete")
-        self.assertNotEqual(first, second)
         cache.close()
 
-    def test_each_opener_carries_its_own_erd(self):
-        # A word's ERD is why it was queued.  It is derived from the word's
-        # cached response groups on every read.  NURDY is the one of these that
-        # leaves a two-answer group, so it is the one whose ERD needs the
-        # cache; the others partition this answer list into singletons, which
-        # are solved by playing them.
-        self._queue_words(("nurdy", 5, 1), ("crane", 3, 1))
+    def test_a_finished_opener_reports_the_erd_the_swarm_stored(self):
+        # CRANE's groups would reduce to 1.75; the stored 2.5 is what shows,
+        # because the report reads the opener's ERD and never derives one.
+        self._queue_words(("crane", 3, 1), ("salet", 5, 1))
+        self._cache_every_group_of("crane")
         cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
-        response_cache = ResponseCache(ANSWERS, score_cache=None)
-        now = int(time.time())
-        for _pattern_code, words in response_cache.group_words(
-                "crane", ANSWERS).items():
-            if not words:
-                continue
-            cache._conn.execute(
-                "INSERT OR REPLACE INTO branch_best_by_policy "
-                "(branch_key, policy, answer_list_id, best_guess, best_score, "
-                " max_depth, solve_budget, updated_at) "
-                "VALUES (?, ?, ?, 'salet', 1.0, 1, ?, ?)",
-                (ScoreCache.encode_subset(words), ERD_ALL,
-                 cache.answer_list_id, GAME_GUESSES - 1, now),
-            )
+        cache.write_opener_erd("crane", ERD_ALL, 2.5, 3, 4)
+        cache.close()
+        queue = self._open_queue()
+        for word in ("crane", "salet"):
+            queue.mark_done(
+                ScoreCache.encode_subset(ANSWERS[:2] + [f"{word}0000"]))
+        queue.mark_openers_complete(queue.openers_ready_to_complete())
+        queue.close()
+
+        rows = {row["opener"]: row for row in self._openers()["summary"]}
+
+        self.assertEqual(rows["crane"]["erd_summary"], {
+            "state": "complete", "erd": 2.5, "max_remaining_depth": 3,
+            "resolved_group_count": 4, "infeasible_group_count": 0,
+            "response_group_count": 4,
+        })
+        # Finished with no stored row: there is nothing to read, and nothing
+        # is derived in its place.
+        self.assertEqual(rows["salet"]["state"], "complete")
+        self.assertIsNone(rows["salet"]["erd_summary"])
+
+    def test_an_unfinished_opener_reports_queue_progress_and_no_erd(self):
+        # NURDY splits the answers into two singletons, which queue add never
+        # takes, and one two-answer group, which it queues as a branch.
+        groups = ResponseCache(ANSWERS, score_cache=None).group_words(
+            "nurdy", ANSWERS)
+        pattern_code, pair = next(
+            (code, words) for code, words in groups.items() if len(words) == 2)
+        pair_key = ScoreCache.encode_subset(pair)
+        queue = self._open_queue()
+        queue.add_pending_many([(pair_key, 2, 5, "nurdy", pattern_code)])
+        queue.close()
+        # Every group cached is still no ERD for a word the queue owes.
+        self._cache_every_group_of("nurdy")
+
+        expected = {
+            "state": "pending", "erd": None, "max_remaining_depth": None,
+            "resolved_group_count": 2, "infeasible_group_count": 0,
+            "response_group_count": 3,
+        }
+        self.assertEqual(self._openers()["summary"][0]["erd_summary"], expected)
+
+        queue = self._open_queue()
+        queue.mark_done(pair_key)
+        queue.close()
+        self.assertEqual(self._openers()["summary"][0]["erd_summary"],
+                         {**expected, "resolved_group_count": 3})
+
+    def _nurdy_queued_without_its_pair(self):
+        # NURDY's two-answer group left out of the queue, the way
+        # `queue add --max-branch-size 1` leaves it: no branch, no result.
+        groups = ResponseCache(ANSWERS, score_cache=None).group_words(
+            "nurdy", ANSWERS)
+        pair = next(words for words in groups.values() if len(words) == 2)
+        queue = self._open_queue()
+        queue.add_pending_many([(
+            ScoreCache.encode_subset(ANSWERS[:2] + ["nurdy0000"]), 3, 5,
+            "nurdy", 0)])
+        queue.close()
+        return ScoreCache.encode_subset(pair)
+
+    def test_a_group_the_queue_skipped_is_not_solved_until_the_cache_says_so(self):
+        pair_key = self._nurdy_queued_without_its_pair()
+
+        summary = self._openers()["summary"][0]["erd_summary"]
+        self.assertEqual(summary["state"], "pending")
+        self.assertEqual(summary["resolved_group_count"], 2)
+        self.assertEqual(summary["response_group_count"], 3)
+
+        # A later poll looks the still-unsettled group up again.
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        cache.write(pair_key, ERD_ALL, "salet", 1.5, max_depth=2,
+                    solve_budget=GAME_GUESSES - 1)
+        cache._conn.commit()
+        cache.close()
+        summary = self._openers()["summary"][0]["erd_summary"]
+        self.assertEqual(summary["resolved_group_count"], 3)
+
+    def test_a_group_the_queue_skipped_that_is_a_loss_makes_the_opener_infeasible(self):
+        pair_key = self._nurdy_queued_without_its_pair()
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        cache.write_loss(pair_key, ERD_ALL, GAME_GUESSES - 1)
         cache._conn.commit()
         cache.close()
 
-        rows = {row["opener"]: row
-                for row in self._openers()["summary"]}
+        summary = self._openers()["summary"][0]["erd_summary"]
 
-        # Every group of CRANE is solved, so its ERD is exact: the guess
-        # itself, plus the mean of its groups -- and the all-green group costs
-        # nothing, since that guess was the answer.  1 + (0+1+1+1)/4.
-        crane = rows["crane"]["erd_summary"]
-        self.assertEqual(crane["state"], "complete")
-        self.assertEqual(crane["erd"], 1.75)
-        self.assertEqual(crane["max_remaining_depth"], 2)
-        # NURDY's two-answer group has nothing cached, so it reports how far
-        # along it is rather than a number that would move under the reader.
-        nurdy = rows["nurdy"]["erd_summary"]
-        self.assertEqual(nurdy["state"], "pending")
-        self.assertIsNone(nurdy["erd"])
-        # Its two singleton groups are solved by playing them; the
-        # two-answer group is the one still outstanding.
-        self.assertEqual(nurdy["resolved_group_count"], 2)
-        self.assertEqual(nurdy["response_group_count"], 3)
+        self.assertEqual(summary["state"], "infeasible")
+        self.assertEqual(summary["infeasible_group_count"], 1)
+        self.assertEqual(summary["resolved_group_count"], 2)
 
-        # Neither word's reduction is persisted anywhere: the report's numbers came
-        # from the branch tables and nothing else was written.
+    def test_a_word_is_partitioned_once_until_the_queue_takes_more_of_it(self):
+        self._nurdy_queued_without_its_pair()
+        with patch.object(ResponseCache, "group_words",
+                          autospec=True,
+                          side_effect=ResponseCache.group_words) as group_words:
+            self._openers()
+            self._openers()
+            self.assertEqual(group_words.call_count, 1)
+            queue = self._open_queue()
+            queue.add_pending_many([(
+                ScoreCache.encode_subset(ANSWERS[:2] + ["nurdy0001"]), 3, 5,
+                "nurdy", 1)])
+            queue.close()
+            self._openers()
+            self.assertEqual(group_words.call_count, 2)
+
+    def test_response_groups_are_counted_from_stored_decompositions(self):
         cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
-        self.assertEqual(
-            [row["name"] for row in cache._conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table' "
-                "AND name = 'candidate_erd_by_policy'")],
-            [],
-        )
+        writer = ResponseCache(ANSWERS, score_cache=cache)
+        for word in ANSWERS:
+            writer.group_words(word, ANSWERS)
+        cache._conn.commit()
         cache.close()
+        self._queue_words(*((word, 5, 1) for word in ANSWERS))
+        with patch("wordle_engine.calculate_response",
+                   side_effect=AssertionError("the partition is stored")):
+            rows = self._openers()["summary"]
+        engine = ResponseCache(ANSWERS, score_cache=None)
+        self.assertEqual(
+            {row["opener"]: row["erd_summary"]["response_group_count"]
+             for row in rows},
+            {word: len(engine.group_words(word, ANSWERS)) for word in ANSWERS})
 
     def test_branch_totals_count_a_shared_branch_once(self):
         # Two different words owning one branch is the case the report exists
