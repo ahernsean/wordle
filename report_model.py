@@ -3983,26 +3983,27 @@ def _grouped_openers(rows, group_by, branch_totals, generated_at):
     return [grouped[key] for key in sorted(grouped)]
 
 
-def _opener_erd_summaries(sources, rows, report, cache, all_answers):
+def _opener_erd_summaries(sources, rows, report, queue, cache, all_answers):
     """Each word's own ERD as the swarm stored it, or its progress toward one.
 
     A finished opener's ERD is stored by the worker that finished it, so this
-    reads it.  An unfinished opener has no ERD yet, and its progress is the
-    queue's: every response group the queue never took needs no work, and
-    each one it took is solved when that branch is done.  Nothing here reduces
-    an ERD.  A finished opener with no stored row (one `reconcile-opener-erds`
-    has not reached) reports no summary.
+    reads it.  An unfinished opener has no ERD yet.  Its progress counts each
+    response group the queue took as solved once that branch is done, and
+    each group it did not take by that group's own cache state: queue add
+    leaves out groups already solved, but also groups its filters skipped,
+    which are not.  Nothing here reduces an ERD.  A finished opener with no
+    stored row (one `reconcile-opener-erds` has not reached) reports no
+    summary.
     """
     summaries = {}
     if not rows:
         return summaries
     try:
         stored = cache.stored_opener_erds(ERD_ALL)
-        unfinished = [row["opener"] for row in rows
-                      if row["opener"] is not None
-                      and row["state"] != "complete"]
-        group_counts = _opener_response_group_counts(
-            sources, all_answers, cache, unfinished)
+        unqueued = _opener_unqueued_groups(
+            sources, queue, cache, all_answers,
+            [row for row in rows
+             if row["opener"] is not None and row["state"] != "complete"])
         for row in rows:
             word = row["opener"]
             if word is None:
@@ -4020,18 +4021,16 @@ def _opener_erd_summaries(sources, rows, report, cache, all_answers):
                     "response_group_count": response_group_count,
                 }
                 continue
-            response_group_count = group_counts[word]
-            unqueued_group_count = max(
-                0, response_group_count - row["direct_branch_count"])
+            groups = unqueued[word]
             summaries[word] = {
-                "state": "pending",
+                "state": "infeasible" if groups.infeasible_count else "pending",
                 "erd": None,
                 "max_remaining_depth": None,
                 "resolved_group_count": min(
-                    response_group_count,
-                    unqueued_group_count + row["direct_done_branch_count"]),
-                "infeasible_group_count": 0,
-                "response_group_count": response_group_count,
+                    groups.response_group_count,
+                    groups.solved_count + row["direct_done_branch_count"]),
+                "infeasible_group_count": groups.infeasible_count,
+                "response_group_count": groups.response_group_count,
             }
         report["sources"]["cache"]["ok"] = True
     except (sqlite3.Error, OSError) as error:
@@ -4039,32 +4038,83 @@ def _opener_erd_summaries(sources, rows, report, cache, all_answers):
     return summaries
 
 
-# How many response groups a word splits the answers into depends on nothing
-# but the word and the answer list, so each word is counted once per list
-# generation, never per poll.
-_opener_response_group_count_memo = None
+@dataclass
+class _UnqueuedGroups:
+    """A word's response groups that its queue requests did not take."""
+    direct_branch_count: int
+    response_group_count: int
+    solved_count: int
+    infeasible_count: int
+    unsettled_keys: list
 
 
-def _opener_response_group_counts(sources, all_answers, cache, words):
-    """{word: the number of response groups it splits every answer into}.
+# A word's groups the queue did not take are fixed until it takes more, and a
+# group found solved or unsolvable stays so, so each word is partitioned and
+# looked up once and only its still-unsettled groups are looked up per poll.
+_opener_unqueued_group_memo = None
+_REPORT_BRANCH_STATE_BATCH_SIZE = 400
 
-    Counted from the word's stored response decomposition, which the cache
-    holds for every candidate; a word without one is computed and not stored,
-    since the report's cache is read-only.
-    """
-    global _opener_response_group_count_memo
-    memo_key = (sources.answer_list_path,
+
+def _opener_unqueued_groups(sources, queue, cache, all_answers, rows):
+    """{word: _UnqueuedGroups} for these unfinished opener rows."""
+    global _opener_unqueued_group_memo
+    memo_key = (sources.queue_path, sources.cache_path,
+                sources.answer_list_path,
                 os.path.getmtime(sources.answer_list_path))
-    if (_opener_response_group_count_memo is None
-            or _opener_response_group_count_memo[0] != memo_key):
-        _opener_response_group_count_memo = (memo_key, {})
-    counted = _opener_response_group_count_memo[1]
-    uncounted = [word for word in words if word not in counted]
-    if uncounted:
+    if (_opener_unqueued_group_memo is None
+            or _opener_unqueued_group_memo[0] != memo_key):
+        _opener_unqueued_group_memo = (memo_key, {})
+    memo = _opener_unqueued_group_memo[1]
+    stale = [row["opener"] for row in rows
+             if row["opener"] not in memo
+             or memo[row["opener"]].direct_branch_count
+             != row["direct_branch_count"]]
+    if stale:
+        direct_keys = queue.opener_direct_branch_keys(stale)
+        direct_counts = {row["opener"]: row["direct_branch_count"]
+                         for row in rows}
         response_cache = ResponseCache(all_answers, score_cache=cache)
-        for word in uncounted:
-            counted[word] = len(response_cache.group_counts(word, all_answers))
-    return {word: counted[word] for word in words}
+        for word in stale:
+            groups = response_cache.group_words(word, all_answers)
+            # A lone answer is solved by playing it; a word's budget after
+            # its first guess always leaves that guess.
+            unsettled_keys = [
+                ScoreCache.encode_subset(words)
+                for words in groups.values() if len(words) >= 2]
+            unsettled_keys = [key for key in unsettled_keys
+                              if key not in direct_keys.get(word, ())]
+            memo[word] = _UnqueuedGroups(
+                direct_branch_count=direct_counts[word],
+                response_group_count=len(groups),
+                solved_count=sum(
+                    1 for words in groups.values()
+                    if len(words) == 1
+                    and ScoreCache.encode_subset(words)
+                    not in direct_keys.get(word, ())),
+                infeasible_count=0,
+                unsettled_keys=unsettled_keys,
+            )
+    words = [row["opener"] for row in rows]
+    unsettled = sorted({key for word in words
+                        for key in memo[word].unsettled_keys})
+    states = {}
+    for start in range(0, len(unsettled), _REPORT_BRANCH_STATE_BATCH_SIZE):
+        states.update(cache.report_branch_states(
+            unsettled[start:start + _REPORT_BRANCH_STATE_BATCH_SIZE],
+            ERD_ALL, GAME_GUESSES - 1))
+    for word in words:
+        groups = memo[word]
+        still_unsettled = []
+        for key in groups.unsettled_keys:
+            cache_state = states[key]["cache_state"]
+            if cache_state == "exact":
+                groups.solved_count += 1
+            elif cache_state == "loss":
+                groups.infeasible_count += 1
+            else:
+                still_unsettled.append(key)
+        groups.unsettled_keys = still_unsettled
+    return {word: memo[word] for word in words}
 
 
 def opener_completion_signal(sources):
@@ -4238,7 +4288,7 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
                          if row["state"] in opener_states]
         erd_summaries = (
             _opener_erd_summaries(
-                sources, collapsed, report, timing_cache, all_answers,
+                sources, collapsed, report, queue, timing_cache, all_answers,
             ) if timing_cache is not None else {}
         )
         for row in collapsed:

@@ -3560,42 +3560,81 @@ class OpenerReportTest(unittest.TestCase):
         self.assertEqual(self._openers()["summary"][0]["erd_summary"],
                          {**expected, "resolved_group_count": 3})
 
-    def test_a_word_is_split_into_response_groups_once(self):
-        self.addCleanup(setattr, report_model,
-                        "_opener_response_group_count_memo", None)
-        report_model._opener_response_group_count_memo = None
-        response_cache = ResponseCache(ANSWERS, score_cache=None)
-        with (
-            patch("report_model.ResponseCache",
-                  return_value=response_cache),
-            patch.object(response_cache, "group_counts",
-                         wraps=response_cache.group_counts) as group_counts,
-        ):
-            first = report_model._opener_response_group_counts(
-                self.sources, ANSWERS, None, ["nurdy", "crane"])
-            second = report_model._opener_response_group_counts(
-                self.sources, ANSWERS, None, ["crane", "nurdy"])
-        self.assertEqual(first, {"nurdy": 3, "crane": 4})
-        self.assertEqual(second, first)
-        self.assertEqual(group_counts.call_count, 2)
+    def _nurdy_queued_without_its_pair(self):
+        # NURDY's two-answer group left out of the queue, the way
+        # `queue add --max-branch-size 1` leaves it: no branch, no result.
+        groups = ResponseCache(ANSWERS, score_cache=None).group_words(
+            "nurdy", ANSWERS)
+        pair = next(words for words in groups.values() if len(words) == 2)
+        queue = self._open_queue()
+        queue.add_pending_many([(
+            ScoreCache.encode_subset(ANSWERS[:2] + ["nurdy0000"]), 3, 5,
+            "nurdy", 0)])
+        queue.close()
+        return ScoreCache.encode_subset(pair)
 
-    def test_response_groups_are_counted_from_stored_decompositions(self):
-        self.addCleanup(setattr, report_model,
-                        "_opener_response_group_count_memo", None)
-        report_model._opener_response_group_count_memo = None
+    def test_a_group_the_queue_skipped_is_not_solved_until_the_cache_says_so(self):
+        pair_key = self._nurdy_queued_without_its_pair()
+
+        summary = self._openers()["summary"][0]["erd_summary"]
+        self.assertEqual(summary["state"], "pending")
+        self.assertEqual(summary["resolved_group_count"], 2)
+        self.assertEqual(summary["response_group_count"], 3)
+
+        # A later poll looks the still-unsettled group up again.
         cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
-        writer = ResponseCache(ANSWERS, score_cache=cache)
-        expected = {word: len(writer.group_words(word, ANSWERS))
-                    for word in ANSWERS}
+        cache.write(pair_key, ERD_ALL, "salet", 1.5, max_depth=2,
+                    solve_budget=GAME_GUESSES - 1)
         cache._conn.commit()
         cache.close()
-        reader = report_model._open_report_cache(self.sources, ANSWERS)
-        self.addCleanup(reader.close)
+        summary = self._openers()["summary"][0]["erd_summary"]
+        self.assertEqual(summary["resolved_group_count"], 3)
+
+    def test_a_group_the_queue_skipped_that_is_a_loss_makes_the_opener_infeasible(self):
+        pair_key = self._nurdy_queued_without_its_pair()
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        cache.write_loss(pair_key, ERD_ALL, GAME_GUESSES - 1)
+        cache._conn.commit()
+        cache.close()
+
+        summary = self._openers()["summary"][0]["erd_summary"]
+
+        self.assertEqual(summary["state"], "infeasible")
+        self.assertEqual(summary["infeasible_group_count"], 1)
+        self.assertEqual(summary["resolved_group_count"], 2)
+
+    def test_a_word_is_partitioned_once_until_the_queue_takes_more_of_it(self):
+        self._nurdy_queued_without_its_pair()
+        with patch.object(ResponseCache, "group_words",
+                          autospec=True,
+                          side_effect=ResponseCache.group_words) as group_words:
+            self._openers()
+            self._openers()
+            self.assertEqual(group_words.call_count, 1)
+            queue = self._open_queue()
+            queue.add_pending_many([(
+                ScoreCache.encode_subset(ANSWERS[:2] + ["nurdy0001"]), 3, 5,
+                "nurdy", 1)])
+            queue.close()
+            self._openers()
+            self.assertEqual(group_words.call_count, 2)
+
+    def test_response_groups_are_counted_from_stored_decompositions(self):
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        writer = ResponseCache(ANSWERS, score_cache=cache)
+        for word in ANSWERS:
+            writer.group_words(word, ANSWERS)
+        cache._conn.commit()
+        cache.close()
+        self._queue_words(*((word, 5, 1) for word in ANSWERS))
         with patch("wordle_engine.calculate_response",
                    side_effect=AssertionError("the partition is stored")):
-            counts = report_model._opener_response_group_counts(
-                self.sources, ANSWERS, reader, list(ANSWERS))
-        self.assertEqual(counts, expected)
+            rows = self._openers()["summary"]
+        engine = ResponseCache(ANSWERS, score_cache=None)
+        self.assertEqual(
+            {row["opener"]: row["erd_summary"]["response_group_count"]
+             for row in rows},
+            {word: len(engine.group_words(word, ANSWERS)) for word in ANSWERS})
 
     def test_branch_totals_count_a_shared_branch_once(self):
         # Two different words owning one branch is the case the report exists

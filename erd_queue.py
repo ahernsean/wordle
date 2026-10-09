@@ -6363,6 +6363,30 @@ class ERDQueue:
             ORDER BY requested_priority DESC, s.opener
         """).fetchall()
 
+    def opener_direct_branch_keys(self, openers):
+        """{opener: branch keys of the response groups its requests took}.
+
+        A direct branch is one a request asked for outright, so it carries no
+        parent; counted over every request of the word, finished or not, like
+        direct_branch_count in opener_rows().
+        """
+        keys = collections.defaultdict(set)
+        words = list(openers)
+        for start in range(0, len(words), 500):
+            chunk = words[start:start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            for opener, branch_key in self._conn.execute(f"""
+                SELECT s.opener, b.branch_key
+                FROM opener_work AS s
+                JOIN branch_opener_work AS m
+                  ON m.opener_work_id = s.opener_work_id
+                JOIN branches AS b ON b.branch_id = m.branch_id
+                WHERE s.opener IN ({placeholders})
+                  AND m.parent_branch_id IS NULL
+            """, chunk):
+                keys[opener].add(bytes(branch_key))
+        return keys
+
     def distinct_branch_count_for_words(self, openers):
         """Count the branches owned by these opener words, each branch once.
 
