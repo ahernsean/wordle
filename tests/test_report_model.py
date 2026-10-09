@@ -3669,6 +3669,39 @@ class OpenerReportTest(unittest.TestCase):
              row["direct_done_branch_count"]), (2, 2, 2))
         self.assertIsNotNone(row["completed_at"])
 
+    def test_a_queue_from_before_totals_were_recorded_gains_them_when_opened(self):
+        self._queue_words(("crane", 1, 2))
+        self._finish("crane")
+        queue = self._open_queue()
+        # opener_work as it stood before completion totals existed.
+        queue._conn.executescript("""
+            PRAGMA legacy_alter_table = ON;
+            CREATE TABLE opener_work_before (
+                opener_work_id     INTEGER PRIMARY KEY,
+                opener             TEXT,
+                requested_priority INTEGER NOT NULL,
+                requested_at       INTEGER NOT NULL,
+                started_at         INTEGER,
+                state              TEXT    NOT NULL DEFAULT 'queued');
+            INSERT INTO opener_work_before
+                SELECT opener_work_id, opener, requested_priority,
+                       requested_at, started_at, state FROM opener_work;
+            DROP TABLE opener_work;
+            ALTER TABLE opener_work_before RENAME TO opener_work;
+        """)
+        resolved_at = queue._conn.execute(
+            "SELECT MAX(resolved_at) FROM branch_opener_work").fetchone()[0]
+        queue.close()
+        # The swarm's next writable open migrates it; a report never does.
+        self._open_queue().close()
+
+        row = self._openers(opener_states=("complete",))["summary"][0]
+
+        self.assertEqual(
+            (row["branch_count"], row["direct_branch_count"],
+             row["direct_done_branch_count"]), (2, 2, 2))
+        self.assertEqual(row["completed_at"], resolved_at)
+
     def test_a_word_is_counted_live_until_every_request_is_finished(self):
         self._queue_words(("crane", 1, 2))
         self._finish("crane")

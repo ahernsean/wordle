@@ -7152,6 +7152,11 @@ class ReportClientContract:
         # The source-only grouping cannot be served by a word report, so it
         # must not ride along into a request that would be rejected.
         self.assertNotIn("group_by", self.page.url)
+        # Nor the list's page size, which a word report would read as a cap
+        # on its response groups.
+        self.assertNotIn("limit", self.page.url)
+        self.assertNotIn("limit", self.page.evaluate(
+            "buildAPIURL(__reportClient.getState())"))
 
     def test_sources_card_shows_the_words_own_erd(self):
         self.open_sources()
@@ -7363,7 +7368,11 @@ class ReportClientContract:
             "__reportClient.setState(parsePageState({search:'?kind=openers'}))")
         state = self.page.evaluate("__reportClient.getState()")
         self.assertEqual(state["opener_state"], ["queued", "active"])
-        self.assertEqual(state["limit"], 100)
+        # The page size is the report's own: it reaches the request, not the
+        # state another report would inherit.
+        self.assertIsNone(state["limit"])
+        self.assertIn("limit=100", self.page.evaluate(
+            "buildAPIURL(__reportClient.getState())"))
         # The default is the page's own, so its URL does not spell it out.
         self.assertNotIn("opener_state", self.page.url)
         checked = self.page.evaluate("""() => [...document.querySelectorAll(

@@ -1716,12 +1716,30 @@ class ERDQueue:
             "resolved_at": "INTEGER",
         })
         self._add_columns("opener_work", {"started_at": "INTEGER"})
+        opener_work_columns = {
+            row["name"] for row in
+            self._conn.execute("PRAGMA table_info(opener_work)")}
         self._add_columns("opener_work", {
             "completed_at": "INTEGER",
             "completed_branch_count": "INTEGER",
             "completed_direct_branch_count": "INTEGER",
             "completed_direct_done_branch_count": "INTEGER",
         })
+        if "completed_branch_count" not in opener_work_columns:
+            # A queue from before completion totals were recorded: its
+            # completed requests still hold their memberships, so the totals
+            # and the moment of completion are taken from those.
+            self._conn.execute("""
+                UPDATE opener_work SET completed_at = (
+                    SELECT MAX(membership.resolved_at)
+                    FROM branch_opener_work AS membership
+                    WHERE membership.opener_work_id = opener_work.opener_work_id)
+                WHERE state = 'complete'
+            """)
+            self._record_word_totals(
+                row["opener"] for row in self._conn.execute(
+                    "SELECT DISTINCT opener FROM opener_work "
+                    "WHERE state = 'complete'"))
         if "claimed_at" in pending_columns:
             self._conn.execute("""
                 UPDATE opener_work AS opener
