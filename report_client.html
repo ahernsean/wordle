@@ -471,12 +471,12 @@
     const overviewBranchWorkerStatusNames=["active"];
     // A source word's lifecycle, which is not a branch's: queued until a
     // worker picks one of its requests up, complete once every request is.
-    const sourceStateNames=["queued","active","complete"];
+    const sourceStateNames=["active","queued","complete"];
     // The Openers list opens on the work still owed, a page at a time: a
     // finished opener's ERD is the leaderboard's, and a sweep finishes
     // thousands of them, which no page should render at once.  Every state
     // ticked, or none, shows them all.
-    const OPENER_LIST_DEFAULT_STATES=["queued","active"],OPENER_PAGE_SIZE=100;
+    const OPENER_LIST_DEFAULT_STATES=["active","queued"],OPENER_PAGE_SIZE=100;
     // The page size is the report's own default, never written into the
     // shared limit: a word report reached from an opener card would read
     // that limit as a cap on its response groups.
@@ -940,6 +940,18 @@
     // a rendered object rather than only text.
     function labeledFacts(values){const node=element("div","labeled-facts");for(const [key,value] of values){if(value===null||value===undefined||value==="")continue;const fact=element("span","fact"),cell=element("span","");if(value instanceof Node)cell.append(value);else cell.textContent=valueOrDash(value);fact.append(element("span","fact-label",key)," ",cell);node.append(fact);}return node;}
     function progress(done,total){const node=element("div","progress"),bar=element("span");bar.style.width=total?Math.min(100,100*done/total)+"%":"0";node.append(bar);return node;}
+    // A group's header covers the whole group, not the page.  Branch totals
+    // count only unfinished words, so a group of finished words states none
+    // rather than zero, and workers are named only where a word is active.
+    function sourceGroupRollupText(rollup){
+      const parts=[numText(rollup.opener_count)+(rollup.opener_count===1?" word":" words")];
+      if(rollup.unfinished_opener_count){
+        const unfinished=rollup.unfinished_opener_count<rollup.opener_count?" of "+numText(rollup.unfinished_opener_count)+" unfinished "+(rollup.unfinished_opener_count===1?"word":"words"):"";
+        parts.push(numText(rollup.branch_count)+(rollup.branch_count===1?" branch":" branches")+unfinished+" ("+numText(rollup.open_branch_count)+" open, "+numText(rollup.done_branch_count)+" done)");
+      }
+      if(rollup.active_opener_count)parts.push(numText(rollup.worker_count)+(rollup.worker_count===1?" worker":" workers"));
+      return parts.join(" · ");
+    }
     function sourceGroupProgress(row,summary){
       if(!summary||!summary.response_group_count)return null;
       const total=summary.response_group_count,workCount=Math.min(total,row.direct_branch_count||0);
@@ -2183,7 +2195,7 @@
           details.open=!collapsedResponseGroups.has(groupKey);
           details.addEventListener("toggle",()=>details.open?collapsedResponseGroups.delete(groupKey):collapsedResponseGroups.add(groupKey));
           const rollup=group.rollup,summaryEl=element("summary","clickable");
-          summaryEl.append(element("strong","",group.label),element("span","dim"," "+numText(rollup.opener_count)+(rollup.opener_count===1?" word":" words")+" · "+numText(rollup.branch_count)+(rollup.branch_count===1?" branch":" branches")+" · "+numText(rollup.open_branch_count)+" open · "+numText(rollup.done_branch_count)+" done · "+numText(rollup.worker_count)+(rollup.worker_count===1?" worker":" workers")));
+          summaryEl.append(element("strong","",group.label),element("span","dim"," "+sourceGroupRollupText(rollup)));
           const grid=gridElement("source-words/"+group.label);
           for(const row of ordered(group.rows,"opener","source-words/"+group.label,state))grid.append(wordCard(row));
           details.append(summaryEl,grid);

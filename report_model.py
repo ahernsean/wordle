@@ -3950,36 +3950,40 @@ def _opener_group_key(row, group_by, generated_at):
     return (-(priority or 0), f"priority {priority}")
 
 
-def _grouped_openers(rows, group_by, branch_totals, generated_at):
-    """Bucket the collapsed rows, each group carrying its own rollup.
+def _grouped_openers(page_rows, rows, group_by, branch_totals, generated_at):
+    """Bucket the page's rows, each group carrying the rollup of all of it.
 
-    A group's branch totals are counted distinctly over the words in it, for
-    the same reason the report's own are: two words can own the same branch,
-    and summing their per-word counts would count it once per word.
+    A group's rollup covers every matched word in it, not only those on this
+    page, so its header says how much work the whole group holds.  Its
+    branch totals are counted distinctly over its unfinished words, for the
+    same reason the report's own are: two words can own the same branch, and
+    summing their per-word counts would count it once per word.
     """
-    grouped = {}
+    rollups = {}
+    words_by_group = collections.defaultdict(list)
     for row in rows:
-        sort_key, label = _opener_group_key(row, group_by, generated_at)
-        group = grouped.setdefault(
-            (sort_key, label),
-            {"label": label, "rows": [],
-             "rollup": {"opener_count": 0, "branch_count": 0,
-                        "open_branch_count": 0, "done_branch_count": 0,
-                        "worker_count": 0}},
-        )
-        group["rows"].append(row)
-        rollup = group["rollup"]
+        key = _opener_group_key(row, group_by, generated_at)
+        rollup = rollups.setdefault(key, {
+            "opener_count": 0, "unfinished_opener_count": 0,
+            "active_opener_count": 0, "branch_count": 0,
+            "open_branch_count": 0, "done_branch_count": 0,
+            "worker_count": 0})
         rollup["opener_count"] += 1
+        rollup["unfinished_opener_count"] += row["state"] != "complete"
+        rollup["active_opener_count"] += row["state"] == "active"
         rollup["worker_count"] += row["worker_count"]
-    for group in grouped.values():
-        branch_count, open_branch_count = branch_totals(
-            [row["opener"] for row in group["rows"]]
-        )
-        group["rollup"]["branch_count"] = branch_count
-        group["rollup"]["open_branch_count"] = open_branch_count
-        group["rollup"]["done_branch_count"] = max(
-            0, branch_count - open_branch_count
-        )
+        words_by_group[key].append(row["opener"])
+    grouped = {}
+    for row in page_rows:
+        key = _opener_group_key(row, group_by, generated_at)
+        grouped.setdefault(key, {"label": key[1], "rows": [],
+                                 "rollup": rollups[key]})["rows"].append(row)
+    for key in grouped:
+        rollup = rollups[key]
+        branch_count, open_branch_count = branch_totals(words_by_group[key])
+        rollup["branch_count"] = branch_count
+        rollup["open_branch_count"] = open_branch_count
+        rollup["done_branch_count"] = max(0, branch_count - open_branch_count)
     return [grouped[key] for key in sorted(grouped)]
 
 
@@ -4294,6 +4298,14 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
         for row in collapsed:
             row["erd_summary"] = erd_summaries.get(row["opener"])
         collapsed = _sorted_openers(collapsed, opener_sort)
+        # A grouped list is paged in group order, so the first page opens on
+        # the first group: grouping a page cut from the plain sort would
+        # leave the active words on whichever page the sort put them.  The
+        # sort is stable, so the chosen order holds within each group.
+        group_by = request.filters.group_by
+        if group_by is not None and group_by != "none":
+            collapsed.sort(key=lambda row: _opener_group_key(
+                row, group_by, generated_at))
         data["matched_opener_count"] = len(collapsed)
         # Counted with each branch counted once: two words can own the same
         # branch, so summing their per-word counts double-counts precisely the
@@ -4334,11 +4346,10 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
             collapsed[offset:offset + limit] if limit is not None
             else collapsed[offset:]
         )
-        group_by = request.filters.group_by
         if group_by is not None and group_by != "none":
             data["summary_groups"] = _grouped_openers(
-                data["summary"], group_by, branch_totals, generated_at
-            )
+                data["summary"], collapsed, group_by, branch_totals,
+                generated_at)
         # Branch rows belong to one named word.  Emitting them for every word
         # would bury ten queued roots under the hundreds of branches they
         # spawned, which is the explosion this report exists to roll up.

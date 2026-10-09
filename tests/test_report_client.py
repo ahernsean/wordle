@@ -6953,7 +6953,7 @@ class ReportClientContract:
         self.assertEqual(
             self.page.eval_on_selector_all(
                 "[data-source-state]", "inputs => inputs.map(i => i.value)"),
-            ["queued", "active", "complete"])
+            ["active", "queued", "complete"])
         # iOS Safari shows hidden <option>s, so each report's own strategies
         # must be the only ones in the DOM.
         self.assertEqual(
@@ -6990,13 +6990,14 @@ class ReportClientContract:
           elsewhere: buildAPIURL(parsePageState({search:'?kind=queue&opener_state=queued'}))
         })""")
         # The list's own defaults: unfinished words, a page at a time.
-        defaults = "opener_state=queued%2Cactive"
+        defaults = "opener_state=active%2Cqueued"
         self.assertEqual(result["ungrouped"],
                          f"/api/view/openers?{defaults}&group_by=none&limit=100")
         # URLSearchParams percent-encodes the separator; the server decodes it.
         self.assertEqual(
             result["filtered"],
-            f"/api/view/openers?{defaults}&group_by=state&limit=100")
+            "/api/view/openers?opener_state=queued%2Cactive&group_by=state"
+            "&limit=100")
         self.assertEqual(
             result["sorted"],
             f"/api/view/openers?{defaults}&sort=branches&group_by=state&limit=100")
@@ -7112,6 +7113,8 @@ class ReportClientContract:
           const bucket = state => rows.filter(row => row.state === state);
           const rollup = group => ({
             opener_count: group.length,
+            unfinished_opener_count: group.filter(row => row.state !== 'complete').length,
+            active_opener_count: group.filter(row => row.state === 'active').length,
             branch_count: group.reduce((total, row) => total + row.branch_count, 0),
             open_branch_count: group.reduce((total, row) => total + row.open_branch_count, 0),
             done_branch_count: group.reduce((total, row) => total + row.done_branch_count, 0),
@@ -7128,8 +7131,13 @@ class ReportClientContract:
         first = " ".join(groups.first.locator("summary").inner_text().split())
         self.assertIn("queued", first)
         self.assertIn("2 words", first)
-        self.assertIn("1,336 branches", first)
-        self.assertIn("1,211 open", first)
+        # Open and done are said of the branches, and a group with no active
+        # word names no workers.
+        self.assertIn("2 words · 1,336 branches (1,211 open, 125 done)", first)
+        self.assertNotIn("worker", first)
+        # A group of finished words states no branch totals rather than zero.
+        second = " ".join(groups.nth(1).locator("summary").inner_text().split())
+        self.assertNotIn("branch", second)
         self.assertEqual(
             groups.first.locator("[data-grid-key='source-words/queued'] > .card")
             .count(), 2)
@@ -7139,6 +7147,32 @@ class ReportClientContract:
         # Every word lands in exactly one group.
         self.assertEqual(
             self.page.locator(".source-word-groups .card").count(), 3)
+
+    def test_a_group_header_names_only_what_applies_to_it(self):
+        self.open_sources()
+        headers = self.page.evaluate("""async () => {
+          const report = await (await fetch('/api/view/openers')).json();
+          const rows = report.data.summary;
+          const rollup = (counts) => ({opener_count: 3, branch_count: 40,
+            open_branch_count: 30, done_branch_count: 10, worker_count: 2,
+            ...counts});
+          report.data.summary_groups = [
+            {label: 'active', rows: rows.slice(0, 1),
+             rollup: rollup({unfinished_opener_count: 3, active_opener_count: 3})},
+            {label: 'priority 5', rows: rows.slice(1, 2),
+             rollup: rollup({unfinished_opener_count: 1, active_opener_count: 0,
+                             worker_count: 0})},
+          ];
+          applyReport(report, null,
+            parsePageState({search:'?kind=openers&group_by=state'}));
+          return [...document.querySelectorAll('.source-word-groups > details > summary')]
+            .map(node => node.innerText.replace(/\\s+/g, ' ').trim());
+        }""")
+        self.assertEqual(headers, [
+            "active 3 words · 40 branches (30 open, 10 done) · 2 workers",
+            "priority 5 3 words · 40 branches of 1 unfinished word "
+            "(30 open, 10 done)",
+        ])
 
     def test_sources_card_opens_the_word_report_where_its_erd_lives(self):
         # The card leads to the word report: that is where a word's ERD,
@@ -7350,7 +7384,7 @@ class ReportClientContract:
         # than leaving the server to guess: a pasted URL reproduces the view.
         # The list of every opener defaults to the unfinished ones; a named
         # word's view has no state default.  Both are paged by default.
-        listed = "/api/view/openers?opener_state=queued%2Cactive&group_by=state"
+        listed = "/api/view/openers?opener_state=active%2Cqueued&group_by=state"
         self.assertEqual(result["explicit"], listed + "&limit=100")
         self.assertEqual(
             result["word"],
@@ -7367,7 +7401,7 @@ class ReportClientContract:
         self.page.evaluate(
             "__reportClient.setState(parsePageState({search:'?kind=openers'}))")
         state = self.page.evaluate("__reportClient.getState()")
-        self.assertEqual(state["opener_state"], ["queued", "active"])
+        self.assertEqual(state["opener_state"], ["active", "queued"])
         # The page size is the report's own: it reaches the request, not the
         # state another report would inherit.
         self.assertIsNone(state["limit"])
@@ -7400,7 +7434,7 @@ class ReportClientContract:
         self.page.locator("[data-kind=openers]").click()
         self.assertEqual(
             self.page.evaluate("__reportClient.getState().opener_state"),
-            ["queued", "active"])
+            ["active", "queued"])
 
     def test_worker_cards_name_the_scheduling_role_and_why(self):
         preferred = self.page.locator('.card.worker[data-identity="worker-0"]')

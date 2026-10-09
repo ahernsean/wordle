@@ -3863,6 +3863,36 @@ class OpenerReportTest(unittest.TestCase):
             sum(len(group["rows"]) for group in groups),
             len(self._openers()["summary"]))
 
+    def test_a_grouped_list_is_paged_in_group_order(self):
+        # ZONAL is the only active word and sorts last by every default, so a
+        # page cut before grouping would show it nowhere near the top.
+        self._queue_words(("abbey", 5, 1), ("crane", 3, 1), ("zonal", 1, 1))
+        queue = self._open_queue()
+        queue._conn.execute(
+            "UPDATE opener_work SET state = 'active' WHERE opener = 'zonal'")
+        queue._conn.commit()
+        queue.close()
+
+        def page(offset):
+            data = self._openers(group_by="state", limit=2,
+                                 opener_offset=offset, sort="word")
+            return [[(group["label"], [row["opener"] for row in group["rows"]])
+                     for group in data["summary_groups"]]]
+
+        self.assertEqual(page(0), [[("active", ["zonal"]),
+                                    ("queued", ["abbey"])]])
+        # The chosen sort still orders the words within a group.
+        self.assertEqual(page(2), [[("queued", ["crane"])]])
+
+        # A group's header covers the whole group, not the page it is on.
+        groups = {group["label"]: group["rollup"] for group in self._openers(
+            group_by="state", limit=2, sort="word")["summary_groups"]}
+        self.assertEqual(
+            {label: (rollup["opener_count"], rollup["unfinished_opener_count"],
+                     rollup["active_opener_count"], rollup["branch_count"])
+             for label, rollup in groups.items()},
+            {"active": (1, 1, 1, 1), "queued": (2, 2, 0, 2)})
+
     def test_opener_time_grouping_boundaries(self):
         generated_at = 1_787_270_400  # 21 Aug 2026 00:00 UTC (Friday)
         base_row = {"state": "complete", "worker_count": 0,
