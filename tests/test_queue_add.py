@@ -1247,6 +1247,41 @@ class TestEachWordIsReportedOnce(unittest.TestCase):
                       '1 word already solved.', output)
 
 
+class TestReviewFindings(unittest.TestCase):
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.queue = ERDQueue(os.path.join(self._tmp.name, 'queue.sqlite3'))
+        self.addCleanup(self.queue.close)
+
+    def test_a_branch_another_opener_queued_still_counts_as_attached(self):
+        shared = encode_subset(['cigar', 'rebut'])
+        own = encode_subset(['sissy', 'humph'])
+        self.queue.add_pending_many([(own, 2, 10, 'salet', 0)])
+        self.queue.add_pending_many([(shared, 2, 20, 'crane', 0)])
+
+        outcome = self.queue.add_pending_many([(shared, 2, 10, 'salet', 1)])
+
+        _request_id, _priority, created, attached = outcome['salet']
+        self.assertFalse(created)
+        self.assertEqual(attached, 1)
+        again = self.queue.add_pending_many([(shared, 2, 10, 'salet', 1)])
+        self.assertEqual(again['salet'][3], 0)
+
+    def test_a_word_with_every_group_filtered_out_still_gets_a_line(self):
+        output = StringIO()
+        with redirect_stdout(output):
+            erd_search.cmd_queue_add(_make_args(
+                self._tmp.name, word=[LARGE_BRANCH_WORD], max_branch_size=1))
+        self.assertIn(f'{LARGE_BRANCH_WORD.upper()}: every response group has '
+                      f'fewer than 2 answer words or more than '
+                      f'--max-branch-size 1; nothing to queue.',
+                      output.getvalue())
+        self.assertIn('Unchanged: 1 word with nothing large enough to queue.',
+                      output.getvalue())
+
+
 class TestCountNoun(unittest.TestCase):
 
     def test_the_noun_agrees_with_the_count(self):

@@ -1117,7 +1117,7 @@ class QueueAddReportingTest(unittest.TestCase):
         self.queue.status_by_branch_keys.return_value = {}
         # A new request for whichever opener the rows belong to.
         self.queue.add_pending_many.side_effect = (
-            lambda rows: {rows[0][3]: (1, rows[0][2], True)})
+            lambda rows: {rows[0][3]: (1, rows[0][2], True, len(rows))})
         self.response_cache = Mock()
         self.response_cache.group_words.return_value = {0: ["cigar", "rebut"]}
         self.arguments = SimpleNamespace(

@@ -464,6 +464,13 @@ def cmd_queue_add(args):
 
             if not rows:
                 word_plans[word] = None
+                skip_message_by_word.setdefault(word, (
+                    f'{word.upper()}: every response group has fewer than 2 '
+                    f'answer words or more than --max-branch-size '
+                    f'{args.max_branch_size:,}; nothing to queue.'
+                    if args.max_branch_size is not None else
+                    f'{word.upper()}: every response group has fewer than 2 '
+                    f'answer words; nothing to queue.'))
                 continue
 
             branch_keys = [branch_key for branch_key, _count, _code in rows]
@@ -486,12 +493,7 @@ def cmd_queue_add(args):
                     row for row in rows if row[0] not in already_cached_keys]
                 already_solved_keys = already_cached_keys
 
-            already_queued_keys = set(
-                queue.status_by_branch_keys(
-                    [branch_key for branch_key, _count, _code
-                     in rows_to_queue]))
-            word_plans[word] = (rows_to_queue, already_queued_keys,
-                               already_solved_keys)
+            word_plans[word] = (rows_to_queue, already_solved_keys)
 
         # Each word is one of: skipped (nothing large enough to search),
         # already solved (every branch cached), already queued (it has an
@@ -578,25 +580,22 @@ def cmd_queue_add(args):
             plan = word_plans[word]
             if plan is None:
                 skipped_words += 1
-                message = skip_message_by_word.get(word)
-                if message is not None:
-                    print(message)
+                print(skip_message_by_word[word])
                 continue
             if is_solved(word):
                 solved_words += 1
                 print(f'{word.upper()}: already solved.')
                 continue
 
-            rows_to_queue, already_queued_keys, already_solved_keys = plan
+            rows_to_queue, already_solved_keys = plan
             priority = (fallback_rungs[word] if word in existing_requests
                         else ladder.get(word, OPENER_PRIORITY_MIN))
             outcome = queue.add_pending_many([
                 (branch_key, count, priority, word, code)
                 for branch_key, count, code in rows_to_queue])[word]
-            _request_id, priority, created = outcome
+            _request_id, priority, created, added = outcome
             if not created:
                 kept_words += 1
-                added = len(rows_to_queue) - len(already_queued_keys)
                 branches_added_to_kept += added
                 extra = (f'; added {count_noun(added, "branch", "branches")} '
                          f'to it' if added else '')
