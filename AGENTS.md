@@ -865,6 +865,16 @@ into a sentence:
 
 In Python, use the `:,` format spec (`f"{count:,}"`).
 
+### A count agrees with its noun
+
+Never hedge a plural: `1 branch`, `3 branches`, never `branch(es)` or
+`word(s)`.  The count is known when the line is printed, so print the word that
+fits it, and make the verb agree too (`1 branch is`, `2 branches are`).
+`wordle_ui.count_noun(count, singular, plural)` returns the count with
+separators and the agreeing noun; it is importable from everywhere, since
+`wordle_ui` imports nothing.  Where no count is involved, rephrase rather than
+hedge: "every pattern of each word", not "all patterns for the word(s)".
+
 ### Dates run day, month, year
 
 `1 Aug 2026`, never `Aug 1, 2026`. The American form orders the fields

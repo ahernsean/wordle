@@ -85,7 +85,7 @@ class TestQueueReconcileOrphanedOwnership(unittest.TestCase):
         queue.close()
 
         output = self._run(_make_args(self.queue_path))
-        self.assertIn('Demoted 1 orphaned owned branch(es)', output)
+        self.assertIn('Demoted 1 orphaned owned branch to direct', output)
         self.assertIn('claimable without a live opener-work membership',
                        output)
         self.assertIn(str(branch_id), output)

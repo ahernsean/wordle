@@ -119,6 +119,6 @@ for size in BRANCH_SIZES:
 
 print('\ndone', flush=True)
 if mismatches:
-    print(f'\n{len(mismatches)} branch(es) diverged between matrix-on and '
+    print(f'\n{len(mismatches):,} {"branch" if len(mismatches) == 1 else "branches"} diverged between matrix-on and '
           f'matrix-off: {mismatches}', flush=True)
     sys.exit(1)

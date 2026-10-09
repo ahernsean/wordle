@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from wordle_ui import count_noun
+
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 import hashlib
@@ -1799,7 +1801,7 @@ def _render_opener_sections(report, width, display_order):
             f"{row['branch_status']}/{row['branch_worker_status'] or '-'} "
             f"requested={row['requested_priority']} "
             f"effective={row['branch_effective_priority']} "
-            f"({shared}{row['owner_count']} owner(s)) "
+            f"({shared}{count_noun(row['owner_count'], 'owner')}) "
             f"root={row['root_pattern']}{parent} "
             f"workers={row['worker_count']}",
             width,

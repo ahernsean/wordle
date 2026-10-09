@@ -900,7 +900,7 @@ def scheduling_role_reason(scheduling_role):
     """
     return {
         "preferred": "serving its preferred opener work",
-        "fallback": "serving fallback work: preferred opener(s) had no "
+        "fallback": "serving fallback work: no preferred opener had a "
                     "claimable bundle at the last claim boundary",
         "direct": "direct branch work with no live opener-work ownership",
     }.get(scheduling_role, "unattributed")

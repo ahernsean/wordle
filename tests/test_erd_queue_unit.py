@@ -371,7 +371,7 @@ class TestBranchLifecycle(_TmpQueue):
             conn.close()
 
         with self.assertRaisesRegex(RuntimeError,
-                                    "pending_branches is missing column"):
+                                    "pending_branches is missing (a column|columns)"):
             ERDQueue(queue_path)
 
     def test_opener_work_migration_preserves_opener_pattern_idempotently(self):
@@ -1237,7 +1237,7 @@ class TestClaimNext(_TmpQueue):
         violations = self.q.check_opener_work_invariants()
 
         self.assertIn(
-            '1 open branch(es) at or above legacy priority 1,000,000: crane '
+            '1 open branch at or above legacy priority 1,000,000: crane '
             'without live membership', violations)
         self.q._conn.execute(
             'UPDATE active_branches SET priority = 0 WHERE branch_id = ?',

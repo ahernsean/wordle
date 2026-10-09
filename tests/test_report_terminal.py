@@ -3009,7 +3009,7 @@ class TerminalUtilityTest(unittest.TestCase):
         output = report_terminal.render_report(report, width=120)
         self.assertIn("Openers: 1 of 2", output)
         self.assertIn("Ownership:", output)
-        self.assertIn("shared, 2 owner(s)", output)
+        self.assertIn("shared, 2 owners", output)
         # RAISE is in the answer set here, so both the table row and the
         # ownership row mark it -- the same fact the web client notches.
         self.assertEqual(output.count("RAISE*"), 2)

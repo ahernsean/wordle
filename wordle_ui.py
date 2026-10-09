@@ -14,6 +14,13 @@ def _is_gray_char(ch: str) -> bool:
     return ch == '0' or ch == '_' or ch.lower() == 'x' or not ch.isalnum()
 
 
+def count_noun(count: int, singular: str, plural: str = None) -> str:
+    """`count`, separated by thousands, with the noun that agrees with it:
+    '1 branch', '3 branches'.  plural defaults to singular + 's'."""
+    noun = singular if count == 1 else (plural or singular + 's')
+    return f'{count:,} {noun}'
+
+
 def parse_pattern(s: str) -> int:
     """Parse a 5-character response string to its integer code.
 

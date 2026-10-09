@@ -145,7 +145,7 @@ class TestQueueOpenerPriority(unittest.TestCase):
         output = self._run_branch_priority(_make_args(
             self.queue_path, opener_word='salet', priority=9))
 
-        self.assertIn('1 ownerless open branch(es)', output)
+        self.assertIn('1 ownerless open branch for', output)
         self.assertIn('ownerless', output)
         queue = ERDQueue(self.queue_path)
         self.addCleanup(queue.close)
@@ -170,7 +170,7 @@ class TestQueueOpenerPriority(unittest.TestCase):
         queue.close()
 
         output = self._run(_make_args(self.queue_path, priority=2))
-        self.assertIn('all 1 opener-work request(s) are complete', output)
+        self.assertIn('its one opener-work request is complete', output)
         self.assertNotIn('no opener-work request found', output)
 
     def test_completed_request_does_not_make_later_request_ambiguous(self):
@@ -219,7 +219,7 @@ class TestQueueOpenerPriority(unittest.TestCase):
         for opener_work_id in ids:
             self.assertIn(f'id {opener_work_id}', output)
         self.assertIn('direct', output)
-        self.assertIn('branch(es)', output)
+        self.assertRegex(output, r'\d+ branch(es)?  ')
         self.assertIn('queued', output)
 
         queue = ERDQueue(self.queue_path)

@@ -133,6 +133,7 @@ from erd_queue import (
 )
 from erd_reduction import reduce_opener
 import erd_swarm
+from wordle_ui import count_noun
 
 ANSWER_FILE = DEFAULT_ANSWER_LIST_PATH
 WORDS_FILE = DEFAULT_CANDIDATE_LIST_PATH
@@ -361,8 +362,12 @@ def cmd_queue_add(args):
     branch shared with another opener's request takes the higher of their
     priorities.  Branches with reusable cached results are
     already solved and are not queued, unless --delete-erd-cache is given.
-    For each word, reports how many unresolved branches are new versus already
-    queued, and how many response groups were already solved.
+    Each word gets one line saying what became of it, decided at the word
+    before any branch: already solved (every branch cached), already queued
+    (its request stays where it is), or queued now at a priority with the
+    branches it has to solve.  The closing summary reports the change the
+    command made -- the words and branches it queued -- and counts the words
+    it left unchanged.
     --delete-erd-cache deletes each queued branch's existing ERD cache entry
     first, so it gets recomputed instead of being claimed and immediately
     marked done as already-cached.  For branches the queue already completed
@@ -385,9 +390,10 @@ def cmd_queue_add(args):
     invalid_words = [word for word in words_to_process
                      if len(word) != 5 or word not in candidate_words]
     if invalid_words:
-        invalid_display = ', '.join(sorted(set(invalid_words)))
+        invalid = sorted(set(invalid_words))
+        noun = 'word' if len(invalid) == 1 else 'words'
         raise ValueError(
-            f'invalid candidate word(s): {invalid_display}; expected '
+            f'invalid candidate {noun}: {", ".join(invalid)}; expected '
             f'five-letter words from {WORDS_FILE}')
 
     priority_words = {w.strip().lower() for w in (args.priority_words or [])}
@@ -415,10 +421,6 @@ def cmd_queue_add(args):
     # is solved at ROOT_BUDGET - 1 == GAME_GUESSES - 1.
     branch_budget = GAME_GUESSES - 1
 
-    n_new = 0
-    n_already_requested = 0
-    n_already_queued = 0
-    n_already_solved = 0
     n_reset = 0
     n_busy = 0
     try:
@@ -438,7 +440,8 @@ def cmd_queue_add(args):
                 if len(branch) < 2:
                     skip_message_by_word[word] = (
                         f'{word.upper()} {fmt_pattern(code)}: '
-                        f'{len(branch)} answer word(s) — nothing to queue.')
+                        f'{count_noun(len(branch), "answer word", "answer words")}'
+                        f' — nothing to queue.')
                     rows = []
                 elif (args.max_branch_size is not None
                       and len(branch) > args.max_branch_size):
@@ -461,6 +464,13 @@ def cmd_queue_add(args):
 
             if not rows:
                 word_plans[word] = None
+                skip_message_by_word.setdefault(word, (
+                    f'{word.upper()}: every response group has fewer than 2 '
+                    f'answer words or more than --max-branch-size '
+                    f'{args.max_branch_size:,}; nothing to queue.'
+                    if args.max_branch_size is not None else
+                    f'{word.upper()}: every response group has fewer than 2 '
+                    f'answer words; nothing to queue.'))
                 continue
 
             branch_keys = [branch_key for branch_key, _count, _code in rows]
@@ -483,30 +493,29 @@ def cmd_queue_add(args):
                     row for row in rows if row[0] not in already_cached_keys]
                 already_solved_keys = already_cached_keys
 
-            already_queued_keys = set(
-                queue.status_by_branch_keys(
-                    [branch_key for branch_key, _count, _code
-                     in rows_to_queue]))
-            word_plans[word] = (rows_to_queue, already_queued_keys,
-                               already_solved_keys)
+            word_plans[word] = (rows_to_queue, already_solved_keys)
 
-        # A word with an unfinished request is already on the ladder.  Its
-        # branches join that request at its priority, so it takes no rung.
+        # Each word is one of: skipped (nothing large enough to search),
+        # already solved (every branch cached), already queued (it has an
+        # unfinished request, which keeps its place), or new.  Only new words
+        # take a rung, so the ladder never seats a word that queues nothing.
         existing_requests = {
             word: request for word in words_to_process
             if (request := queue.unfinished_opener_request(word)) is not None}
-        any_rows_to_queue = any(
-            plan is not None and plan[0]
-            for word, plan in word_plans.items()
-            if word not in existing_requests)
 
-        laddered_words = [word for word in words_to_process
-                          if (not priority_words or word in priority_words)
-                          and word not in existing_requests]
+        def is_solved(word):
+            plan = word_plans[word]
+            return plan is not None and not plan[0]
+
+        new_words = [word for word in words_to_process
+                     if word_plans[word] is not None and not is_solved(word)
+                     and word not in existing_requests]
+        laddered_words = [word for word in new_words
+                          if not priority_words or word in priority_words]
         lowest_queued = queue.lowest_unfinished_opener_priority()
         shift = 0
         if (args.priority is None and lowest_queued is not None
-                and laddered_words and any_rows_to_queue):
+                and laddered_words):
             lowest_queued, shift = _make_room_for_append(
                 queue, lowest_queued, args.priority_step, len(laddered_words))
         top_priority = ladder_top_priority(
@@ -542,8 +551,9 @@ def cmd_queue_add(args):
                   f'{ladder[laddered_words[-1]]:,}{placement}.')
             floor = min(ladder.values())
             headroom = floor - OPENER_PRIORITY_MIN
-            print(f'{headroom:,} priority value(s) of headroom remain below it, '
-                  f'down to {OPENER_PRIORITY_MIN:,}.')
+            print(f'{count_noun(headroom, "priority value", "priority values")}'
+                  f' of headroom {"remains" if headroom == 1 else "remain"} '
+                  f'below it, down to {OPENER_PRIORITY_MIN:,}.')
             on_floor = sum(1 for word in laddered_words if ladder[word] == floor)
             if args.priority_step and on_floor > 1:
                 # Distinct rungs only collide once the ladder clamps, so a tie here
@@ -557,69 +567,88 @@ def cmd_queue_add(args):
                       f'with queue opener-priority, or pass --priority to place '
                       f'this batch deliberately.')
 
-        # Second pass: assign each word's rung and write it, now that the
-        # ladder (and any reladdering) has been decided.
+        # Second pass: write each word and say, in one line, what became of
+        # it.  What add_pending_many reports is what happened: a word seen as
+        # already queued can have finished in the meantime.
+        queued_words = []
+        queued_branches = 0
+        kept_words = 0
+        branches_added_to_kept = 0
+        solved_words = 0
+        skipped_words = 0
         for word in words_to_process:
             plan = word_plans[word]
             if plan is None:
-                message = skip_message_by_word.get(word)
-                if message is not None:
-                    print(message)
+                skipped_words += 1
+                print(skip_message_by_word[word])
+                continue
+            if is_solved(word):
+                solved_words += 1
+                print(f'{word.upper()}: already solved.')
                 continue
 
-            rows_to_queue, already_queued_keys, already_solved_keys = plan
+            rows_to_queue, already_solved_keys = plan
             priority = (fallback_rungs[word] if word in existing_requests
                         else ladder.get(word, OPENER_PRIORITY_MIN))
-            rows_with_priority = [
+            outcome = queue.add_pending_many([
                 (branch_key, count, priority, word, code)
-                for branch_key, count, code in rows_to_queue]
-            outcome = (queue.add_pending_many(rows_with_priority)[word]
-                       if rows_with_priority else None)
+                for branch_key, count, code in rows_to_queue])[word]
+            _request_id, priority, created, added = outcome
+            if not created:
+                kept_words += 1
+                branches_added_to_kept += added
+                extra = (f'; added {count_noun(added, "branch", "branches")} '
+                         f'to it' if added else '')
+                print(f'{word.upper()}: already queued at priority '
+                      f'{priority:,}{extra}.')
+                continue
+            queued_words.append((word, priority))
+            queued_branches += len(rows_to_queue)
+            solved_note = (
+                f' ({count_noun(len(already_solved_keys), "response group", "response groups")}'
+                f' already solved)' if already_solved_keys else '')
+            again = ('; it finished while this ran' if word in existing_requests
+                     else '')
+            print(f'{word.upper()}: queued at priority {priority:,}: '
+                  f'{count_noun(len(rows_to_queue), "branch", "branches")} '
+                  f'to solve{solved_note}{again}.')
 
-            word_already_queued = len(already_queued_keys)
-            word_new = len(rows_to_queue) - word_already_queued
-            word_already_solved = len(already_solved_keys)
-            n_new += word_new
-            n_already_queued += word_already_queued
-            n_already_solved += word_already_solved
-            if not rows_to_queue:
-                response_group_label = (
-                    'response group' if word_already_solved == 1
-                    else 'response groups')
-                print(f'{word.upper()}: already solved — '
-                      f'{word_already_solved:,} {response_group_label} already '
-                      f'cached; nothing queued.')
-            else:
-                print(f'{word.upper()}: {len(rows_to_queue):,} branch(es) '
-                      f'— {word_new:,} new, '
-                      f'{word_already_queued:,} already queued, '
-                      f'{word_already_solved:,} already solved.')
-            if outcome is not None and not outcome[2]:
-                n_already_requested += 1
-                print(f'  {word.upper()} was already queued at priority '
-                      f'{outcome[1]:,}; it stays there.  Use queue '
-                      f'opener-priority to move it.')
-            elif outcome is not None and word in existing_requests:
-                print(f'  {word.upper()} finished while this ran; queued '
-                      f'again at priority {outcome[1]:,}, below queued work.')
-
-        total = queue.total_branches()
-        n_added = n_new + n_already_queued
         if n_reset:
-            print(f'\n{n_reset:,} completed branch(es) cleared for recompute '
-                  f'(claims and active state discarded with the cache entry).')
+            print(f'\n{count_noun(n_reset, "completed branch", "completed branches")}'
+                  f' cleared for recompute (claims and active state discarded '
+                  f'with the cache entry).')
         if n_busy:
-            print(f'{n_busy:,} branch(es) are being solved right now and were '
-                  f'left untouched, cache entry included.  Re-run once they '
-                  f'finish to recompute them.')
-        print(f'\n{n_added:,} branch(es) queued across '
-              f'{len(words_to_process):,} word(s): {n_new:,} new, '
-              f'{n_already_queued:,} already queued, '
-              f'{n_already_solved:,} already solved.  '
-              f'Queue total: {total:,}.')
-        if n_already_requested:
-            print(f'{n_already_requested:,} word(s) were already queued and '
-                  f'kept their place.')
+            print(f'{count_noun(n_busy, "branch is", "branches are")} being '
+                  f'solved right now and {"was" if n_busy == 1 else "were"} left '
+                  f'untouched, cache entry included.  Re-run once '
+                  f'{"it finishes to recompute it" if n_busy == 1 else "they finish to recompute them"}.')
+        print()
+        if queued_words:
+            priorities = [priority for _word, priority in queued_words]
+            span = (f'priority {max(priorities):,}'
+                    if max(priorities) == min(priorities)
+                    else f'priorities {max(priorities):,} down to '
+                         f'{min(priorities):,}')
+            print(f'Queued {count_noun(len(queued_words), "word", "words")} '
+                  f'({count_noun(queued_branches, "branch", "branches")}) at '
+                  f'{span}.')
+        else:
+            print('Queued no new words.')
+        unchanged = [
+            (kept_words, 'already queued, left in place'),
+            (solved_words, 'already solved'),
+            (skipped_words, 'with nothing large enough to queue'),
+        ]
+        unchanged_text = '; '.join(
+            f'{count_noun(count, "word", "words")} {label}'
+            for count, label in unchanged if count)
+        if unchanged_text:
+            print(f'Unchanged: {unchanged_text}.')
+        if branches_added_to_kept:
+            print(f'Added {count_noun(branches_added_to_kept, "branch", "branches")}'
+                  f' to words that were already queued.')
+        if kept_words:
+            print('Use queue opener-priority to move an already-queued word.')
 
     except KeyboardInterrupt:
         print('\nInterrupted.')
@@ -776,7 +805,7 @@ def cmd_queue_priority(args):
             return
         finally:
             queue.close()
-        print(f'{updated:,} ownerless open branch(es) for '
+        print(f'{count_noun(updated, "ownerless open branch", "ownerless open branches")} for '
               f'{args.opener_word.strip().upper()}: priority set to '
               f'{args.priority}.')
         return
@@ -858,8 +887,11 @@ def cmd_queue_opener_priority(args):
                         if row['opener'] == word]
             if not open_ids:
                 if all_rows:
-                    print(f'{word.upper()}: all {len(all_rows)} '
-                          f'opener-work request(s) are complete.')
+                    print(f'{word.upper()}: '
+                          + (f'its one opener-work request is complete.'
+                             if len(all_rows) == 1 else
+                             f'all {len(all_rows):,} opener-work requests are '
+                             f'complete.'))
                 else:
                     print(f'{word.upper()}: no opener-work request found.')
                 return
@@ -874,7 +906,7 @@ def cmd_queue_opener_priority(args):
                     print(f'  id {candidate_id}  '
                           f'priority {row["requested_priority"]}  '
                           f'{row["state"]}  {row["root_count"]} direct, '
-                          f'{row["branch_count"]} branch(es)  '
+                          f'{count_noun(row["branch_count"], "branch", "branches")}  '
                           f'requested {requested_at}')
                 return
             opener_work_id = open_ids[0]
@@ -1097,8 +1129,8 @@ def _check_opener_work_invariants(queue):
     """Log any check_opener_work_invariants() violations found right now."""
     violations = queue.check_opener_work_invariants()
     if violations:
-        logger.warning('Opener-work invariant check found %d violation(s):',
-                       len(violations))
+        logger.warning('Opener-work invariant check found %s:',
+                       count_noun(len(violations), 'violation'))
         for violation in violations:
             logger.warning('  %s', violation)
 
@@ -1333,7 +1365,8 @@ def cmd_run(args):
             # Liveness-gated reclaim never frees work held by a live worker.
             freed = q.reclaim_stale_claims(args.worker_timeout_seconds)
             if freed:
-                logger.info('Reclaimed %d stale candidate claim(s).', freed)
+                logger.info('Reclaimed %s.',
+                            count_noun(freed, 'stale candidate claim'))
             counts = q.counts_by_status()
             in_flight = len(q.branches_in_progress())
 
@@ -1382,8 +1415,8 @@ def _reap_worker(queue, worker_id: int):
     freed = queue.reclaim_claims_of_worker(name)
     queue.clear_heartbeat(name)
     if freed:
-        logger.info('Reaped worker %d: freed %d candidate claim(s).',
-                    worker_id, freed)
+        logger.info('Reaped worker %d: freed %s.', worker_id,
+                    count_noun(freed, 'candidate claim'))
 
 
 def _hint_cache_is_usable(args) -> bool:
@@ -1439,7 +1472,7 @@ def cmd_reset_stale(args):
     queue = ERDQueue(args.queue)
     n = queue.reset_stale_in_progress()
     queue.close()
-    print(f'Reset {n} in_progress row(s) to pending.')
+    print(f'Reset {count_noun(n, "in_progress row")} to pending.')
 
 
 # ---------------------------------------------------------------------------
@@ -1453,7 +1486,7 @@ def cmd_queue_reconcile_orphaned_ownership(args):
     if not branch_ids:
         print('No orphaned owned branches found.')
         return
-    print(f'Demoted {len(branch_ids)} orphaned owned branch(es) to direct '
+    print(f'Demoted {count_noun(len(branch_ids), "orphaned owned branch", "orphaned owned branches")} to direct '
           f'(claimable without a live opener-work membership): '
           f'{", ".join(str(b) for b in branch_ids)}')
 
@@ -1507,7 +1540,7 @@ def cmd_reconcile_opener_erds(args):
     finally:
         cache.close()
         queue.close()
-    print(f'{len(owing):,} opener(s) owed an ERD: stored {len(stored):,}, '
+    print(f'{count_noun(len(owing), "opener")} owed an ERD: stored {len(stored):,}, '
           f'finished {len(finished):,}.')
     if infeasible:
         print(f'Infeasible (done, no ERD): {", ".join(infeasible)}')
@@ -1742,7 +1775,7 @@ def main():
     p_qa.add_argument('--pattern', metavar='PAT',
                       help='Only add this specific response pattern for --word '
                            '(5 chars: g=green y=yellow -=gray).  '
-                           'Omit to add all patterns for the word(s).')
+                           'Omit to add every pattern of each word.')
     p_qa.add_argument('--priority', type=int, default=None, metavar='N',
                       help='Priority of the last word on the ladder.  Higher '
                            'numbers are worked sooner.  Omit to append the '

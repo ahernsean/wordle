@@ -87,7 +87,7 @@ class ReconcileOpenerERDsTest(unittest.TestCase):
 
         output = self._run()
 
-        self.assertIn("0 opener(s) owed", output)
+        self.assertIn("0 openers owed", output)
 
     def test_an_opener_whose_groups_are_unsettled_is_reported_and_not_stored(self):
         # HOWDY puts both answers in one group, which no result settles.
