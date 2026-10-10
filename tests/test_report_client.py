@@ -7205,20 +7205,30 @@ class ReportClientContract:
           report.data.summary_groups = [
             {label: 'active', rows: rows.slice(0, 1),
              rollup: rollup({unfinished_opener_count: 3, active_opener_count: 3})},
-            {label: 'priority 5', rows: rows.slice(1, 2),
-             rollup: rollup({unfinished_opener_count: 1, active_opener_count: 0,
-                             worker_count: 0})},
+            {label: '[0, 1 hour)', rows: rows.slice(1, 2),
+             rollup: rollup({unfinished_opener_count: 1, active_opener_count: 1})},
           ];
           applyReport(report, null,
             parsePageState({search:'?kind=openers&group_by=state'}));
           return [...document.querySelectorAll('.source-word-groups > details > summary')]
-            .map(node => node.innerText.replace(/\\s+/g, ' ').trim());
+            .map(node => ({text: node.textContent,
+                           labelWraps: getComputedStyle(
+                             node.querySelector('strong')).whiteSpace}));
         }""")
-        self.assertEqual(headers, [
+        self.assertEqual(
+            [" ".join(header["text"].split()) for header in headers], [
             "active 3 words · 40 branches (30 open, 10 done) · 2 workers",
-            "priority 5 3 words · 40 branches of 1 unfinished word "
-            "(30 open, 10 done)",
+            # Among finished words, the branches are the unfinished ones'.
+            "[0, 1 hour) 3 words · 1 unfinished: 40 branches "
+            "(30 open, 10 done) · 2 workers",
         ])
+        # A count never parts from the word it counts, and a label never
+        # breaks inside itself.
+        text = headers[1]["text"]
+        for phrase in ("3 words", "1 unfinished", "40 branches", "30 open",
+                       "10 done", "2 workers"):
+            self.assertIn(phrase.replace(" ", "\u00a0"), text)
+        self.assertEqual({header["labelWraps"] for header in headers}, {"nowrap"})
 
     def test_sources_card_opens_the_word_report_where_its_erd_lives(self):
         # The card leads to the word report: that is where a word's ERD,

@@ -117,6 +117,7 @@
     .status-line[hidden] { display:none; }
     .status-line > .label { color:var(--dim); }
     .statuses { display:flex; flex-wrap:wrap; gap:.5rem; align-items:baseline; }
+    .group-label { white-space:nowrap; }
     .statuses label { display:inline-flex; gap:.25rem; align-items:center; white-space:nowrap; }
     .statuses label[hidden] { display:none; }
     .statuses label.inert { opacity:.45; }
@@ -949,13 +950,17 @@
     // A group's header covers the whole group, not the page.  Branch totals
     // count only unfinished words, so a group of finished words states none
     // rather than zero, and workers are named only where a word is active.
+    // A count and the word it counts never part across a line break.
+    function countNoun(count,singular,plural=singular+"s"){return numText(count)+"\u00a0"+(count===1?singular:plural);}
     function sourceGroupRollupText(rollup){
-      const parts=[numText(rollup.opener_count)+(rollup.opener_count===1?" word":" words")];
+      const parts=[countNoun(rollup.opener_count,"word")];
       if(rollup.unfinished_opener_count){
-        const unfinished=rollup.unfinished_opener_count<rollup.opener_count?" of "+numText(rollup.unfinished_opener_count)+" unfinished "+(rollup.unfinished_opener_count===1?"word":"words"):"";
-        parts.push(numText(rollup.branch_count)+(rollup.branch_count===1?" branch":" branches")+unfinished+" ("+numText(rollup.open_branch_count)+" open, "+numText(rollup.done_branch_count)+" done)");
+        // In a group that also holds finished words, the branches belong to
+        // its unfinished ones, so those are counted first.
+        const branches=countNoun(rollup.branch_count,"branch","branches")+" ("+countNoun(rollup.open_branch_count,"open","open")+", "+countNoun(rollup.done_branch_count,"done","done")+")";
+        parts.push(rollup.unfinished_opener_count<rollup.opener_count?countNoun(rollup.unfinished_opener_count,"unfinished","unfinished")+": "+branches:branches);
       }
-      if(rollup.active_opener_count)parts.push(numText(rollup.worker_count)+(rollup.worker_count===1?" worker":" workers"));
+      if(rollup.active_opener_count)parts.push(countNoun(rollup.worker_count,"worker"));
       return parts.join(" · ");
     }
     function sourceGroupProgress(row,summary){
@@ -2202,7 +2207,7 @@
           details.open=!collapsedResponseGroups.has(groupKey);
           details.addEventListener("toggle",()=>details.open?collapsedResponseGroups.delete(groupKey):collapsedResponseGroups.add(groupKey));
           const rollup=group.rollup,summaryEl=element("summary","clickable");
-          summaryEl.append(element("strong","",group.label),element("span","dim"," "+sourceGroupRollupText(rollup)));
+          summaryEl.append(element("strong","group-label",group.label),element("span","dim"," "+sourceGroupRollupText(rollup)));
           const grid=gridElement("source-words/"+group.label);
           for(const row of ordered(group.rows,"opener","source-words/"+group.label,state))grid.append(wordCard(row));
           details.append(summaryEl,grid);
