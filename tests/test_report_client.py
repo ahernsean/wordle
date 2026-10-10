@@ -7261,6 +7261,29 @@ class ReportClientContract:
         # Still searching: how much of it is solved, not a number that moves.
         self.assertIn("ERD pending · 96/148 groups solved", cards["SALET"])
 
+    def test_an_opener_page_never_parts_a_count_from_its_word(self):
+        # The ERD fact is the one on a card that wraps, so it may break only
+        # between its parts; so may the filter note and a pager's caption.
+        self.open_sources()
+        texts = self.page.evaluate("""async () => {
+          const report = await (await fetch('/api/view/openers')).json();
+          report.data.matched_opener_count = 2;
+          report.data.total_opener_count = 2760;
+          delete report.data.summary_groups;
+          applyReport(report, null, parsePageState(
+            {search: '?kind=openers&limit=1&group_by=none'}));
+          return {
+            cards: [...document.querySelectorAll('.card.source-word')]
+              .map(card => card.textContent).join(' '),
+            page: document.querySelector('#report').textContent,
+          };
+        }""")
+        for phrase in ("ERD 3.421", "max 5", "ERD pending",
+                       "96/148 groups solved"):
+            self.assertIn(phrase.replace(" ", "\u00a0"), texts["cards"])
+        for phrase in ("2,760 words", "2 words"):
+            self.assertIn(phrase.replace(" ", "\u00a0"), texts["page"])
+
     def test_active_source_card_shows_elapsed_work_time(self):
         text = self.page.evaluate("""async () => {
           const report = await (await fetch('/api/view/openers')).json();

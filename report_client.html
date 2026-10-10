@@ -2147,9 +2147,11 @@
     // count while it is still being searched.
     function sourceWordErdText(summary){
       if(!summary)return null;
-      if(summary.state==="complete")return "ERD "+fixed(summary.erd,3)+" · max "+valueOrDash(summary.max_remaining_depth);
-      if(summary.state==="infeasible")return "ERD ∞ · "+numText(summary.infeasible_group_count)+" unsolvable";
-      return "ERD pending · "+numText(summary.resolved_group_count)+"/"+numText(summary.response_group_count)+" groups solved";
+      // This fact wraps, unlike the others on the card, so it may break only
+      // between its parts.
+      if(summary.state==="complete")return "ERD\u00a0"+fixed(summary.erd,3)+" · max\u00a0"+valueOrDash(summary.max_remaining_depth);
+      if(summary.state==="infeasible")return "ERD\u00a0∞ · "+countNoun(summary.infeasible_group_count,"unsolvable","unsolvable");
+      return "ERD\u00a0pending · "+numText(summary.resolved_group_count)+"/"+numText(summary.response_group_count)+"\u00a0groups\u00a0solved";
     }
     // The page size is the "Words per page" control, so a limit that would
     // otherwise just truncate the list becomes a page through it.  With no
@@ -2162,7 +2164,7 @@
       if(matchedCount<=pageSize)return null;
       const pager=element("div","status-line "+className);
       pager.append(element("span","dim",shownCount
-        ?"Showing "+numText(offset+1)+"–"+numText(offset+shownCount)+" of "+numText(matchedCount)+" "+noun
+        ?"Showing "+numText(offset+1)+"–"+numText(offset+shownCount)+" of "+numText(matchedCount)+"\u00a0"+noun
         :"No "+noun+" on this page, of "+numText(matchedCount)));
       const previousButton=element("button","","Prev");
       previousButton.disabled=offset<=0;
@@ -2188,7 +2190,7 @@
       // double-count a branch two words own.
       metrics.append(metric("openers",matchedWords),metric("branches (unfinished)",data.matched_branch_count),metric("open",data.matched_open_branch_count));
       fragment.append(metrics,element("h2","","Openers"));
-      if(matchedWords!==totalWords)fragment.append(element("p","dim",numText(matchedWords)+" of "+numText(totalWords)+" words match this state filter."));
+      if(matchedWords!==totalWords)fragment.append(element("p","dim",numText(matchedWords)+" of "+countNoun(totalWords,"word")+" match this state filter."));
       const namedWord=(state.branch_target||"").trim();
       if(!sourceWords.length)fragment.append(element("p","empty",totalWords?"No opener matches this state filter":"No opener requests"));
       // A named word with no rows owns no live branch — its work has finished
