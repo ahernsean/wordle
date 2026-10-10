@@ -6953,21 +6953,21 @@ class ReportClientContract:
         self.assertEqual(
             self.page.eval_on_selector_all(
                 "[data-source-state]", "inputs => inputs.map(i => i.value)"),
-            ["queued", "active", "complete"])
+            ["active", "queued", "complete"])
         # iOS Safari shows hidden <option>s, so each report's own strategies
         # must be the only ones in the DOM.
         self.assertEqual(
             self.page.eval_on_selector_all(
                 "#group-by option", "options => options.map(o => o.value)"),
             ["state", "completed", "elapsed", "worker_time", "requested",
-             "worker_presence", "priority", "none"])
+             "worker_presence", "queue_position", "none"])
         self.assertEqual(
             self.page.eval_on_selector_all(
                 "#group-by option", "options => options.map(o => [o.value, o.textContent])"),
             [["state", "state (default)"], ["completed", "completion date"],
              ["elapsed", "elapsed time"], ["worker_time", "total worker time"],
              ["requested", "time since request"], ["worker_presence", "worker"],
-             ["priority", "priority"], ["none", "none"]],
+             ["queue_position", "queue position"], ["none", "none"]],
         )
         # State is the default, and "none" is an explicit choice rather than
         # the absence of one.
@@ -6990,13 +6990,14 @@ class ReportClientContract:
           elsewhere: buildAPIURL(parsePageState({search:'?kind=queue&opener_state=queued'}))
         })""")
         # The list's own defaults: unfinished words, a page at a time.
-        defaults = "opener_state=queued%2Cactive"
+        defaults = "opener_state=active%2Cqueued"
         self.assertEqual(result["ungrouped"],
                          f"/api/view/openers?{defaults}&group_by=none&limit=100")
         # URLSearchParams percent-encodes the separator; the server decodes it.
         self.assertEqual(
             result["filtered"],
-            f"/api/view/openers?{defaults}&group_by=state&limit=100")
+            "/api/view/openers?opener_state=queued%2Cactive&group_by=state"
+            "&limit=100")
         self.assertEqual(
             result["sorted"],
             f"/api/view/openers?{defaults}&sort=branches&group_by=state&limit=100")
@@ -7057,8 +7058,9 @@ class ReportClientContract:
               report.data.total_opener_count = 12;
               report.data.opener_offset = offset;
               report.data.summary = report.data.summary.slice(0, shown);
+              delete report.data.summary_groups;
               applyReport(report, null,
-                parsePageState({search:'?kind=openers&limit=3'}));
+                parsePageState({search:'?kind=openers&limit=3&group_by=none'}));
             }""", [offset, shown])
         apply_page(0, 3)
         pager = self.page.locator(".source-word-pager")
@@ -7074,6 +7076,51 @@ class ReportClientContract:
                       " ".join(pager.inner_text().split()))
         self.assertFalse(pager.locator("button", has_text="Prev").is_disabled())
         self.assertTrue(pager.locator("button", has_text="Next").is_disabled())
+
+    def test_each_group_pages_on_its_own(self):
+        self.open_sources()
+        self.page.evaluate("""async () => {
+          const report = await (await fetch('/api/view/openers')).json();
+          const rows = report.data.summary;
+          const rollup = count => ({opener_count: count,
+            unfinished_opener_count: count, active_opener_count: 0,
+            branch_count: 0, open_branch_count: 0, done_branch_count: 0,
+            worker_count: 0});
+          report.data.summary_groups = [
+            {label: 'active', offset: 0, rows: rows.slice(0, 1), rollup: rollup(1)},
+            {label: 'queued', offset: 0, rows: rows.slice(0, 2), rollup: rollup(5)},
+          ];
+          applyReport(report, null, parsePageState(
+            {search: '?kind=openers&limit=2&group_by=state'}));
+        }""")
+        groups = self.page.locator(".source-word-groups > details")
+        # A group that fits on one page has no pager.
+        self.assertEqual(groups.nth(0).locator(".source-word-pager").count(), 0)
+        pager = groups.nth(1).locator(".source-word-pager")
+        self.assertIn("Showing 1–2 of 5 words", " ".join(pager.inner_text().split()))
+        self.assertEqual(self.page.locator(
+            ".source-words-pager, #report > .source-word-pager").count(), 0)
+        pager.locator("button", has_text="Next").click()
+        state = self.page.evaluate("__reportClient.getState()")
+        self.assertEqual(state["group_offsets"], {"queued": 2})
+        self.assertIn("group_offset=2%3Aqueued", self.page.url)
+        self.assertIn("group_offset=2%3Aqueued", self.page.evaluate(
+            "buildAPIURL(__reportClient.getState())"))
+        # Changing a control returns every group to its first page.
+        self.page.evaluate(
+            "__reportClient.setState({...__reportClient.getState(), group_offsets: {}})")
+        self.assertNotIn("group_offset", self.page.url)
+
+    def test_a_group_offset_survives_a_reload_whatever_its_label_holds(self):
+        state = self.page.evaluate("""() => parsePageState(
+            {search: '?kind=openers&group_by=elapsed&group_offset=100%3A%5B0%2C%201%20hour%29'})""")
+        self.assertEqual(state["group_offsets"], {"[0, 1 hour)": 100})
+        self.assertIn("group_offset=100%3A%5B0%2C+1+hour%29",
+                      self.page.evaluate("""() => buildAPIURL(parsePageState(
+            {search: '?kind=openers&group_by=elapsed&group_offset=100%3A%5B0%2C%201%20hour%29'}))"""))
+        # Ungrouped, there is nothing for a group offset to page.
+        self.assertEqual(self.page.evaluate("""() => parsePageState(
+            {search: '?kind=openers&group_by=none&group_offset=3%3Aqueued'}).group_offsets"""), {})
 
     def test_sources_branch_rows_have_their_own_pager(self):
         # The branch list pages like the word list: a named word can own
@@ -7112,6 +7159,8 @@ class ReportClientContract:
           const bucket = state => rows.filter(row => row.state === state);
           const rollup = group => ({
             opener_count: group.length,
+            unfinished_opener_count: group.filter(row => row.state !== 'complete').length,
+            active_opener_count: group.filter(row => row.state === 'active').length,
             branch_count: group.reduce((total, row) => total + row.branch_count, 0),
             open_branch_count: group.reduce((total, row) => total + row.open_branch_count, 0),
             done_branch_count: group.reduce((total, row) => total + row.done_branch_count, 0),
@@ -7128,8 +7177,13 @@ class ReportClientContract:
         first = " ".join(groups.first.locator("summary").inner_text().split())
         self.assertIn("queued", first)
         self.assertIn("2 words", first)
-        self.assertIn("1,336 branches", first)
-        self.assertIn("1,211 open", first)
+        # Open and done are said of the branches, and a group with no active
+        # word names no workers.
+        self.assertIn("2 words · 1,336 branches (1,211 open, 125 done)", first)
+        self.assertNotIn("worker", first)
+        # A group of finished words states no branch totals rather than zero.
+        second = " ".join(groups.nth(1).locator("summary").inner_text().split())
+        self.assertNotIn("branch", second)
         self.assertEqual(
             groups.first.locator("[data-grid-key='source-words/queued'] > .card")
             .count(), 2)
@@ -7139,6 +7193,42 @@ class ReportClientContract:
         # Every word lands in exactly one group.
         self.assertEqual(
             self.page.locator(".source-word-groups .card").count(), 3)
+
+    def test_a_group_header_names_only_what_applies_to_it(self):
+        self.open_sources()
+        headers = self.page.evaluate("""async () => {
+          const report = await (await fetch('/api/view/openers')).json();
+          const rows = report.data.summary;
+          const rollup = (counts) => ({opener_count: 3, branch_count: 40,
+            open_branch_count: 30, done_branch_count: 10, worker_count: 2,
+            ...counts});
+          report.data.summary_groups = [
+            {label: 'active', rows: rows.slice(0, 1),
+             rollup: rollup({unfinished_opener_count: 3, active_opener_count: 3})},
+            {label: '[0, 1 hour)', rows: rows.slice(1, 2),
+             rollup: rollup({unfinished_opener_count: 1, active_opener_count: 1})},
+          ];
+          applyReport(report, null,
+            parsePageState({search:'?kind=openers&group_by=state'}));
+          return [...document.querySelectorAll('.source-word-groups > details > summary')]
+            .map(node => ({text: node.textContent,
+                           labelWraps: getComputedStyle(
+                             node.querySelector('strong')).whiteSpace}));
+        }""")
+        self.assertEqual(
+            [" ".join(header["text"].split()) for header in headers], [
+            "active 3 words · 40 branches (30 open, 10 done) · 2 workers",
+            # Among finished words, the branches are the unfinished ones'.
+            "[0, 1 hour) 3 words · 1 unfinished: 40 branches "
+            "(30 open, 10 done) · 2 workers",
+        ])
+        # A count never parts from the word it counts, and a label never
+        # breaks inside itself.
+        text = headers[1]["text"]
+        for phrase in ("3 words", "1 unfinished", "40 branches", "30 open",
+                       "10 done", "2 workers"):
+            self.assertIn(phrase.replace(" ", "\u00a0"), text)
+        self.assertEqual({header["labelWraps"] for header in headers}, {"nowrap"})
 
     def test_sources_card_opens_the_word_report_where_its_erd_lives(self):
         # The card leads to the word report: that is where a word's ERD,
@@ -7170,6 +7260,29 @@ class ReportClientContract:
         self.assertIn("ERD 3.389 · max 4", cards["CRANE"])
         # Still searching: how much of it is solved, not a number that moves.
         self.assertIn("ERD pending · 96/148 groups solved", cards["SALET"])
+
+    def test_an_opener_page_never_parts_a_count_from_its_word(self):
+        # The ERD fact is the one on a card that wraps, so it may break only
+        # between its parts; so may the filter note and a pager's caption.
+        self.open_sources()
+        texts = self.page.evaluate("""async () => {
+          const report = await (await fetch('/api/view/openers')).json();
+          report.data.matched_opener_count = 2;
+          report.data.total_opener_count = 2760;
+          delete report.data.summary_groups;
+          applyReport(report, null, parsePageState(
+            {search: '?kind=openers&limit=1&group_by=none'}));
+          return {
+            cards: [...document.querySelectorAll('.card.source-word')]
+              .map(card => card.textContent).join(' '),
+            page: document.querySelector('#report').textContent,
+          };
+        }""")
+        for phrase in ("ERD 3.421", "max 5", "ERD pending",
+                       "96/148 groups solved"):
+            self.assertIn(phrase.replace(" ", "\u00a0"), texts["cards"])
+        for phrase in ("2,760 words", "2 words"):
+            self.assertIn(phrase.replace(" ", "\u00a0"), texts["page"])
 
     def test_active_source_card_shows_elapsed_work_time(self):
         text = self.page.evaluate("""async () => {
@@ -7350,7 +7463,7 @@ class ReportClientContract:
         # than leaving the server to guess: a pasted URL reproduces the view.
         # The list of every opener defaults to the unfinished ones; a named
         # word's view has no state default.  Both are paged by default.
-        listed = "/api/view/openers?opener_state=queued%2Cactive&group_by=state"
+        listed = "/api/view/openers?opener_state=active%2Cqueued&group_by=state"
         self.assertEqual(result["explicit"], listed + "&limit=100")
         self.assertEqual(
             result["word"],
@@ -7367,7 +7480,7 @@ class ReportClientContract:
         self.page.evaluate(
             "__reportClient.setState(parsePageState({search:'?kind=openers'}))")
         state = self.page.evaluate("__reportClient.getState()")
-        self.assertEqual(state["opener_state"], ["queued", "active"])
+        self.assertEqual(state["opener_state"], ["active", "queued"])
         # The page size is the report's own: it reaches the request, not the
         # state another report would inherit.
         self.assertIsNone(state["limit"])
@@ -7400,7 +7513,7 @@ class ReportClientContract:
         self.page.locator("[data-kind=openers]").click()
         self.assertEqual(
             self.page.evaluate("__reportClient.getState().opener_state"),
-            ["queued", "active"])
+            ["active", "queued"])
 
     def test_worker_cards_name_the_scheduling_role_and_why(self):
         preferred = self.page.locator('.card.worker[data-identity="worker-0"]')

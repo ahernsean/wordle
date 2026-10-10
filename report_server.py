@@ -75,7 +75,12 @@ SCALAR_PARAMETERS = {
     *INTEGER_PARAMETERS,
 }
 FINALIZATION_CURSOR_PATTERN = re.compile(r"(after|before):(\d+):(\d+)")
-ALLOWED_PARAMETERS = SCALAR_PARAMETERS
+# Repeated, one per group: "<offset>:<group label>".  A label can hold a
+# comma or a space ("[0, 1 hour)"), so the offset leads and the label is the
+# rest of the value.
+REPEATED_PARAMETERS = {"group_offset"}
+GROUP_OFFSET_PATTERN = re.compile(r"(\d+):(.+)", re.DOTALL)
+ALLOWED_PARAMETERS = SCALAR_PARAMETERS | REPEATED_PARAMETERS
 SORT_FIELDS = {
     "default", "age", "size", "workers", "priority", "nodes", "slowest",
     *OPENER_SORT_FIELDS,
@@ -323,7 +328,15 @@ def parse_report_request(path, query):
     if explicit_kind == "hotspots" and limit is None:
         limit = 10
 
+    group_offsets = []
+    for value in parameters.get("group_offset", ()):
+        match = GROUP_OFFSET_PATTERN.fullmatch(value)
+        if not match:
+            raise InvalidRequest(
+                "group_offset must be '<offset>:<group label>'")
+        group_offsets.append((match.group(2), int(match.group(1))))
     filters = ReportFilters(
+        group_offsets=tuple(group_offsets),
         branch_statuses=branch_statuses,
         branch_worker_statuses=branch_worker_statuses,
         minimum_answer_count=minimum_answer_count,

@@ -136,6 +136,9 @@ class ReportFilters:
     opener_states: tuple[str, ...] = ()
     opener_offset: int | None = None
     branch_row_offset: int | None = None
+    # A grouped opener list pages each group on its own: (group label,
+    # offset into that group).  A group not named starts at its first word.
+    group_offsets: tuple[tuple[str, int], ...] = ()
 
 
 BRANCH_STATUSES = ("unqueued", "queued", "evaluating", "finalizing", "done")
@@ -154,8 +157,8 @@ GROUP_BY_STRATEGIES = (
     "none", "status", "answer_count", "cache_state", "worker_presence", "priority",
 )
 OPENER_GROUP_BY_STRATEGIES = (
-    "none", "state", "worker_presence", "priority", "completed", "elapsed",
-    "worker_time", "requested",
+    "none", "state", "worker_presence", "queue_position", "completed",
+    "elapsed", "worker_time", "requested",
 )
 OPENER_SORT_FIELDS = (
     "default", "age", "word", "priority", "branches", "open", "done", "workers",
@@ -322,6 +325,15 @@ def validate_report_request(request: ReportRequest) -> None:
         )
     if request.filters.opener_states and report_kind != "openers":
         raise ValueError("opener_state requires an opener report")
+    grouped = request.filters.group_by not in (None, "none")
+    if request.filters.group_offsets and (
+            report_kind != "openers" or not grouped):
+        raise ValueError("group_offset requires a grouped opener report")
+    if request.filters.opener_offset is not None and grouped and (
+            report_kind == "openers"):
+        raise ValueError(
+            "opener_offset pages an ungrouped opener list; a grouped one "
+            "pages each group with group_offset")
     for name in ("opener_offset", "branch_row_offset"):
         offset = getattr(request.filters, name)
         if offset is None:
@@ -3946,41 +3958,93 @@ def _opener_group_key(row, group_by, generated_at):
     if group_by == "requested":
         return _duration_group_key(
             max(0, generated_at - row["requested_at"]) * 1000)
-    priority = row["requested_priority"]
-    return (-(priority or 0), f"priority {priority}")
+    return _queue_position_group_key(row)
 
 
-def _grouped_openers(rows, group_by, branch_totals, generated_at):
-    """Bucket the collapsed rows, each group carrying its own rollup.
+_ACTIVE_QUEUE_POSITION_GROUP = (0, "active")
+_COMPLETE_QUEUE_POSITION_GROUP = (99, "complete")
 
-    A group's branch totals are counted distinctly over the words in it, for
-    the same reason the report's own are: two words can own the same branch,
-    and summing their per-word counts would count it once per word.
+
+def _queue_position_group_key(row):
+    """Active words, then queued words in bands ten times wider than the last.
+
+    The next 10 words to be started, then the 11th to the 100th, and so on: a
+    priority value says nothing on its own, since each batch is laid on its
+    own ladder, but a word's place in line does.  Finished words have no place
+    and close the list.
     """
-    grouped = {}
+    if row["state"] == "active":
+        return _ACTIVE_QUEUE_POSITION_GROUP
+    if row["state"] == "complete":
+        return _COMPLETE_QUEUE_POSITION_GROUP
+    # The band is the number of digits in position - 1: 1-10 is band 1,
+    # 11-100 band 2, 101-1,000 band 3.
+    band = len(str(row["queue_position"] - 1))
+    if band == 1:
+        return (band, "next 10")
+    return (band, f"{10 ** (band - 1) + 1:,}–{10 ** band:,}")
+
+
+def _assign_queue_positions(rows):
+    """Number the queued words 1, 2, ... in the order they will be started.
+
+    Highest priority first, as the swarm serves them; ties go to the earlier
+    request, then to the word.  Active and finished words have no position.
+    """
+    queued = sorted(
+        (row for row in rows if row["state"] == "queued"),
+        key=lambda row: (-(row["requested_priority"] or 0),
+                         row["requested_at"] or 0, row["opener"] or ""))
     for row in rows:
-        sort_key, label = _opener_group_key(row, group_by, generated_at)
-        group = grouped.setdefault(
-            (sort_key, label),
-            {"label": label, "rows": [],
-             "rollup": {"opener_count": 0, "branch_count": 0,
-                        "open_branch_count": 0, "done_branch_count": 0,
-                        "worker_count": 0}},
-        )
-        group["rows"].append(row)
-        rollup = group["rollup"]
-        rollup["opener_count"] += 1
-        rollup["worker_count"] += row["worker_count"]
-    for group in grouped.values():
-        branch_count, open_branch_count = branch_totals(
-            [row["opener"] for row in group["rows"]]
-        )
-        group["rollup"]["branch_count"] = branch_count
-        group["rollup"]["open_branch_count"] = open_branch_count
-        group["rollup"]["done_branch_count"] = max(
-            0, branch_count - open_branch_count
-        )
-    return [grouped[key] for key in sorted(grouped)]
+        row["queue_position"] = None
+    for position, row in enumerate(queued, start=1):
+        row["queue_position"] = position
+
+
+def _grouped_openers(rows, group_by, branch_totals, generated_at, limit,
+                     group_offsets=(), empty_keys=()):
+    """Bucket the rows, each group paged on its own and rolled up whole.
+
+    Each group shows `limit` of its words from its own offset, so paging one
+    group leaves the others where they are.  Its rollup covers every matched
+    word in it, so its header says how much work the whole group holds.  Its
+    branch totals are counted distinctly over its unfinished words, for the
+    same reason the report's own are: two words can own the same branch, and
+    summing their per-word counts would count it once per word.  A key in
+    `empty_keys` heads a group even when no word is in it.
+    """
+    rows_by_group = collections.defaultdict(list)
+    for row in rows:
+        rows_by_group[_opener_group_key(row, group_by, generated_at)].append(row)
+    for key in empty_keys:
+        rows_by_group.setdefault(key, [])
+    offsets = dict(group_offsets)
+    groups = []
+    for key in sorted(rows_by_group):
+        group_rows = rows_by_group[key]
+        offset = offsets.get(key[1], 0)
+        branch_count = open_branch_count = 0
+        if group_rows:
+            branch_count, open_branch_count = branch_totals(
+                [row["opener"] for row in group_rows])
+        groups.append({
+            "label": key[1],
+            "offset": offset,
+            "rows": (group_rows[offset:offset + limit] if limit is not None
+                     else group_rows[offset:]),
+            "rollup": {
+                "opener_count": len(group_rows),
+                "unfinished_opener_count": sum(
+                    row["state"] != "complete" for row in group_rows),
+                "active_opener_count": sum(
+                    row["state"] == "active" for row in group_rows),
+                "branch_count": branch_count,
+                "open_branch_count": open_branch_count,
+                "done_branch_count": max(0, branch_count - open_branch_count),
+                "worker_count": sum(row["worker_count"] for row in group_rows),
+            },
+        })
+    return groups
 
 
 def _opener_erd_summaries(sources, rows, report, queue, cache, all_answers):
@@ -4281,6 +4345,7 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
             for row in summary_rows
         ]
         opener_sort = request.filters.sort or "completed"
+        _assign_queue_positions(collapsed)
         data["total_opener_count"] = len(collapsed)
         opener_states = request.filters.opener_states
         if opener_states:
@@ -4294,6 +4359,8 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
         for row in collapsed:
             row["erd_summary"] = erd_summaries.get(row["opener"])
         collapsed = _sorted_openers(collapsed, opener_sort)
+        group_by = request.filters.group_by
+        grouped = group_by is not None and group_by != "none"
         data["matched_opener_count"] = len(collapsed)
         # Counted with each branch counted once: two words can own the same
         # branch, so summing their per-word counts double-counts precisely the
@@ -4326,18 +4393,36 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
         # limit is a page size and opener_offset is where that page starts, so
         # the words past the first page stay reachable rather than truncated
         # away.  An offset past the end yields an empty page, not the last one:
-        # the count above is what tells the client how far it can page.
+        # the count above is what tells the client how far it can page.  A
+        # grouped list pages each group instead, and its summary is the
+        # groups' pages in group order.
         offset = request.filters.opener_offset or 0
         limit = request.filters.limit
         data["opener_offset"] = offset
-        data["summary"] = (
-            collapsed[offset:offset + limit] if limit is not None
-            else collapsed[offset:]
-        )
-        group_by = request.filters.group_by
-        if group_by is not None and group_by != "none":
+        if grouped:
+            # Grouped by state, every state the filter selects (every state,
+            # when it selects none) heads a group, empty or not; grouped by
+            # queue position, so do the active and finished bands.
+            selected_states = opener_states or tuple(_OPENER_STATE_GROUP_ORDER)
+            empty_keys = ()
+            if group_by == "state":
+                empty_keys = [(_OPENER_STATE_GROUP_ORDER[state], state)
+                              for state in selected_states]
+            elif group_by == "queue_position":
+                empty_keys = [key for state, key in (
+                    ("active", _ACTIVE_QUEUE_POSITION_GROUP),
+                    ("complete", _COMPLETE_QUEUE_POSITION_GROUP))
+                    if state in selected_states]
             data["summary_groups"] = _grouped_openers(
-                data["summary"], group_by, branch_totals, generated_at
+                collapsed, group_by, branch_totals, generated_at, limit,
+                group_offsets=request.filters.group_offsets,
+                empty_keys=empty_keys)
+            data["summary"] = [row for group in data["summary_groups"]
+                               for row in group["rows"]]
+        else:
+            data["summary"] = (
+                collapsed[offset:offset + limit] if limit is not None
+                else collapsed[offset:]
             )
         # Branch rows belong to one named word.  Emitting them for every word
         # would bury ten queued roots under the hundreds of branches they

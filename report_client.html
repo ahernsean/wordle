@@ -117,6 +117,7 @@
     .status-line[hidden] { display:none; }
     .status-line > .label { color:var(--dim); }
     .statuses { display:flex; flex-wrap:wrap; gap:.5rem; align-items:baseline; }
+    .group-label { white-space:nowrap; }
     .statuses label { display:inline-flex; gap:.25rem; align-items:center; white-space:nowrap; }
     .statuses label[hidden] { display:none; }
     .statuses label.inert { opacity:.45; }
@@ -471,12 +472,12 @@
     const overviewBranchWorkerStatusNames=["active"];
     // A source word's lifecycle, which is not a branch's: queued until a
     // worker picks one of its requests up, complete once every request is.
-    const sourceStateNames=["queued","active","complete"];
+    const sourceStateNames=["active","queued","complete"];
     // The Openers list opens on the work still owed, a page at a time: a
     // finished opener's ERD is the leaderboard's, and a sweep finishes
     // thousands of them, which no page should render at once.  Every state
     // ticked, or none, shows them all.
-    const OPENER_LIST_DEFAULT_STATES=["queued","active"],OPENER_PAGE_SIZE=100;
+    const OPENER_LIST_DEFAULT_STATES=["active","queued"],OPENER_PAGE_SIZE=100;
     // The page size is the report's own default, never written into the
     // shared limit: a word report reached from an opener card would read
     // that limit as a cap on its response groups.
@@ -496,7 +497,7 @@
     const SORT_OPTIONS_OPENERS=[["completed","most recently completed"],["erd","ERD (lowest first)"],["elapsed","elapsed time (longest first)"],["worker_time","total worker time (longest first)"],["priority","priority (highest to lowest)"],["requested","date requested (newest to oldest)"],["age","age since request (oldest first)"],["word","word (alphabetical)"],["branches","# of branches (highest to lowest)"],["open","# of open branches (highest to lowest)"],["done","# of completed branches (highest to lowest)"],["workers","# of workers (highest to lowest)"]];
     const OPENER_ONLY_SORT_VALUES=new Set(SORT_OPTIONS_OPENERS.map(([value])=>value).filter(value=>value&&!SORT_OPTIONS_DEFAULT.some(([defaultValue])=>defaultValue===value)));
     const GROUP_BY_OPTIONS_WORD=[["","none"],["status","status"],["answer_count","answer count"],["cache_state","cache state"],["worker_presence","worker"],["priority","priority"]];
-    const GROUP_BY_OPTIONS_OPENERS=[["state","state (default)"],["completed","completion date"],["elapsed","elapsed time"],["worker_time","total worker time"],["requested","time since request"],["worker_presence","worker"],["priority","priority"],["none","none"]];
+    const GROUP_BY_OPTIONS_OPENERS=[["state","state (default)"],["completed","completion date"],["elapsed","elapsed time"],["worker_time","total worker time"],["requested","time since request"],["worker_presence","worker"],["queue_position","queue position"],["none","none"]];
     const explicitKinds=new Set(["queue","workers","cache","hotspots","work_distribution","leaderboard","openers"]);
     const treelessKinds=new Set(["cache","hotspots","work_distribution","leaderboard","openers"]);
     const populationNames={current_queue_branches:"current queue branches",recent_branch_finalizations:"recent branch finalizations",recent_cut_reuse_misses:"recent cut-reuse misses",epoch_finalized_branches:"finalized branches"};
@@ -663,6 +664,10 @@
       // Defaulted once the target is settled: only the list of every opener has
       // a default state, never one named word's view.
       if(normalized.opener_state===undefined)normalized.opener_state=normalized.kind==="openers"&&normalized.branch_target===""?[...OPENER_LIST_DEFAULT_STATES]:[];
+      // A grouped opener list pages each group on its own, and only it does.
+      const groupedOpeners=normalized.kind==="openers"&&normalized.group_by!=="none";
+      normalized.group_offsets=groupedOpeners?Object.fromEntries(Object.entries(state.group_offsets||{}).map(([label,offset])=>[label,intOrNull(offset)]).filter(([,offset])=>offset>0)):{};
+      if(groupedOpeners)normalized.opener_offset=null;
       if(normalized.kind!=="hotspots")normalized.by="";
       if(normalized.kind!=="hotspots"&&normalized.kind!=="work_distribution"){normalized.epoch=null;normalized.since_seconds=null;normalized.sample_size=null;}
       // The distribution describes a whole sampled population; a filter
@@ -688,7 +693,7 @@
     function parsePageState(locationObject){
       const query=new URLSearchParams(locationObject.search||"");
       const parseFilter=name=>query.has(name)?(query.get(name)==="all"?[]:query.get(name).split(",")):undefined;
-      return normalizeState({kind:query.get("kind")||"auto",branch_target:query.get("branch_target")||"",tree:bool(query.get("tree")),branch_status:parseFilter("branch_status"),branch_worker_status:parseFilter("branch_worker_status"),opener_state:parseFilter("opener_state"),opener_offset:query.get("opener_offset"),branch_row_offset:query.get("branch_row_offset"),minimum_answer_count:query.get("minimum_answer_count"),maximum_answer_count:query.get("maximum_answer_count"),budget:query.get("budget"),priority:query.get("priority"),sort:query.get("sort"),group_by:query.get("group_by"),limit:query.get("limit"),by:query.get("by"),epoch:query.get("epoch"),since_seconds:query.get("since_seconds"),sample_size:query.get("sample_size"),poll:query.get("poll"),answers:bool(query.get("answers")),claims:bool(query.get("claims")),worker_id:query.get("worker"),finalization_cursor:query.get("finalization_cursor"),tree_cursor:query.get("tree_cursor"),erd_numerator_range:query.get("erd_numerator_range")});
+      return normalizeState({kind:query.get("kind")||"auto",branch_target:query.get("branch_target")||"",tree:bool(query.get("tree")),branch_status:parseFilter("branch_status"),branch_worker_status:parseFilter("branch_worker_status"),opener_state:parseFilter("opener_state"),group_offsets:Object.fromEntries(query.getAll("group_offset").map(value=>{const separator=value.indexOf(":");return [value.slice(separator+1),value.slice(0,separator)];}).filter(([label,offset])=>label&&offset)),opener_offset:query.get("opener_offset"),branch_row_offset:query.get("branch_row_offset"),minimum_answer_count:query.get("minimum_answer_count"),maximum_answer_count:query.get("maximum_answer_count"),budget:query.get("budget"),priority:query.get("priority"),sort:query.get("sort"),group_by:query.get("group_by"),limit:query.get("limit"),by:query.get("by"),epoch:query.get("epoch"),since_seconds:query.get("since_seconds"),sample_size:query.get("sample_size"),poll:query.get("poll"),answers:bool(query.get("answers")),claims:bool(query.get("claims")),worker_id:query.get("worker"),finalization_cursor:query.get("finalization_cursor"),tree_cursor:query.get("tree_cursor"),erd_numerator_range:query.get("erd_numerator_range")});
     }
     function stateQuery(state,includeClient=true){
       const query=new URLSearchParams();
@@ -708,6 +713,8 @@
         const value=name==="limit"&&!includeClient&&state.kind==="openers"?openerPageSize(state):state[name];
         if(value!==null&&value!=="")query.set(name,String(value));
       }
+      // "<offset>:<label>": a label can hold a comma, so it is the remainder.
+      for(const label of Object.keys(state.group_offsets||{}).sort())query.append("group_offset",state.group_offsets[label]+":"+label);
       if(state.worker_id)query.set("worker",state.worker_id);
       if(state.finalization_cursor)query.set("finalization_cursor",state.finalization_cursor);
       if(state.tree_cursor)query.set("tree_cursor",state.tree_cursor);
@@ -794,7 +801,7 @@
       byId("limit").placeholder=isSources?String(OPENER_PAGE_SIZE):"";
       byId("limit-field").hidden=currentState.tree||isDistribution;
     }
-    function readControls(){return {...currentState,branch_target:byId("branch-target-input").value,branch_status:[...document.querySelectorAll("[data-branch-status]:checked")].map(input=>input.value),branch_worker_status:[...document.querySelectorAll("[data-branch-worker-status]:checked")].map(input=>input.value),opener_state:[...document.querySelectorAll("[data-source-state]:checked")].map(input=>input.value),minimum_answer_count:byId("minimum-answer-count").value,maximum_answer_count:byId("maximum-answer-count").value,budget:byId("budget").value,priority:byId("priority").value,sort:byId("sort").value,group_by:byId("group-by").value,limit:currentState.tree?currentState.limit:byId("limit").value,opener_offset:null,branch_row_offset:null,by:byId("by").value,epoch:byId("epoch").value,since_seconds:byId("since-seconds").value,poll:byId("poll").value,finalization_cursor:"",tree_cursor:null};}
+    function readControls(){return {...currentState,branch_target:byId("branch-target-input").value,branch_status:[...document.querySelectorAll("[data-branch-status]:checked")].map(input=>input.value),branch_worker_status:[...document.querySelectorAll("[data-branch-worker-status]:checked")].map(input=>input.value),opener_state:[...document.querySelectorAll("[data-source-state]:checked")].map(input=>input.value),minimum_answer_count:byId("minimum-answer-count").value,maximum_answer_count:byId("maximum-answer-count").value,budget:byId("budget").value,priority:byId("priority").value,sort:byId("sort").value,group_by:byId("group-by").value,limit:currentState.tree?currentState.limit:byId("limit").value,opener_offset:null,branch_row_offset:null,group_offsets:{},by:byId("by").value,epoch:byId("epoch").value,since_seconds:byId("since-seconds").value,poll:byId("poll").value,finalization_cursor:"",tree_cursor:null};}
 
     function ordered(rows,identityName,orderName,state){
       const key=contextKey(state)+"|"+orderName, incoming=rows.map(row=>String(row[identityName]));
@@ -940,6 +947,22 @@
     // a rendered object rather than only text.
     function labeledFacts(values){const node=element("div","labeled-facts");for(const [key,value] of values){if(value===null||value===undefined||value==="")continue;const fact=element("span","fact"),cell=element("span","");if(value instanceof Node)cell.append(value);else cell.textContent=valueOrDash(value);fact.append(element("span","fact-label",key)," ",cell);node.append(fact);}return node;}
     function progress(done,total){const node=element("div","progress"),bar=element("span");bar.style.width=total?Math.min(100,100*done/total)+"%":"0";node.append(bar);return node;}
+    // A group's header covers the whole group, not the page.  Branch totals
+    // count only unfinished words, so a group of finished words states none
+    // rather than zero, and workers are named only where a word is active.
+    // A count and the word it counts never part across a line break.
+    function countNoun(count,singular,plural=singular+"s"){return numText(count)+"\u00a0"+(count===1?singular:plural);}
+    function sourceGroupRollupText(rollup){
+      const parts=[countNoun(rollup.opener_count,"word")];
+      if(rollup.unfinished_opener_count){
+        // In a group that also holds finished words, the branches belong to
+        // its unfinished ones, so those are counted first.
+        const branches=countNoun(rollup.branch_count,"branch","branches")+" ("+countNoun(rollup.open_branch_count,"open","open")+", "+countNoun(rollup.done_branch_count,"done","done")+")";
+        parts.push(rollup.unfinished_opener_count<rollup.opener_count?countNoun(rollup.unfinished_opener_count,"unfinished","unfinished")+": "+branches:branches);
+      }
+      if(rollup.active_opener_count)parts.push(countNoun(rollup.worker_count,"worker"));
+      return parts.join(" · ");
+    }
     function sourceGroupProgress(row,summary){
       if(!summary||!summary.response_group_count)return null;
       const total=summary.response_group_count,workCount=Math.min(total,row.direct_branch_count||0);
@@ -2124,28 +2147,31 @@
     // count while it is still being searched.
     function sourceWordErdText(summary){
       if(!summary)return null;
-      if(summary.state==="complete")return "ERD "+fixed(summary.erd,3)+" · max "+valueOrDash(summary.max_remaining_depth);
-      if(summary.state==="infeasible")return "ERD ∞ · "+numText(summary.infeasible_group_count)+" unsolvable";
-      return "ERD pending · "+numText(summary.resolved_group_count)+"/"+numText(summary.response_group_count)+" groups solved";
+      // This fact wraps, unlike the others on the card, so it may break only
+      // between its parts.
+      if(summary.state==="complete")return "ERD\u00a0"+fixed(summary.erd,3)+" · max\u00a0"+valueOrDash(summary.max_remaining_depth);
+      if(summary.state==="infeasible")return "ERD\u00a0∞ · "+countNoun(summary.infeasible_group_count,"unsolvable","unsolvable");
+      return "ERD\u00a0pending · "+numText(summary.resolved_group_count)+"/"+numText(summary.response_group_count)+"\u00a0groups\u00a0solved";
     }
     // The page size is the "Words per page" control, so a limit that would
     // otherwise just truncate the list becomes a page through it.  With no
     // page size set there is nothing to page and no pager is drawn.
     // Both of this view's lists page the same way, so they share one pager:
     // the words, and the branch rows a named word owns.
-    function sourceListPager({state,offset,shownCount,matchedCount,noun,offsetField,className}){
+    function sourceListPager({state,offset,shownCount,matchedCount,noun,offsetField,className,page}){
+      page=page||(nextOffset=>setState({...state,[offsetField]:nextOffset}));
       const pageSize=openerPageSize(state);
       if(matchedCount<=pageSize)return null;
       const pager=element("div","status-line "+className);
       pager.append(element("span","dim",shownCount
-        ?"Showing "+numText(offset+1)+"–"+numText(offset+shownCount)+" of "+numText(matchedCount)+" "+noun
+        ?"Showing "+numText(offset+1)+"–"+numText(offset+shownCount)+" of "+numText(matchedCount)+"\u00a0"+noun
         :"No "+noun+" on this page, of "+numText(matchedCount)));
       const previousButton=element("button","","Prev");
       previousButton.disabled=offset<=0;
-      previousButton.addEventListener("click",()=>setState({...state,[offsetField]:Math.max(0,offset-pageSize)}));
+      previousButton.addEventListener("click",()=>page(Math.max(0,offset-pageSize)));
       const nextButton=element("button","","Next");
       nextButton.disabled=offset+shownCount>=matchedCount;
-      nextButton.addEventListener("click",()=>setState({...state,[offsetField]:offset+pageSize}));
+      nextButton.addEventListener("click",()=>page(offset+pageSize));
       pager.append(previousButton,nextButton);
       return pager;
     }
@@ -2164,7 +2190,7 @@
       // double-count a branch two words own.
       metrics.append(metric("openers",matchedWords),metric("branches (unfinished)",data.matched_branch_count),metric("open",data.matched_open_branch_count));
       fragment.append(metrics,element("h2","","Openers"));
-      if(matchedWords!==totalWords)fragment.append(element("p","dim",numText(matchedWords)+" of "+numText(totalWords)+" words match this state filter."));
+      if(matchedWords!==totalWords)fragment.append(element("p","dim",numText(matchedWords)+" of "+countNoun(totalWords,"word")+" match this state filter."));
       const namedWord=(state.branch_target||"").trim();
       if(!sourceWords.length)fragment.append(element("p","empty",totalWords?"No opener matches this state filter":"No opener requests"));
       // A named word with no rows owns no live branch — its work has finished
@@ -2183,10 +2209,16 @@
           details.open=!collapsedResponseGroups.has(groupKey);
           details.addEventListener("toggle",()=>details.open?collapsedResponseGroups.delete(groupKey):collapsedResponseGroups.add(groupKey));
           const rollup=group.rollup,summaryEl=element("summary","clickable");
-          summaryEl.append(element("strong","",group.label),element("span","dim"," "+numText(rollup.opener_count)+(rollup.opener_count===1?" word":" words")+" · "+numText(rollup.branch_count)+(rollup.branch_count===1?" branch":" branches")+" · "+numText(rollup.open_branch_count)+" open · "+numText(rollup.done_branch_count)+" done · "+numText(rollup.worker_count)+(rollup.worker_count===1?" worker":" workers")));
+          summaryEl.append(element("strong","group-label",group.label),element("span","dim"," "+sourceGroupRollupText(rollup)));
           const grid=gridElement("source-words/"+group.label);
           for(const row of ordered(group.rows,"opener","source-words/"+group.label,state))grid.append(wordCard(row));
           details.append(summaryEl,grid);
+          const groupPager=sourceListPager({
+            state,offset:group.offset??0,shownCount:group.rows.length,
+            matchedCount:rollup.opener_count,noun:"words",
+            className:"source-word-pager",
+            page:offset=>setState({...state,group_offsets:{...state.group_offsets,[group.label]:offset}})});
+          if(groupPager)details.append(groupPager);
           container.append(details);
         }
         fragment.append(container);
@@ -2195,7 +2227,7 @@
         for(const row of ordered(sourceWords,"opener","source-words",state))wordGrid.append(wordCard(row));
         fragment.append(wordGrid);
       }
-      const wordPager=sourceListPager({
+      const wordPager=data.summary_groups?null:sourceListPager({
         state,offset:data.opener_offset??0,shownCount:sourceWords.length,
         matchedCount:matchedWords,noun:"words",offsetField:"opener_offset",
         className:"source-word-pager"});

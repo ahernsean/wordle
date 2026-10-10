@@ -34,6 +34,7 @@
     "open_branch_count": 1203,
     "opener": "salet",
     "opener_is_answer": false,
+    "queue_position": 1,
     "request_count": 2,
     "requested_at": 400,
     "requested_priority": 5,
@@ -60,6 +61,7 @@
     "open_branch_count": 8,
     "opener": "raise",
     "opener_is_answer": true,
+    "queue_position": 2,
     "request_count": 1,
     "requested_at": 200,
     "requested_priority": 3,
@@ -86,6 +88,7 @@
     "open_branch_count": 0,
     "opener": "crane",
     "opener_is_answer": true,
+    "queue_position": null,
     "request_count": 1,
     "requested_at": 100,
     "requested_priority": 1,
@@ -98,11 +101,14 @@
   "summary_groups": [
    {
     "label": "queued",
+    "offset": 0,
     "rollup": {
+     "active_opener_count": 0,
      "branch_count": 1336,
      "done_branch_count": 125,
      "open_branch_count": 1211,
      "opener_count": 2,
+     "unfinished_opener_count": 2,
      "worker_count": 4
     },
     "rows": [
@@ -124,6 +130,7 @@
       "open_branch_count": 1203,
       "opener": "salet",
       "opener_is_answer": false,
+      "queue_position": 1,
       "request_count": 2,
       "requested_at": 400,
       "requested_priority": 5,
@@ -149,6 +156,7 @@
       "open_branch_count": 8,
       "opener": "raise",
       "opener_is_answer": true,
+      "queue_position": 2,
       "request_count": 1,
       "requested_at": 200,
       "requested_priority": 3,
@@ -160,11 +168,14 @@
    },
    {
     "label": "complete",
+    "offset": 0,
     "rollup": {
+     "active_opener_count": 0,
      "branch_count": 40,
      "done_branch_count": 40,
      "open_branch_count": 0,
      "opener_count": 1,
+     "unfinished_opener_count": 0,
      "worker_count": 0
     },
     "rows": [
@@ -186,6 +197,7 @@
       "open_branch_count": 0,
       "opener": "crane",
       "opener_is_answer": true,
+      "queue_position": null,
       "request_count": 1,
       "requested_at": 100,
       "requested_priority": 1,
