@@ -104,6 +104,7 @@
      "response_group_count": 148,
      "state": "pending"
     },
+    "last_branch_finished_at": null,
     "open_branch_count": 1203,
     "opener": "salet",
     "opener_is_answer": false,

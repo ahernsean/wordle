@@ -494,7 +494,7 @@
     const overviewSorted=(rows,sort)=>{const key=OVERVIEW_SORT_KEYS[sort];return key?[...rows].sort((first,second)=>key(first)-key(second)):rows;};
     const SORT_OPTIONS_OVERVIEW=[["","unsorted (default)"],["age","age"],["size","# of answers"],["workers","workers"],["priority","priority"],["nodes","nodes"],["slowest","slowest"]];
     const SORT_OPTIONS_WORD=[["size","# of answers (default)"],["workers","workers"],["priority","priority"]];
-    const SORT_OPTIONS_OPENERS=[["completed","most recently completed"],["erd","ERD (lowest first)"],["elapsed","elapsed time (longest first)"],["worker_time","total worker time (longest first)"],["priority","priority (highest to lowest)"],["requested","date requested (newest to oldest)"],["age","age since request (oldest first)"],["word","word (alphabetical)"],["branches","# of branches (highest to lowest)"],["open","# of open branches (highest to lowest)"],["done","# of completed branches (highest to lowest)"],["workers","# of workers (highest to lowest)"]];
+    const SORT_OPTIONS_OPENERS=[["default","state: latest activity, next up, latest finished (default)"],["completed","most recently completed"],["erd","ERD (lowest first)"],["elapsed","elapsed time (longest first)"],["worker_time","total worker time (longest first)"],["priority","priority (highest to lowest)"],["requested","date requested (newest to oldest)"],["age","age since request (oldest first)"],["word","word (alphabetical)"],["branches","# of branches (highest to lowest)"],["open","# of open branches (highest to lowest)"],["done","# of completed branches (highest to lowest)"],["workers","# of workers (highest to lowest)"]];
     const OPENER_ONLY_SORT_VALUES=new Set(SORT_OPTIONS_OPENERS.map(([value])=>value).filter(value=>value&&!SORT_OPTIONS_DEFAULT.some(([defaultValue])=>defaultValue===value)));
     const GROUP_BY_OPTIONS_WORD=[["","none"],["status","status"],["answer_count","answer count"],["cache_state","cache state"],["worker_presence","worker"],["priority","priority"]];
     const GROUP_BY_OPTIONS_OPENERS=[["state","state (default)"],["completed","completion date"],["elapsed","elapsed time"],["worker_time","total worker time"],["requested","time since request"],["worker_presence","worker"],["queue_position","queue position"],["none","none"]];
@@ -773,7 +773,7 @@
         groupSelect.replaceChildren(...(isSources?GROUP_BY_OPTIONS_OPENERS:GROUP_BY_OPTIONS_WORD).map(([value,text])=>{const option=element("option","",text);option.value=value;return option;}));
         groupSelect.dataset.mode=groupMode;
       }
-      sortSelect.value=currentState.sort||(isSources?"completed":"");byId("by").value=currentState.by;groupSelect.value=currentState.group_by;
+      sortSelect.value=currentState.sort||(isSources?"default":"");byId("by").value=currentState.by;groupSelect.value=currentState.group_by;
       const isOverview=currentState.kind==="auto"&&currentState.branch_target===""&&!currentState.tree;
       document.querySelectorAll("[data-kind]").forEach(button=>button.setAttribute("aria-current",(button.dataset.overview?isOverview:button.dataset.kind===currentState.kind)?"page":"false"));
       document.querySelectorAll("[data-branch-status]").forEach(input=>{input.checked=currentState.branch_status.includes(input.value);input.parentElement.hidden=input.value==="unqueued"?!wordReport||currentState.tree:isOverview&&!overviewBranchStatusNames.includes(input.value);});
@@ -1149,7 +1149,9 @@
     function reportHeader(report,state){
       const meta=element("section","report-meta");
       meta.append(element("h1","",report.report_kind+" report"));
-      if(report.report_kind!=="branch"||report.tree)meta.append(branchTargetLabel(report,state));
+      // The list of every opener names no target; "root" would say nothing.
+      const openerList=report.report_kind==="openers"&&!state.branch_target;
+      if((report.report_kind!=="branch"||report.tree)&&!openerList)meta.append(branchTargetLabel(report,state));
       meta.append(element("span","dim","sorted by "+activeSortLabel(state)));
       // A report served from revalidation is not refreshed by the poll: its
       // data is as old as the last time its signal moved.  Saying so is the

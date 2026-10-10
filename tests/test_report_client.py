@@ -1921,11 +1921,20 @@ class ReportClientContract:
     def test_leaderboard_tab_drops_an_opener_only_sort(self):
         self.page.locator("[data-kind=openers]").click()
         self.page.wait_for_selector("text=openers report")
-        self.assertEqual(self.page.locator("#sort").input_value(), "completed")
+        self.assertEqual(self.page.locator("#sort").input_value(), "default")
+        # The list of every opener names no target, so its caption names none.
+        caption = " ".join(self.page.locator(".report-meta").first.inner_text().split())
+        self.assertNotIn("root", caption)
+        self.assertIn(
+            "sorted by state: latest activity, next up, latest finished",
+            caption)
+        self.page.evaluate(
+            "__reportClient.setState({...__reportClient.getState(), sort: 'default'})")
+        self.assertIn("sort=default", self.page.url)
         self.page.locator("[data-kind=leaderboard]").click()
         self.page.wait_for_selector("text=Opener leaderboard")
         self.assertEqual(self.page.evaluate("__reportClient.getState().sort"), "")
-        self.assertNotIn("sort=completed", self.page.url)
+        self.assertNotIn("sort=default", self.page.url)
 
     def test_leaderboard_tab_ranks_openers_and_rounds_erd(self):
         self.page.locator("[data-kind=leaderboard]").click()
@@ -6972,11 +6981,11 @@ class ReportClientContract:
         # State is the default, and "none" is an explicit choice rather than
         # the absence of one.
         self.assertEqual(self.page.locator("#group-by").input_value(), "state")
-        self.assertEqual(self.page.locator("#sort").input_value(), "completed")
+        self.assertEqual(self.page.locator("#sort").input_value(), "default")
         self.assertEqual(
             self.page.eval_on_selector_all(
                 "#sort option", "options => options.map(o => o.value)"),
-            ["completed", "erd", "elapsed", "worker_time", "priority",
+            ["default", "completed", "erd", "elapsed", "worker_time", "priority",
              "requested", "age", "word", "branches", "open", "done", "workers"])
 
     def test_sources_state_filter_and_sort_reach_the_request(self):

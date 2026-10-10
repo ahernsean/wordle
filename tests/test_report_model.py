@@ -3315,13 +3315,11 @@ class OpenerReportTest(unittest.TestCase):
         queue._conn.commit()
         queue.close()
 
-        # The default shows the newest completed work first.  With no
-        # completed sources, its word tie-breaker gives a stable order.
+        # Every word is queued, so the default is the queue's own order.
         self.assertEqual(
             [row["opener"] for row in
              self._openers(sort="default")["summary"]],
-            [row["opener"] for row in
-             self._openers(sort="erd")["summary"]])
+            ["crane", "salet", "nurdy"])
         self.assertEqual(
             [row["opener"] for row in
              self._openers(sort="priority")["summary"]],
@@ -3450,10 +3448,50 @@ class OpenerReportTest(unittest.TestCase):
              self._openers(sort="worker_time")["summary"]],
             ["crane", "salet", "nurdy"],
         )
+        # The default puts unfinished work first, then the newest finished.
         self.assertEqual(
             [row["opener"] for row in self._openers()["summary"]],
-            ["salet", "crane", "nurdy"],
+            ["nurdy", "salet", "crane"],
         )
+
+    def test_the_default_order_is_each_states_own(self):
+        # Two active words, two queued, two finished.
+        self._queue_words(("baker", 1, 2), ("cider", 2, 2), ("zebra", 9, 1),
+                          ("eager", 3, 1), ("fable", 5, 1), ("gamut", 4, 1))
+        self._finish("fable")
+        self._finish("gamut")
+        queue = self._open_queue()
+        queue._conn.execute(
+            "UPDATE opener_work SET state = 'active', started_at = CASE opener "
+            "WHEN 'baker' THEN 100 WHEN 'cider' THEN 500 END "
+            "WHERE opener IN ('baker', 'cider')")
+        # BAKER started first, but finished a branch after CIDER started.
+        queue.mark_done(self._branch_of("baker", 0))
+        queue._conn.execute(
+            "UPDATE branch_opener_work SET resolved_at = 900 "
+            "WHERE resolved_at IS NOT NULL AND opener_work_id = ("
+            "SELECT opener_work_id FROM opener_work WHERE opener = 'baker')")
+        queue._conn.execute(
+            "UPDATE opener_work SET completed_at = CASE opener "
+            "WHEN 'fable' THEN 50 WHEN 'gamut' THEN 70 END "
+            "WHERE opener IN ('fable', 'gamut')")
+        queue._conn.commit()
+        queue.close()
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        cache._conn.execute("DELETE FROM completed_opener_summaries")
+        cache._conn.commit()
+        cache.close()
+
+        rows = self._openers(group_by="none")["summary"]
+
+        # Active by latest branch finished, queued next up first (ZEBRA's
+        # priority 9 leads, though it sorts last by word), finished newest first.
+        self.assertEqual([row["opener"] for row in rows],
+                         ["baker", "cider", "zebra", "eager", "gamut", "fable"])
+        self.assertEqual(
+            {row["opener"]: row["last_branch_finished_at"] for row in rows
+             if row["state"] == "active"},
+            {"baker": 900, "cider": None})
 
     def test_active_opener_elapsed_time_starts_when_work_is_claimed(self):
         self._queue_words(("salet", 5, 1))

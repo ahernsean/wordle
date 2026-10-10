@@ -3841,6 +3841,7 @@ def _opener_summary_payload(row, rollup, timing, generated_at, answer_set):
         "requested_at": _row_value(row, "requested_at"),
         "started_at": _row_value(row, "started_at"),
         "completed_at": completed_at,
+        "last_branch_finished_at": _row_value(row, "last_branch_finished_at"),
         "request_count": row["request_count"] or 0,
         "state": state,
         "direct_branch_count": row["direct_branch_count"] or 0,
@@ -3864,6 +3865,22 @@ def _merged_opener_state(row):
         return "complete"
     return "active" if _row_value(row, "has_active_request", 0) else "queued"
 
+def _opener_default_sort_key(row):
+    """Each state in its own natural order, active words first.
+
+    Active words by their latest finished branch, most recent first (by when
+    they started, until one has finished); queued words by their place in
+    line; finished words by when they finished, most recent first.
+    """
+    word = row["opener"] or ""
+    if row["state"] == "active":
+        return (0, -(row["last_branch_finished_at"] or row["started_at"] or 0),
+                word)
+    if row["state"] == "queued":
+        return (1, row["queue_position"] or 0, word)
+    return (2, -(row["completed_at"] or 0), word)
+
+
 def _opener_erd_sort_key(row):
     summary = row.get("erd_summary")
     if not summary:
@@ -3876,7 +3893,7 @@ def _opener_erd_sort_key(row):
 
 
 _OPENER_SORT_KEYS = {
-    "default": _opener_erd_sort_key,
+    "default": _opener_default_sort_key,
     "age": lambda row: (row["requested_at"] or float("inf"),
                         row["opener"] or ""),
     "word": lambda row: (row["opener"] or "",),
@@ -4344,7 +4361,7 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
             )
             for row in summary_rows
         ]
-        opener_sort = request.filters.sort or "completed"
+        opener_sort = request.filters.sort or "default"
         _assign_queue_positions(collapsed)
         data["total_opener_count"] = len(collapsed)
         opener_states = request.filters.opener_states
