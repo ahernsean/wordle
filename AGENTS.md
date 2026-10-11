@@ -265,13 +265,16 @@ observed 16.7% fallback rate, the 506-opener point reproduces epoch 17's
 measured coordination share to within a percentage point without being fitted
 to it; 14,000 predicts 98%, which is a swarm that does nothing but scan.
 
-**So the sweep must be queued a few hundred openers at a time. Nothing in the
-code enforces that, and exceeding it degrades throughput smoothly rather than
-failing.**
-
-Exhaustion means nothing anywhere is claimable, which is the drained or
-fully-occupied condition rather than the common one. Do not read the flat
-common case as a guarantee for the whole scheduler.
+**That scan runs only when no opener has anything to offer, and a queue of
+pending openers always has.** Epochs 18 to 23 recorded no fruitless scan at
+all, and on a copy of the production queue with every remaining opener queued
+(12,276 unfinished, 609,659 live memberships, measured 11 Oct 2026) the claim
+path's queries stayed flat: `opener_work_candidates(limit=1)` 1.1 ms,
+`branches_in_progress(opener_work_id)` under 1 ms.  So the whole sweep can be
+queued at once.  Exhaustion is the drained or fully-occupied condition, which a
+sweep reaches only at its tail; `worker_time.fruitless_scans` is what says so,
+and a linear scan there costs seconds per claim at that depth.  Do not read
+the flat common case as a guarantee for the whole scheduler.
 
 **A scan that selects nothing is counted in `worker_time.fruitless_scans`**,
 so the fallback rate is measured rather than inferred; its duration is already
@@ -281,6 +284,33 @@ in `scheduling_time_millis` with every other scan.
 branch and loses its bundle to a racing worker returns None from the short
 served path, never having walked to exhaustion; `_scan_selected_work` marks it
 so it stays out of the count.
+
+### Reports and views at full-queue depth
+
+The whole sweep queued at once is about 12,000 unfinished openers, 600,000
+live memberships and as many queue rows.  Three shapes that were invisible at
+a few hundred openers stopped reports there, and must not come back:
+
+- **Nothing may count per node by scanning every node.** `_tree_layout` once
+  counted each node's children that way; at 155,510 rows the overview tree did
+  not finish in ten minutes.  Count once per parent.
+- **A report counts in SQL, never by shipping memberships to Python.** The
+  Openers report's per-word open branches come from `opener_rows`, its worker
+  counts from the live heartbeats (`opener_worker_counts`, a handful of rows),
+  and its cross-word branch totals from one pass that reduces to one row per
+  (group, branch) before counting (`branch_counts_by_group`): a
+  `COUNT(DISTINCT)` per group builds a set of every branch for each.  Word lists
+  go in as one JSON parameter (`json_each`), and `idx_opener_work_opener` is
+  what lets them join to their requests without a scan per word.
+- **`live_branch_opener_rows` stays a single-table view.** It is the right side
+  of the LEFT JOIN in `active_branch_owner_rows`, and SQLite cannot flatten a
+  join there: as a join it materialized every live membership to find the
+  owners of a few dozen open branches, 2.5 s per read of the open branches at
+  full depth against 0.2 ms now.  `TestOpenBranchOwnersAreFoundByBranch` checks
+  the plan.
+
+The tree views still read every queue row, about 8 s today and 32 s at full
+depth; computing a tree page in SQL is the remaining step.
 
 ### The coordination window feeds the publish threshold
 
@@ -462,8 +492,11 @@ opener done (`_BranchWorker._complete_openers`).  That order is forced: the
 queue and the cache are separate databases with no shared transaction, so
 flipping first would leave a window in which an opener is done with no ERD.
 A failure before the flip leaves the opener not done, which is true, and
-`ERDQueue.openers_ready_to_complete` offers it again at the next finalize
-anywhere.  `ScoreCache.write_opener_erd` raises on a failed write, disk errors
+each worker's look over every request between claims, about once a minute
+(`_BranchWorker._complete_stranded_openers`), offers it again.  A finalize
+itself asks `ERDQueue.openers_ready_to_complete` only about the requests owning
+the branch it resolved: it holds the write lock, and asking about every request
+there cost 58 ms per finalize at full-queue depth.  `ScoreCache.write_opener_erd` raises on a failed write, disk errors
 included, because the flip is conditioned on the row existing.
 
 An opener is done when no further computation is needed on it, which in

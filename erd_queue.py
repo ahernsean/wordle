@@ -1974,18 +1974,26 @@ class ERDQueue:
     def _rebuild_queue_views(self):
         """Restore queue views when their stored definition differs from code."""
         view_definitions = {
+            # One table, its request read by key: a view that is a join cannot
+            # be flattened into the LEFT JOIN active_branch_owner_rows makes,
+            # so SQLite materializes every live membership of the queue to
+            # find the owners of a few open branches.
             "live_branch_opener_rows": """
                 CREATE VIEW live_branch_opener_rows AS
                 SELECT membership.branch_id,
-                       opener.opener_work_id,
-                       opener.opener AS owner_opener,
+                       membership.opener_work_id,
+                       (SELECT opener.opener FROM opener_work AS opener
+                         WHERE opener.opener_work_id = membership.opener_work_id)
+                           AS owner_opener,
                        membership.opener_pattern AS owner_opener_pattern,
-                       opener.requested_priority AS owner_priority
+                       (SELECT opener.requested_priority FROM opener_work AS opener
+                         WHERE opener.opener_work_id = membership.opener_work_id)
+                           AS owner_priority
                 FROM branch_opener_work AS membership
-                JOIN opener_work AS opener
-                  ON opener.opener_work_id = membership.opener_work_id
                 WHERE membership.resolved_at IS NULL
-                  AND opener.state != 'complete'
+                  AND (SELECT opener.state FROM opener_work AS opener
+                        WHERE opener.opener_work_id = membership.opener_work_id)
+                      != 'complete'
             """,
             "active_branch_owner_rows": f"""
                 CREATE VIEW active_branch_owner_rows AS

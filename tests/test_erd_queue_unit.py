@@ -2549,3 +2549,16 @@ class TestSpineAttribution(_TmpQueue):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestOpenBranchOwnersAreFoundByBranch(_TmpQueue):
+
+    def test_owners_of_open_branches_are_looked_up_not_materialized(self):
+        # The full sweep holds hundreds of thousands of live memberships and a
+        # few dozen open branches.  A plan that materializes the memberships
+        # reads every one of them to answer for those few.
+        plan = " ".join(row[3] for row in self.q._conn.execute(
+            "EXPLAIN QUERY PLAN SELECT * FROM active_branch_owner_rows"))
+        self.assertNotIn("MATERIALIZE", plan)
+        self.assertRegex(plan, r"branch_opener_work AS membership USING "
+                               r"\S*INDEX \S+ \(branch_id=\?\)")
