@@ -103,6 +103,8 @@ from report_model import (
     is_overview_request,
     OPENER_SORT_FIELDS,
     ROOT_PROGRESS_SORT_FIELDS,
+    OPENER_LIST_DEFAULT_STATES,
+    OPENER_LIST_PAGE_SIZE,
     OPENER_STATES,
     ReportFilters,
     ReportRequest,
@@ -1984,6 +1986,11 @@ def main():
         hotspot_field = args.by or 'nodes'
         if args.hotspots and args.limit is None:
             args.limit = 10
+        if args.openers and args.branch_target.kind == 'root':
+            if args.opener_state is None:
+                args.opener_state = OPENER_LIST_DEFAULT_STATES
+            if args.limit is None:
+                args.limit = OPENER_LIST_PAGE_SIZE
         overview = is_overview_request(
             args.report_kind, args.branch_target.kind, args.tree
         )

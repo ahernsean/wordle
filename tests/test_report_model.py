@@ -14,6 +14,7 @@ from unittest.mock import Mock, patch
 from cache_sqlite import ScoreCache
 from pattern_matrix import PatternMatrix
 from erd_queue import ERDQueue
+import erd_queue
 import erd_search
 import report_model
 from report_model import (
@@ -284,6 +285,44 @@ class ReportModelTest(unittest.TestCase):
             "", rows, set(ANSWERS))
         self.assertEqual(second_page["paging"]["returned_group_count"], 1)
 
+    def _tree_row(self, spine, words):
+        key = ScoreCache.encode_subset(words)
+        return {
+            "branch_key": key, "branch_key_hex": key.hex(), "spine": spine,
+            "branch_status": "queued", "branch_worker_status": None,
+            "answer_count": len(words), "worker_count": 0, "priority": 1,
+            "completed_candidate_count": 0, "candidate_count": 3,
+        }
+
+    def test_tree_nodes_count_their_own_children(self):
+        rows = [
+            self._tree_row("RAISE ----- CRANE y----", ["crane"]),
+            self._tree_row("RAISE ----- SLATE -y---", ["salet"]),
+            self._tree_row("RAISE -g---", ["nurdy"]),
+        ]
+        layout = report_model._tree_layout(
+            rows, ReportRequest(report_kind="queue", tree=True), "", rows,
+            set(ANSWERS))
+        counts = {node["spine"]: (node["child_count"], node["has_children"])
+                  for node in layout["nodes"]}
+        self.assertEqual(counts, {"RAISE -----": (2, True),
+                                  "RAISE -g---": (0, False)})
+
+    def test_tree_layout_is_linear_in_its_nodes(self):
+        # The whole queue's tree runs to hundreds of thousands of nodes; a
+        # count taken per node over every node never finishes there, and at
+        # this size takes seconds where a linear layout takes milliseconds.
+        letters = "abcdefghijklmnopqrstuvwxyz"
+        words = [a + b + c + "ed" for a in letters for b in letters
+                 for c in letters[:6]][:4000]
+        rows = [self._tree_row(f"{word.upper()} ----- CRANE y----", ["crane"])
+                for word in words]
+        started = time.perf_counter()
+        report_model._tree_layout(
+            rows, ReportRequest(report_kind="queue", tree=True), "", rows,
+            set(ANSWERS))
+        self.assertLess(time.perf_counter() - started, 2.0)
+
     def test_historical_hotspot_reports_normalize_branch_keys(self):
         branch_key = ScoreCache.encode_subset(["salet"])
         queue = Mock(epoch=9)
@@ -465,13 +504,15 @@ class ReportModelTest(unittest.TestCase):
 
     def test_opener_report_never_writes_the_timing_it_finds_missing(self):
         queue = Mock()
-        queue.opener_rows.return_value = [{"opener": "raise", "state": "done"}]
+        queue.opener_rows.return_value = [
+            {"opener": "raise", "state": "done", "open_branch_count": 0}]
         queue.opener_membership_rows.return_value = []
         queue.completed_opener_timing.return_value = {
             "completed_at": 20, "first_created_at": 10,
             "worker_time_millis": 4, "telemetry_epochs": "2,4",
         }
-        queue.distinct_branch_count_for_words.return_value = 0
+        queue.branch_counts_by_group.return_value = {None: (0, 0)}
+        queue.opener_worker_counts.return_value = {}
         timing_cache = Mock()
         timing_cache.completed_opener_summary_map.return_value = {}
         payload = {"opener": "raise", "state": "complete", "branch_count": 0,
@@ -480,7 +521,6 @@ class ReportModelTest(unittest.TestCase):
             patch("report_model._open_report_queue", return_value=queue),
             patch("report_model.ScoreCache", return_value=timing_cache),
             patch("report_model.load_word_list", return_value=ANSWERS),
-            patch("report_model._opener_rollups", return_value={"raise": {}}),
             patch("report_model._opener_summary_payload", return_value=payload),
             patch("report_model._opener_erd_summaries", return_value={}),
         ):
@@ -523,7 +563,7 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(report_model._opener_group_key(
             {"elapsed_time_millis": None}, "elapsed", 0), (5, "not completed"))
 
-    def test_opener_rollups_and_membership_payload_preserve_shared_branch_context(self):
+    def test_opener_membership_payload_preserves_shared_branch_context(self):
         branch_key = ScoreCache.encode_subset(["salet"])
         parent_key = ScoreCache.encode_subset(["crane"])
         row = {
@@ -533,8 +573,6 @@ class ReportModelTest(unittest.TestCase):
             "pending_status": "in_progress", "active_status": "open", "worker_count": 2,
             "branch_effective_priority": 6,
         }
-        rollup = report_model._opener_rollups([row, row])["raise"]
-        self.assertEqual(rollup["open_branch_count"], 1)
         payload = report_model._opener_membership_payload(row, 2, set(ANSWERS))
         self.assertTrue(payload["is_shared"])
         self.assertEqual(payload["parent_branch_reference"], branch_reference(parent_key))
@@ -3805,6 +3843,56 @@ class OpenerReportTest(unittest.TestCase):
         self.assertIsNotNone(stored["completed_at"])
         self.assertEqual((stored["completed_branch_count"],
                           stored["completed_direct_done_branch_count"]), (1, 1))
+
+    def test_open_branches_and_workers_are_counted_once_per_word(self):
+        # CRANE holds two requests owning one branch, and shares it with
+        # SALET; one live worker is on it, and a worker whose heartbeat has
+        # lapsed is on another of SALET's.
+        shared = self._branch_of("crane", 0)
+        lapsed = self._branch_of("salet", 1)
+        queue = self._open_queue()
+        queue.add_pending_many([(shared, 3, 5, "crane", 0)])
+        add_second_request(queue, [(shared, 3, 5, "crane", 0)])
+        queue.add_pending_many([(shared, 3, 3, "salet", 0),
+                                (lapsed, 3, 3, "salet", 1)])
+        now = int(time.time())
+        queue.heartbeat("worker-1", 1, shared, 3, now, 0)
+        queue.heartbeat("worker-2", 2, lapsed, 3, now, 0)
+        queue._conn.execute(
+            "UPDATE worker_heartbeat SET updated_at = ? "
+            "WHERE worker_id = 'worker-2'",
+            (now - erd_queue.WORKER_LIVENESS_SECONDS - 60,))
+        queue._conn.commit()
+        queue.close()
+
+        rows = {row["opener"]: row for row in self._openers()["summary"]}
+
+        self.assertEqual(
+            (rows["crane"]["open_branch_count"], rows["crane"]["worker_count"]),
+            (1, 1))
+        self.assertEqual(
+            (rows["salet"]["open_branch_count"], rows["salet"]["worker_count"]),
+            (2, 1))
+
+    def test_only_the_words_shown_are_summarized_unless_ordered_by_erd(self):
+        # An unfinished word's summary looks up its response groups; at the
+        # whole queue's depth, doing that for words no page shows costs
+        # seconds.  Ordering by ERD needs every word's.
+        self._queue_words(("crane", 1, 1), ("salet", 2, 1), ("nurdy", 3, 1))
+        real = report_model._opener_erd_summaries
+        summarized = []
+
+        def spy(sources, rows, *args):
+            summarized.append(sorted(row["opener"] for row in rows))
+            return real(sources, rows, *args)
+
+        with patch("report_model._opener_erd_summaries", side_effect=spy):
+            page = self._openers(limit=1, group_by="none")["summary"]
+            self.assertEqual(summarized, [[page[0]["opener"]]])
+            summarized.clear()
+            self._openers(limit=1, group_by="none", sort="erd")
+            self.assertEqual(summarized, [["crane", "nurdy", "salet"]])
+        self.assertIsNotNone(page[0]["erd_summary"])
 
     def test_branch_totals_count_only_words_with_unfinished_work(self):
         self._queue_words(("crane", 1, 2), ("salet", 5, 3))

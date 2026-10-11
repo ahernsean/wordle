@@ -15,6 +15,7 @@ they miss:
   returns immediately without evaluating any candidates).
 """
 import ast
+import inspect
 import math
 import multiprocessing
 import os
@@ -105,6 +106,7 @@ def _bare_worker():
     w._help_recursion_depth = 0
     w._time_account = erd_swarm._WorkerTimeAccount()
     w._open_dependency_episodes = 0
+    w._last_stranded_opener_check = 0.0
     w._time_account_nodes = 0
     w._time_account_claim_timing = (0, 0, 0, 0)
     w._bundle_coordination_time_millis = {}
@@ -3119,6 +3121,7 @@ class TestCoordinationWindowExcludesNonHandoffTime(unittest.TestCase):
         worker.queue = mock.Mock()
         worker._heartbeat = mock.Mock()
         worker.claim_one = mock.Mock(return_value=None)
+        worker._complete_stranded_openers = mock.Mock()
         worker._log = mock.Mock()
         opened_at = time.time() - 600.0        # ten minutes with no work
         worker._last_claim_complete = opened_at
@@ -5223,6 +5226,50 @@ class TestClaimDeclineReason(unittest.TestCase):
                                       expected_budget=4))
         self.assertEqual(self.q.last_claim_decline(),
                          erd_queue.CLAIM_DECLINE_BUDGET_MISMATCH)
+
+
+class TestStrandedOpenersAreCompleted(unittest.TestCase):
+
+    def test_every_request_is_looked_over_about_once_a_minute(self):
+        worker = _bare_worker()
+        worker.queue = mock.Mock()
+        worker.queue.openers_ready_to_complete.return_value = ["crane"]
+        worker._complete_openers = mock.Mock()
+        worker._respect_checkpoint_pause = mock.Mock()
+        now = [10_000.0]
+        with mock.patch("erd_swarm.time.time", side_effect=lambda: now[0]):
+            worker._complete_stranded_openers()
+            now[0] += erd_swarm.STRANDED_OPENER_CHECK_SECONDS - 1
+            worker._complete_stranded_openers()
+            now[0] += 2
+            worker._complete_stranded_openers()
+        # Over every request, not a finalize's few.
+        self.assertEqual(worker.queue.openers_ready_to_complete.call_args_list,
+                         [mock.call(), mock.call()])
+        self.assertEqual(worker._complete_openers.call_args_list,
+                         [mock.call(["crane"]), mock.call(["crane"])])
+
+    def test_the_worker_loop_runs_the_check_idle_or_not(self):
+        # run() is the only caller and is not exercised end to end here.  The
+        # check must come before the claim: a worker that finds nothing to
+        # claim skips the rest of the loop, and the tail of a sweep, when
+        # nothing is claimable, is where a stranded opener waits.
+        source = inspect.getsource(erd_swarm._BranchWorker.run)
+        self.assertLess(source.index("self._complete_stranded_openers()"),
+                        source.index("self.claim_one()"))
+
+    def test_the_check_waits_out_a_checkpoint_pause_before_writing(self):
+        worker = _bare_worker()
+        worker.queue = mock.Mock()
+        worker.queue.openers_ready_to_complete.return_value = []
+        order = []
+        worker._respect_checkpoint_pause = mock.Mock(
+            side_effect=lambda: order.append("pause"))
+        worker._complete_openers = mock.Mock(
+            side_effect=lambda _openers: order.append("complete"))
+        worker._complete_stranded_openers()
+        worker._complete_stranded_openers()     # throttled: nothing at all
+        self.assertEqual(order, ["pause", "complete"])
 
 
 class TestDependencyWaitAttribution(unittest.TestCase):

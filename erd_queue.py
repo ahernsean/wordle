@@ -284,6 +284,10 @@ CREATE TABLE IF NOT EXISTS opener_work (
 CREATE INDEX IF NOT EXISTS idx_opener_work_priority_order
     ON opener_work(requested_priority DESC, opener_work_id);
 
+-- A word's requests, found by the word: a report joins a word list to its
+-- requests, which without this scans every request once per word.
+CREATE INDEX IF NOT EXISTS idx_opener_work_opener ON opener_work(opener);
+
 -- Every opener-work request that owns a branch.  parent_branch_id records the
 -- opener-local promotion lineage; NULL identifies a requested root.
 CREATE TABLE IF NOT EXISTS branch_opener_work (
@@ -1970,18 +1974,26 @@ class ERDQueue:
     def _rebuild_queue_views(self):
         """Restore queue views when their stored definition differs from code."""
         view_definitions = {
+            # One table, its request read by key: a view that is a join cannot
+            # be flattened into the LEFT JOIN active_branch_owner_rows makes,
+            # so SQLite materializes every live membership of the queue to
+            # find the owners of a few open branches.
             "live_branch_opener_rows": """
                 CREATE VIEW live_branch_opener_rows AS
                 SELECT membership.branch_id,
-                       opener.opener_work_id,
-                       opener.opener AS owner_opener,
+                       membership.opener_work_id,
+                       (SELECT opener.opener FROM opener_work AS opener
+                         WHERE opener.opener_work_id = membership.opener_work_id)
+                           AS owner_opener,
                        membership.opener_pattern AS owner_opener_pattern,
-                       opener.requested_priority AS owner_priority
+                       (SELECT opener.requested_priority FROM opener_work AS opener
+                         WHERE opener.opener_work_id = membership.opener_work_id)
+                           AS owner_priority
                 FROM branch_opener_work AS membership
-                JOIN opener_work AS opener
-                  ON opener.opener_work_id = membership.opener_work_id
                 WHERE membership.resolved_at IS NULL
-                  AND opener.state != 'complete'
+                  AND (SELECT opener.state FROM opener_work AS opener
+                        WHERE opener.opener_work_id = membership.opener_work_id)
+                      != 'complete'
             """,
             "active_branch_owner_rows": f"""
                 CREATE VIEW active_branch_owner_rows AS
@@ -2219,10 +2231,18 @@ class ERDQueue:
         - opener / opener_pattern record the first opener whose branch
           produced this entry (kept for display in `status`).
 
+        A word is a word in either case: the opener is stored lower case, as
+        every reader that looks one up asks for it, and the returned map is
+        keyed the same way.
+
         Raises ValueError, before writing anything, if any row's priority lies
         outside the opener-work range.
         """
-        rows = list(rows)
+        rows = [(branch_key, n_words, priority,
+                 opener.lower() if opener is not None else None,
+                 opener_pattern)
+                for branch_key, n_words, priority, opener, opener_pattern
+                in rows]
         for row in rows:
             check_opener_priority_range(row[2])
         # Intern before the transaction: the branches registry is append-only,
@@ -2546,7 +2566,7 @@ class ERDQueue:
           )
     """
 
-    def openers_ready_to_complete(self):
+    def openers_ready_to_complete(self, opener_work_ids=None):
         """Openers whose every owned branch has resolved but are not yet done.
 
         An opener is done when no further computation is needed on it, and
@@ -2554,7 +2574,14 @@ class ERDQueue:
         response groups to its own ERD.  This is the list of openers owing
         that reduction.  It is a query over durable state rather than a stored
         obligation, so an opener whose reducing worker died before finishing
-        simply appears again at the next finalize anywhere.
+        is found again by the next check that looks at every request: each
+        worker runs one about once a minute.
+
+        opener_work_ids limits the check to those requests.  A finalize asks
+        only about the requests owning the branch it resolved, which is every
+        request that branch can have finished, inside its write transaction;
+        asking about every request there costs time with the lock held for
+        each of the queue's unfinished requests.
 
         Two workers resolving an opener's last two branches near-
         simultaneously can both see it here and both reduce it.  The
@@ -2562,9 +2589,15 @@ class ERDQueue:
         replaced with identical values, so the repeat costs a few
         milliseconds and changes nothing.
         """
+        if opener_work_ids is None:
+            return sorted({row["opener"] for row in self._conn.execute(
+                "SELECT opener FROM opener_work AS s WHERE "
+                + self._FINISHED_OPENER_WORK_PREDICATE)})
         return sorted({row["opener"] for row in self._conn.execute(
-            "SELECT opener FROM opener_work AS s WHERE "
-            + self._FINISHED_OPENER_WORK_PREDICATE)})
+            "SELECT opener FROM opener_work AS s WHERE s.opener_work_id IN "
+            "(SELECT value FROM json_each(?)) AND "
+            + self._FINISHED_OPENER_WORK_PREDICATE,
+            (json.dumps(sorted(opener_work_ids)),))})
 
     def completed_opener_names(self):
         """Every opener with a request that is done."""
@@ -2633,6 +2666,11 @@ class ERDQueue:
         """Make branch ownership unschedulable and update request lifecycle."""
         branch_condition = "" if branch_id is None else " AND branch_id = ?"
         parameters = () if branch_id is None else (branch_id,)
+        # Only a request owning the branch can be finished by resolving it.
+        owners = None if branch_id is None else {
+            row["opener_work_id"] for row in self._conn.execute(
+                "SELECT opener_work_id FROM branch_opener_work "
+                "WHERE branch_id = ?", parameters)}
         withdrawn_request_ids = set()
         if withdraw:
             withdrawn_request_ids = {
@@ -2651,7 +2689,7 @@ class ERDQueue:
                 "UPDATE branch_opener_work SET resolved_at = ? "
                 "WHERE resolved_at IS NULL" + branch_condition,
                 (int(time.time()), *parameters))
-        completed_words = self.openers_ready_to_complete()
+        completed_words = self.openers_ready_to_complete(owners)
         if withdraw:
             # Withdrawal is an operator removing work, not an opener finishing:
             # the requests it took work from, and left with nothing owed, are
@@ -2659,14 +2697,19 @@ class ERDQueue:
             # its own and is waiting on its reduction is not this withdrawal's
             # to complete.
             self._finish_opener_work_ids(
-                withdrawn_request_ids & self._ready_opener_work_ids())
+                self._ready_opener_work_ids(withdrawn_request_ids))
         self._demote_orphaned_owned_branches()
         return completed_words
 
-    def _ready_opener_work_ids(self):
+    def _ready_opener_work_ids(self, opener_work_ids):
+        """Those of opener_work_ids whose every owned branch has resolved."""
+        if not opener_work_ids:
+            return set()
         return {row["opener_work_id"] for row in self._conn.execute(
             "SELECT opener_work_id FROM opener_work AS s WHERE "
-            + self._FINISHED_OPENER_WORK_PREDICATE)}
+            "s.opener_work_id IN (SELECT value FROM json_each(?)) AND "
+            + self._FINISHED_OPENER_WORK_PREDICATE,
+            (json.dumps(sorted(opener_work_ids)),))}
 
     def _finish_opener_work_ids(self, opener_work_ids):
         opener_work_ids = sorted(opener_work_ids)
@@ -2758,7 +2801,8 @@ class ERDQueue:
                     f"DELETE FROM active_branches WHERE branch_id IN ({active_placeholders})",
                     active_ids)
 
-        return self.openers_ready_to_complete()
+        return self.openers_ready_to_complete(
+            {group["opener_work_id"] for group in direct_groups})
 
     def completed_opener_timing(self, opener):
         """Return durable-opener timing and cost from every telemetry epoch.
@@ -6425,6 +6469,9 @@ class ERDQueue:
         back to the priority of the completed requests only once none are
         outstanding.
 
+        open_branch_count counts the word's live branches that are not done;
+        a finished word owns none.
+
         last_branch_finished_at is when the latest branch of an unfinished
         word's unfinished requests resolved, NULL until one has: a word queued
         again after finishing is not dated by its earlier run.
@@ -6447,7 +6494,8 @@ class ERDQueue:
                    MAX(s.completed_branch_count) AS branch_count,
                    MAX(s.completed_direct_branch_count) AS direct_branch_count,
                    MAX(s.completed_direct_done_branch_count)
-                       AS direct_done_branch_count
+                       AS direct_done_branch_count,
+                   0 AS open_branch_count
             FROM opener_work s
             GROUP BY s.opener
             HAVING MAX(s.state != 'complete') = 0
@@ -6473,7 +6521,11 @@ class ERDQueue:
                    COUNT(DISTINCT CASE
                        WHEN m.parent_branch_id IS NULL
                         AND p.status = 'done'
-                       THEN m.branch_id END) AS direct_done_branch_count
+                       THEN m.branch_id END) AS direct_done_branch_count,
+                   COUNT(DISTINCT CASE
+                       WHEN m.resolved_at IS NULL
+                        AND COALESCE(p.status, '') != 'done'
+                       THEN m.branch_id END) AS open_branch_count
             FROM opener_work s
             LEFT JOIN branch_opener_work m
               ON m.opener_work_id = s.opener_work_id
@@ -6508,24 +6560,83 @@ class ERDQueue:
                 keys[opener].add(bytes(branch_key))
         return keys
 
-    def distinct_branch_count_for_words(self, openers):
-        """Count the branches owned by these opener words, each branch once.
+    def branch_counts_by_group(self, groups):
+        """Branch totals for groups of words, each branch counted once.
 
-        Two words can own the same branch, so summing their branch counts
-        double-counts exactly the shared ownership the opener report exists to
-        show.  Counted over every membership, resolved or not, to match the
-        per-word branch_count in opener_rows().
+        groups maps each word to its group's label.  Returns {label: (all,
+        open)}, with the totals over every word together under None.  Two
+        words can own the same branch, so summing per-word counts would
+        double-count exactly the shared ownership the opener report exists to
+        show.  all spans every membership, resolved or not, to match
+        branch_count in opener_rows(); open counts live memberships whose
+        branch is not done.  One query serves every group and the whole.
         """
-        words = [word for word in openers if word is not None]
-        if not words:
-            return 0
-        placeholders = ",".join("?" for _ in words)
-        return self._conn.execute(f"""
-            SELECT COUNT(DISTINCT m.branch_id)
-            FROM branch_opener_work AS m
-            JOIN opener_work AS s ON s.opener_work_id = m.opener_work_id
-            WHERE s.opener IN ({placeholders})
-        """, words).fetchone()[0]
+        if not groups:
+            return {None: (0, 0)}
+        # Reduced to one row per (group, branch) and per branch before
+        # counting, so the totals are plain counts: a COUNT(DISTINCT) per
+        # group builds a set of every branch for each one.
+        totals = {None: (0, 0)}
+        for label, every, open_count in self._conn.execute("""
+            WITH word_group(opener, label) AS (
+                SELECT key, value FROM json_each(?)
+            ), owned AS (
+                SELECT w.label, m.branch_id,
+                       m.resolved_at IS NULL
+                       AND COALESCE(p.status, '') != 'done' AS is_open
+                FROM word_group AS w
+                JOIN opener_work AS s ON s.opener = w.opener
+                JOIN branch_opener_work AS m
+                  ON m.opener_work_id = s.opener_work_id
+                LEFT JOIN pending_branches AS p ON p.branch_id = m.branch_id
+            )
+            SELECT label, COUNT(*), SUM(is_open) FROM (
+                SELECT label, branch_id, MAX(is_open) AS is_open
+                FROM owned GROUP BY label, branch_id)
+            GROUP BY label
+            UNION ALL
+            SELECT NULL, COUNT(*), SUM(is_open) FROM (
+                SELECT branch_id, MAX(is_open) AS is_open
+                FROM owned GROUP BY branch_id)
+        """, (json.dumps(groups),)):
+            totals[label] = (every, open_count or 0)
+        return totals
+
+    def opener_worker_counts(self):
+        """{opener: live workers on its live branches}, each branch once.
+
+        Started from the live heartbeats, a handful of rows, rather than from
+        the memberships, which the whole queue holds by the hundred thousand.
+        """
+        live_since = int(time.time()) - WORKER_LIVENESS_SECONDS
+        return dict(self._conn.execute("""
+            WITH workers AS (
+                SELECT current_branch_id AS branch_id, COUNT(*) AS worker_count
+                FROM worker_heartbeat
+                WHERE updated_at >= ? AND current_branch_id IS NOT NULL
+                GROUP BY current_branch_id
+            ), owned AS (
+                SELECT DISTINCT s.opener, workers.branch_id,
+                       workers.worker_count
+                FROM workers
+                JOIN branch_opener_work AS m
+                  ON m.branch_id = workers.branch_id AND m.resolved_at IS NULL
+                JOIN opener_work AS s ON s.opener_work_id = m.opener_work_id
+            )
+            SELECT opener, SUM(worker_count) FROM owned GROUP BY opener
+        """, (live_since,)).fetchall())
+
+    def live_owner_counts(self, branch_ids):
+        """{branch_id: how many requests own it live}."""
+        branch_ids = list(branch_ids)
+        if not branch_ids:
+            return {}
+        return dict(self._conn.execute("""
+            SELECT branch_id, COUNT(*) FROM branch_opener_work
+            WHERE resolved_at IS NULL
+              AND branch_id IN (SELECT value FROM json_each(?))
+            GROUP BY branch_id
+        """, (json.dumps(branch_ids),)).fetchall())
 
     def opener_membership_rows(self, opener_work_id=None, opener=None,
                                include_resolved=False):

@@ -153,6 +153,11 @@ OVERVIEW_BRANCH_WORKER_STATUSES = ("active",)
 # of its requests up, and complete only once every request behind it is.  These
 # are deliberately not the branch statuses, which describe a single branch.
 OPENER_STATES = ("queued", "active", "complete")
+# The list of every opener opens on the work still owed, a page at a time: a
+# sweep finishes thousands of openers, and their ERDs are the leaderboard's.
+# The browser client carries the same defaults.
+OPENER_LIST_DEFAULT_STATES = ("active", "queued")
+OPENER_LIST_PAGE_SIZE = 100
 GROUP_BY_STRATEGIES = (
     "none", "status", "answer_count", "cache_state", "worker_presence", "priority",
 )
@@ -2988,16 +2993,14 @@ def _tree_layout(rows, request, prefix, unfiltered_rows, answer_set):
             "candidate_count": row["candidate_count"],
             "is_context": bool(row.get("is_context")),
         })
-    parent_node_ids = {
+    # Counted once per parent: a count taken per node by scanning every node
+    # is quadratic, and the whole queue's tree has hundreds of thousands.
+    child_counts = collections.Counter(
         candidate["parent_node_id"] for candidate in nodes.values()
-        if candidate["parent_node_id"] is not None
-    }
+        if candidate["parent_node_id"] is not None)
     for node in nodes.values():
-        node["has_children"] = node["node_id"] in parent_node_ids
-        node["child_count"] = sum(
-            candidate["parent_node_id"] == node["node_id"]
-            for candidate in nodes.values()
-        )
+        node["child_count"] = child_counts[node["node_id"]]
+        node["has_children"] = node["child_count"] > 0
     for node in nodes.values():
         worker_count = node["worker_count"]
         current_node = node
@@ -4024,11 +4027,12 @@ def _grouped_openers(rows, group_by, branch_totals, generated_at, limit,
 
     Each group shows `limit` of its words from its own offset, so paging one
     group leaves the others where they are.  Its rollup covers every matched
-    word in it, so its header says how much work the whole group holds.  Its
-    branch totals are counted distinctly over its unfinished words, for the
-    same reason the report's own are: two words can own the same branch, and
-    summing their per-word counts would count it once per word.  A key in
-    `empty_keys` heads a group even when no word is in it.
+    word in it, so its header says how much work the whole group holds.
+    `branch_totals` maps each group's label to its (all, open) branch counts,
+    counted distinctly over its unfinished words for the same reason the
+    report's own are: two words can own the same branch, and summing their
+    per-word counts would count it once per word.  A key in `empty_keys`
+    heads a group even when no word is in it.
     """
     rows_by_group = collections.defaultdict(list)
     for row in rows:
@@ -4040,10 +4044,7 @@ def _grouped_openers(rows, group_by, branch_totals, generated_at, limit,
     for key in sorted(rows_by_group):
         group_rows = rows_by_group[key]
         offset = offsets.get(key[1], 0)
-        branch_count = open_branch_count = 0
-        if group_rows:
-            branch_count, open_branch_count = branch_totals(
-                [row["opener"] for row in group_rows])
+        branch_count, open_branch_count = branch_totals.get(key[1], (0, 0))
         groups.append({
             "label": key[1],
             "offset": offset,
@@ -4236,32 +4237,6 @@ def opener_completion_signal(sources):
         connection.close()
 
 
-def _opener_rollups(membership_rows):
-    """Per-word live-branch totals, keyed by opener.
-
-    A branch owned by two of a word's requests holds two membership rows, so
-    branches are counted once per word rather than once per membership.
-    """
-    rollups = collections.defaultdict(
-        lambda: {"open_branch_count": 0, "worker_count": 0, "branch_ids": set()}
-    )
-    for row in membership_rows:
-        opener = (_row_value(row, "opener") or "").lower() or None
-        rollup = rollups[opener]
-        if row["branch_id"] in rollup["branch_ids"]:
-            continue
-        rollup["branch_ids"].add(row["branch_id"])
-        worker_count = _row_value(row, "worker_count", 0)
-        branch_status, _branch_worker_status = branch_status_and_worker_status(
-            _row_value(row, "pending_status"), _row_value(row, "active_status"),
-            worker_count,
-        )
-        if branch_status != "done":
-            rollup["open_branch_count"] += 1
-        rollup["worker_count"] += worker_count
-    return rollups
-
-
 def _opener_membership_payload(row, owner_count, answer_set):
     branch_key = bytes(row["branch_key"])
     parent_branch_key = _row_value(row, "parent_branch_key")
@@ -4337,10 +4312,11 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
         if opener is not None:
             summary_rows = [row for row in summary_rows
                             if (row["opener"] or "").lower() == opener]
-        # Rolled up from every live membership, not only the named word's, so
-        # each word's own totals are complete whichever word is in scope.
-        all_membership_rows = queue.opener_membership_rows()
-        rollups = _opener_rollups(all_membership_rows)
+        # Counted in the queue, not from membership rows: the whole queue
+        # holds hundreds of thousands of them, and every word's totals are a
+        # few numbers.
+        worker_counts = {(word or "").lower(): count for word, count
+                         in queue.opener_worker_counts().items()}
         all_answers = None
         try:
             all_answers = load_word_list(sources.answer_list_path)
@@ -4351,7 +4327,9 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
             report["sources"]["cache"]["error"] = str(error)
         collapsed = [
             _opener_summary_payload(
-                row, rollups[(_row_value(row, "opener") or "").lower() or None],
+                row, {"open_branch_count": row["open_branch_count"] or 0,
+                      "worker_count": worker_counts.get(
+                          (_row_value(row, "opener") or "").lower(), 0)},
                 timings.get(
                     (_row_value(row, "opener") or "").lower() or None,
                     {"completed_at": None, "elapsed_time_millis": None,
@@ -4368,13 +4346,20 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
         if opener_states:
             collapsed = [row for row in collapsed
                          if row["state"] in opener_states]
-        erd_summaries = (
-            _opener_erd_summaries(
-                sources, collapsed, report, queue, timing_cache, all_answers,
-            ) if timing_cache is not None else {}
-        )
-        for row in collapsed:
-            row["erd_summary"] = erd_summaries.get(row["opener"])
+        def attach_erd_summaries(rows):
+            erd_summaries = (
+                _opener_erd_summaries(
+                    sources, rows, report, queue, timing_cache, all_answers,
+                ) if timing_cache is not None else {}
+            )
+            for row in rows:
+                row["erd_summary"] = erd_summaries.get(row["opener"])
+
+        # Summarized for the words shown, unless the order itself is by ERD:
+        # an unfinished word's summary looks up its response groups, which at
+        # full-queue depth is seconds for words no page shows.
+        if opener_sort == "erd":
+            attach_erd_summaries(collapsed)
         collapsed = _sorted_openers(collapsed, opener_sort)
         group_by = request.filters.group_by
         grouped = group_by is not None and group_by != "none"
@@ -4384,29 +4369,15 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
         # shared ownership this report exists to show.  Only words with
         # unfinished work are counted: a finished word's branches are history,
         # and counting every branch ever owned would grow with the whole sweep.
-        unfinished_words = {row["opener"] for row in collapsed
-                            if row["state"] != "complete"}
-        open_branch_ids_by_word = collections.defaultdict(set)
-        for row in all_membership_rows:
-            if branch_status_and_worker_status(
-                    _row_value(row, "pending_status"),
-                    _row_value(row, "active_status"),
-                    _row_value(row, "worker_count", 0))[0] != "done":
-                open_branch_ids_by_word[
-                    (_row_value(row, "opener") or "").lower()].add(
-                        row["branch_id"])
-
-        def branch_totals(words):
-            words = [word for word in words if word in unfinished_words]
-            return (
-                queue.distinct_branch_count_for_words(words),
-                len(set().union(*(open_branch_ids_by_word.get(word, ())
-                                  for word in words))),
-            )
-
-        matched_words = [row["opener"] for row in collapsed]
+        # One query counts the whole and every group, since each needs its own
+        # distinct count.
+        branch_totals = queue.branch_counts_by_group({
+            row["opener"]: (_opener_group_key(row, group_by, generated_at)[1]
+                            if grouped else "")
+            for row in collapsed
+            if row["state"] != "complete" and row["opener"] is not None})
         (data["matched_branch_count"],
-         data["matched_open_branch_count"]) = branch_totals(matched_words)
+         data["matched_open_branch_count"]) = branch_totals[None]
         # limit is a page size and opener_offset is where that page starts, so
         # the words past the first page stay reachable rather than truncated
         # away.  An offset past the end yields an empty page, not the last one:
@@ -4441,21 +4412,22 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
                 collapsed[offset:offset + limit] if limit is not None
                 else collapsed[offset:]
             )
+        if opener_sort != "erd":
+            attach_erd_summaries(data["summary"])
         # Branch rows belong to one named word.  Emitting them for every word
         # would bury ten queued roots under the hundreds of branches they
         # spawned, which is the explosion this report exists to roll up.
         if opener is not None:
-            # Owner counts are computed from every live membership so a branch
-            # shared with a request outside the word filter still reports
-            # is_shared correctly, rather than only counting the filtered rows.
-            owner_counts = collections.Counter(
-                row["branch_id"] for row in all_membership_rows
-            )
+            membership_rows = queue.opener_membership_rows(opener=opener)
+            # Owner counts are taken over every live membership of these
+            # branches, so a branch shared with another word's request still
+            # reports is_shared correctly.
+            owner_counts = queue.live_owner_counts(
+                {row["branch_id"] for row in membership_rows})
             payload_rows = [
                 _opener_membership_payload(
-                    row, owner_counts[row["branch_id"]], answer_set)
-                for row in all_membership_rows
-                if (row["opener"] or "").lower() == opener
+                    row, owner_counts.get(row["branch_id"], 0), answer_set)
+                for row in membership_rows
             ]
             data["matched_rows"] = len(payload_rows)
             # Counted over every matched row, like matched_rows itself: a shared
