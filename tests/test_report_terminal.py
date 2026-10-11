@@ -1897,6 +1897,26 @@ class OpenersCommandEndToEndTest(unittest.TestCase):
         # The unnamed report still points the way in.
         self.assertIn("Name an opener", self._run())
 
+    def test_the_list_opens_on_unfinished_words_a_page_at_a_time(self):
+        # SLATE finishes; the default list is the work still owed, like the
+        # browser's, and says how to reach the rest.
+        queue = ERDQueue(self.queue_path)
+        queue.mark_done(encode_subset(["crane", "slate"]))
+        queue.mark_openers_complete(queue.openers_ready_to_complete())
+        queue.close()
+        text = self._run()
+        self.assertIn("RAISE", text)
+        self.assertNotIn("SLATE", text)
+        self.assertIn("Openers: 1 of 2", text)
+        self.assertIn("--opener-state all includes every state", text)
+        self.assertIn("SLATE", self._run("--opener-state", "all"))
+        self.assertNotIn("--opener-state all", self._run("--opener-state", "all"))
+        # The page size is a default too, and a cut list says so.
+        with patch.object(erd_search, "OPENER_LIST_PAGE_SIZE", 1):
+            paged = self._run("--opener-state", "all")
+        self.assertIn("--limit N shows more than 1", paged)
+        self.assertIn("SLATE", self._run("--opener-state", "all", "--limit", "5"))
+
     def test_opener_state_filter_and_sort_reach_the_rendered_table(self):
         # --opener-state and --sort are the terminal's half of the same
         # filtering the browser gets; grouping is browser-only.

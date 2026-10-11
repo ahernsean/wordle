@@ -1762,6 +1762,15 @@ def _render_opener_sections(report, width, display_order):
     if data.get("rows"):
         counts += f"   memberships: {data.get('matched_rows', 0):,} matched"
     lines = [counts]
+    # Say how to reach the openers the page or the state filter left out.
+    matched_words = data.get("matched_opener_count", total_words)
+    reach = []
+    if len(summary) < matched_words:
+        reach.append(f"--limit N shows more than {len(summary):,}")
+    if matched_words < total_words:
+        reach.append("--opener-state all includes every state")
+    if reach:
+        lines.append(_fit("  " + "; ".join(reach) + ".", width))
     if summary:
         lines.extend(_render_table(
             _opener_columns(summary),

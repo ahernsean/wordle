@@ -153,6 +153,11 @@ OVERVIEW_BRANCH_WORKER_STATUSES = ("active",)
 # of its requests up, and complete only once every request behind it is.  These
 # are deliberately not the branch statuses, which describe a single branch.
 OPENER_STATES = ("queued", "active", "complete")
+# The list of every opener opens on the work still owed, a page at a time: a
+# sweep finishes thousands of openers, and their ERDs are the leaderboard's.
+# The browser client carries the same defaults.
+OPENER_LIST_DEFAULT_STATES = ("active", "queued")
+OPENER_LIST_PAGE_SIZE = 100
 GROUP_BY_STRATEGIES = (
     "none", "status", "answer_count", "cache_state", "worker_presence", "priority",
 )
