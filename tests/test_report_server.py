@@ -82,6 +82,17 @@ class ReportServerTest(unittest.TestCase):
         with self.assertRaisesRegex(InvalidRequest, "complete spine"):
             parse_report_request("/api/view", "tree=1&tree_parent=RAISE")
 
+    def test_each_group_offset_names_its_group_by_the_rest_of_the_value(self):
+        request = parse_report_request(
+            "/api/view/openers",
+            "group_by=elapsed&group_offset=100:%5B0%2C%201%20hour%29"
+            "&group_offset=0:queued")
+        self.assertEqual(request.filters.group_offsets,
+                         (("[0, 1 hour)", 100), ("queued", 0)))
+        with self.assertRaisesRegex(InvalidRequest, "<offset>:<group label>"):
+            parse_report_request(
+                "/api/view/openers", "group_by=state&group_offset=queued")
+
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
