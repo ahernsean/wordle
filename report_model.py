@@ -2988,16 +2988,14 @@ def _tree_layout(rows, request, prefix, unfiltered_rows, answer_set):
             "candidate_count": row["candidate_count"],
             "is_context": bool(row.get("is_context")),
         })
-    parent_node_ids = {
+    # Counted once per parent: a count taken per node by scanning every node
+    # is quadratic, and the whole queue's tree has hundreds of thousands.
+    child_counts = collections.Counter(
         candidate["parent_node_id"] for candidate in nodes.values()
-        if candidate["parent_node_id"] is not None
-    }
+        if candidate["parent_node_id"] is not None)
     for node in nodes.values():
-        node["has_children"] = node["node_id"] in parent_node_ids
-        node["child_count"] = sum(
-            candidate["parent_node_id"] == node["node_id"]
-            for candidate in nodes.values()
-        )
+        node["child_count"] = child_counts[node["node_id"]]
+        node["has_children"] = node["child_count"] > 0
     for node in nodes.values():
         worker_count = node["worker_count"]
         current_node = node

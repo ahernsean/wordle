@@ -284,6 +284,44 @@ class ReportModelTest(unittest.TestCase):
             "", rows, set(ANSWERS))
         self.assertEqual(second_page["paging"]["returned_group_count"], 1)
 
+    def _tree_row(self, spine, words):
+        key = ScoreCache.encode_subset(words)
+        return {
+            "branch_key": key, "branch_key_hex": key.hex(), "spine": spine,
+            "branch_status": "queued", "branch_worker_status": None,
+            "answer_count": len(words), "worker_count": 0, "priority": 1,
+            "completed_candidate_count": 0, "candidate_count": 3,
+        }
+
+    def test_tree_nodes_count_their_own_children(self):
+        rows = [
+            self._tree_row("RAISE ----- CRANE y----", ["crane"]),
+            self._tree_row("RAISE ----- SLATE -y---", ["salet"]),
+            self._tree_row("RAISE -g---", ["nurdy"]),
+        ]
+        layout = report_model._tree_layout(
+            rows, ReportRequest(report_kind="queue", tree=True), "", rows,
+            set(ANSWERS))
+        counts = {node["spine"]: (node["child_count"], node["has_children"])
+                  for node in layout["nodes"]}
+        self.assertEqual(counts, {"RAISE -----": (2, True),
+                                  "RAISE -g---": (0, False)})
+
+    def test_tree_layout_is_linear_in_its_nodes(self):
+        # The whole queue's tree runs to hundreds of thousands of nodes; a
+        # count taken per node over every node never finishes there, and at
+        # this size takes seconds where a linear layout takes milliseconds.
+        letters = "abcdefghijklmnopqrstuvwxyz"
+        words = [a + b + c + "ed" for a in letters for b in letters
+                 for c in letters[:6]][:4000]
+        rows = [self._tree_row(f"{word.upper()} ----- CRANE y----", ["crane"])
+                for word in words]
+        started = time.perf_counter()
+        report_model._tree_layout(
+            rows, ReportRequest(report_kind="queue", tree=True), "", rows,
+            set(ANSWERS))
+        self.assertLess(time.perf_counter() - started, 2.0)
+
     def test_historical_hotspot_reports_normalize_branch_keys(self):
         branch_key = ScoreCache.encode_subset(["salet"])
         queue = Mock(epoch=9)
