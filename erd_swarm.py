@@ -3262,10 +3262,11 @@ class _BranchWorker:
                 if completed:
                     self.maybe_finalize(branch_key, words, n_candidates)
             self._maybe_checkpoint()
-            self._complete_stranded_openers()
             self._check_ram()
             self._check_disk()
             self._respect_checkpoint_pause()
+            # After the pause: completing an opener writes to both databases.
+            self._complete_stranded_openers()
 
     def _complete_stranded_openers(self):
         """Finish any opener whose last branch resolved without its

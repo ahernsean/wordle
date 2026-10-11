@@ -6561,7 +6561,7 @@ class ERDQueue:
         double-count exactly the shared ownership the opener report exists to
         show.  all spans every membership, resolved or not, to match
         branch_count in opener_rows(); open counts live memberships whose
-        branch is not done.  One pass serves every group and the whole.
+        branch is not done.  One query serves every group and the whole.
         """
         if not groups:
             return {None: (0, 0)}

@@ -15,6 +15,7 @@ they miss:
   returns immediately without evaluating any candidates).
 """
 import ast
+import inspect
 import math
 import multiprocessing
 import os
@@ -5245,6 +5246,15 @@ class TestStrandedOpenersAreCompleted(unittest.TestCase):
                          [mock.call(), mock.call()])
         self.assertEqual(worker._complete_openers.call_args_list,
                          [mock.call(["crane"]), mock.call(["crane"])])
+
+    def test_the_worker_loop_runs_the_check(self):
+        # run() is the only caller and is not exercised end to end here; a
+        # loop that stopped calling it would leave an opener whose reducing
+        # worker died never completed, with nothing else to say so.
+        source = inspect.getsource(erd_swarm._BranchWorker.run)
+        self.assertIn("self._complete_stranded_openers()", source)
+        self.assertLess(source.index("self._respect_checkpoint_pause()"),
+                        source.index("self._complete_stranded_openers()"))
 
 
 class TestDependencyWaitAttribution(unittest.TestCase):

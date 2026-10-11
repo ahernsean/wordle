@@ -266,12 +266,14 @@ measured coordination share to within a percentage point without being fitted
 to it; 14,000 predicts 98%, which is a swarm that does nothing but scan.
 
 **That scan runs only when no opener has anything to offer, and a queue of
-pending openers always has.** Epochs 18 to 23 recorded no fruitless scan at
-all, and on a copy of the production queue with every remaining opener queued
-(12,276 unfinished, 609,659 live memberships, measured 11 Oct 2026) the claim
-path's queries stayed flat: `opener_work_candidates(limit=1)` 1.1 ms,
-`branches_in_progress(opener_work_id)` under 1 ms.  So the whole sweep can be
-queued at once.  Exhaustion is the drained or fully-occupied condition, which a
+pending openers always has.** No scan selected nothing in a 393,923-claim
+window of epoch 18, nor in epochs 23 and 24 (`worker_time.fruitless_scans`),
+all with about a thousand openers queued or fewer.  At full depth the claim
+path was measured on a copy of the production queue with every remaining
+opener queued (12,276 unfinished, 609,659 live memberships, 11 Oct 2026), not
+on a running swarm: its queries stayed flat, `opener_work_candidates(limit=1)`
+1.1 ms and `branches_in_progress(opener_work_id)` under 1 ms.  So the whole
+sweep can be queued at once.  Exhaustion is the drained or fully-occupied condition, which a
 sweep reaches only at its tail; `worker_time.fruitless_scans` is what says so,
 and a linear scan there costs seconds per claim at that depth.  Do not read
 the flat common case as a guarantee for the whole scheduler.

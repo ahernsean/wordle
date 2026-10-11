@@ -2560,5 +2560,8 @@ class TestOpenBranchOwnersAreFoundByBranch(_TmpQueue):
         plan = " ".join(row[3] for row in self.q._conn.execute(
             "EXPLAIN QUERY PLAN SELECT * FROM active_branch_owner_rows"))
         self.assertNotIn("MATERIALIZE", plan)
-        self.assertRegex(plan, r"branch_opener_work AS membership USING "
-                               r"\S*INDEX \S+ \(branch_id=\?\)")
+        # SQLite 3.34 names the table and alias ("SEARCH TABLE
+        # branch_opener_work AS membership"), later releases the alias alone.
+        self.assertRegex(plan, r"SEARCH (TABLE branch_opener_work AS )?"
+                               r"membership USING \S*INDEX \S+ "
+                               r"\(branch_id=\?\)")
