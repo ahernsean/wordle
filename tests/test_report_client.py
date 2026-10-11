@@ -7127,9 +7127,16 @@ class ReportClientContract:
         self.assertIn("group_offset=100%3A%5B0%2C+1+hour%29",
                       self.page.evaluate("""() => buildAPIURL(parsePageState(
             {search: '?kind=openers&group_by=elapsed&group_offset=100%3A%5B0%2C%201%20hour%29'}))"""))
-        # Ungrouped, there is nothing for a group offset to page.
+        # Ungrouped, there is nothing for a group offset to page, and nor is
+        # there in one named word's view, whose one word a carried offset
+        # would page away.
         self.assertEqual(self.page.evaluate("""() => parsePageState(
             {search: '?kind=openers&group_by=none&group_offset=3%3Aqueued'}).group_offsets"""), {})
+        named = '?kind=openers&branch_target=SALET&group_by=state&group_offset=100%3Aqueued'
+        self.assertEqual(self.page.evaluate(
+            f"() => parsePageState({{search: '{named}'}}).group_offsets"), {})
+        self.assertNotIn("group_offset", self.page.evaluate(
+            f"() => buildAPIURL(parsePageState({{search: '{named}'}}))"))
 
     def test_sources_branch_rows_have_their_own_pager(self):
         # The branch list pages like the word list: a named word can own

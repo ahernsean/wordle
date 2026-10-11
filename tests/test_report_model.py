@@ -3493,6 +3493,25 @@ class OpenerReportTest(unittest.TestCase):
              if row["state"] == "active"},
             {"baker": 900, "cider": None})
 
+    def test_a_requeued_word_is_not_dated_by_its_earlier_run(self):
+        # CRANE finished once, then was queued again and started; until the
+        # new run finishes a branch, its activity is its new start.
+        self._queue_words(("crane", 1, 1))
+        self._finish("crane")
+        queue = self._open_queue()
+        queue._conn.execute("UPDATE branch_opener_work SET resolved_at = 900")
+        queue.add_pending_many([(self._branch_of("crane", 1), 3, 1, "crane", 1)])
+        queue._conn.execute(
+            "UPDATE opener_work SET state = 'active', started_at = 1000 "
+            "WHERE state != 'complete'")
+        queue._conn.commit()
+        queue.close()
+
+        row = self._openers()["summary"][0]
+
+        self.assertEqual(row["state"], "active")
+        self.assertIsNone(row["last_branch_finished_at"])
+
     def test_active_opener_elapsed_time_starts_when_work_is_claimed(self):
         self._queue_words(("salet", 5, 1))
         queue = self._open_queue()

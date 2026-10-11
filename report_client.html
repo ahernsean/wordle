@@ -664,8 +664,9 @@
       // Defaulted once the target is settled: only the list of every opener has
       // a default state, never one named word's view.
       if(normalized.opener_state===undefined)normalized.opener_state=normalized.kind==="openers"&&normalized.branch_target===""?[...OPENER_LIST_DEFAULT_STATES]:[];
-      // A grouped opener list pages each group on its own, and only it does.
-      const groupedOpeners=normalized.kind==="openers"&&normalized.group_by!=="none";
+      // A grouped list of every opener pages each group on its own, and only
+      // it does: a named word's view is one word, with nothing to page.
+      const groupedOpeners=normalized.kind==="openers"&&normalized.group_by!=="none"&&normalized.branch_target==="";
       normalized.group_offsets=groupedOpeners?Object.fromEntries(Object.entries(state.group_offsets||{}).map(([label,offset])=>[label,intOrNull(offset)]).filter(([,offset])=>offset>0)):{};
       if(groupedOpeners)normalized.opener_offset=null;
       if(normalized.kind!=="hotspots")normalized.by="";

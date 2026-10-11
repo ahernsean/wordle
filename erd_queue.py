@@ -6402,8 +6402,9 @@ class ERDQueue:
         back to the priority of the completed requests only once none are
         outstanding.
 
-        last_branch_finished_at is when an unfinished word's latest branch
-        resolved, NULL until one has.
+        last_branch_finished_at is when the latest branch of an unfinished
+        word's unfinished requests resolved, NULL until one has: a word queued
+        again after finishing is not dated by its earlier run.
 
         A word whose every request is complete reads the totals recorded when
         its last request completed; only words with an unfinished request are
@@ -6437,7 +6438,8 @@ class ERDQueue:
                                 THEN s.requested_priority END),
                        MAX(s.requested_priority)) AS requested_priority,
                    NULL AS completed_at,
-                   MAX(m.resolved_at) AS last_branch_finished_at,
+                   MAX(CASE WHEN s.state != 'complete' THEN m.resolved_at END)
+                       AS last_branch_finished_at,
                    COUNT(DISTINCT s.opener_work_id) AS request_count,
                    MAX(s.state = 'active') AS has_active_request,
                    MAX(s.state != 'complete') AS has_incomplete_request,
