@@ -2231,10 +2231,18 @@ class ERDQueue:
         - opener / opener_pattern record the first opener whose branch
           produced this entry (kept for display in `status`).
 
+        A word is a word in either case: the opener is stored lower case, as
+        every reader that looks one up asks for it, and the returned map is
+        keyed the same way.
+
         Raises ValueError, before writing anything, if any row's priority lies
         outside the opener-work range.
         """
-        rows = list(rows)
+        rows = [(branch_key, n_words, priority,
+                 opener.lower() if opener is not None else None,
+                 opener_pattern)
+                for branch_key, n_words, priority, opener, opener_pattern
+                in rows]
         for row in rows:
             check_opener_priority_range(row[2])
         # Intern before the transaction: the branches registry is append-only,

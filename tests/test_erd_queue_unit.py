@@ -2551,6 +2551,21 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class TestAWordIsAWordInEitherCase(_TmpQueue):
+
+    def test_an_opener_is_stored_and_requested_once_whatever_its_case(self):
+        first = self.q.add_pending_many([(self.key, len(WORDS), 5, "CRANE", 0)])
+        again = self.q.add_pending_many([
+            (ScoreCache.encode_subset(WORDS[:3]), 3, 5, "crane", 1)])
+        self.assertTrue(first["crane"][2])
+        self.assertFalse(again["crane"][2])
+        self.assertEqual(again["crane"][0], first["crane"][0])
+        stored = {row[0] for row in self.q._conn.execute(
+            "SELECT opener FROM opener_work UNION SELECT opener "
+            "FROM pending_branches")}
+        self.assertEqual(stored, {"crane"})
+
+
 class TestOpenBranchOwnersAreFoundByBranch(_TmpQueue):
 
     def test_owners_of_open_branches_are_looked_up_not_materialized(self):
