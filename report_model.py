@@ -4346,13 +4346,20 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
         if opener_states:
             collapsed = [row for row in collapsed
                          if row["state"] in opener_states]
-        erd_summaries = (
-            _opener_erd_summaries(
-                sources, collapsed, report, queue, timing_cache, all_answers,
-            ) if timing_cache is not None else {}
-        )
-        for row in collapsed:
-            row["erd_summary"] = erd_summaries.get(row["opener"])
+        def attach_erd_summaries(rows):
+            erd_summaries = (
+                _opener_erd_summaries(
+                    sources, rows, report, queue, timing_cache, all_answers,
+                ) if timing_cache is not None else {}
+            )
+            for row in rows:
+                row["erd_summary"] = erd_summaries.get(row["opener"])
+
+        # Summarized for the words shown, unless the order itself is by ERD:
+        # an unfinished word's summary looks up its response groups, which at
+        # full-queue depth is seconds for words no page shows.
+        if opener_sort == "erd":
+            attach_erd_summaries(collapsed)
         collapsed = _sorted_openers(collapsed, opener_sort)
         group_by = request.filters.group_by
         grouped = group_by is not None and group_by != "none"
@@ -4405,6 +4412,8 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
                 collapsed[offset:offset + limit] if limit is not None
                 else collapsed[offset:]
             )
+        if opener_sort != "erd":
+            attach_erd_summaries(data["summary"])
         # Branch rows belong to one named word.  Emitting them for every word
         # would bury ten queued roots under the hundreds of branches they
         # spawned, which is the explosion this report exists to roll up.

@@ -3874,6 +3874,26 @@ class OpenerReportTest(unittest.TestCase):
             (rows["salet"]["open_branch_count"], rows["salet"]["worker_count"]),
             (2, 1))
 
+    def test_only_the_words_shown_are_summarized_unless_ordered_by_erd(self):
+        # An unfinished word's summary looks up its response groups; at the
+        # whole queue's depth, doing that for words no page shows costs
+        # seconds.  Ordering by ERD needs every word's.
+        self._queue_words(("crane", 1, 1), ("salet", 2, 1), ("nurdy", 3, 1))
+        real = report_model._opener_erd_summaries
+        summarized = []
+
+        def spy(sources, rows, *args):
+            summarized.append(sorted(row["opener"] for row in rows))
+            return real(sources, rows, *args)
+
+        with patch("report_model._opener_erd_summaries", side_effect=spy):
+            page = self._openers(limit=1, group_by="none")["summary"]
+            self.assertEqual(summarized, [[page[0]["opener"]]])
+            summarized.clear()
+            self._openers(limit=1, group_by="none", sort="erd")
+            self.assertEqual(summarized, [["crane", "nurdy", "salet"]])
+        self.assertIsNotNone(page[0]["erd_summary"])
+
     def test_branch_totals_count_only_words_with_unfinished_work(self):
         self._queue_words(("crane", 1, 2), ("salet", 5, 3))
         self._finish("crane")
