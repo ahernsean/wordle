@@ -1920,7 +1920,9 @@ class ReportClientContract:
 
     def test_leaderboard_tab_drops_an_opener_only_sort(self):
         self.page.locator("[data-kind=openers]").click()
-        self.page.wait_for_selector("text=openers report")
+        # The caption itself, not the "Computing openers report" status, which
+        # shows while the previous report's caption is still on screen.
+        self.page.wait_for_selector('.report-meta h1:text-is("openers report")')
         self.assertEqual(self.page.locator("#sort").input_value(), "default")
         # The list of every opener names no target, so its caption names none.
         caption = " ".join(self.page.locator(".report-meta").first.inner_text().split())
