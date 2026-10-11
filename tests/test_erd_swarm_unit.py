@@ -105,6 +105,7 @@ def _bare_worker():
     w._help_recursion_depth = 0
     w._time_account = erd_swarm._WorkerTimeAccount()
     w._open_dependency_episodes = 0
+    w._last_stranded_opener_check = 0.0
     w._time_account_nodes = 0
     w._time_account_claim_timing = (0, 0, 0, 0)
     w._bundle_coordination_time_millis = {}
@@ -5223,6 +5224,27 @@ class TestClaimDeclineReason(unittest.TestCase):
                                       expected_budget=4))
         self.assertEqual(self.q.last_claim_decline(),
                          erd_queue.CLAIM_DECLINE_BUDGET_MISMATCH)
+
+
+class TestStrandedOpenersAreCompleted(unittest.TestCase):
+
+    def test_every_request_is_looked_over_about_once_a_minute(self):
+        worker = _bare_worker()
+        worker.queue = mock.Mock()
+        worker.queue.openers_ready_to_complete.return_value = ["crane"]
+        worker._complete_openers = mock.Mock()
+        now = [10_000.0]
+        with mock.patch("erd_swarm.time.time", side_effect=lambda: now[0]):
+            worker._complete_stranded_openers()
+            now[0] += erd_swarm.STRANDED_OPENER_CHECK_SECONDS - 1
+            worker._complete_stranded_openers()
+            now[0] += 2
+            worker._complete_stranded_openers()
+        # Over every request, not a finalize's few.
+        self.assertEqual(worker.queue.openers_ready_to_complete.call_args_list,
+                         [mock.call(), mock.call()])
+        self.assertEqual(worker._complete_openers.call_args_list,
+                         [mock.call(["crane"]), mock.call(["crane"])])
 
 
 class TestDependencyWaitAttribution(unittest.TestCase):

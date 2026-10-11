@@ -109,6 +109,9 @@ PROGRESS_LOG_SECONDS = 120   # log a mid-candidate progress line this often
 # heartbeat write after the interval ends, so six workers write about 8,600
 # rows a day.
 WORKER_TIME_INTERVAL_SECONDS = 60
+# How often each worker looks over every request for an opener left finished
+# but not completed, which no finalize will offer again.
+STRANDED_OPENER_CHECK_SECONDS = 60
 RAM_WARN_MB = 1024            # log warning when free RAM drops below this
 RAM_CRIT_MB = 512             # force checkpoint when free RAM drops below this
 
@@ -1004,6 +1007,7 @@ class _BranchWorker:
         # WORKER_TIME_INTERVAL_SECONDS, with the node counter and the queue's
         # claim timing as they stood when the open interval began.
         self._time_account = _WorkerTimeAccount()
+        self._last_stranded_opener_check = 0.0
         # Dependency wait episodes open on this worker, so one run inside
         # another is marked as enclosed by it.
         self._open_dependency_episodes = 0
@@ -3258,9 +3262,27 @@ class _BranchWorker:
                 if completed:
                     self.maybe_finalize(branch_key, words, n_candidates)
             self._maybe_checkpoint()
+            self._complete_stranded_openers()
             self._check_ram()
             self._check_disk()
             self._respect_checkpoint_pause()
+
+    def _complete_stranded_openers(self):
+        """Finish any opener whose last branch resolved without its
+        completion, at most once per STRANDED_OPENER_CHECK_SECONDS.
+
+        A finalize checks only the requests owning the branch it resolved.
+        An opener whose reducing worker died after its last branch resolved
+        owns no branch left to resolve, so this check over every request is
+        what offers it again.  It runs between claims, outside any write
+        transaction.
+        """
+        now = time.time()
+        if now - self._last_stranded_opener_check < STRANDED_OPENER_CHECK_SECONDS:
+            return
+        self._last_stranded_opener_check = now
+        with self._time_account.activity("finalizing"):
+            self._complete_openers(self.queue.openers_ready_to_complete())
 
     # -- focused single-branch loop ------------------------------------------
 

@@ -2550,7 +2550,7 @@ class ERDQueue:
           )
     """
 
-    def openers_ready_to_complete(self):
+    def openers_ready_to_complete(self, opener_work_ids=None):
         """Openers whose every owned branch has resolved but are not yet done.
 
         An opener is done when no further computation is needed on it, and
@@ -2558,7 +2558,14 @@ class ERDQueue:
         response groups to its own ERD.  This is the list of openers owing
         that reduction.  It is a query over durable state rather than a stored
         obligation, so an opener whose reducing worker died before finishing
-        simply appears again at the next finalize anywhere.
+        is found again by the next check that looks at every request: each
+        worker runs one about once a minute.
+
+        opener_work_ids limits the check to those requests.  A finalize asks
+        only about the requests owning the branch it resolved, which is every
+        request that branch can have finished, inside its write transaction;
+        asking about every request there costs time with the lock held for
+        each of the queue's unfinished requests.
 
         Two workers resolving an opener's last two branches near-
         simultaneously can both see it here and both reduce it.  The
@@ -2566,9 +2573,15 @@ class ERDQueue:
         replaced with identical values, so the repeat costs a few
         milliseconds and changes nothing.
         """
+        if opener_work_ids is None:
+            return sorted({row["opener"] for row in self._conn.execute(
+                "SELECT opener FROM opener_work AS s WHERE "
+                + self._FINISHED_OPENER_WORK_PREDICATE)})
         return sorted({row["opener"] for row in self._conn.execute(
-            "SELECT opener FROM opener_work AS s WHERE "
-            + self._FINISHED_OPENER_WORK_PREDICATE)})
+            "SELECT opener FROM opener_work AS s WHERE s.opener_work_id IN "
+            "(SELECT value FROM json_each(?)) AND "
+            + self._FINISHED_OPENER_WORK_PREDICATE,
+            (json.dumps(sorted(opener_work_ids)),))})
 
     def completed_opener_names(self):
         """Every opener with a request that is done."""
@@ -2637,6 +2650,11 @@ class ERDQueue:
         """Make branch ownership unschedulable and update request lifecycle."""
         branch_condition = "" if branch_id is None else " AND branch_id = ?"
         parameters = () if branch_id is None else (branch_id,)
+        # Only a request owning the branch can be finished by resolving it.
+        owners = None if branch_id is None else {
+            row["opener_work_id"] for row in self._conn.execute(
+                "SELECT opener_work_id FROM branch_opener_work "
+                "WHERE branch_id = ?", parameters)}
         withdrawn_request_ids = set()
         if withdraw:
             withdrawn_request_ids = {
@@ -2655,7 +2673,7 @@ class ERDQueue:
                 "UPDATE branch_opener_work SET resolved_at = ? "
                 "WHERE resolved_at IS NULL" + branch_condition,
                 (int(time.time()), *parameters))
-        completed_words = self.openers_ready_to_complete()
+        completed_words = self.openers_ready_to_complete(owners)
         if withdraw:
             # Withdrawal is an operator removing work, not an opener finishing:
             # the requests it took work from, and left with nothing owed, are
@@ -2663,14 +2681,19 @@ class ERDQueue:
             # its own and is waiting on its reduction is not this withdrawal's
             # to complete.
             self._finish_opener_work_ids(
-                withdrawn_request_ids & self._ready_opener_work_ids())
+                self._ready_opener_work_ids(withdrawn_request_ids))
         self._demote_orphaned_owned_branches()
         return completed_words
 
-    def _ready_opener_work_ids(self):
+    def _ready_opener_work_ids(self, opener_work_ids):
+        """Those of opener_work_ids whose every owned branch has resolved."""
+        if not opener_work_ids:
+            return set()
         return {row["opener_work_id"] for row in self._conn.execute(
             "SELECT opener_work_id FROM opener_work AS s WHERE "
-            + self._FINISHED_OPENER_WORK_PREDICATE)}
+            "s.opener_work_id IN (SELECT value FROM json_each(?)) AND "
+            + self._FINISHED_OPENER_WORK_PREDICATE,
+            (json.dumps(sorted(opener_work_ids)),))}
 
     def _finish_opener_work_ids(self, opener_work_ids):
         opener_work_ids = sorted(opener_work_ids)
@@ -2762,7 +2785,8 @@ class ERDQueue:
                     f"DELETE FROM active_branches WHERE branch_id IN ({active_placeholders})",
                     active_ids)
 
-        return self.openers_ready_to_complete()
+        return self.openers_ready_to_complete(
+            {group["opener_work_id"] for group in direct_groups})
 
     def completed_opener_timing(self, opener):
         """Return durable-opener timing and cost from every telemetry epoch.

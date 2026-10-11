@@ -2317,18 +2317,39 @@ class TestOpenerCompletion(_TmpQueue):
         ProductionERDQueue.mark_done(self.q, later_key)
         self.q.mark_openers_complete(self.q.openers_ready_to_complete())
 
-    def test_an_opener_nobody_flipped_is_offered_again_at_the_next_finalize(self):
+    def test_a_finalize_offers_only_what_its_branch_finished(self):
         self._resolve_only_branch()
         other_key = ScoreCache.encode_subset(WORDS[:3])
         self.q.add_pending_many([(other_key, 3, 0, "slate", 1)])
         self.q.claim_next("worker-1")
 
-        # A different opener finishing returns every opener still owing its
-        # reduction, not only its own, which is how an abandoned one recovers.
+        # Inside its write transaction a finalize asks only about the requests
+        # owning its branch.  CRANE, finished earlier and never flipped, is
+        # found by the check over every request, which each worker runs
+        # between claims.
         resolved = ProductionERDQueue.mark_done(self.q, other_key)
 
-        self.assertEqual(sorted(resolved), ["crane", "slate"])
-        self.q.mark_openers_complete(resolved)
+        self.assertEqual(resolved, ["slate"])
+        self.assertEqual(self.q.openers_ready_to_complete(), ["crane", "slate"])
+        self.q.mark_openers_complete(["crane", "slate"])
+
+    def test_resolving_a_branch_asks_only_about_its_owners(self):
+        # CRANE is left finished and never flipped; resolving SLATE's branch
+        # outside the direct-group path still names SLATE, and only SLATE.
+        self._resolve_only_branch()
+        other_key = ScoreCache.encode_subset(WORDS[:3])
+        self.q.add_pending_many([(other_key, 3, 0, "slate", 1)])
+        branch_id = self.q._intern_branch(other_key)
+        self.q._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.q._conn.execute(
+                "UPDATE pending_branches SET status = 'done' WHERE branch_id = ?",
+                (branch_id,))
+            resolved = self.q._resolve_branch_memberships(branch_id)
+        finally:
+            self.q._conn.execute("ROLLBACK")
+        self.assertEqual(resolved, ["slate"])
+        self.q.mark_openers_complete(["crane"])
 
     def test_a_withdrawal_does_not_finish_an_opener_waiting_on_its_reduction(self):
         self._resolve_only_branch()
