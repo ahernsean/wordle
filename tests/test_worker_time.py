@@ -690,3 +690,43 @@ class TestDependencyWaitIsNotEvaluation(unittest.TestCase):
             0, (0, 0, 0, 0))
         self.assertEqual(figures["wait_dependency_time_millis"], 50)
         self.assertEqual(figures["evaluation_time_millis"], 5)
+
+
+class TestDependencyEpisodeSplitsItsTime(unittest.TestCase):
+
+    def test_an_episode_is_split_by_the_activity_its_time_was_charged_to(self):
+        # The split partitions the account's own view of the episode: every
+        # named wait together as waiting, uncovered time as other.
+        clock = _SteppingClock()
+        account = _account(clock)
+        clock.advance(7)                     # before the episode: not its time
+        wait = erd_swarm._DependencyWait(
+            "SALET -----", 30, 4, 0, activity_at_start=account.activity_totals())
+        for activity, millis in (("evaluation", 20), ("claiming", 10),
+                                 ("finalizing", 4), ("scheduling", 2),
+                                 ("wait_dependency", 5), ("wait_no_work", 3)):
+            with account.activity(activity):
+                clock.advance(millis)
+        clock.advance(1)                     # outside every activity
+        self.assertEqual(wait.activity_time_millis(account.activity_totals()), {
+            "evaluation": 20, "claiming": 10, "finalizing": 4,
+            "scheduling": 2, "waiting": 8, "other": 1})
+
+    def test_the_totals_outlive_an_interval(self):
+        # An episode can span many worker_time intervals; closing one must
+        # not reset what the episode measures against.
+        clock = _SteppingClock()
+        account = _account(clock)
+        start = account.activity_totals()
+        with account.activity("claiming"):
+            clock.advance(30)
+            account.close_interval(0, (0, 0, 0, 0))
+            clock.advance(30)
+        totals = account.activity_totals()
+        self.assertEqual(
+            (totals["claiming"] - start["claiming"]) // 1_000_000, 60)
+
+    def test_an_episode_with_no_snapshot_has_no_split(self):
+        wait = erd_swarm._DependencyWait("SALET -----", 30, 4, 0)
+        self.assertIsNone(wait.activity_time_millis(
+            _account(_SteppingClock()).activity_totals()))

@@ -612,9 +612,10 @@ class _DependencyWait:
     __slots__ = ("spine", "n_words", "budget", "help_depth", "outcome",
                  "_started", "iterations", "blocked_time_millis", "empty_scans",
                  "helped_scans", "bundles_claimed", "pair_attempts",
-                 "pair_successes", "blocks")
+                 "pair_successes", "blocks", "_activity_at_start", "enclosed")
 
-    def __init__(self, spine, n_words, budget, help_depth):
+    def __init__(self, spine, n_words, budget, help_depth,
+                 activity_at_start=None, enclosed=False):
         self.spine = spine
         self.n_words = n_words
         self.budget = budget
@@ -629,6 +630,8 @@ class _DependencyWait:
         self.pair_attempts = 0
         self.pair_successes = 0
         self.blocks = collections.Counter()
+        self._activity_at_start = activity_at_start
+        self.enclosed = enclosed
 
     @property
     def episode_time_millis(self):
@@ -640,6 +643,22 @@ class _DependencyWait:
     NAMED_BLOCK_REASONS = frozenset((
         CLAIM_DECLINE_WORKER_CAP, CLAIM_DECLINE_NO_CANDIDATES,
         BLOCK_AWAITING_FINALIZE, BLOCK_HELP_CAPPED))
+
+    def activity_time_millis(self, activity_now):
+        """The episode's time by worker activity, from the account's totals
+        at its start and now: evaluation, claiming, finalizing, scheduling,
+        every named wait together as waiting, and the rest as other.  None
+        when the episode took no snapshot at its start."""
+        if self._activity_at_start is None:
+            return None
+        spent = {name: (activity_now[name] - self._activity_at_start[name])
+                 // 1_000_000 for name in activity_now}
+        split = {name: spent.pop(name) for name in
+                 ("evaluation", "claiming", "finalizing", "scheduling")}
+        split["waiting"] = sum(spent.pop(name) for name in list(spent)
+                               if name.startswith("wait_"))
+        split["other"] = sum(spent.values())
+        return split
 
     def note_blocked(self, reason, millis):
         """Charge one sleep, against the reason the deciding code gave for it."""
@@ -712,6 +731,9 @@ class _WorkerTimeAccount:
         self._wall_clock = wall_clock
         self._stack = [("other", None)]
         self._owned_nanoseconds = {}
+        # Every activity's time since the account opened, never reset by an
+        # interval, so a span of any length can be split by difference.
+        self._total_nanoseconds = dict.fromkeys(self.ACTIVITIES, 0)
         now = clock()
         self._since = now
         self._open_interval(now)
@@ -734,6 +756,7 @@ class _WorkerTimeAccount:
         name, owner = self._stack[-1]
         elapsed = now - self._since
         self._nanoseconds[name] += elapsed
+        self._total_nanoseconds[name] += elapsed
         if owner is not None:
             self._owned_nanoseconds[owner] = (
                 self._owned_nanoseconds.get(owner, 0) + elapsed)
@@ -757,6 +780,11 @@ class _WorkerTimeAccount:
         finally:
             self._charge(self._clock())
             self._stack.pop()
+
+    def activity_totals(self):
+        """Every activity's time so far, in nanoseconds, up to now."""
+        self._charge(self._clock())
+        return dict(self._total_nanoseconds)
 
     def take_owned_time_millis(self, owner):
         """The time charged to `owner` so far, which is then forgotten; None
@@ -976,6 +1004,9 @@ class _BranchWorker:
         # WORKER_TIME_INTERVAL_SECONDS, with the node counter and the queue's
         # claim timing as they stood when the open interval began.
         self._time_account = _WorkerTimeAccount()
+        # Dependency wait episodes open on this worker, so one run inside
+        # another is marked as enclosed by it.
+        self._open_dependency_episodes = 0
         self._time_account_nodes = self._nodes
         self._time_account_claim_timing = self.queue.claim_timing_totals()
         # Coordination time of each open bundle's evaluated members, by
@@ -1954,6 +1985,11 @@ class _BranchWorker:
                 self._complete_bundle_two_level_erd_prunes(
                     branch_key, words, n_words, bundle_id,
                     claimed_candidate_indices))
+        # The prune is evaluation, already charged as such, so the window the
+        # next completed candidate measures its coordination over steps past
+        # it rather than counting it a second time.
+        self._restart_coordination_window(
+            self._last_claim_complete + (time.time() - prune_wall_t0))
         if cancelled:
             self._finish_bundle(branch_key, bundle_id, prune_nodes_at_start,
                                 prune_wall_t0, censored=True)
@@ -2569,6 +2605,9 @@ class _BranchWorker:
                 return (OVER_ERD_LIMIT, cut_bound, None, cut_tainted)
         return None
 
+    def _close_dependency_episode(self):
+        self._open_dependency_episodes -= 1
+
     def _record_dependency_wait(self, wait):
         """Persist one wait episode, unless it never reached the wait loop."""
         if not wait.should_record():
@@ -2583,7 +2622,10 @@ class _BranchWorker:
             blocks_awaiting_finalize=wait.blocks[BLOCK_AWAITING_FINALIZE],
             blocks_help_capped=wait.blocks[BLOCK_HELP_CAPPED],
             blocks_other=wait.other_blocks(),
-            help_depth=wait.help_depth, outcome=wait.outcome)
+            help_depth=wait.help_depth, outcome=wait.outcome,
+            activity_time_millis=wait.activity_time_millis(
+                self._time_account.activity_totals()),
+            enclosed=int(wait.enclosed))
 
     @_charged_to("wait_dependency")
     def cooperative_solve(self, words, budget, ceiling=float('inf')):
@@ -2713,8 +2755,12 @@ class _BranchWorker:
             context_stack.enter_context(self._entered(
                 parent_context.descend(branch_key, child_spine)))
 
-            wait = _DependencyWait(child_spine, n_words, budget,
-                                   self._help_recursion_depth)
+            wait = _DependencyWait(
+                child_spine, n_words, budget, self._help_recursion_depth,
+                activity_at_start=self._time_account.activity_totals(),
+                enclosed=self._open_dependency_episodes > 0)
+            self._open_dependency_episodes += 1
+            context_stack.callback(self._close_dependency_episode)
             context_stack.callback(self._record_dependency_wait, wait)
             while not self.cancel():
                 wait.iterations += 1

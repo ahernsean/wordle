@@ -120,6 +120,17 @@ set inside the claim transaction at each of its `return None` sites; the other
 two are the branch condition the worker is standing in. Nothing on this path
 reads live state, so no counter can disagree with the moment it describes.
 
+**Each episode also says where its time went.**  Its row splits the episode
+by the activity `worker_time` charged it to -- evaluation, claiming,
+finalizing, scheduling, waiting (every named wait), other -- from the time
+account's running totals at its start and end, so the six partition it the
+way `worker_time`'s columns partition an interval.  An episode opened while
+another is open on the same worker is `enclosed`: its time is already in the
+outer row, so a total over episodes sums only the rows with `enclosed = 0`.
+That split is what tells an episode spent evaluating the dependency from one
+spent handing out and finalizing its bundles, which no total over
+`worker_time` can, since a long episode spans many of its intervals.
+
 That property is the design, not an optimization. **Occupancy is counted
 against the claims the claim transaction is about to create, so only that
 transaction can say whether the cap refused a claim** — anything reconstructing
@@ -280,7 +291,10 @@ completion to its own, less its evaluation. It feeds `_coord_ema`, which
 `bundle_stats.coordination_time_millis`, which carries it to the branch's finalize
 row. It restarts at every wait, after every finalize, and around a helped
 sub-branch, through `_restart_coordination_window`, because none of those spans
-is the cost of handing work from one claim to the next.
+is the cost of handing work from one claim to the next.  A bundle's two-level
+prune moves the window past itself for the same reason: it is evaluation,
+already charged as such, and the next evaluated candidate would otherwise
+count it a second time -- wholly so after a bundle the prune empties.
 
 Three costs on that path are already removed and must not come back.
 `_claim_paired_branch` rewalks the branches the main loop recorded instead of

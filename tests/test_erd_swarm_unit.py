@@ -104,6 +104,7 @@ def _bare_worker():
     w._work_context = WorkContext.empty()
     w._help_recursion_depth = 0
     w._time_account = erd_swarm._WorkerTimeAccount()
+    w._open_dependency_episodes = 0
     w._time_account_nodes = 0
     w._time_account_claim_timing = (0, 0, 0, 0)
     w._bundle_coordination_time_millis = {}
@@ -3088,6 +3089,28 @@ class TestCoordinationWindowExcludesNonHandoffTime(unittest.TestCase):
     helped, and time spent idle because the queue held nothing claimable.
     """
 
+
+    def test_a_bundle_prune_is_not_counted_again_as_coordination(self):
+        # The two-level prune is evaluation and charged as such.  Left inside
+        # the window, the next evaluated candidate would count it a second
+        # time as handoff cost -- in every bundle, and wholly for a bundle the
+        # prune empties, whose next candidate is elsewhere.
+        worker = _bare_worker()
+        now = [1_000.0]
+        worker._last_claim_complete = 990.0
+
+        def prune_taking_thirty_seconds(_key, _words, _n, _bundle, indices):
+            now[0] += 30.0
+            return set(indices), False
+
+        with mock.patch.object(worker, "_complete_bundle_two_level_erd_prunes",
+                               side_effect=prune_taking_thirty_seconds), \
+                mock.patch.object(worker, "_finish_bundle"), \
+                mock.patch("erd_swarm.time.time", side_effect=lambda: now[0]):
+            self.assertTrue(worker.evaluate_bundle(
+                b"key", BRANCH, len(BRANCH), "bundle", [0, 1, 2], set()))
+        self.assertEqual(worker._last_claim_complete, 1_020.0)
+
     def test_idle_waiting_restarts_the_window_before_the_next_claim(self):
         # Drives run()'s idle branch: nothing claimable, so it sleeps and
         # loops.  The window must not still be open on the far side, or the
@@ -5282,6 +5305,55 @@ class TestDependencyWaitAttribution(unittest.TestCase):
         rows = self._wait_rows()
         self.assertEqual(len(rows), 1)
         return rows[0]
+
+    def test_an_episode_records_its_time_by_activity(self):
+        w = self._worker()
+        words = BRANCH[:3]
+        key = ScoreCache.encode_subset(words)
+        w.queue.create_branch(key, len(words), w.n_candidates,
+                              budget=ROOT_BUDGET)
+        self.assertIsNotNone(self._rival_claims(w, key, count_cap=1))
+        row = self._stall_once(w, key, words, cap=1)
+        split = [row[f"{activity}_time_millis"] for activity in (
+            "evaluation", "claiming", "finalizing", "scheduling", "waiting",
+            "other")]
+        self.assertNotIn(None, split)
+        # The six partition the episode; it is timed on its own clock, so
+        # allow the rounding of six floored figures and the gap between reads.
+        self.assertLessEqual(abs(sum(split) - row["episode_time_millis"]), 20)
+        self.assertEqual(row["enclosed"], 0)
+
+    def test_an_episode_inside_another_is_marked_enclosed(self):
+        # Helping elsewhere from inside one wait can open another wait; its
+        # time is already in the outer row, so a total must be able to skip it.
+        w = self._worker()
+        outer, inner = BRANCH[:3], BRANCH[2:5]
+        for words in (outer, inner):
+            key = ScoreCache.encode_subset(words)
+            w.queue.create_branch(key, len(words), w.n_candidates,
+                                  budget=ROOT_BUDGET)
+            self.assertIsNotNone(self._rival_claims(w, key, count_cap=1))
+        helped = []
+
+        def help_by_waiting_on_inner(*_args, **_kwargs):
+            if not helped:
+                helped.append(True)
+                w.cooperative_solve(inner, ROOT_BUDGET)
+            return False
+
+        with mock.patch.object(erd_swarm, "MAX_WORKERS_PER_BRANCH", 1), \
+                mock.patch.object(w, "_help_other_branch",
+                                  side_effect=help_by_waiting_on_inner), \
+                mock.patch.object(w, "_idle_wait",
+                                  side_effect=lambda *_a: w.request_stop()):
+            w.cooperative_solve(outer, ROOT_BUDGET)
+        # The inner episode ends first, so it is written first.
+        rows = self._wait_rows()
+        self.assertEqual([(row["n_words"], row["enclosed"]) for row in rows],
+                         [(len(inner), 1), (len(outer), 0)])
+        self.assertGreaterEqual(rows[1]["episode_time_millis"],
+                                rows[0]["episode_time_millis"])
+        self.assertEqual(w._open_dependency_episodes, 0)
 
     def test_cache_hit_writes_no_wait_row(self):
         """An episode answered before the wait loop never opens an episode."""

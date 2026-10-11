@@ -60,6 +60,9 @@ class TestNoColumnNamesOnlyItsUnit(_Files):
         created_named = {
             ("bundle_stats", "evaluation_time_millis"),
             ("branch_finalize_log", "evaluation_time_millis"),
+            *(("dependency_wait", f"{activity}_time_millis") for activity in (
+                "evaluation", "claiming", "finalizing", "scheduling",
+                "waiting", "other")),
         }
         ERDQueue(self.queue_path).close()
         ScoreCache(self.cache_path, ANSWERS,
