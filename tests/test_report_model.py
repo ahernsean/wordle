@@ -14,6 +14,7 @@ from unittest.mock import Mock, patch
 from cache_sqlite import ScoreCache
 from pattern_matrix import PatternMatrix
 from erd_queue import ERDQueue
+import erd_queue
 import erd_search
 import report_model
 from report_model import (
@@ -503,13 +504,15 @@ class ReportModelTest(unittest.TestCase):
 
     def test_opener_report_never_writes_the_timing_it_finds_missing(self):
         queue = Mock()
-        queue.opener_rows.return_value = [{"opener": "raise", "state": "done"}]
+        queue.opener_rows.return_value = [
+            {"opener": "raise", "state": "done", "open_branch_count": 0}]
         queue.opener_membership_rows.return_value = []
         queue.completed_opener_timing.return_value = {
             "completed_at": 20, "first_created_at": 10,
             "worker_time_millis": 4, "telemetry_epochs": "2,4",
         }
-        queue.distinct_branch_count_for_words.return_value = 0
+        queue.branch_counts_by_group.return_value = {None: (0, 0)}
+        queue.opener_worker_counts.return_value = {}
         timing_cache = Mock()
         timing_cache.completed_opener_summary_map.return_value = {}
         payload = {"opener": "raise", "state": "complete", "branch_count": 0,
@@ -518,7 +521,6 @@ class ReportModelTest(unittest.TestCase):
             patch("report_model._open_report_queue", return_value=queue),
             patch("report_model.ScoreCache", return_value=timing_cache),
             patch("report_model.load_word_list", return_value=ANSWERS),
-            patch("report_model._opener_rollups", return_value={"raise": {}}),
             patch("report_model._opener_summary_payload", return_value=payload),
             patch("report_model._opener_erd_summaries", return_value={}),
         ):
@@ -561,7 +563,7 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(report_model._opener_group_key(
             {"elapsed_time_millis": None}, "elapsed", 0), (5, "not completed"))
 
-    def test_opener_rollups_and_membership_payload_preserve_shared_branch_context(self):
+    def test_opener_membership_payload_preserves_shared_branch_context(self):
         branch_key = ScoreCache.encode_subset(["salet"])
         parent_key = ScoreCache.encode_subset(["crane"])
         row = {
@@ -571,8 +573,6 @@ class ReportModelTest(unittest.TestCase):
             "pending_status": "in_progress", "active_status": "open", "worker_count": 2,
             "branch_effective_priority": 6,
         }
-        rollup = report_model._opener_rollups([row, row])["raise"]
-        self.assertEqual(rollup["open_branch_count"], 1)
         payload = report_model._opener_membership_payload(row, 2, set(ANSWERS))
         self.assertTrue(payload["is_shared"])
         self.assertEqual(payload["parent_branch_reference"], branch_reference(parent_key))
@@ -3843,6 +3843,36 @@ class OpenerReportTest(unittest.TestCase):
         self.assertIsNotNone(stored["completed_at"])
         self.assertEqual((stored["completed_branch_count"],
                           stored["completed_direct_done_branch_count"]), (1, 1))
+
+    def test_open_branches_and_workers_are_counted_once_per_word(self):
+        # CRANE holds two requests owning one branch, and shares it with
+        # SALET; one live worker is on it, and a worker whose heartbeat has
+        # lapsed is on another of SALET's.
+        shared = self._branch_of("crane", 0)
+        lapsed = self._branch_of("salet", 1)
+        queue = self._open_queue()
+        queue.add_pending_many([(shared, 3, 5, "crane", 0)])
+        add_second_request(queue, [(shared, 3, 5, "crane", 0)])
+        queue.add_pending_many([(shared, 3, 3, "salet", 0),
+                                (lapsed, 3, 3, "salet", 1)])
+        now = int(time.time())
+        queue.heartbeat("worker-1", 1, shared, 3, now, 0)
+        queue.heartbeat("worker-2", 2, lapsed, 3, now, 0)
+        queue._conn.execute(
+            "UPDATE worker_heartbeat SET updated_at = ? "
+            "WHERE worker_id = 'worker-2'",
+            (now - erd_queue.WORKER_LIVENESS_SECONDS - 60,))
+        queue._conn.commit()
+        queue.close()
+
+        rows = {row["opener"]: row for row in self._openers()["summary"]}
+
+        self.assertEqual(
+            (rows["crane"]["open_branch_count"], rows["crane"]["worker_count"]),
+            (1, 1))
+        self.assertEqual(
+            (rows["salet"]["open_branch_count"], rows["salet"]["worker_count"]),
+            (2, 1))
 
     def test_branch_totals_count_only_words_with_unfinished_work(self):
         self._queue_words(("crane", 1, 2), ("salet", 5, 3))
