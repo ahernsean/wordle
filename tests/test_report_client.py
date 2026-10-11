@@ -7248,6 +7248,24 @@ class ReportClientContract:
             self.assertIn(phrase.replace(" ", "\u00a0"), text)
         self.assertEqual({header["labelWraps"] for header in headers}, {"nowrap"})
 
+    def test_the_opener_list_shows_the_pace_and_where_it_ends(self):
+        self.open_sources()
+        metrics = " ".join(self.page.locator(".metrics").first.inner_text().split())
+        # The fixture: two finished in the last day, a day to go.
+        self.assertIn("2 finished in the last 24 h", metrics)
+        self.assertIn("1.0d", metrics)
+        self.assertIn("ETA at that rate", metrics)
+        text = self.page.evaluate("""async () => {
+          const report = await (await fetch('/api/view/openers')).json();
+          report.data.eta_seconds = null;
+          applyReport(report, null, parsePageState({search:'?kind=openers'}));
+          return [...document.querySelectorAll('.metrics .metric')]
+            .find(node => node.textContent.includes('ETA at that rate'))
+            .querySelector('strong').textContent;
+        }""")
+        # Nothing finished in the last day projects no end, and no date.
+        self.assertEqual(text, "—")
+
     def test_sources_card_opens_the_word_report_where_its_erd_lives(self):
         # The card leads to the word report: that is where a word's ERD,
         # response groups and root progress are, and it is what an operator

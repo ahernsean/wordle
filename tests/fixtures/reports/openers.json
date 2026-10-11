@@ -8,6 +8,8 @@
  },
  "data": {
   "branch_row_offset": 0,
+  "eta_seconds": 86400,
+  "finished_last_day_count": 2,
   "matched_branch_count": 1376,
   "matched_open_branch_count": 1211,
   "matched_opener_count": 3,
@@ -214,7 +216,8 @@
     ]
    }
   ],
-  "total_opener_count": 3
+  "total_opener_count": 3,
+  "unfinished_opener_count": 2
  },
  "filters": {},
  "generated_at": 1000,
