@@ -826,6 +826,18 @@ CREATE TABLE IF NOT EXISTS telemetry.dependency_wait (
     help_depth           INTEGER,
     -- How the wait ended: 'solved', 'loss', 'cut', 'deleted', 'cancelled'.
     outcome              TEXT,
+    -- The episode's time by the activity worker_time charged it to, these six
+    -- partitioning it: evaluation on the dependency or anywhere it helped,
+    -- the claim and finalize work around it, scheduling, every named wait,
+    -- and the rest.  enclosed is 1 for an episode run inside another of the
+    -- same worker's, whose own row already holds this time.
+    evaluation_time_millis   INTEGER,
+    claiming_time_millis     INTEGER,
+    finalizing_time_millis   INTEGER,
+    scheduling_time_millis   INTEGER,
+    waiting_time_millis      INTEGER,
+    other_time_millis        INTEGER,
+    enclosed                 INTEGER,
     epoch                INTEGER NOT NULL DEFAULT 0,
     recorded_at          INTEGER NOT NULL
 );
@@ -1476,6 +1488,17 @@ class ERDQueue:
         self._add_columns("branch_finalize_log", {
             "coordination_time_millis": "INTEGER",
             "evaluation_time_millis": "INTEGER",
+        }, schema="telemetry")
+        # An episode written before these columns holds NULL: its time was
+        # recorded only whole.
+        self._add_columns("dependency_wait", {
+            "evaluation_time_millis": "INTEGER",
+            "claiming_time_millis": "INTEGER",
+            "finalizing_time_millis": "INTEGER",
+            "scheduling_time_millis": "INTEGER",
+            "waiting_time_millis": "INTEGER",
+            "other_time_millis": "INTEGER",
+            "enclosed": "INTEGER",
         }, schema="telemetry")
 
         report_indexes = (
@@ -7158,15 +7181,20 @@ class ERDQueue:
                             pair_attempts, pair_successes,
                             blocks_worker_cap=0, blocks_no_candidates=0,
                             blocks_awaiting_finalize=0, blocks_help_capped=0,
-                            blocks_other=0, help_depth=None, outcome=None):
+                            blocks_other=0, help_depth=None, outcome=None,
+                            activity_time_millis=None, enclosed=None):
         """Record one cooperative_solve wait episode.
 
         Attributes what worker_time's wait_dependency_time_millis can only total: which
         dependency the worker waited on, how much of the episode it was asleep
         rather than helping or claiming, and why each sleep happened.  A caller
         that never blocked has nothing to attribute and should not write a row.
+
+        activity_time_millis maps evaluation, claiming, finalizing,
+        scheduling, waiting and other to the episode's time in each.
         """
         now = int(time.time())
+        activity = activity_time_millis or {}
         self._conn.execute("""
             INSERT INTO telemetry.dependency_wait
                 (worker_id, spine, n_words, budget, episode_time_millis,
@@ -7174,15 +7202,21 @@ class ERDQueue:
                  bundles_claimed, pair_attempts, pair_successes,
                  blocks_worker_cap, blocks_no_candidates,
                  blocks_awaiting_finalize, blocks_help_capped, blocks_other,
-                 help_depth, outcome, epoch, recorded_at)
+                 help_depth, outcome, evaluation_time_millis,
+                 claiming_time_millis, finalizing_time_millis,
+                 scheduling_time_millis, waiting_time_millis,
+                 other_time_millis, enclosed, epoch, recorded_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?)
+                    ?, ?, ?, ?, ?, ?, ?, ?)
         """, (worker_id, spine, n_words, budget, episode_time_millis,
               blocked_time_millis, iterations, empty_scans, helped_scans,
               bundles_claimed, pair_attempts, pair_successes,
               blocks_worker_cap, blocks_no_candidates,
               blocks_awaiting_finalize, blocks_help_capped, blocks_other,
-              help_depth, outcome, self.epoch, now))
+              help_depth, outcome, activity.get("evaluation"),
+              activity.get("claiming"), activity.get("finalizing"),
+              activity.get("scheduling"), activity.get("waiting"),
+              activity.get("other"), enclosed, self.epoch, now))
 
     WORKER_TIME_COLUMNS = (
         "evaluation_time_millis", "scheduling_time_millis", "claiming_time_millis",
