@@ -3238,6 +3238,10 @@ class _BranchWorker:
     def run(self):  # pragma: no cover
         idle_since = None
         while not self.cancel():
+            # Before the claim, so an idle worker runs it too: the tail of a
+            # sweep, with nothing left to claim, is where a stranded opener
+            # is left waiting.
+            self._complete_stranded_openers()
             work = self.claim_one()
             if work is None:
                 # Nothing claimable: queue empty or all candidates in flight.
@@ -3265,8 +3269,6 @@ class _BranchWorker:
             self._check_ram()
             self._check_disk()
             self._respect_checkpoint_pause()
-            # After the pause: completing an opener writes to both databases.
-            self._complete_stranded_openers()
 
     def _complete_stranded_openers(self):
         """Finish any opener whose last branch resolved without its
@@ -3276,12 +3278,14 @@ class _BranchWorker:
         An opener whose reducing worker died after its last branch resolved
         owns no branch left to resolve, so this check over every request is
         what offers it again.  It runs between claims, outside any write
-        transaction.
+        transaction, and after any checkpoint pause, since completing an
+        opener writes to both databases.
         """
         now = time.time()
         if now - self._last_stranded_opener_check < STRANDED_OPENER_CHECK_SECONDS:
             return
         self._last_stranded_opener_check = now
+        self._respect_checkpoint_pause()
         with self._time_account.activity("finalizing"):
             self._complete_openers(self.queue.openers_ready_to_complete())
 
