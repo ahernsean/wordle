@@ -535,7 +535,7 @@
     // takes milliseconds, and a panel held from an earlier moment contradicts
     // the header above it once a group finishes.  The latest answer per target
     // is kept only so a re-render shows it while the next one is in flight.
-    const rootProgressLatest=new Map(), rootProgressInFlight=new Set(), rootProgressScroll=new Map(), rootProgressFailure=new Map();
+    const rootProgressLatest=new Map(), rootProgressInFlight=new Map(), rootProgressScroll=new Map(), rootProgressFailure=new Map();
     const byId=id=>document.getElementById(id);
     const element=(tag,className,text)=>{const node=document.createElement(tag);if(className)node.className=className;if(text!==undefined)node.textContent=String(text);return node;};
     const formatInteger=value=>value===null||value===undefined?"—":Number(value).toLocaleString("en-US");
@@ -1677,26 +1677,35 @@
     }
     // Called by every render of the word report, so once per poll: the latest
     // answer is shown at once and a fresh one requested, one at a time per
-    // target, replacing it when it lands.
+    // target, replacing it when it lands.  A request still unanswered after
+    // STUCK_REQUEST_TIMEOUT_MILLIS is abandoned and replaced, as the main
+    // report's is: nothing else would ever ask again.
     function attachRootProgress(headlineHost,host,url,solvedGroupCount,state){
       const latest=rootProgressLatest.get(url),failure=rootProgressFailure.get(url);
       if(latest)renderRootProgressInto(headlineHost,host,url,latest,solvedGroupCount,state);
       else if(failure!==undefined)renderRootProgressFailure(headlineHost,host,failure);
       else host.replaceChildren(element("p","dim","Computing root progress…"));
-      if(rootProgressInFlight.has(url))return;
-      rootProgressInFlight.add(url);
-      fetch(url,{headers:{Accept:"application/json"}})
+      const inFlight=rootProgressInFlight.get(url);
+      if(inFlight){
+        if(Date.now()-inFlight.startedAt<STUCK_REQUEST_TIMEOUT_MILLIS)return;
+        inFlight.controller.abort();
+      }
+      const request={startedAt:Date.now(),controller:new AbortController()};
+      rootProgressInFlight.set(url,request);
+      fetch(url,{headers:{Accept:"application/json"},signal:request.controller.signal})
         .then(response=>{if(!response.ok)throw new Error("Root progress request failed ("+response.status+")");return response.json();})
         .then(progress=>{
           rootProgressLatest.set(url,progress.data);
           rootProgressFailure.delete(url);
           if(host.isConnected)renderRootProgressInto(headlineHost,host,url,progress.data,solvedGroupCount,state);})
         .catch(error=>{
+          // An abandoned request has a replacement, which owns the panel.
+          if(request.controller.signal.aborted)return;
           rootProgressFailure.set(url,error.message);
           // An earlier answer still describes the root better than an error
           // does; it stays until a request succeeds.
           if(host.isConnected&&!rootProgressLatest.has(url))renderRootProgressFailure(headlineHost,host,error.message);})
-        .finally(()=>rootProgressInFlight.delete(url));
+        .finally(()=>{if(rootProgressInFlight.get(url)===request)rootProgressInFlight.delete(url);});
     }
     function renderWord(report,previous,state){
       const fragment=document.createDocumentFragment(),data=report.data;const heading=element("h2","");heading.append(wordTiles(data.word,null,data.word_is_answer,"word-lg"));fragment.append(heading);

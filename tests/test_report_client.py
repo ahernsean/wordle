@@ -34,6 +34,10 @@ FIXTURE_DIRECTORY = os.path.join(ROOT, "tests", "fixtures", "reports")
 # The client's DEFAULT_POLL; a re-render lands on every one of these.
 CLIENT_POLL_INTERVAL_MILLIS = 2000
 CLIENT_PATH = os.path.join(ROOT, "report_client.html")
+# Read from the client itself, so a test using it cannot drift from it.
+with open(CLIENT_PATH) as _client:
+    STUCK_REQUEST_TIMEOUT_MILLIS = int(re.search(
+        r"STUCK_REQUEST_TIMEOUT_MILLIS=(\d+)", _client.read()).group(1))
 # The sweep strip arrives as a base64 bitset, one bit per candidate, sized by
 # the whole candidate list rather than by how far the sweep has reached.  A
 # test therefore states both numbers: how many candidates the branch holds and
@@ -892,6 +896,48 @@ class ReportClientContract:
                 branch_target)
         finally:
             self.page.unroute("**/api/view/root-progress**")
+
+    def test_a_request_that_never_answers_is_abandoned_and_replaced(self):
+        # Nothing else would ever ask again: every poll finds the URL in
+        # flight.  The first request hangs until aborted; once it is older
+        # than the stuck-request limit, a poll replaces it.
+        self.page.evaluate("""() => {
+          const original = window.fetch, realNow = Date.now;
+          Object.assign(window, {__progressCalls: 0, __progressAborted: false,
+                                 __clockAhead: 0});
+          Date.now = () => realNow() + window.__clockAhead;
+          window.fetch = (input, init) => {
+            if (!String(input).includes("/api/view/root-progress"))
+              return original(input, init);
+            window.__progressCalls++;
+            // The replacement takes a while, so an error shown for the
+            // abandoned request would still be on screen while it runs.
+            if (window.__progressCalls > 1)
+              return new Promise(resolve => setTimeout(resolve, 5000))
+                .then(() => original(input, init));
+            return new Promise((resolve, reject) => {
+              init.signal.addEventListener("abort", () => {
+                window.__progressAborted = true;
+                reject(new DOMException("aborted", "AbortError"));
+              });
+            });
+          };
+        }""")
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("text=Computing root progress")
+        self.page.wait_for_timeout(2 * CLIENT_POLL_INTERVAL_MILLIS)
+        # Within the limit, polls wait on the request already out.
+        self.assertEqual(self.page.evaluate("window.__progressCalls"), 1)
+        self.page.evaluate(
+            f"window.__clockAhead = {STUCK_REQUEST_TIMEOUT_MILLIS + 1000}")
+        self.page.wait_for_function("() => window.__progressAborted")
+        # While the replacement runs, polls go on rendering the panel; the
+        # abandoned request's rejection is not shown as an error on any of
+        # them, since the replacement owns the panel.
+        self.page.wait_for_timeout(int(1.5 * CLIENT_POLL_INTERVAL_MILLIS))
+        self.assertEqual(
+            self.page.locator(".root-progress-host p.error").count(), 0)
+        self.page.wait_for_selector("table.root-progress")
 
     def test_a_failure_stays_steady_while_polls_retry_and_clears_on_success(self):
         # Retrying is cheap, but the computing notice and the error wrap to
