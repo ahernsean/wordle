@@ -19,6 +19,7 @@ import erd_search
 import report_model
 from report_model import (
     leaderboard_rows,
+    breakdown_work_state,
     LEADERBOARD_NEIGHBOUR_COUNT,
     encode_candidate_bitmap,
     decode_candidate_bitmap,
@@ -1752,7 +1753,8 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(len(breakdown), data["total_rows"])
         self.assertEqual(
             [set(entry) for entry in breakdown],
-            [{"pattern", "answer_count", "solved"}] * len(breakdown),
+            [{"pattern", "answer_count", "solved", "work_state"}]
+            * len(breakdown),
         )
         self.assertEqual(
             [entry["answer_count"] for entry in breakdown], [2, 1, 1]
@@ -1796,6 +1798,69 @@ class ReportModelTest(unittest.TestCase):
             sum(solved.values()), data["erd_summary"]["resolved_group_count"],
             "the outlined groups must be the groups the ERD line counts",
         )
+
+    def test_response_group_breakdown_reports_where_each_group_stands(self):
+        # BEBOP splits these answers into two groups of two, so neither is
+        # settled by playing a survivor and only the queue and cache place them.
+        target = parse_report_branch_target("bebop")
+        first, second = collect_report(
+            self.sources, ReportRequest(branch_target=target)
+        )["data"]["response_groups"]
+        first_key = bytes.fromhex(first["branch_key_hex"])
+        second_key = bytes.fromhex(second["branch_key_hex"])
+
+        def work_states():
+            return {
+                entry["pattern"]: entry["work_state"]
+                for entry in collect_report(
+                    self.sources, ReportRequest(branch_target=target)
+                )["data"]["response_group_breakdown"]
+            }
+
+        self.assertEqual(work_states(), {first["pattern"]: "unqueued",
+                                         second["pattern"]: "unqueued"})
+        queue = self._open_queue()
+        queue.add_pending_many([(first_key, 2, 9, "bebop", first["pattern"])])
+        claimed = queue.claim_next("worker-0")
+        self.assertEqual(claimed["branch_key"], first_key)
+        queue.create_branch(
+            first_key, 2, 5, priority=9, opener="bebop",
+            opener_pattern=first["pattern"],
+            opener_work_id=claimed["opener_work_id"],
+        )
+        queue.add_pending_many([(second_key, 2, 8, "bebop", second["pattern"])])
+        queue.close()
+        # No worker holds the open branch: open is working all the same.
+        self.assertEqual(work_states(), {first["pattern"]: "working",
+                                         second["pattern"]: "queued"})
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        cache.write(first_key, ERD_ALL, "salet", 1.5,
+                    max_depth=2, solve_budget=None)
+        cache.close()
+        self.assertEqual(work_states(), {first["pattern"]: "finished",
+                                         second["pattern"]: "queued"})
+
+    def test_breakdown_work_state_finishes_every_group_with_nothing_left_to_do(self):
+        def row(**fields):
+            return {"pattern": "-----", "answer_count": 9, "best_erd": None,
+                    "max_remaining_depth": None, "cache_state": "missing",
+                    "branch_status": "unqueued", **fields}
+
+        # Solved, proven lost, and a lone survivor lost for want of a guess.
+        self.assertEqual(breakdown_work_state(
+            row(best_erd=2.0, max_remaining_depth=3), 5), "finished")
+        self.assertEqual(breakdown_work_state(
+            row(cache_state="loss", branch_status="done"), 5), "finished")
+        self.assertEqual(breakdown_work_state(row(answer_count=1), 0),
+                         "finished")
+        self.assertEqual(breakdown_work_state(
+            row(branch_status="finalizing"), 5), "working")
+        self.assertEqual(breakdown_work_state(
+            row(branch_status="evaluating"), 5), "working")
+        # The queue calling a branch done does not finish a group the cache
+        # holds no result for at this budget; nothing is queued to finish it.
+        self.assertEqual(breakdown_work_state(row(branch_status="done"), 5),
+                         "unqueued")
 
     def test_response_group_breakdown_solves_a_lone_survivor_only_with_budget(self):
         # A one-answer group is solved by playing the survivor, which costs a
