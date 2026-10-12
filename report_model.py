@@ -4280,6 +4280,22 @@ def _opener_membership_payload(row, owner_count, answer_set):
     }
 
 
+_ONE_DAY_SECONDS = 24 * 60 * 60
+
+
+def _opener_eta_seconds(unfinished, finished_last_day):
+    """When the unfinished openers would all be done at the last day's rate.
+
+    A projection, not a forecast: openers differ in cost by orders of
+    magnitude, so it moves with whichever ones the last day happened to
+    finish.  None when nothing finished in the last day, which projects no
+    end at all.
+    """
+    if not finished_last_day:
+        return None
+    return int(unfinished * _ONE_DAY_SECONDS / finished_last_day)
+
+
 def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dict:
     """Report every opener with its requests and branches rolled up —
     the reporting half of #200's operator surface.
@@ -4292,6 +4308,8 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
     alongside each owner's individually requested priority."""
     generated_at = int(time.time())
     data = {"summary": [], "total_opener_count": 0,
+            "finished_last_day_count": None, "unfinished_opener_count": None,
+            "eta_seconds": None,
             "matched_opener_count": 0, "matched_branch_count": 0,
             "matched_open_branch_count": 0, "opener_offset": 0,
             "matched_rows": 0, "shared_branch_count": 0,
@@ -4309,6 +4327,14 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
             if request.branch_target.kind == "word" else None
         )
         summary_rows = queue.opener_rows()
+        # Over every opener, whatever the view, so the projection is the
+        # same wherever it is read.
+        data["unfinished_opener_count"] = sum(
+            1 for row in summary_rows if row["has_incomplete_request"])
+        data["finished_last_day_count"] = queue.openers_finished_since(
+            generated_at - _ONE_DAY_SECONDS)
+        data["eta_seconds"] = _opener_eta_seconds(
+            data["unfinished_opener_count"], data["finished_last_day_count"])
         if opener is not None:
             summary_rows = [row for row in summary_rows
                             if (row["opener"] or "").lower() == opener]

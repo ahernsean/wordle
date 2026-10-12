@@ -1917,6 +1917,29 @@ class OpenersCommandEndToEndTest(unittest.TestCase):
         self.assertIn("--limit N shows more than 1", paged)
         self.assertIn("SLATE", self._run("--opener-state", "all", "--limit", "5"))
 
+    def test_the_list_says_the_pace_and_where_it_ends(self):
+        report = overview_report()
+        report.update({"report_kind": "openers", "tree": False,
+                       "generated_at": 1_800_000_000,
+                       "branch_target": {"trailing_word": None}})
+        report["data"] = {"summary": [], "total_opener_count": 0,
+                          "finished_last_day_count": 253,
+                          "eta_seconds": 86_400 * 48, "rows": []}
+        with patch.dict(os.environ, {"TZ": "UTC"}):
+            time.tzset()
+            try:
+                text = report_terminal.render_report(report, width=120)
+            finally:
+                time.tzset()
+        self.assertIn("Finished in the last 24 h: 253   "
+                      "ETA at that rate: 48.0d (", text)
+        report["data"]["eta_seconds"] = None
+        self.assertIn("ETA at that rate: —",
+                      report_terminal.render_report(report, width=120))
+        report["branch_target"]["trailing_word"] = "raise"
+        self.assertNotIn("Finished in the last 24 h",
+                         report_terminal.render_report(report, width=120))
+
     def test_opener_state_filter_and_sort_reach_the_rendered_table(self):
         # --opener-state and --sort are the terminal's half of the same
         # filtering the browser gets; grouping is browser-only.

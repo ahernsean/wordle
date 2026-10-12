@@ -1762,6 +1762,16 @@ def _render_opener_sections(report, width, display_order):
     if data.get("rows"):
         counts += f"   memberships: {data.get('matched_rows', 0):,} matched"
     lines = [counts]
+    finished = data.get("finished_last_day_count")
+    if finished is not None and not (report["branch_target"] or {}).get(
+            "trailing_word"):
+        eta_seconds = data.get("eta_seconds")
+        eta = "—" if eta_seconds is None else (
+            f"{_abbreviate_duration(eta_seconds)} ("
+            + time.strftime("%d %b %Y", time.localtime(
+                report["generated_at"] + eta_seconds)) + ")")
+        lines.append(f"Finished in the last 24 h: {finished:,}   "
+                     f"ETA at that rate: {eta}")
     # Say how to reach the openers the page or the state filter left out.
     matched_words = data.get("matched_opener_count", total_words)
     reach = []
