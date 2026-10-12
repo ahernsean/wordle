@@ -2599,6 +2599,17 @@ class ERDQueue:
             + self._FINISHED_OPENER_WORK_PREDICATE,
             (json.dumps(sorted(opener_work_ids)),))})
 
+    def openers_finished_since(self, since):
+        """How many words had a request completed at or after `since`.
+
+        A request is completed when its opener is finished, whether its ERD
+        was stored or it proved infeasible, and completed_at is that moment.
+        """
+        return self._conn.execute(
+            "SELECT COUNT(DISTINCT opener) FROM opener_work "
+            "WHERE state = 'complete' AND completed_at >= ?",
+            (since,)).fetchone()[0]
+
     def completed_opener_names(self):
         """Every opener with a request that is done."""
         return sorted({row["opener"] for row in self._conn.execute(

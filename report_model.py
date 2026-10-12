@@ -4331,6 +4331,10 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
         # same wherever it is read.
         data["unfinished_opener_count"] = sum(
             1 for row in summary_rows if row["has_incomplete_request"])
+        data["finished_last_day_count"] = queue.openers_finished_since(
+            generated_at - _ONE_DAY_SECONDS)
+        data["eta_seconds"] = _opener_eta_seconds(
+            data["unfinished_opener_count"], data["finished_last_day_count"])
         if opener is not None:
             summary_rows = [row for row in summary_rows
                             if (row["opener"] or "").lower() == opener]
@@ -4344,14 +4348,6 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
             all_answers = load_word_list(sources.answer_list_path)
             timing_cache = _open_report_cache(sources, all_answers)
             timings = timing_cache.completed_opener_summary_map(ERD_ALL)
-            # Finished means its ERD was stored: a request that ends because
-            # an operator withdrew its work is complete without one.
-            data["finished_last_day_count"] = sum(
-                1 for timing in timings.values()
-                if (timing["completed_at"] or 0) > generated_at - _ONE_DAY_SECONDS)
-            data["eta_seconds"] = _opener_eta_seconds(
-                data["unfinished_opener_count"],
-                data["finished_last_day_count"])
         except (sqlite3.Error, OSError) as error:
             timings = {}
             report["sources"]["cache"]["error"] = str(error)
