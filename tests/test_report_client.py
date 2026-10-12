@@ -1684,7 +1684,10 @@ class ReportClientContract:
           applyReport(report, null,
             {...__reportClient.getState(), branch_target:'SALET'});
         }""", report)
-        self.page.wait_for_selector(".response-group-breakdown .answer-segment")
+        # The outline is applied by measurement in the frame after the strip
+        # is built; the 400-answer segment is the one wide enough to carry it.
+        self.page.wait_for_selector(
+            ".response-group-breakdown .answer-segment.solved-group")
 
     def test_word_report_breakdown_menu_reaches_a_two_pixel_group(self):
         # The reason every group opens a menu rather than only the wide ones:
@@ -1787,18 +1790,24 @@ class ReportClientContract:
         # parked, so only the resize can put this right.
         self._apply_graded_word_report()
         wide = self._breakdown_segment_states()
+        wide_outlined = sum(outlined for _, outlined in wide)
+        # The remeasure runs on the resize event, which a browser may deliver
+        # well after the viewport has changed, so wait for the outline count
+        # to move rather than for a fixed time.
         self.page.set_viewport_size({"width": 375, "height": 800})
-        self.page.wait_for_timeout(200)
+        self.page.wait_for_function(
+            """count => document.querySelectorAll(
+                 '.response-group-breakdown .answer-segment.solved-group'
+               ).length < count""", arg=wide_outlined)
         narrow = self._breakdown_segment_states()
-        self.assertGreater(
-            sum(outlined for _, outlined in wide),
-            sum(outlined for _, outlined in narrow),
-            "no segment crossed the outline threshold, so this proves nothing")
         for width, outlined in narrow:
             self.assertEqual(outlined, width >= 16, f"{width}px segment")
         # And back: a segment the resize widened regains its outline.
         self.page.set_viewport_size({"width": 1200, "height": 800})
-        self.page.wait_for_timeout(200)
+        self.page.wait_for_function(
+            """count => document.querySelectorAll(
+                 '.response-group-breakdown .answer-segment.solved-group'
+               ).length === count""", arg=wide_outlined)
         self.assertEqual(self._breakdown_segment_states(), wide)
 
     def test_word_report_histogram_scales_against_the_branch_best(self):
