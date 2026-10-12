@@ -531,9 +531,11 @@
     // the debt is carried here and settled by the first poll that finds the
     // interaction over.
     let renderOwed=false;
-    // The root-progress scan takes seconds, so a result is held per target and
-    // reused across the poll cycle's re-renders; refreshing is explicit.
-    const rootProgressCache=new Map(), rootProgressGeneration=new Map(), rootProgressPending=new Set(), rootProgressScroll=new Map(), rootProgressFailure=new Map();
+    // Root progress is fetched with every poll, like the report around it: it
+    // takes milliseconds, and a panel held from an earlier moment contradicts
+    // the header above it once a group finishes.  The latest answer per target
+    // is kept only so a re-render shows it while the next one is in flight.
+    const rootProgressLatest=new Map(), rootProgressInFlight=new Map(), rootProgressScroll=new Map(), rootProgressFailure=new Map();
     const byId=id=>document.getElementById(id);
     const element=(tag,className,text)=>{const node=document.createElement(tag);if(className)node.className=className;if(text!==undefined)node.textContent=String(text);return node;};
     const formatInteger=value=>value===null||value===undefined?"—":Number(value).toLocaleString("en-US");
@@ -1418,16 +1420,15 @@
     // The panel reads only which root and which epoch; every other key in
     // stateQuery is word-view display state that this report rejects rather
     // than ignores, so it is built from a whitelist, not by subtraction.
-    // Keeping it minimal also means changing sort or grouping reuses the
-    // cached result instead of re-running the scan.
-    function rootProgressURL(state,inheritedCost){
+    // Keeping it minimal also means changing sort or grouping keeps the same
+    // target, so its latest answer stays on screen.
+    function rootProgressURL(state){
       const query=new URLSearchParams();
       if(state.branch_target)query.set("branch_target",state.branch_target);
       if(state.epoch!==null&&state.epoch!=="")query.set("epoch",String(state.epoch));
-      // The second stage rolls up whole subtrees other openers finalized, which
-      // is a scan of the finalize log rather than a lookup per group.  It is a
-      // separate URL so the panel can render without it and fill it in.
-      if(inheritedCost)query.set("inherited_cost","1");
+      // With what other openers spent on the groups this one inherited: one
+      // request answers the whole panel.
+      query.set("inherited_cost","1");
       return "/api/view/root-progress"+(query.size?"?"+query.toString():"");
     }
     // What a group cost and what this opener spent on it stop being the same
@@ -1657,10 +1658,8 @@
       return fragment;
     }
     function renderRootProgressInto(headlineHost,host,url,data,solvedGroupCount,state){
-      const refresh=element("button","refresh","Refresh");
-      refresh.addEventListener("click",()=>{invalidateRootProgress(url);attachRootProgress(headlineHost,host,url,solvedGroupCount,state);});
       headlineHost.replaceChildren(renderRootProgressHeadline(data,solvedGroupCount));
-      host.replaceChildren(renderRootProgressPanel(data,url,state,headlineHost,host,solvedGroupCount),refresh);
+      host.replaceChildren(renderRootProgressPanel(data,url,state,headlineHost,host,solvedGroupCount));
       // The panel is built before the report is mounted, and scroll offsets do
       // not apply to a detached element.  A microtask runs after the mount and
       // before the paint, so the restored position is never seen scrolling.
@@ -1669,103 +1668,44 @@
         if(scroller&&saved){scroller.scrollLeft=saved.left;scroller.scrollTop=saved.top;}
       });
     }
-    // A failure is held like a result.  Retrying on every poll would re-render
-    // the computing notice, re-fire the request and re-render the error every
-    // couple of seconds -- and those two messages wrap to different heights, so
-    // the whole page below the panel would shift each time.  Refresh retries.
-    function renderRootProgressFailure(headlineHost,host,url,message,solvedGroupCount,state){
-      const refresh=element("button","refresh","Refresh");
-      refresh.addEventListener("click",()=>{invalidateRootProgress(url);attachRootProgress(headlineHost,host,url,solvedGroupCount,state);});
+    // A failure stays on screen while the next polls retry, rather than giving
+    // way to the computing notice between them: the two wrap to different
+    // heights, so alternating would shift the whole page below the panel.
+    function renderRootProgressFailure(headlineHost,host,message){
       headlineHost.replaceChildren();
-      host.replaceChildren(element("p","error",message),refresh);
+      host.replaceChildren(element("p","error",message));
     }
-    // A report that costs too much to compute in one pass answers cheaply
-    // first and is filled in by a second request.  The enriched response
-    // replaces the cached one under the *first* stage's key, so a re-render --
-    // a poll, a scroll restore, a reopened panel -- keeps the filled-in
-    // figures instead of dropping back to the cheap shape.
-    //
-    // A failed enrichment leaves the rendered panel alone rather than
-    // replacing it with an error: the first stage is measured and correct on
-    // its own, and an error notice would claim more was lost than was.  It is
-    // recorded so the request is not reissued on every poll.
-    //
-    // `wanted` reads the rendered data and decides whether the second stage
-    // has anything to add, so a report with nothing to enrich never pays for
-    // the request.
-    // Refresh means "discard what is displayed and ask again", and a request
-    // already in flight predates that instruction.  Without a generation, the
-    // in-flight request keeps its place in rootProgressPending, so the fresh
-    // first stage finds the enrichment "already running" and starts none --
-    // and when the old one lands it writes its pre-refresh response under the
-    // shared cache key.  The panel then sits on stale data that an explicit
-    // Refresh was supposed to replace.
-    //
-    // Bumping the generation both frees the slot for a replacement request
-    // and marks every response issued before the refresh as superseded, so a
-    // late arrival is dropped rather than rendered.
-    function rootProgressGenerationOf(cacheKey){
-      return rootProgressGeneration.get(cacheKey)||0;
-    }
-    function invalidateRootProgress(cacheKey){
-      rootProgressGeneration.set(cacheKey,rootProgressGenerationOf(cacheKey)+1);
-      rootProgressCache.delete(cacheKey);
-      rootProgressFailure.delete(cacheKey);
-    }
-    function attachProgressiveStage({cacheKey,stageURL,host,data,wanted,render}){
-      if(!wanted(data))return;
-      const generation=rootProgressGenerationOf(cacheKey);
-      const stageKey=stageURL+"#"+generation;
-      if(rootProgressPending.has(stageKey)||rootProgressFailure.has(stageKey))return;
-      rootProgressPending.add(stageKey);
-      fetch(stageURL,{headers:{Accept:"application/json"}})
-        .then(response=>{if(!response.ok)throw new Error("Progressive stage request failed ("+response.status+")");return response.json();})
-        .then(enriched=>{
-          if(rootProgressGenerationOf(cacheKey)!==generation)return;
-          rootProgressCache.set(cacheKey,enriched.data);
-          if(host.isConnected)render(enriched.data);})
-        .catch(error=>{
-          if(rootProgressGenerationOf(cacheKey)===generation)
-            rootProgressFailure.set(stageKey,error.message);})
-        .finally(()=>rootProgressPending.delete(stageKey));
-    }
-    // Inherited cost is root progress's second stage: the first names which
-    // groups another opener paid for, this one measures what they cost.
-    const inheritedCostWanted=data=>
-      Boolean(((data.totals||{}).provenance_counts||{}).inherited)
-      &&!(data.totals||{}).inherited_cost_known;
-    function attachInheritedCost(headlineHost,host,url,state,solvedGroupCount,data){
-      attachProgressiveStage({
-        cacheKey:url,stageURL:rootProgressURL(state,true),host,data,
-        wanted:inheritedCostWanted,
-        render:enriched=>renderRootProgressInto(
-          headlineHost,host,url,enriched,solvedGroupCount,state)});
-    }
+    // Called by every render of the word report, so once per poll: the latest
+    // answer is shown at once and a fresh one requested, one at a time per
+    // target, replacing it when it lands.  A request still unanswered after
+    // STUCK_REQUEST_TIMEOUT_MILLIS is abandoned and replaced, as the main
+    // report's is: nothing else would ever ask again.
     function attachRootProgress(headlineHost,host,url,solvedGroupCount,state){
-      const failure=rootProgressFailure.get(url);
-      if(failure!==undefined){renderRootProgressFailure(headlineHost,host,url,failure,solvedGroupCount,state);return;}
-      const cached=rootProgressCache.get(url);
-      if(cached){
-        renderRootProgressInto(headlineHost,host,url,cached,solvedGroupCount,state);
-        attachInheritedCost(headlineHost,host,url,state,solvedGroupCount,cached);
-        return;
+      const latest=rootProgressLatest.get(url),failure=rootProgressFailure.get(url);
+      if(latest)renderRootProgressInto(headlineHost,host,url,latest,solvedGroupCount,state);
+      else if(failure!==undefined)renderRootProgressFailure(headlineHost,host,failure);
+      else host.replaceChildren(element("p","dim","Computing root progress…"));
+      const inFlight=rootProgressInFlight.get(url);
+      if(inFlight){
+        if(Date.now()-inFlight.startedAt<STUCK_REQUEST_TIMEOUT_MILLIS)return;
+        inFlight.controller.abort();
       }
-      host.replaceChildren(element("p","dim","Computing root progress… (a full telemetry scan, usually a few seconds)"));
-      const generation=rootProgressGenerationOf(url),stageKey=url+"#"+generation;
-      if(rootProgressPending.has(stageKey))return;
-      rootProgressPending.add(stageKey);
-      fetch(url,{headers:{Accept:"application/json"}})
+      const request={startedAt:Date.now(),controller:new AbortController()};
+      rootProgressInFlight.set(url,request);
+      fetch(url,{headers:{Accept:"application/json"},signal:request.controller.signal})
         .then(response=>{if(!response.ok)throw new Error("Root progress request failed ("+response.status+")");return response.json();})
         .then(progress=>{
-          if(rootProgressGenerationOf(url)!==generation)return;
-          rootProgressCache.set(url,progress.data);
-          if(host.isConnected)renderRootProgressInto(headlineHost,host,url,progress.data,solvedGroupCount,state);
-          attachInheritedCost(headlineHost,host,url,state,solvedGroupCount,progress.data);})
+          rootProgressLatest.set(url,progress.data);
+          rootProgressFailure.delete(url);
+          if(host.isConnected)renderRootProgressInto(headlineHost,host,url,progress.data,solvedGroupCount,state);})
         .catch(error=>{
-          if(rootProgressGenerationOf(url)!==generation)return;
+          // An abandoned request has a replacement, which owns the panel.
+          if(request.controller.signal.aborted)return;
           rootProgressFailure.set(url,error.message);
-          if(host.isConnected)renderRootProgressFailure(headlineHost,host,url,error.message,solvedGroupCount,state);})
-        .finally(()=>rootProgressPending.delete(stageKey));
+          // An earlier answer still describes the root better than an error
+          // does; it stays until a request succeeds.
+          if(host.isConnected&&!rootProgressLatest.has(url))renderRootProgressFailure(headlineHost,host,error.message);})
+        .finally(()=>{if(rootProgressInFlight.get(url)===request)rootProgressInFlight.delete(url);});
     }
     function renderWord(report,previous,state){
       const fragment=document.createDocumentFragment(),data=report.data;const heading=element("h2","");heading.append(wordTiles(data.word,null,data.word_is_answer,"word-lg"));fragment.append(heading);
@@ -1804,9 +1744,9 @@
       progressDetails.append(element("summary","clickable","Root progress"),progressHost);
       progressDetails.addEventListener("toggle",()=>{rootProgressOpen=progressDetails.open;});
       // Fetched whether or not the panel is open: the headline outside it
-      // carries the same result, and the result is cached per target.  The
-      // solved-group count is only passed on when the ERD line above is the
-      // one that shows it, so the headline reports the same partition.
+      // carries the same result.  The solved-group count is only passed on
+      // when the ERD line above is the one that shows it, so the headline
+      // reports the same partition.
       attachRootProgress(progressHeadline,progressHost,progressURL,
         erd&&erd.state!=="complete"&&erd.state!=="infeasible"?erd.resolved_group_count:null,state);
       fragment.append(progressHeadline,progressDetails);
@@ -3545,7 +3485,7 @@
       addEventListener("resize",()=>{measureStickyTop();const root=byId("report");layoutSpines(root);layoutSweepMarkerDigits(root);for(const strip of root.querySelectorAll(".answer-strip"))measureAnswerStrip(strip);if(openGroupMenuNode)positionGroupMenu(openGroupMenuNode.node,openGroupMenuNode.opener);if(currentState?.kind==="leaderboard"&&lastReport&&root.clientWidth!==leaderboardReportWidth&&!reportHasFocusedControl()&&!reportHasActiveSelection())applyReport(lastReport,lastReport,currentState);});
       addEventListener("popstate",()=>{abortActiveRequest();currentState=parsePageState(location);syncControls();redrawLeaderboardZoom();fetchReport();schedulePoll();});document.addEventListener("visibilitychange",()=>{if(!document.hidden){if(!skipAutomaticScan())fetchReport();schedulePoll();}});fetchReport();schedulePoll();
     }
-    window.parsePageState=parsePageState;window.buildAPIURL=buildAPIURL;window.rootProgressURL=rootProgressURL;window.attachProgressiveStage=attachProgressiveStage;window.renderRootProgressHeadline=renderRootProgressHeadline;window.applyReport=applyReport;window.spineTextFromSelection=spineTextFromSelection;window.__skipAutomaticScanProbe=()=>skipAutomaticScan();window.__reportClient={setState:state=>setState(state),getState:()=>({...currentState}),fetchReport};
+    window.parsePageState=parsePageState;window.buildAPIURL=buildAPIURL;window.rootProgressURL=rootProgressURL;window.renderRootProgressHeadline=renderRootProgressHeadline;window.applyReport=applyReport;window.spineTextFromSelection=spineTextFromSelection;window.__skipAutomaticScanProbe=()=>skipAutomaticScan();window.__reportClient={setState:state=>setState(state),getState:()=>({...currentState}),fetchReport};
     document.addEventListener("DOMContentLoaded",initialize);
   })();
   </script>

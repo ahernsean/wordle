@@ -34,6 +34,10 @@ FIXTURE_DIRECTORY = os.path.join(ROOT, "tests", "fixtures", "reports")
 # The client's DEFAULT_POLL; a re-render lands on every one of these.
 CLIENT_POLL_INTERVAL_MILLIS = 2000
 CLIENT_PATH = os.path.join(ROOT, "report_client.html")
+# Read from the client itself, so a test using it cannot drift from it.
+with open(CLIENT_PATH) as _client:
+    STUCK_REQUEST_TIMEOUT_MILLIS = int(re.search(
+        r"STUCK_REQUEST_TIMEOUT_MILLIS=(\d+)", _client.read()).group(1))
 # The sweep strip arrives as a base64 bitset, one bit per candidate, sized by
 # the whole candidate list rather than by how far the sweep has reached.  A
 # test therefore states both numbers: how many candidates the branch holds and
@@ -893,32 +897,80 @@ class ReportClientContract:
         finally:
             self.page.unroute("**/api/view/root-progress**")
 
-    def test_root_progress_failure_renders_once_and_stops_refiring(self):
-        # A failed scan that is not held gets re-requested every poll, and the
-        # computing notice and the error wrap to different heights -- so the
-        # whole page below the panel shifts on every cycle.
-        calls = []
-        self.page.route(
-            "**/api/view/root-progress**",
-            lambda route: (calls.append(1), route.fulfill(
-                status=400, content_type="application/json",
-                body='{"error": {"message": "bad target"}}'))[-1])
-        try:
-            self.apply_branch_target("SALET")
-            self.page.wait_for_selector(".root-progress-host p.error")
-            self.page.wait_for_timeout(3 * CLIENT_POLL_INTERVAL_MILLIS)
-            # One request for the life of the panel.  Re-firing is what makes
-            # the panel alternate between the computing notice and the error,
-            # and those wrap to different heights on a phone, so every poll
-            # shifts the whole page below it.  The height cannot be asserted
-            # here -- this fixture answers in milliseconds, so the notice is
-            # never on screen when a sample is taken -- but the re-fire that
-            # causes it is deterministic.
-            self.assertEqual(len(calls), 1, "a held failure must not re-fire")
-            self.assertEqual(
-                self.page.locator(".root-progress-host p.error").count(), 1)
-        finally:
-            self.page.unroute("**/api/view/root-progress**")
+    def test_a_request_that_never_answers_is_abandoned_and_replaced(self):
+        # Nothing else would ever ask again: every poll finds the URL in
+        # flight.  The first request hangs until aborted; once it is older
+        # than the stuck-request limit, a poll replaces it.
+        self.page.evaluate("""() => {
+          const original = window.fetch, realNow = Date.now;
+          Object.assign(window, {__progressCalls: 0, __progressAborted: false,
+                                 __clockAhead: 0});
+          Date.now = () => realNow() + window.__clockAhead;
+          window.fetch = (input, init) => {
+            if (!String(input).includes("/api/view/root-progress"))
+              return original(input, init);
+            window.__progressCalls++;
+            // The replacement takes a while, so an error shown for the
+            // abandoned request would still be on screen while it runs.
+            if (window.__progressCalls > 1)
+              return new Promise(resolve => setTimeout(resolve, 5000))
+                .then(() => original(input, init));
+            return new Promise((resolve, reject) => {
+              init.signal.addEventListener("abort", () => {
+                window.__progressAborted = true;
+                reject(new DOMException("aborted", "AbortError"));
+              });
+            });
+          };
+        }""")
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("text=Computing root progress")
+        self.page.wait_for_timeout(2 * CLIENT_POLL_INTERVAL_MILLIS)
+        # Within the limit, polls wait on the request already out.
+        self.assertEqual(self.page.evaluate("window.__progressCalls"), 1)
+        self.page.evaluate(
+            f"window.__clockAhead = {STUCK_REQUEST_TIMEOUT_MILLIS + 1000}")
+        self.page.wait_for_function("() => window.__progressAborted")
+        # While the replacement runs, polls go on rendering the panel; the
+        # abandoned request's rejection is not shown as an error on any of
+        # them, since the replacement owns the panel.
+        self.page.wait_for_timeout(int(1.5 * CLIENT_POLL_INTERVAL_MILLIS))
+        self.assertEqual(
+            self.page.locator(".root-progress-host p.error").count(), 0)
+        self.page.wait_for_selector("table.root-progress")
+
+    def test_a_failure_stays_steady_while_polls_retry_and_clears_on_success(self):
+        # Retrying is cheap, but the computing notice and the error wrap to
+        # different heights on a phone: alternating between them would shift
+        # the whole page below the panel on every poll.  Each failure takes
+        # most of a poll to arrive, as a slow one would, so a notice shown
+        # while a retry is in flight stays up long enough to be seen.
+        self.page.evaluate("""delay => {
+          const original = window.fetch;
+          Object.assign(window, {__progressFailing: true, __progressCalls: 0});
+          window.fetch = async (input, init) => {
+            if (!String(input).includes("/api/view/root-progress"))
+              return original(input, init);
+            window.__progressCalls++;
+            if (!window.__progressFailing) return original(input, init);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            return new Response('{"error": {"message": "bad target"}}',
+                                {status: 400,
+                                 headers: {"Content-Type": "application/json"}});
+          };
+        }""", CLIENT_POLL_INTERVAL_MILLIS * 2 // 3)
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector(".root-progress-host p.error")
+        seen = set()
+        for _ in range(12):
+            seen.add(self.page.locator(".root-progress-host").inner_text())
+            self.page.wait_for_timeout(CLIENT_POLL_INTERVAL_MILLIS // 4)
+        self.assertGreater(self.page.evaluate("window.__progressCalls"), 1)
+        self.assertFalse(any("Computing" in text for text in seen), seen)
+        self.page.evaluate("window.__progressFailing = false")
+        self.page.wait_for_selector("table.root-progress")
+        self.assertEqual(
+            self.page.locator(".root-progress-host p.error").count(), 0)
 
     def test_root_progress_dates_are_day_month_year(self):
         self.apply_branch_target("SALET")
@@ -1206,134 +1258,54 @@ class ReportClientContract:
             self.page.locator("table.root-progress tbody tr.dim td.paid-by-inherited").count(),
             0)
 
-    def test_root_progress_fills_in_inherited_cost_after_the_first_render(self):
-        """The panel renders before the expensive rollup, then fills in.
-
-        Attributing an inherited group's whole subtree is a scan of the
-        finalize log, so it is answered by a second request.  The first render
-        must stand on its own — every measured figure present, the inherited
-        cost marked as still coming — and the enriched response must replace
-        it in place rather than arriving as a separate view.
-        """
-        pending = Event()
-        released = Event()
-
-        def hold_second_stage(route):
-            pending.set()
-            released.wait(10)
-            route.continue_()
-
-        self.page.route("**/api/view/root-progress?*inherited_cost=1*",
-                        hold_second_stage)
+    def test_root_progress_asks_for_inherited_cost_in_its_one_request(self):
+        # What other openers spent on the groups this one inherited costs
+        # milliseconds, so it comes with the rest: never a cheap first answer
+        # waiting on a second request.
+        requested = []
+        self.page.route("**/api/view/root-progress**", lambda route: (
+            requested.append(route.request.url), route.continue_())[-1])
         try:
             self.apply_branch_target("SALET")
             self.page.wait_for_selector("table.root-progress")
-            # First stage: groups are named as inherited, cost is not known.
-            self.assertTrue(pending.wait(10), "second stage was never requested")
-            first = self.page.locator("details.root-progress-panel").inner_text()
-            self.assertIn("Measuring what other openers spent", first)
-            self.assertNotIn("tree total nodes", first)
-            # Nodes on an inherited row: awaited, not zero and not absent.
-            awaited = self.page.eval_on_selector_all(
-                "table.root-progress tbody tr td:nth-child(6)",
-                "cells => cells.map(c => c.textContent)")
-            self.assertIn("…", awaited)
+            text = self.page.locator("details.root-progress-panel").inner_text()
+            self.assertIn("tree total nodes", text)
+            self.assertNotIn("Measuring what other openers spent", text)
+            self.assertTrue(requested)
+            self.assertTrue(all("inherited_cost=1" in url for url in requested))
         finally:
-            released.set()
-        # Second stage: the same panel, filled in.
-        self.page.wait_for_function(
-            "() => document.querySelector('details.root-progress-panel')"
-            "        .innerText.includes('tree total nodes')")
-        filled = self.page.locator("details.root-progress-panel").inner_text()
-        self.assertNotIn("Measuring what other openers spent", filled)
-        self.assertIn("inherited nodes", filled)
-        self.assertEqual(
-            self.page.locator("table.root-progress").count(), 1)
+            self.page.unroute("**/api/view/root-progress**")
 
-    def test_refresh_replaces_an_inherited_cost_request_left_in_flight(self):
-        """Refresh must not be satisfied by a response that predates it.
-
-        The enrichment is slow by design, so Refresh lands while one is often
-        still in flight.  That request holds the pending slot a replacement
-        would need, and its response is written under the shared cache key —
-        so without a generation the panel answers an explicit Refresh with
-        pre-refresh figures and issues no new request at all.
-        """
-        # The first enrichment is held and doctored so a stale render is
-        # visible; later ones are served normally.
+    def test_the_panel_follows_each_poll_without_being_asked(self):
+        # A panel held from an earlier poll went on calling a group working
+        # after the header above it had it solved.  The first answer is
+        # doctored here; a later poll's must replace it with nothing clicked.
         self.page.evaluate("""() => {
           const original = window.fetch;
-          window.__stage = {calls: 0, held: []};
-          window.fetch = (input, init) => {
-            if (!String(input).includes("inherited_cost=1")) return original(input, init);
-            window.__stage.calls++;
-            if (window.__stage.calls > 1) return original(input, init);
-            return new Promise(resolve => window.__stage.held.push(async () => {
-              const payload = await (await original(input, init)).json();
-              payload.data.totals.inherited_search_node_count = 987654321;
-              resolve(new Response(JSON.stringify(payload),
-                                   {headers: {"Content-Type": "application/json"}}));
-            }));
+          window.__progressCalls = 0;
+          window.fetch = async (input, init) => {
+            if (!String(input).includes("/api/view/root-progress"))
+              return original(input, init);
+            window.__progressCalls++;
+            const response = await original(input, init);
+            if (window.__progressCalls > 1) return response;
+            const payload = await response.json();
+            payload.data.totals.inherited_search_node_count = 987654321;
+            return new Response(JSON.stringify(payload),
+                                {headers: {"Content-Type": "application/json"}});
           };
         }""")
         self.apply_branch_target("SALET")
-        self.page.wait_for_selector("table.root-progress")
-        self.page.wait_for_function("() => window.__stage.calls === 1")
-
-        self.page.locator("details.root-progress-panel button.refresh").click()
-        # Release the pre-refresh response only after the refresh is under way,
-        # so it arrives exactly as it would in the race.
-        self.page.evaluate("() => window.__stage.held.splice(0).forEach(r => r())")
-
-        # A replacement enrichment is issued rather than skipped as pending...
-        self.page.wait_for_function("() => window.__stage.calls === 2")
         self.page.wait_for_function(
             "() => document.querySelector('details.root-progress-panel')"
-            "        .innerText.includes('tree total nodes')")
-        text = self.page.locator("details.root-progress-panel").inner_text()
-        # ...and the superseded response never reaches the panel.
-        self.assertNotIn("987.7M", text)
-        self.assertIn("5.0M", text)
-
-    def test_root_progress_skips_the_rollup_when_nothing_was_inherited(self):
-        """An opener that paid for its own tree must not pay for the scan.
-
-        The first-mover case — every group worked or trivial — has nothing for
-        the second stage to add, and the rollup is a scan of the whole finalize
-        log.  Firing it anyway is invisible in the rendering, so only the
-        absence of the request can be asserted.
-        """
-        second_stage_requests = []
-
-        # One handler, because Playwright matches routes in reverse
-        # registration order: a second pattern covering the same URLs would
-        # swallow the requests this one exists to count, and the assertion
-        # would hold no matter what the client did.
-        def serve_without_inherited_groups(route):
-            if "inherited_cost=1" in route.request.url:
-                second_stage_requests.append(route.request.url)
-                route.continue_()
-                return
-            payload = route.fetch().json()
-            totals = payload["data"]["totals"]
-            totals["provenance_counts"] = {
-                name: count
-                for name, count in totals["provenance_counts"].items()
-                if name != "inherited"
-            }
-            for row in payload["data"]["response_groups"]:
-                if row["provenance"] == "inherited":
-                    row["provenance"], row["paid_by"] = "worked", None
-            route.fulfill(json=payload)
-
-        self.page.route("**/api/view/root-progress**",
-                        serve_without_inherited_groups)
-        self.apply_branch_target("SALET")
-        self.page.wait_for_selector("table.root-progress")
-        text = self.page.locator("details.root-progress-panel").inner_text()
-        self.assertNotIn("Measuring what other openers spent", text)
-        self.page.wait_for_timeout(500)
-        self.assertEqual(second_stage_requests, [])
+            "        ?.innerText.includes('987.7M')")
+        self.page.wait_for_function(
+            "() => window.__progressCalls > 1 && !document.querySelector("
+            "'details.root-progress-panel').innerText.includes('987.7M')")
+        self.assertIn("5.0M", self.page.locator(
+            "details.root-progress-panel").inner_text())
+        self.assertEqual(self.page.locator(
+            "details.root-progress-panel button.refresh").count(), 0)
 
     def _root_progress_patterns(self):
         """Row order, read as response patterns.
@@ -1446,7 +1418,8 @@ class ReportClientContract:
           worker_id:'worker-1', finalization_cursor:'abc', tree_cursor:'def',
           answers:true, claims:true, epoch:null,
         })""")
-        self.assertEqual(url, "/api/view/root-progress?branch_target=SCOPE")
+        self.assertEqual(
+            url, "/api/view/root-progress?branch_target=SCOPE&inherited_cost=1")
 
     def test_root_progress_panel_shows_open_groups_as_started(self):
         # A group whose first branch is still open is being worked right now.
@@ -1474,29 +1447,34 @@ class ReportClientContract:
         self.assertIn("—", dimmed)
         self.assertNotIn("0.0%", dimmed)
 
-    def test_root_progress_scan_runs_once_per_stage_across_poll_cycles(self):
-        # The word report polls every couple of seconds; re-running a
-        # multi-second telemetry scan on each cycle would pin a worker's
-        # database.  One fetch per stage per target, refreshed only on
-        # request — the count must not grow with the number of polls.
-        self.page.evaluate("window.__rootProgressCalls = 0;")
-        self.page.route("**/api/view/root-progress**", lambda route: (
-            self.page.evaluate("window.__rootProgressCalls++;"),
-            route.continue_())[-1])
-        try:
-            self.apply_branch_target("SALET")
-            self.page.wait_for_selector("table.root-progress")
-            self.page.wait_for_function(
-                "() => document.querySelector('details.root-progress-panel')"
-                "        .innerText.includes('tree total nodes')")
-            settled = self.page.evaluate("window.__rootProgressCalls")
-            # The cheap first stage and the inherited-cost rollup, once each.
-            self.assertEqual(settled, 2)
-            self.page.wait_for_timeout(3 * CLIENT_POLL_INTERVAL_MILLIS)
-            self.assertEqual(
-                self.page.evaluate("window.__rootProgressCalls"), settled)
-        finally:
-            self.page.unroute("**/api/view/root-progress**")
+    def test_root_progress_is_fetched_with_every_poll_one_at_a_time(self):
+        # It costs milliseconds, so it keeps pace with the report around it;
+        # but a poll never starts a second request while one is in flight.
+        # Each answer takes longer than a poll, so polls do arrive while one
+        # is still in flight.
+        self.page.evaluate("""delay => {
+          const original = window.fetch;
+          Object.assign(window, {__progressCalls: 0, __progressInFlight: 0,
+                                 __progressMostInFlight: 0});
+          window.fetch = async (input, init) => {
+            if (!String(input).includes("/api/view/root-progress"))
+              return original(input, init);
+            window.__progressCalls++;
+            window.__progressInFlight++;
+            window.__progressMostInFlight = Math.max(
+              window.__progressMostInFlight, window.__progressInFlight);
+            try {
+              await new Promise(resolve => setTimeout(resolve, delay));
+              return await original(input, init);
+            } finally { window.__progressInFlight--; }
+          };
+        }""", CLIENT_POLL_INTERVAL_MILLIS * 3 // 2)
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("table.root-progress")
+        first = self.page.evaluate("window.__progressCalls")
+        self.page.wait_for_timeout(5 * CLIENT_POLL_INTERVAL_MILLIS)
+        self.assertGreater(self.page.evaluate("window.__progressCalls"), first)
+        self.assertEqual(self.page.evaluate("window.__progressMostInFlight"), 1)
 
     def test_word_report_card_shows_one_status_chip_without_worker(self):
         # The fixture's four groups are branch_status done/done/done/unqueued
@@ -1706,7 +1684,10 @@ class ReportClientContract:
           applyReport(report, null,
             {...__reportClient.getState(), branch_target:'SALET'});
         }""", report)
-        self.page.wait_for_selector(".response-group-breakdown .answer-segment")
+        # The outline is applied by measurement in the frame after the strip
+        # is built; the 400-answer segment is the one wide enough to carry it.
+        self.page.wait_for_selector(
+            ".response-group-breakdown .answer-segment.solved-group")
 
     def test_word_report_breakdown_menu_reaches_a_two_pixel_group(self):
         # The reason every group opens a menu rather than only the wide ones:
@@ -1809,18 +1790,24 @@ class ReportClientContract:
         # parked, so only the resize can put this right.
         self._apply_graded_word_report()
         wide = self._breakdown_segment_states()
+        wide_outlined = sum(outlined for _, outlined in wide)
+        # The remeasure runs on the resize event, which a browser may deliver
+        # well after the viewport has changed, so wait for the outline count
+        # to move rather than for a fixed time.
         self.page.set_viewport_size({"width": 375, "height": 800})
-        self.page.wait_for_timeout(200)
+        self.page.wait_for_function(
+            """count => document.querySelectorAll(
+                 '.response-group-breakdown .answer-segment.solved-group'
+               ).length < count""", arg=wide_outlined)
         narrow = self._breakdown_segment_states()
-        self.assertGreater(
-            sum(outlined for _, outlined in wide),
-            sum(outlined for _, outlined in narrow),
-            "no segment crossed the outline threshold, so this proves nothing")
         for width, outlined in narrow:
             self.assertEqual(outlined, width >= 16, f"{width}px segment")
         # And back: a segment the resize widened regains its outline.
         self.page.set_viewport_size({"width": 1200, "height": 800})
-        self.page.wait_for_timeout(200)
+        self.page.wait_for_function(
+            """count => document.querySelectorAll(
+                 '.response-group-breakdown .answer-segment.solved-group'
+               ).length === count""", arg=wide_outlined)
         self.assertEqual(self._breakdown_segment_states(), wide)
 
     def test_word_report_histogram_scales_against_the_branch_best(self):
