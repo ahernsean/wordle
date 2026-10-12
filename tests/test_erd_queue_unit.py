@@ -12,6 +12,7 @@ claims_for_branch, heartbeats_with_branch, worker_counts_by_branch,
 set_meta/get_meta, and total_branches.  claim_next/mark_done are also tested
 here for completeness.
 """
+import itertools
 import os
 import sqlite3
 import tempfile
@@ -21,6 +22,7 @@ import unittest
 from unittest import mock
 
 import erd_queue
+from report_model import ReportFilters
 from cache_sqlite import ScoreCache
 from erd_queue import (
     OPENER_PRIORITY_MAX,
@@ -2580,3 +2582,68 @@ class TestOpenBranchOwnersAreFoundByBranch(_TmpQueue):
         self.assertRegex(plan, r"SEARCH (TABLE branch_opener_work AS )?"
                                r"membership USING \S*INDEX \S+ "
                                r"\(branch_id=\?\)")
+
+
+class TestInProgressReportsReadOnlyInProgressBranches(_TmpQueue):
+
+    def setUp(self):
+        super().setUp()
+        # One branch in every state a report can name: queued, done, an
+        # in-progress pending row, an open and a finalized active row, and a
+        # cooperative branch with no pending row at all.
+        keys = [ScoreCache.encode_subset(list(pair))
+                for pair in itertools.combinations(WORDS, 2)][:6]
+        self.assertEqual(len(set(keys)), 6)
+        self.q.add_pending_many(
+            [(key, 3, 5, "crane", index) for index, key in enumerate(keys[:5])])
+        queued, done, in_progress, opened, finalized = keys[:5]
+        cooperative = keys[5]
+        ids = {key: self.q._intern_branch(key) for key in keys}
+        ProductionERDQueue.mark_done(self.q, done)
+        self.q._conn.execute("UPDATE pending_branches SET status = 'in_progress' "
+                             "WHERE branch_id = ?", (ids[in_progress],))
+        for key in (opened, finalized, cooperative):
+            self.q.create_branch(key, 3, N_CANDIDATES)
+        self.q._conn.execute("UPDATE active_branches SET status = 'finalized' "
+                             "WHERE branch_id = ?", (ids[finalized],))
+        self.q._conn.commit()
+
+    def _rows(self, statuses):
+        result = self.q.report_queue_rows(
+            ReportFilters(branch_statuses=statuses), generated_at=int(time.time()))
+        return sorted((row["branch_key"], row["branch_status"])
+                      for row in result["rows"]), result["summary"]["branch_count"]
+
+    def test_an_in_progress_filter_answers_as_filtering_everything_would(self):
+        everything, _count = self._rows(())
+        # Including filters the narrowing must not apply to: a queued or done
+        # branch has no in-progress row to start from.
+        for statuses in (("evaluating",), ("finalizing",),
+                         ("evaluating", "finalizing"), ("queued",),
+                         ("evaluating", "queued"), ("done", "finalizing")):
+            with self.subTest(statuses=statuses):
+                expected = [row for row in everything if row[1] in statuses]
+                self.assertEqual(self._rows(statuses), (expected, len(expected)))
+        phase = self.q.overview_phase_counts()
+        self.assertEqual(
+            (phase["evaluating_user_branch_count"],
+             phase["evaluating_cooperative_branch_count"],
+             phase["finalizing_branch_count"]), (2, 1, 1))
+
+    def test_an_in_progress_filter_starts_from_in_progress_rows(self):
+        # The whole sweep's queue holds hundreds of thousands of pending rows
+        # and a few dozen in progress; building every one to filter it away
+        # cost seconds per overview poll.
+        statements = []
+        self.q._conn.set_trace_callback(statements.append)
+        try:
+            self.q.report_queue_rows(
+                ReportFilters(branch_statuses=("evaluating", "finalizing")))
+            self.q.overview_phase_counts()
+        finally:
+            self.q._conn.set_trace_callback(None)
+        reads = [statement for statement in statements
+                 if "branch_ids AS" in statement]
+        self.assertEqual(len(reads), 3)
+        for statement in reads:
+            self.assertIn("WHERE status = 'in_progress'", statement)

@@ -3006,12 +3006,17 @@ class ERDQueue:
         )}
 
     def overview_phase_counts(self) -> dict:
-        """Return queue-wide evaluating and finalizing branch counts."""
+        """Return queue-wide evaluating and finalizing branch counts.
+
+        Each count needs an active row or an in-progress pending one, so only
+        those branches are read, not every branch the queue holds.
+        """
         row = self._conn.execute("""
             WITH branch_ids AS (
-                SELECT branch_id FROM pending_branches
-                UNION
                 SELECT branch_id FROM active_branches
+                UNION
+                SELECT branch_id FROM pending_branches
+                WHERE status = 'in_progress'
             )
             SELECT
                 SUM(CASE
@@ -4851,9 +4856,26 @@ class ERDQueue:
                 THEN CASE WHEN worker_count > 0 THEN 'active' ELSE 'waiting' END
             ELSE NULL END"""
         active_only = branch_worker_statuses == ("active",)
+        # A branch being evaluated or finalized has an active row or an
+        # in-progress pending one, so a filter asking for nothing else starts
+        # there: every other branch the queue holds -- most of them, at a
+        # whole sweep's depth -- could only be built to be filtered away.
+        in_progress_only = bool(branch_statuses) and set(branch_statuses) <= {
+            "evaluating", "finalizing"}
+        branch_ids_query = (
+            """SELECT branch_id FROM active_branches
+                UNION
+                SELECT branch_id FROM pending_branches
+                WHERE status = 'in_progress'"""
+            if in_progress_only else
+            """SELECT branch_id FROM pending_branches
+                UNION
+                SELECT branch_id FROM active_branches""")
         completed_query = """
                 SELECT branch_id, COUNT(*) AS completed_candidate_count
-                FROM candidate_claims WHERE done = 1 GROUP BY branch_id
+                FROM candidate_claims
+                WHERE done = 1 AND branch_id IN (SELECT branch_id FROM branch_ids)
+                GROUP BY branch_id
         """
         if active_only:
             completed_query = """
@@ -4866,9 +4888,7 @@ class ERDQueue:
             """
         base_query = f"""
             WITH branch_ids AS (
-                SELECT branch_id FROM pending_branches
-                UNION
-                SELECT branch_id FROM active_branches
+                {branch_ids_query}
             ),
             workers AS (
                 SELECT current_branch_id AS branch_id, COUNT(*) AS worker_count
