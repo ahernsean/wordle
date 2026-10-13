@@ -516,12 +516,12 @@ class ReportClientContract:
         self.assertEqual(result["defaultOverview"], "/api/view")
         self.assertEqual(result["allOverview"], "/api/view?branch_worker_status=all")
 
-    def test_tree_branch_worker_status_filter_and_context_node(self):
+    def test_tree_of_a_branch_starts_without_the_overviews_worker_filter(self):
         self.apply_branch_target("RAISE .....")
         self.page.locator("#layout-tree").click()
         self.page.wait_for_selector("ul.tree > li")
         self.assertIn("tree=1", self.page.url)
-        self.assertIn("branch_worker_status=active", self.page.url)
+        self.assertNotIn("branch_worker_status", self.page.url)
         self.assertGreater(self.page.locator("text=waiting").count(), 0)
         base_words = self.page.locator("ul.tree > li")
         self.assertGreater(base_words.count(), 0)
@@ -5728,6 +5728,45 @@ class ReportClientContract:
         self.assertEqual(result["state"]["branch_worker_status"], ["active"])
         self.assertNotIn("branch_status", result["search"])
         self.assertNotIn("branch_worker_status", result["search"])
+
+    def test_a_word_typed_on_the_overview_is_not_narrowed_to_branches_in_flight(self):
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("text=word report")
+        state = self.page.evaluate("""() => ({
+          state: __reportClient.getState(), search: location.search})""")
+        self.assertEqual(state["state"]["branch_status"], [])
+        self.assertEqual(state["state"]["branch_worker_status"], [])
+        self.assertNotIn("branch_status", state["search"])
+
+    def test_a_tab_opens_with_its_own_status_filters(self):
+        self.page.locator("[data-kind=queue]").click()
+        self.page.wait_for_function(
+            "() => __reportClient.getState().kind === 'queue'")
+        state = self.page.evaluate("() => __reportClient.getState()")
+        self.assertEqual(state["branch_status"], [])
+        self.assertEqual(state["branch_worker_status"], [])
+
+    def test_filters_chosen_in_a_view_survive_moving_within_it(self):
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("text=word report")
+        self.page.evaluate("""() => __reportClient.setState(
+          {...__reportClient.getState(), branch_status: ['done']})""")
+        self.apply_branch_target("CRANE")
+        self.page.wait_for_function(
+            "() => __reportClient.getState().branch_target === 'CRANE'")
+        self.assertEqual(self.page.evaluate(
+            "() => __reportClient.getState().branch_status"), ["done"])
+        # Flat and Tree are one view: the toggle keeps its filters.
+        self.page.locator("[data-kind=auto][data-overview]").click()
+        self.page.wait_for_function(
+            "() => __reportClient.getState().branch_target === ''")
+        before = self.page.evaluate(
+            "() => __reportClient.getState().branch_status")
+        self.assertEqual(before, ["evaluating", "finalizing"])
+        self.page.evaluate("""() => __reportClient.setState(
+          {...__reportClient.getState(), tree: true})""")
+        self.assertEqual(self.page.evaluate(
+            "() => __reportClient.getState().branch_status"), before)
 
     def test_an_overview_filter_chosen_on_the_overview_is_kept(self):
         self.page.evaluate("""() => __reportClient.setState(

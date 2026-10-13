@@ -753,18 +753,24 @@
       return "Computing "+(state.kind==="openers"?"openers report":state.kind==="leaderboard"?"leaderboard":"report")+"…";
     }
     function syncTargetClear(){byId("clear-target").hidden=byId("branch-target-input").value==="";}
-    // A word report lists no status filter as empty lists, and the overview
-    // writes empty lists out as "all": carried across, "nothing chosen" asks
-    // for every branch the queue holds.  Arriving at the overview from anywhere
-    // else starts from its own defaults.
-    function withOverviewFilters(previous,next){
-      if(!previous||isOverviewState(previous.kind,previous.branch_target,previous.tree)||!isOverviewState(next.kind,next.branch_target,next.tree))return next;
-      return {...next,branch_status:[...overviewBranchStatusNames],branch_worker_status:[...overviewBranchWorkerStatusNames]};
+    // The views are tabs, so what is chosen in one is not carried into the next.
+    // The status filters are where that bites: a word report and most other
+    // views hold none, as empty lists, and the overview writes empty lists out
+    // as "all" -- carried across, "nothing chosen" asks for every branch the
+    // queue holds.  A word report given the overview's lists is just as wrong,
+    // narrowed to branches in flight.  Arriving at a different view starts from
+    // that view's own filters.  Flat and Tree are one view, and so are the
+    // reports of different words.
+    const viewOf=state=>state.kind==="auto"?(state.branch_target===""?"overview":"report"):state.kind;
+    function withViewFilters(previous,next){
+      if(!previous||viewOf(previous)===viewOf(next))return next;
+      const overviewDefaults=isOverviewState(next.kind,next.branch_target,next.tree);
+      return {...next,branch_status:overviewDefaults?[...overviewBranchStatusNames]:[],branch_worker_status:overviewDefaults?[...overviewBranchWorkerStatusNames]:[]};
     }
     function setState(next,push=true){
       abortActiveRequest();
       const previousGroupBy=currentState?.group_by;
-      currentState=withOverviewFilters(currentState,normalizeState(next)); const query=stateQuery(currentState,true).toString();
+      currentState=withViewFilters(currentState,normalizeState(next)); const query=stateQuery(currentState,true).toString();
       if(currentState.group_by!==previousGroupBy)collapsedResponseGroups.clear();
       const url=location.pathname+(query?"?"+query:"");
       if(push)history.pushState(null,"",url);else history.replaceState(null,"",url);
