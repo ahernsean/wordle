@@ -1879,6 +1879,42 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(groups()[first["pattern"]],
                          ("evaluating", 1, "working"))
 
+    def test_word_report_ignores_a_queued_opener_group_at_another_budget(self):
+        # TRACE's top-level group y-g-g (slate, plate, stale) is queued at the
+        # budget one below the root.  The report at CRANE --g-g TRACE reaches
+        # the same answer set one guess deeper, so what is queued there is not
+        # work on this group.
+        answers = ["crane", "slate", "trace", "grace", "brace", "place",
+                   "plane", "plate", "stale", "spade"]
+        directory = self.temporary_directory.name
+        answer_path = os.path.join(directory, "deeper-answers.txt")
+        with open(answer_path, "w") as answer_file:
+            answer_file.write("\n".join(answers) + "\n")
+        sources = replace(
+            self.sources, answer_list_path=answer_path,
+            candidate_list_path=answer_path)
+        ScoreCache(self.cache_path, answers, checkpoint_on_close=False).close()
+        pending_key = ScoreCache.encode_subset(["slate", "plate", "stale"])
+        queue = self._open_queue()
+        queue.add_pending_many([(pending_key, 3, 9, "trace", "y-g-g")])
+        queue.close()
+
+        def group(target):
+            data = collect_report(sources, ReportRequest(
+                branch_target=parse_report_branch_target(target)))["data"]
+            return next(
+                (row["branch_status"],
+                 next(entry["work_state"]
+                      for entry in data["response_group_breakdown"]
+                      if entry["pattern"] == row["pattern"]),
+                 row["priority"])
+                for row in data["response_groups"]
+                if bytes.fromhex(row["branch_key_hex"]) == pending_key)
+
+        self.assertEqual(group("trace"), ("queued", "queued", 9))
+        self.assertEqual(group("crane --g-g trace"),
+                         ("unqueued", "unqueued", None))
+
     def test_breakdown_work_state_finishes_every_group_with_nothing_left_to_do(self):
         def row(**fields):
             return {"pattern": "-----", "answer_count": 9, "best_erd": None,
