@@ -1031,6 +1031,7 @@ def _empty_data():
             "hint_inline_win_count": 0,
         },
         "branches": [],
+        "matched_branch_count": 0,
         "recently_completed_branches": [],
         "workers": [],
     }
@@ -1046,6 +1047,7 @@ def _queue_overview(sources, generated_at, answer_set, report):
         filters = report.get("filters") or {}
         queue_result = queue.report_queue_rows(
             filters=filters,
+            limit=filters.get("limit") or DEFAULT_OVERVIEW_BRANCH_LIMIT,
             generated_at=generated_at,
         )
         active_branch_keys = [
@@ -1151,6 +1153,7 @@ def _queue_overview(sources, generated_at, answer_set, report):
         }
         report["data"]["worker_totals"] = worker_totals
         report["data"]["branches"] = normalized_rows
+        report["data"]["matched_branch_count"] = queue_result["matched_rows"]
         # Completions explain a departure from the view, so they are sent to
         # any overview still showing the branches a worker is on.
         worker_statuses = filters.get("branch_worker_statuses") or ()
@@ -2850,6 +2853,10 @@ NO_WORKER_STATUS_BUCKET = "not_applicable"
 #: the view says how much it is not showing, and the row-limit control raises
 #: it.
 DEFAULT_QUEUE_ROW_LIMIT = 100
+# The Overview's branches are the ones in flight, a few dozen at most, but its
+# filters can ask for every branch the queue holds -- 607,750 at full depth,
+# 805 MB of JSON -- so a request that names no limit still gets a page.
+DEFAULT_OVERVIEW_BRANCH_LIMIT = 200
 
 
 def _bucketed_collection_summary(summary):

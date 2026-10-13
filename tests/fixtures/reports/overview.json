@@ -138,6 +138,7 @@
    "used_fraction": 0.125,
    "warning_fraction": 0.8
   },
+  "matched_branch_count": 3,
   "queue_counts": {
    "done_branch_count": 8,
    "evaluating_cooperative_branch_count": 1,

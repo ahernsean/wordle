@@ -5703,6 +5703,98 @@ class ReportClientContract:
         self.assertIn("candidates re-queued", text)
         self.assertNotIn("7×2", text)
 
+    def _cleared_target_state(self):
+        # The Openers report holds no status filter either, so a word taken
+        # there and then cleared arrives at the overview with empty lists.
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("text=word report")
+        self.page.locator("[data-kind=openers]").click()
+        self.page.wait_for_selector('.report-meta h1:text-is("openers report")')
+        self.assertEqual(self.page.evaluate(
+            "() => __reportClient.getState().branch_status"), [])
+        self.apply_branch_target("")
+        self.page.wait_for_function(
+            "() => __reportClient.getState().branch_target === ''")
+        return self.page.evaluate("""() => ({
+          state: __reportClient.getState(), search: location.search})""")
+
+    def test_clearing_a_word_returns_to_the_overview_with_its_own_statuses(self):
+        # A word report holds no status filter, as empty lists, and the
+        # overview writes empty lists as "all": carried over, they asked for
+        # every branch the queue holds.
+        result = self._cleared_target_state()
+        self.assertEqual(result["state"]["branch_status"],
+                         ["evaluating", "finalizing"])
+        self.assertEqual(result["state"]["branch_worker_status"], ["active"])
+        self.assertNotIn("branch_status", result["search"])
+        self.assertNotIn("branch_worker_status", result["search"])
+
+    def test_an_overview_filter_chosen_on_the_overview_is_kept(self):
+        self.page.evaluate("""() => __reportClient.setState(
+          {...__reportClient.getState(), branch_status: [],
+           branch_worker_status: []})""")
+        state = self.page.evaluate("() => __reportClient.getState()")
+        self.assertEqual(state["branch_status"], [])
+        self.assertEqual(state["branch_worker_status"], [])
+
+    def test_target_box_has_a_clear_button_and_no_back_button(self):
+        clear = self.page.locator("#clear-target")
+        target = self.page.locator("#branch-target-input")
+        self.assertEqual(self.page.locator("#back").count(), 0)
+        self.assertEqual(
+            self.page.locator(".branch-target button:text-is('Back')").count(), 0)
+        self.assertFalse(clear.is_visible())
+        target.fill("SALET -----")
+        self.assertTrue(clear.is_visible())
+        before = self.page.evaluate("() => __reportClient.getState()")
+        clear.click()
+        self.assertEqual(target.input_value(), "")
+        self.assertFalse(clear.is_visible())
+        self.assertTrue(self.page.evaluate(
+            "() => document.activeElement.id === 'branch-target-input'"))
+        # Clearing edits the box; Go is what navigates.
+        self.assertEqual(
+            self.page.evaluate("() => __reportClient.getState()"), before)
+
+    def test_clear_button_tracks_a_target_set_by_navigation(self):
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("text=word report")
+        self.assertTrue(self.page.locator("#clear-target").is_visible())
+        self.page.evaluate("() => history.back()")
+        self.page.wait_for_function(
+            "() => __reportClient.getState().branch_target === ''")
+        self.assertFalse(self.page.locator("#clear-target").is_visible())
+
+    def test_clear_button_stays_inside_the_box_at_phone_width(self):
+        self.page.set_viewport_size({"width": 375, "height": 800})
+        self.page.locator("#branch-target-input").fill("SALET -----")
+        clear = self.page.locator("#clear-target").bounding_box()
+        box = self.page.locator("#branch-target-input").bounding_box()
+        self.assertGreaterEqual(clear["x"], box["x"])
+        self.assertLessEqual(clear["x"] + clear["width"], box["x"] + box["width"])
+        self.assertLessEqual(self.page.evaluate(
+            "() => document.documentElement.scrollWidth"), 375)
+
+    def _apply_overview_matching(self, matched_branch_count):
+        self.page.route("**/api/view**", lambda route: route.abort())
+        report = copy.deepcopy(load_fixtures(FIXTURE_DIRECTORY)["overview.json"])
+        report["data"]["matched_branch_count"] = matched_branch_count
+        self.page.evaluate("""(report) => applyReport(
+          report, null, __reportClient.getState())""", report)
+        self.page.wait_for_selector("text=Workers")
+        return len(report["data"]["branches"])
+
+    def test_overview_says_when_it_shows_only_some_of_the_matched_branches(self):
+        shown = self._apply_overview_matching(607750)
+        self.assertIn(f"Shown {shown} of 607,750 matched branches",
+                      self.page.locator("#report").inner_text())
+
+    def test_overview_is_silent_when_it_shows_every_matched_branch(self):
+        shown = self._apply_overview_matching(3)
+        self.assertEqual(shown, 3)
+        self.assertNotIn("matched branches",
+                         self.page.locator("#report").inner_text())
+
     def test_url_state_round_trips_branch_filters(self):
         state = self.page.evaluate("""() => parsePageState({search:'?kind=queue&branch_status=queued,done&branch_worker_status=waiting&limit=25&sort=nodes&poll=5000'})""")
         self.assertEqual(state["branch_status"], ["queued", "done"])

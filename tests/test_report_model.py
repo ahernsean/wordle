@@ -26,6 +26,7 @@ from report_model import (
     _worker_process_is_running,
     _normalize_worker,
     DEFAULT_QUEUE_ROW_LIMIT,
+    DEFAULT_OVERVIEW_BRANCH_LIMIT,
     opener_completion_signal,
     _bucketed_collection_summary,
     NO_WORKER_STATUS_BUCKET,
@@ -1267,6 +1268,28 @@ class ReportModelTest(unittest.TestCase):
             for status in ("unqueued", "queued", "evaluating", "finalizing", "done")
         ]
         self.assertEqual(order, sorted(order))
+
+    def test_overview_pages_the_branches_a_filter_matches(self):
+        # Asking for every status matches every branch the queue holds, which
+        # at a whole sweep's depth is 607,750 branches and 805 MB of JSON.
+        extra = 50
+        queue = self._open_queue()
+        queue.add_pending_many([
+            (f"branch-{index}".encode(), 3, 9, "salet", 0)
+            for index in range(DEFAULT_OVERVIEW_BRANCH_LIMIT + extra)
+        ])
+        queue.close()
+
+        def branches(**filter_values):
+            data = collect_overview_report(self.sources, ReportRequest(
+                report_kind="overview", filters=ReportFilters(**filter_values),
+            ))["data"]
+            return len(data["branches"]), data["matched_branch_count"]
+
+        total = DEFAULT_OVERVIEW_BRANCH_LIMIT + extra
+        self.assertEqual(branches(), (DEFAULT_OVERVIEW_BRANCH_LIMIT, total))
+        self.assertEqual(branches(limit=7), (7, total))
+        self.assertEqual(branches(limit=total + 100), (total, total))
 
     def test_overview_includes_recent_finalization_after_active_row_is_gone(self):
         branch_key = ScoreCache.encode_subset(ANSWERS)
