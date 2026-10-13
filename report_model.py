@@ -1540,6 +1540,17 @@ def collect_word_report(sources: ReportOpeners, request: ReportRequest) -> dict:
             queue.close()
 
     group_budget = GAME_GUESSES - len(resolved.steps) - 1
+    # An open branch is this group's own only at the group's budget.  The same
+    # answer set reached by a spine of another length can be open at another
+    # budget, and a result solved there need not be reusable here, so neither
+    # it nor the workers on it describe this group.  A NULL budget is admitted,
+    # as the claim transaction admits it.
+    for branch_key in [
+        branch_key for branch_key, row in active_rows.items()
+        if row["budget"] is not None and row["budget"] != group_budget
+    ]:
+        del active_rows[branch_key]
+        worker_counts.pop(branch_key, None)
     cache_states = {
         branch_key: ScoreCache.report_branch_state_without_rows(
             branch_key, group_budget

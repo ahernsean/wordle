@@ -1840,6 +1840,45 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(work_states(), {first["pattern"]: "finished",
                                          second["pattern"]: "queued"})
 
+    def test_word_report_ignores_a_groups_answer_set_open_at_another_budget(self):
+        # BEBOP is played from the root, so its groups sit at budget 5.  The
+        # same answer set reached by a longer spine is open at budget 4, and
+        # what that run solves need not be reusable here.
+        target = parse_report_branch_target("bebop")
+        first, second = collect_report(
+            self.sources, ReportRequest(branch_target=target)
+        )["data"]["response_groups"]
+        first_key = bytes.fromhex(first["branch_key_hex"])
+        second_key = bytes.fromhex(second["branch_key_hex"])
+        now = int(time.time())
+
+        def groups():
+            data = collect_report(
+                self.sources, ReportRequest(branch_target=target))["data"]
+            work_states = {entry["pattern"]: entry["work_state"]
+                           for entry in data["response_group_breakdown"]}
+            return {row["pattern"]: (row["branch_status"], row["worker_count"],
+                                     work_states[row["pattern"]])
+                    for row in data["response_groups"]}
+
+        queue = self._open_queue()
+        queue.create_branch(first_key, 2, 5, budget=4)
+        # A row with no recorded budget is admitted, as a claim admits it.
+        queue.create_branch(second_key, 2, 5)
+        queue.heartbeat("worker-1", 1, first_key, 2, now, 0)
+        queue.close()
+        self.assertEqual(groups(), {
+            first["pattern"]: ("unqueued", 0, "unqueued"),
+            second["pattern"]: ("evaluating", 0, "working"),
+        })
+
+        queue = self._open_queue()
+        queue._conn.execute("DELETE FROM active_branches")
+        queue.create_branch(first_key, 2, 5, budget=5)
+        queue.close()
+        self.assertEqual(groups()[first["pattern"]],
+                         ("evaluating", 1, "working"))
+
     def test_breakdown_work_state_finishes_every_group_with_nothing_left_to_do(self):
         def row(**fields):
             return {"pattern": "-----", "answer_count": 9, "best_erd": None,
