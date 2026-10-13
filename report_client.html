@@ -936,7 +936,11 @@
           :COMPLETED_BRANCH_HOLD_DURATION_MILLIS;
         recentOverviewCompletionRows.set(key,{context,identity,expires_at:now+remainingTimeMillis,row});
       }
-      for(const row of (previous?.data?.branches||[])){
+      // A page that is short of the matched branches loses rows to the order
+      // changing between polls as readily as to their finishing, so a row's
+      // absence says nothing then; the server's own list of completions does.
+      const pagedOut=(report.data.matched_branch_count??rows.length)>rows.length;
+      for(const row of (pagedOut?[]:previous?.data?.branches||[])){
         const identity=String(row.branch_key_hex),key=context+"|"+identity;
         if(!present.has(identity)&&completedOverviewBranch(row)&&!recentOverviewCompletionRows.has(key)){
           recentOverviewCompletionRows.set(key,{context,identity,expires_at:now+COMPLETED_BRANCH_HOLD_DURATION_MILLIS,row:{...row,branch_status:"done",branch_worker_status:null,recently_completed:true}});

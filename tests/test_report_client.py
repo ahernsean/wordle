@@ -129,6 +129,8 @@ GRID_SCRIPT_HELPERS = """
       const row=structuredClone(base.data.branches[index%%base.data.branches.length]);
       row.branch_key_hex=name;row.branch_reference=name;return row;
     });
+    // An unpaged page matches exactly the branches it carries.
+    report.data.matched_branch_count=names.length;
     return report;
   };
   // Every card's (row, column) read off the laid-out grid rather than from the
@@ -5034,6 +5036,48 @@ class ReportClientContract:
         self.assertIn("done", result["held"]["text"])
         self.assertFalse(result["remaining"])
         self.assertNotIn("recently-completed", result["ordinaryClass"])
+
+    def test_overview_does_not_read_a_paged_out_row_as_completed(self):
+        """A short page loses rows to reordering as well as to finishing.
+
+        When the overview matches more branches than it carries, a finalizing
+        row missing from the next poll may only have moved off the page.  Real
+        completions come from the server's own list.
+        """
+        for matched, held in ((5, False), (0, True)):
+            with self.subTest(matched_branch_count=matched):
+                card = self.page.evaluate(self.grid_script("""
+                  const base=await overviewReport();
+                  const state=__reportClient.getState();
+                  const finalizing=namedBranches(base,['complete']);
+                  finalizing.data.branches[0].branch_status='finalizing';
+                  const next=namedBranches(base,['other']);
+                  next.data.matched_branch_count=%d+1;
+                  applyReport(finalizing,null,state);await settled();
+                  applyReport(next,finalizing,state);await settled();
+                  return !!document.querySelector('[data-identity="complete"]');
+                """ % matched))
+                self.assertEqual(card, held)
+
+    def test_overview_still_shows_a_completion_the_server_reports_on_a_short_page(self):
+        card = self.page.evaluate(self.grid_script("""
+          const base=await overviewReport();
+          const state=__reportClient.getState();
+          const finalizing=namedBranches(base,['complete']);
+          finalizing.data.branches[0].branch_status='finalizing';
+          const next=namedBranches(base,['other']);
+          next.data.matched_branch_count=500;
+          const row=structuredClone(finalizing.data.branches[0]);
+          row.branch_status='done';row.branch_worker_status=null;
+          row.recently_completed=true;row.finalized_at=next.generated_at-1;
+          next.data.recently_completed_branches=[row];
+          applyReport(finalizing,null,state);await settled();
+          applyReport(next,finalizing,state);await settled();
+          const held=document.querySelector('[data-identity="complete"]');
+          return held?held.className:null;
+        """))
+        self.assertIsNotNone(card)
+        self.assertIn("recently-completed", card)
 
     def test_overview_holds_finalization_not_seen_in_the_prior_poll(self):
         result = self.page.evaluate(self.grid_script("""
