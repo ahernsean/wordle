@@ -1802,6 +1802,16 @@ class ReportClientContract:
                 for part in slivers:
                     self.assertNotEqual(part["color"], "rgba(0, 0, 0, 0)")
 
+    def test_word_report_work_bar_touches_the_strip(self):
+        self._apply_word_breakdown([(40, "finished"), (30, "working"),
+                                    (20, "queued"), (10, "unqueued")])
+        gap = self.page.evaluate("""() => {
+          const breakdown = document.querySelector('.response-group-breakdown');
+          return breakdown.querySelector('.answer-strip').getBoundingClientRect().top
+            - breakdown.querySelector('.answer-work-bar').getBoundingClientRect().bottom;
+        }""")
+        self.assertEqual(gap, 0)
+
     def test_word_report_work_bar_gives_each_state_its_own_fill(self):
         self._apply_word_breakdown([(40, "finished"), (30, "working"),
                                     (20, "queued"), (10, "unqueued")])
