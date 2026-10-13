@@ -2845,6 +2845,25 @@ class TerminalUtilityTest(unittest.TestCase):
         self.assertIn("Hints (ordering only):", output)
         self.assertIn("Branches (status=all)\n  none", output)
 
+    def test_overview_renderer_says_when_it_lists_only_some_of_the_matched_branches(self):
+        report = overview_report()
+        report["filters"] = {"branch_statuses": [], "branch_worker_statuses": []}
+        shown = len(report["data"]["branches"])
+        report["data"]["matched_branch_count"] = 607750
+        output = report_terminal.render_overview(report, width=120)
+        self.assertIn(
+            f"Branches (status=all)\n  Shown {shown} of 607,750 matched branches",
+            output)
+        report["data"]["matched_branch_count"] = shown + 1
+        self.assertIn(f"Shown {shown} of 2 matched branches",
+                      report_terminal.render_overview(report, width=120))
+        report["data"]["matched_branch_count"] = shown
+        self.assertNotIn("Shown",
+                         report_terminal.render_overview(report, width=120))
+        del report["data"]["matched_branch_count"]
+        self.assertNotIn("Shown",
+                         report_terminal.render_overview(report, width=120))
+
     def test_formatters_and_change_rules_cover_boundary_values(self):
         self.assertEqual(report_terminal._percentage(1, 0), "—")
         self.assertEqual(report_terminal._format_metric_value("best_erd", 2.5), "2.500")

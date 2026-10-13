@@ -759,6 +759,13 @@ def _render_sections(report, previous_report, color, width, display_order):
             ))
     if len(branch_lines) == 1:
         branch_lines.append("  none")
+    matched_branch_count = report["data"].get("matched_branch_count") or 0
+    if matched_branch_count > len(branches):
+        branch_lines.insert(
+            1,
+            f"  Shown {len(branches):,} of "
+            f"{count_noun(matched_branch_count, 'matched branch', 'matched branches')}",
+        )
 
     remaining_worker_lines = ["Other workers"]
     remaining_workers = [

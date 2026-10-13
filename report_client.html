@@ -44,7 +44,10 @@
     header { position:sticky; top:0; z-index:5; background:var(--header-bg); border-bottom:1px solid var(--border); padding:.4rem clamp(.5rem,1.5vw,1rem); }
     .nav, .branch-target, .metrics, .chips, .row-actions { display:flex; flex-wrap:wrap; gap:.35rem; align-items:center; }
     .branch-target { margin-top:.35rem; flex-wrap:nowrap; }
-    #branch-target-input { flex:1 1 8rem; min-width:6rem; }
+    .target-field { position:relative; display:flex; flex:1 1 8rem; min-width:6rem; }
+    #branch-target-input { flex:1 1 auto; min-width:0; padding-right:2.1rem; }
+    #clear-target { position:absolute; right:.3rem; top:50%; transform:translateY(-50%); min-height:0; width:1.5rem; height:1.5rem; padding:0; border-radius:999px; line-height:1; color:var(--dim); }
+    #clear-target[hidden] { display:none; }
     details.root-progress-panel { border:1px solid var(--border); border-radius:6px; background:var(--panel); padding:.4rem .5rem; margin:.5rem 0; }
     details.root-progress-panel > summary { cursor:pointer; font-weight:bold; }
     /* The table is wider than a phone and longer than a screen; it scrolls
@@ -427,8 +430,11 @@
       </span>
     </div>
     <div class="branch-target">
-      <input id="branch-target-input" placeholder="Spine or @branch" aria-label="Spine or @branch" autocomplete="off" spellcheck="false">
-      <button id="apply">Go</button><button id="back">Back</button>
+      <span class="target-field">
+        <input id="branch-target-input" placeholder="Spine or @branch" aria-label="Spine or @branch" autocomplete="off" spellcheck="false">
+        <button type="button" id="clear-target" aria-label="Clear spine or @branch" hidden>×</button>
+      </span>
+      <button id="apply">Go</button>
     </div>
     <details class="filters"><summary>Filters &amp; view</summary>
       <div class="control-group" id="filters-group">
@@ -746,10 +752,25 @@
       if(displayedState?.kind==="openers"&&state.kind==="openers"&&displayedState.group_by!==state.group_by)return "Showing groups by "+groupByLabel(displayedState)+" while regrouping by "+groupByLabel(state)+"…";
       return "Computing "+(state.kind==="openers"?"openers report":state.kind==="leaderboard"?"leaderboard":"report")+"…";
     }
+    function syncTargetClear(){byId("clear-target").hidden=byId("branch-target-input").value==="";}
+    // The views are tabs, so what is chosen in one is not carried into the next.
+    // The status filters are where that bites: a word report and most other
+    // views hold none, as empty lists, and the overview writes empty lists out
+    // as "all" -- carried across, "nothing chosen" asks for every branch the
+    // queue holds.  A word report given the overview's lists is just as wrong,
+    // narrowed to branches in flight.  Arriving at a different view starts from
+    // that view's own filters.  Flat and Tree are one view, and so are the
+    // reports of different words.
+    const viewOf=state=>state.kind==="auto"?(state.branch_target===""?"overview":"report"):state.kind;
+    function withViewFilters(previous,next){
+      if(!previous||viewOf(previous)===viewOf(next))return next;
+      const overviewDefaults=isOverviewState(next.kind,next.branch_target,next.tree);
+      return {...next,branch_status:overviewDefaults?[...overviewBranchStatusNames]:[],branch_worker_status:overviewDefaults?[...overviewBranchWorkerStatusNames]:[]};
+    }
     function setState(next,push=true){
       abortActiveRequest();
       const previousGroupBy=currentState?.group_by;
-      currentState=normalizeState(next); const query=stateQuery(currentState,true).toString();
+      currentState=withViewFilters(currentState,normalizeState(next)); const query=stateQuery(currentState,true).toString();
       if(currentState.group_by!==previousGroupBy)collapsedResponseGroups.clear();
       const url=location.pathname+(query?"?"+query:"");
       if(push)history.pushState(null,"",url);else history.replaceState(null,"",url);
@@ -758,7 +779,7 @@
     function syncControls(){
       // Repaint the branch_target box only when the committed branch_target changed, so a
       // filter commit never overwrites a spine typed but not yet sent with Go.
-      if(currentState.branch_target!==shownBranchTarget){byId("branch-target-input").value=currentState.branch_target;shownBranchTarget=currentState.branch_target;}
+      if(currentState.branch_target!==shownBranchTarget){byId("branch-target-input").value=currentState.branch_target;shownBranchTarget=currentState.branch_target;syncTargetClear();}
       byId("poll").value=currentState.poll;
       byId("layout-toggle").hidden=treelessKinds.has(currentState.kind);
       byId("layout-flat").setAttribute("aria-pressed",currentState.tree?"false":"true");
@@ -915,7 +936,11 @@
           :COMPLETED_BRANCH_HOLD_DURATION_MILLIS;
         recentOverviewCompletionRows.set(key,{context,identity,expires_at:now+remainingTimeMillis,row});
       }
-      for(const row of (previous?.data?.branches||[])){
+      // A page that is short of the matched branches loses rows to the order
+      // changing between polls as readily as to their finishing, so a row's
+      // absence says nothing then; the server's own list of completions does.
+      const pagedOut=(report.data.matched_branch_count??rows.length)>rows.length;
+      for(const row of (pagedOut?[]:previous?.data?.branches||[])){
         const identity=String(row.branch_key_hex),key=context+"|"+identity;
         if(!present.has(identity)&&completedOverviewBranch(row)&&!recentOverviewCompletionRows.has(key)){
           recentOverviewCompletionRows.set(key,{context,identity,expires_at:now+COMPLETED_BRANCH_HOLD_DURATION_MILLIS,row:{...row,branch_status:"done",branch_worker_status:null,recently_completed:true}});
@@ -923,7 +948,7 @@
       }
       const completedRows=[...recentOverviewCompletionRows.values()].filter(entry=>entry.context===context).map(entry=>entry.row);
       scheduleCompletedBranchExpiry();
-      return completedRows.length?{...report,data:{...report.data,branches:[...rows,...completedRows]}}:report;
+      return completedRows.length?{...report,data:{...report.data,branches:[...rows,...completedRows],sent_branch_count:rows.length}}:report;
     }
     function semanticProjection(value){
       if(Array.isArray(value))return value.map(semanticProjection);
@@ -1392,6 +1417,8 @@
       const disk=report.data.disk;if(disk?.used_fraction!==null&&disk?.used_fraction!==undefined){metrics.append(metric("filesystem used",(100*disk.used_fraction).toFixed(1)+"%"),metric("queue WAL",formatBytes(disk.queue_wal_bytes)));const rate=disk.fill_rate_bytes_per_second;if(rate!==null&&rate!==undefined)metrics.append(metric(rate>0?"filling":"freeing",formatBytes(Math.abs(rate))+"/s"));}
       fragment.append(metrics);
       fragment.append(element("h2","","Branches · status "+(state.branch_status.length?state.branch_status.join(", "):"all")));
+      const sentBranchCount=report.data.sent_branch_count??(report.data.branches||[]).length,matchedBranchCount=report.data.matched_branch_count??sentBranchCount;
+      if(matchedBranchCount>sentBranchCount)fragment.append(element("p","dim","Shown "+numText(sentBranchCount)+" of "+numText(matchedBranchCount)+" matched branches"));
       const liveWorkersByBranch=new Map();for(const worker of report.data.workers||[]){if(!worker.is_live||worker.branch_key_hex===null||worker.branch_key_hex===undefined)continue;const key=String(worker.branch_key_hex);if(!liveWorkersByBranch.has(key))liveWorkersByBranch.set(key,[]);liveWorkersByBranch.get(key).push(worker);}
       const previousWorkersById=previousBy(previous,"workers","worker_id");
       const branches=gridElement("branches"),previousRows=previousBy(previous,"branches","branch_key_hex");
@@ -3446,7 +3473,7 @@
       const query=stateQuery(currentState,true).toString();
       history.replaceState(null,"",location.pathname+(query?"?"+query:""));
       lastContext=contextKey(currentState);
-      byId("branch-target-input").value=currentState.branch_target;shownBranchTarget=currentState.branch_target;
+      byId("branch-target-input").value=currentState.branch_target;shownBranchTarget=currentState.branch_target;syncTargetClear();
     }
     // A view whose report costs a full-epoch scan cannot be refreshed on a
     // clock or on a tab switch: the scan outlasts the poll interval, and an
@@ -3472,7 +3499,7 @@
       const addFilterControls=(containerId,names,dataName)=>{const container=byId(containerId);for(const name of names){const filterLabel=element("label"),input=element("input");input.type="checkbox";input.value=name;input.dataset[dataName]="1";filterLabel.append(input," "+name);container.append(filterLabel);}};
       addFilterControls("branch-statuses",branchStatusNames,"branchStatus");addFilterControls("branch-worker-statuses",branchWorkerStatusNames,"branchWorkerStatus");addFilterControls("source-states",sourceStateNames,"sourceState");
       currentState=parsePageState(location);syncControls();
-      byId("apply").addEventListener("click",()=>setState({...readControls(),kind:"auto"}));byId("branch-target-input").addEventListener("keydown",event=>{if(event.key==="Enter")byId("apply").click();});byId("back").addEventListener("click",()=>history.back());
+      byId("apply").addEventListener("click",()=>setState({...readControls(),kind:"auto"}));byId("branch-target-input").addEventListener("keydown",event=>{if(event.key==="Enter")byId("apply").click();});const targetInput=byId("branch-target-input");targetInput.addEventListener("input",syncTargetClear);byId("clear-target").addEventListener("click",()=>{targetInput.value="";syncTargetClear();targetInput.focus();});
       byId("layout-flat").addEventListener("click",()=>setState({...readControls(),tree:false}));
       byId("layout-tree").addEventListener("click",()=>setState({...readControls(),tree:true,limit:10}));
       // Filters and view controls commit on change against the committed
