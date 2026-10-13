@@ -1665,29 +1665,38 @@ class ReportClientContract:
         })""")
         self.assertTrue(rendered, "the report stopped refreshing after a dismissal")
 
-    def _apply_many_group_word_report(self):
-        # A word that splits its branch 201 ways: every segment but the first
-        # is a couple of pixels wide at any viewport this suite uses.
+    def _apply_word_breakdown(self, groups):
+        """Show the word report with `groups` as its response-group breakdown.
+
+        Each group is (answer_count, work_state), largest first, and is solved
+        when it is finished unless a third element says otherwise.
+        """
         self.page.route("**/api/view**", lambda route: route.abort())
         report = copy.deepcopy(load_fixtures(FIXTURE_DIRECTORY)["word.json"])
         patterns = ["".join(letters)
                     for letters in itertools.product("gy-", repeat=5)]
-        # Every group solved, so the outline threshold is measured against
-        # segments that all ask for one.
-        report["data"]["response_group_breakdown"] = (
-            [{"pattern": patterns[0], "answer_count": 400, "solved": True}]
-            + [{"pattern": pattern, "answer_count": 1, "solved": True}
-               for pattern in patterns[1:201]]
-        )
-        report["data"]["total_rows"] = 201
+        report["data"]["response_group_breakdown"] = [
+            {"pattern": pattern, "answer_count": group[0],
+             "solved": group[2] if len(group) > 2 else group[1] == "finished",
+             "work_state": group[1]}
+            for pattern, group in zip(patterns, groups)
+        ]
+        report["data"]["total_rows"] = len(groups)
         self.page.evaluate("""(report) => {
           applyReport(report, null,
             {...__reportClient.getState(), branch_target:'SALET'});
         }""", report)
-        # The outline is applied by measurement in the frame after the strip
-        # is built; the 400-answer segment is the one wide enough to carry it.
-        self.page.wait_for_selector(
-            ".response-group-breakdown .answer-segment.solved-group")
+        self.page.wait_for_selector(".response-group-breakdown .answer-segment")
+
+    _WORK_STATES = ("finished", "working", "queued", "unqueued")
+
+    def _apply_many_group_word_report(self):
+        # A word that splits its branch 201 ways: every segment but the first
+        # is a couple of pixels wide at any viewport this suite uses, and the
+        # slivers cycle through every work state.
+        self._apply_word_breakdown(
+            [(400, "finished")]
+            + [(1, self._WORK_STATES[index % 4]) for index in range(1, 201)])
 
     def test_word_report_breakdown_menu_reaches_a_two_pixel_group(self):
         # The reason every group opens a menu rather than only the wide ones:
@@ -1754,61 +1763,92 @@ class ReportClientContract:
                     " document.documentElement.clientWidth]")
                 self.assertLessEqual(scroll, client, f"document widened at {width}px")
 
-    def _apply_graded_word_report(self):
-        """A solved decomposition whose segments straddle the outline threshold.
+    def _work_bar_against_strip(self):
+        return self.page.evaluate("""() => {
+          const breakdown = document.querySelector('.response-group-breakdown');
+          const parts = [...breakdown.querySelectorAll('.answer-work-bar > span')];
+          const segments = [...breakdown.querySelectorAll('.answer-segment')];
+          return parts.map((part, index) => {
+            const partBox = part.getBoundingClientRect(),
+                  segmentBox = segments[index].getBoundingClientRect();
+            return {state: part.className, left: partBox.left,
+                    width: partBox.width, segmentLeft: segmentBox.left,
+                    segmentWidth: segmentBox.width,
+                    color: getComputedStyle(part).backgroundColor};
+          });
+        }""")
 
-        Every segment is a fixed share of the strip, so a viewport change moves
-        all of them at once -- the sizes here are graded so that some cross the
-        threshold on the way and others stay on their side of it.
-        """
-        self.page.route("**/api/view**", lambda route: route.abort())
-        report = copy.deepcopy(load_fixtures(FIXTURE_DIRECTORY)["word.json"])
-        patterns = ["".join(letters)
-                    for letters in itertools.product("gy-", repeat=5)]
-        counts = [500, 40, 30, 25, 20, 15, 10, 5, 3, 2, 1]
-        report["data"]["response_group_breakdown"] = [
-            {"pattern": pattern, "answer_count": count, "solved": True}
-            for pattern, count in zip(patterns, counts)
-        ]
-        report["data"]["total_rows"] = len(counts)
-        self.page.evaluate("""(report) => {
-          applyReport(report, null,
-            {...__reportClient.getState(), branch_target:'SALET'});
-        }""", report)
-        self.page.wait_for_selector(
-            ".response-group-breakdown .answer-segment.solved-group")
+    def test_word_report_work_bar_marks_every_group_on_the_strips_scale(self):
+        # The point of a bar over an outline: a two-pixel group still shows
+        # its state, at every width the client supports.
+        self._apply_many_group_word_report()
+        for width in (375, 1200):
+            with self.subTest(width=width):
+                self.page.set_viewport_size({"width": width, "height": 800})
+                parts = self._work_bar_against_strip()
+                self.assertEqual(len(parts), 201)
+                self.assertEqual(parts[0]["state"], "work-finished")
+                for index, part in enumerate(parts[1:], start=1):
+                    self.assertEqual(
+                        part["state"], "work-" + self._WORK_STATES[index % 4])
+                for part in parts:
+                    self.assertAlmostEqual(part["left"], part["segmentLeft"],
+                                           delta=0.5)
+                    self.assertAlmostEqual(part["width"], part["segmentWidth"],
+                                           delta=0.5)
+                slivers = [part for part in parts[1:]
+                           if part["state"] != "work-unqueued"]
+                self.assertLess(max(part["width"] for part in slivers), 5)
+                for part in slivers:
+                    self.assertNotEqual(part["color"], "rgba(0, 0, 0, 0)")
 
-    def _breakdown_segment_states(self):
-        return self.page.eval_on_selector_all(
-            ".response-group-breakdown .answer-segment",
-            """nodes => nodes.map(node => [node.clientWidth,
-                 node.classList.contains('solved-group')])""")
+    def test_word_report_work_bar_touches_the_strip(self):
+        self._apply_word_breakdown([(40, "finished"), (30, "working"),
+                                    (20, "queued"), (10, "unqueued")])
+        gap = self.page.evaluate("""() => {
+          const breakdown = document.querySelector('.response-group-breakdown');
+          return breakdown.querySelector('.answer-strip').getBoundingClientRect().top
+            - breakdown.querySelector('.answer-work-bar').getBoundingClientRect().bottom;
+        }""")
+        self.assertEqual(gap, 0)
 
-    def test_word_report_breakdown_remeasures_outlines_when_the_window_resizes(self):
-        # A segment's width is a share of the strip, so a resize moves it across
-        # the outline threshold with the report itself unchanged.  The poll is
-        # parked, so only the resize can put this right.
-        self._apply_graded_word_report()
-        wide = self._breakdown_segment_states()
-        wide_outlined = sum(outlined for _, outlined in wide)
-        # The remeasure runs on the resize event, which a browser may deliver
-        # well after the viewport has changed, so wait for the outline count
-        # to move rather than for a fixed time.
-        self.page.set_viewport_size({"width": 375, "height": 800})
-        self.page.wait_for_function(
-            """count => document.querySelectorAll(
-                 '.response-group-breakdown .answer-segment.solved-group'
-               ).length < count""", arg=wide_outlined)
-        narrow = self._breakdown_segment_states()
-        for width, outlined in narrow:
-            self.assertEqual(outlined, width >= 16, f"{width}px segment")
-        # And back: a segment the resize widened regains its outline.
-        self.page.set_viewport_size({"width": 1200, "height": 800})
-        self.page.wait_for_function(
-            """count => document.querySelectorAll(
-                 '.response-group-breakdown .answer-segment.solved-group'
-               ).length === count""", arg=wide_outlined)
-        self.assertEqual(self._breakdown_segment_states(), wide)
+    def test_word_report_work_bar_gives_each_state_its_own_fill(self):
+        self._apply_word_breakdown([(40, "finished"), (30, "working"),
+                                    (20, "queued"), (10, "unqueued")])
+        colors = {part["state"]: part["color"]
+                  for part in self._work_bar_against_strip()}
+        self.assertEqual(
+            colors["work-finished"],
+            self.page.evaluate("() => getComputedStyle(document.body).color"))
+        self.assertEqual(colors["work-unqueued"], "rgba(0, 0, 0, 0)")
+        self.assertEqual(len(set(colors.values())), 4, colors)
+
+    def test_a_finished_word_draws_no_work_bar(self):
+        self._apply_word_breakdown([(40, "finished"), (10, "finished")])
+        self.assertEqual(self.page.locator(
+            ".response-group-breakdown .answer-segment").count(), 2)
+        self.assertEqual(self.page.locator(".answer-work-bar").count(), 0)
+
+    def test_word_report_group_names_its_work_state(self):
+        # A sliver's fill is too small to read reliably, so its title and its
+        # menu say the same thing in words; a finished group was either solved
+        # or proven lost.
+        self._apply_word_breakdown([(40, "finished"), (30, "working"),
+                                    (20, "queued"), (10, "unqueued")])
+        segments = self.page.locator(".response-group-breakdown .answer-segment")
+        for index, stated in enumerate(
+                ["solved", "being worked on", "queued", "not queued"]):
+            with self.subTest(stated=stated):
+                self.assertTrue(segments.nth(index).get_attribute("title")
+                                .endswith(" · " + stated))
+                segments.nth(index).click()
+                self.page.wait_for_selector(".group-menu")
+                self.assertTrue(self._menu().locator(".group-menu-facts")
+                                .inner_text().endswith(" · " + stated))
+                self.page.keyboard.press("Escape")
+        self._apply_word_breakdown([(40, "working"), (10, "finished", False)])
+        lost = self.page.locator(".response-group-breakdown .answer-segment").nth(1)
+        self.assertTrue(lost.get_attribute("title").endswith(" · lost"))
 
     def test_word_report_histogram_scales_against_the_branch_best(self):
         # Without a scale the fill spans the track and says nothing about how
@@ -1846,38 +1886,6 @@ class ReportClientContract:
             "4 response groups for QUEUE out of the 8 the best guess splits"
             " this branch into")
 
-    def test_word_report_breakdown_outlines_only_groups_wide_enough_to_show_one(self):
-        # A 2-px outline on each edge of a sliver is all border and no
-        # interior, so a run of finished slivers would read as one black block.
-        self._apply_many_group_word_report()
-        segments = self.page.eval_on_selector_all(
-            ".response-group-breakdown .answer-segment",
-            """nodes => nodes.map(node => [node.clientWidth,
-                 node.classList.contains('solved-group'),
-                 node.title.includes('solved')])""")
-        self.assertEqual(len(segments), 201)
-        for width, outlined, says_solved in segments:
-            self.assertEqual(outlined, width >= 16, f"{width}px segment")
-            self.assertTrue(says_solved)
-        self.assertTrue(any(outlined for _, outlined, _ in segments))
-        self.assertTrue(any(not outlined for _, outlined, _ in segments))
-
-    def test_word_report_breakdown_outlines_solved_groups(self):
-        self.apply_branch_target("SALET")
-        self.page.wait_for_selector(".response-group-breakdown .answer-segment.solved-group")
-        outlined = self.page.eval_on_selector_all(
-            ".response-group-breakdown .answer-segment",
-            """nodes => nodes.map(node => [
-                 node.classList.contains('solved-group'),
-                 getComputedStyle(node).boxShadow,
-                 node.title])""")
-        # The fixture's decomposition is solved, unsolved, unsolved, solved.
-        self.assertEqual([solved for solved, _, _ in outlined],
-                         [True, False, False, True])
-        for solved, shadow, title in outlined:
-            self.assertEqual(solved, "solved" in title)
-            self.assertEqual(solved, "inset" in shadow and "rgb(0, 0, 0)" in shadow)
-
     def test_leaderboard_breakdown_group_opens_a_menu_then_the_branch(self):
         # The same interaction in both views: a group is never a direct jump in
         # one place and a menu in the other.
@@ -1895,15 +1903,14 @@ class ReportClientContract:
         self.assertEqual(
             self.page.locator("#branch-target-input").input_value(), "SALET -----")
 
-    def test_leaderboard_breakdown_leaves_solved_groups_unoutlined(self):
-        # Every ranked opener is complete, so outlining there would black out
-        # every segment and say nothing.  The leaderboard sends no solved flag.
+    def test_leaderboard_breakdown_draws_no_work_bar(self):
+        # Every ranked opener is finished, and the leaderboard sends no state.
         self.page.locator("[data-kind=leaderboard]").click()
         self.page.wait_for_selector(".grid.leaderboard > .leaderboard-card")
         self._leaderboard_breakdown(0)
+        self.page.wait_for_selector(".leaderboard-card .answer-segment")
         self.assertEqual(
-            self.page.locator(".leaderboard-card .answer-segment.solved-group").count(),
-            0)
+            self.page.locator(".leaderboard-card .answer-work-bar").count(), 0)
 
     def test_leaderboard_tab_drops_an_opener_only_sort(self):
         self.page.locator("[data-kind=openers]").click()

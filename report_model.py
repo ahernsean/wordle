@@ -1540,6 +1540,21 @@ def collect_word_report(sources: ReportOpeners, request: ReportRequest) -> dict:
             queue.close()
 
     group_budget = GAME_GUESSES - len(resolved.steps) - 1
+    # A queue row is this group's own only at the group's budget.  The same
+    # answer set reached by a spine of another length can be open or queued at
+    # another budget, and a result solved there need not be reusable here, so
+    # neither the row nor the workers on it describe this group.  An open
+    # branch with a NULL budget is admitted, as the claim transaction admits
+    # it.  A queued row has no budget of its own: it is an opener's response
+    # group, one guess below the root.
+    for branch_key in [
+        branch_key for branch_key, row in active_rows.items()
+        if row["budget"] is not None and row["budget"] != group_budget
+    ]:
+        del active_rows[branch_key]
+        worker_counts.pop(branch_key, None)
+    if group_budget != GAME_GUESSES - 1:
+        pending_rows = {}
     cache_states = {
         branch_key: ScoreCache.report_branch_state_without_rows(
             branch_key, group_budget
@@ -1701,6 +1716,7 @@ def collect_word_report(sources: ReportOpeners, request: ReportRequest) -> dict:
             "pattern": row["pattern"],
             "answer_count": row["answer_count"],
             "solved": response_group_is_solved(row, group_budget),
+            "work_state": breakdown_work_state(row, group_budget),
         }
         for row in sorted(
             all_response_groups,
@@ -1773,6 +1789,30 @@ def _root_progress_estimate(active_branches, recent_window_seconds, now):
 
 
 # Lifecycle order: a group waits, is worked, and ends solved or proven lost.
+BREAKDOWN_WORK_STATES = ("finished", "working", "queued", "unqueued")
+
+
+def breakdown_work_state(row, group_budget):
+    """Where a word report's response group stands in the swarm's work.
+
+    `finished` means no work is left: the group is solved, proven lost, or
+    small enough that playing the survivor settles it either way.  The cache
+    decides that, as it does for the ERD line.  Otherwise the queue decides: an
+    open branch is `working` whether or not a worker is on it this instant,
+    because workers move between claims faster than the client polls.  A group
+    nobody has queued is `unqueued`, which includes a branch the queue records
+    as done whose result the cache does not hold at this budget.
+    """
+    if (response_group_is_solved(row, group_budget)
+            or row["cache_state"] == "loss" or row["answer_count"] < 2):
+        return "finished"
+    if row["branch_status"] in ("evaluating", "finalizing"):
+        return "working"
+    if row["branch_status"] == "queued":
+        return "queued"
+    return "unqueued"
+
+
 ROOT_PROGRESS_GROUP_STATES = ("waiting", "working", "solved", "loss")
 
 

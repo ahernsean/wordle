@@ -27,22 +27,26 @@
    {
     "answer_count": 8,
     "pattern": "-----",
-    "solved": true
+    "solved": true,
+    "work_state": "finished"
    },
    {
     "answer_count": 5,
     "pattern": "y----",
-    "solved": false
+    "solved": false,
+    "work_state": "finished"
    },
    {
     "answer_count": 3,
     "pattern": "-y---",
-    "solved": false
+    "solved": false,
+    "work_state": "unqueued"
    },
    {
     "answer_count": 1,
     "pattern": "ggggg",
-    "solved": true
+    "solved": true,
+    "work_state": "finished"
    }
   ],
   "response_group_counts": {
