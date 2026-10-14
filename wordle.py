@@ -65,7 +65,7 @@ ANSWER_FILE = DEFAULT_ANSWER_LIST_PATH
 WORDS_FILE = DEFAULT_CANDIDATE_LIST_PATH
 ENGINE_PATH = wordle_engine.__file__
 LOG_FILE = DEFAULT_DEBUG_LOG_PATH
-BUILD = "b141"
+BUILD = "b142"
 
 # Diagnostic log for background solver threads (ERDSolver,
 # BranchPrecacheSolver) — periodic progress, lifecycle events, and any
@@ -849,12 +849,7 @@ class GameState:
             all_answers,
         )
         self.cache = ResponseCache(all_answers, self.score_cache)
-        print(f"Score cache: {self.score_cache_path}")
-        # A cold build (no cached .npy, or a decomposition table that isn't
-        # warm yet) can run long enough to look like a hung startup; this
-        # print is the only feedback the user gets until it returns, since
-        # load_or_build is synchronous and doesn't report cold vs warm.
-        print("Loading response-pattern matrix...", flush=True)
+        logger.info("Score cache: %s", self.score_cache_path)
         self.pattern_matrix = pattern_matrix_module.PatternMatrix.load_or_build(
             self.score_cache_path, all_words, all_answers, self.score_cache)
         # Long-lived: hard-mode ERD results are namespaced internally by a
@@ -3483,20 +3478,18 @@ def main():  # pragma: no cover - interactive REPL loop, exercised manually
 
     print(f"{BUILD} {_platform_label()}")
     print(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Debug log: {log_path}")
     all_answers = load_word_list(ANSWER_FILE)
     all_words = load_word_list(WORDS_FILE)
     print(f"Loaded {len(all_answers):,} answers, "
           f"{len(all_words):,} guesses.")
 
+    # A cold response-pattern matrix build runs inside GameState and can take
+    # long enough to look like a hung startup; this line is the feedback.
     print("Opening cache...", flush=True)
-    _t0 = time.time()
     gs = GameState(all_answers, all_words)
-    _open_s = time.time() - _t0
     _size_str = _fmt_size(os.path.getsize(gs.score_cache_path))
     _db_mtime = gs.score_cache.last_write_ts()
-    print(f"  {_size_str}, opened in {_open_s:.1f}s")
-    print(f"  last write {_format_cache_timestamp(_db_mtime)}")
+    print(f"  {_size_str}, last write {_format_cache_timestamp(_db_mtime)}")
     _root_hit = gs.score_cache.read(
         ScoreCache.encode_subset(all_answers), ERD_ALL)
     if _root_hit is not None:
