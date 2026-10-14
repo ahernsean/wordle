@@ -1,6 +1,8 @@
 """Contract tests for the containerized Taildrop export handoff."""
 import os
 import fcntl
+import pty
+import select
 from pathlib import Path
 import shutil
 import subprocess
@@ -25,6 +27,9 @@ class TestExportAndSend(unittest.TestCase):
         self._write_fake("python3.13", """\
             #!/usr/bin/env bash
             touch wordle_erd_export.sqlite3
+            if [[ -n "${EXPORT_SIZE_BYTES:-}" ]]; then
+                truncate -s "$EXPORT_SIZE_BYTES" wordle_erd_export.sqlite3
+            fi
         """)
         self._write_fake("sleep", """\
             #!/usr/bin/env bash
@@ -87,7 +92,7 @@ class TestExportAndSend(unittest.TestCase):
         path.write_text(textwrap.dedent(source))
         path.chmod(0o755)
 
-    def _run(self, *args, **environment):
+    def _environment(self, environment):
         env = {key: value for key, value in os.environ.items()
                if key != "TAILSCALE_AUTHKEY"
                and not key.startswith("WORDLE_TAILDROP_")}
@@ -96,9 +101,37 @@ class TestExportAndSend(unittest.TestCase):
         env["PODMAN_LOG"] = str(self.log_path)
         env["TMPDIR"] = str(self.workdir)
         env["XDG_RUNTIME_DIR"] = str(self.workdir)
+        return env
+
+    def _run(self, *args, **environment):
         return subprocess.run(
             ["bash", "./export_and_send.sh", *args], cwd=self.workdir,
-            env=env, capture_output=True, text=True, check=False)
+            env=self._environment(environment), capture_output=True,
+            text=True, check=False)
+
+    def _run_on_a_terminal(self, **environment):
+        """Run with stdout and stderr on a pseudo-terminal; returns (status, output)."""
+        controller, terminal = pty.openpty()
+        process = subprocess.Popen(
+            ["bash", "./export_and_send.sh"], cwd=self.workdir,
+            env=self._environment(environment), stdin=subprocess.DEVNULL,
+            stdout=terminal, stderr=terminal)
+        os.close(terminal)
+        output = b""
+        while True:
+            ready, _, _ = select.select([controller], [], [], 10)
+            if not ready:
+                process.kill()
+                self.fail("the script stopped writing without exiting")
+            try:
+                chunk = os.read(controller, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            output += chunk
+        os.close(controller)
+        return process.wait(), output.decode()
 
     def test_starts_user_owned_relay_then_copies_and_removes_it(self):
         result = self._run(TAILSCALE_AUTHKEY="tskey-auth-bootstrap")
@@ -203,3 +236,49 @@ class TestExportAndSend(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("Another Taildrop export is already running.", result.stderr)
         self.assertFalse(self.log_path.exists())
+
+    def test_each_slow_step_says_what_it_is_doing_and_how_long_it_took(self):
+        result = self._run(EXPORT_SIZE_BYTES="1234567890")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.splitlines()
+        expected = [
+            "Starting the Taildrop relay...",
+            "  connected in 0s",
+            "Copying the export (1,235 MB) into the relay...",
+            "  done in 0s",
+            "Sending the export (1,235 MB) to ios-app. "
+            "Keep Tailscale open there until this finishes...",
+            "  done in 0s",
+        ]
+        self.assertEqual([line for line in lines if line in expected], expected)
+
+    def test_a_terminal_sees_the_transfers_own_progress(self):
+        # tailscale file cp draws its progress line only on a terminal, so the
+        # relay has to be given one and the output left uncaptured.
+        status, output = self._run_on_a_terminal()
+
+        self.assertEqual(status, 0, output)
+        self.assertIn(
+            "exec --tty wordle-taildrop tailscale file cp "
+            "/exports/wordle_erd_export.sqlite3 ios-app:",
+            self.log_path.read_text())
+
+    def test_a_failed_send_on_a_terminal_still_explains_how_to_retry(self):
+        status, output = self._run_on_a_terminal(PODMAN_TRANSFER_FAIL="1")
+
+        self.assertEqual(status, 42)
+        self.assertIn("502 Bad Gateway:", output)
+        self.assertIn("Taildrop could not reach ios-app.", output)
+        self.assertIn("wait for it to report synchronized", output)
+        self.assertNotIn("Details:", output)
+        self.assertTrue((self.workdir / "wordle_erd_export.sqlite3").exists())
+        self.assertFalse((self.workdir / "wordle_export_watermark").exists())
+
+    def test_without_a_terminal_the_send_is_captured_for_its_details(self):
+        result = self._run()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        commands = self.log_path.read_text()
+        self.assertIn("exec wordle-taildrop tailscale file cp", commands)
+        self.assertNotIn("--tty", commands)

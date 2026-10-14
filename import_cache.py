@@ -68,6 +68,7 @@ import os
 import sqlite3
 import sys
 import time
+from collections import deque
 
 from cache_sqlite import (EXACT_SCORE_TOLERANCE, ScoreCache,
                           branch_reference, exact_results_agree)
@@ -77,6 +78,10 @@ from runtime_paths import DEFAULT_ANSWER_LIST_PATH, DEFAULT_CACHE_PATH, ensure_r
 
 ANSWER_FILE = DEFAULT_ANSWER_LIST_PATH
 BATCH = 20000   # rows per progress step / commit
+# The progress line's rate and ETA describe this much recent copying.  A merge
+# slows as the target grows, so a rate averaged from the start overstates the
+# current one and holds the ETA flat while the copy falls behind it.
+RATE_WINDOW_SECONDS = 10.0
 
 TABLES = [
     'answer_list',
@@ -194,6 +199,30 @@ def _fmt_eta(seconds: float) -> str:
     return f'{seconds // 3600}h{(seconds % 3600) // 60:02d}m'
 
 
+class _RecentRate:
+    """Rows per second over the last RATE_WINDOW_SECONDS of progress.
+
+    The oldest sample kept is the newest one at or before the window's start,
+    so once the copy has run that long the rate always spans a full window.
+    """
+
+    def __init__(self, start_time: float):
+        self._samples = deque([(start_time, 0)])
+
+    def add(self, now: float, scanned: int) -> None:
+        self._samples.append((now, scanned))
+        while (len(self._samples) > 2
+               and self._samples[1][0] <= now - RATE_WINDOW_SECONDS):
+            self._samples.popleft()
+
+    def rows_per_second(self) -> float:
+        (oldest_time, oldest_scanned) = self._samples[0]
+        (newest_time, newest_scanned) = self._samples[-1]
+        if newest_time <= oldest_time:
+            return 0.0
+        return (newest_scanned - oldest_scanned) / (newest_time - oldest_time)
+
+
 class ImportConflict(Exception):
     """A colliding exact result was found while the merge was under way.
 
@@ -218,6 +247,42 @@ def _legacy_budget_rows_predicate(conn) -> str:
 
 def _all_cols_src(conn, table: str) -> list[str]:
     return [r[1] for r in conn.execute(f'PRAGMA src.table_info({table})')]
+
+
+def _paging_key(conn, table: str) -> list[str]:
+    """The columns the copy pages src.table by, in the order it sorts them.
+
+    The source's primary key, in key order: reading in that order walks the
+    key's own index, and the target shares that key, so every insert lands at
+    the right-hand edge of the target's index instead of at a random page of
+    it.  The keys here are hashes, so rowid order is random key order, and a
+    target too large for the page cache then misses on nearly every insert.
+
+    Rowid when the key has a nullable column: a row-value comparison against
+    NULL is never true, so paging by such a key would skip those rows.
+    """
+    key = sorted((r for r in conn.execute(f'PRAGMA src.table_info({table})')
+                  if r[5] > 0), key=lambda r: r[5])
+    if key and all(r[3] for r in key):
+        return [r[1] for r in key]
+    return ['rowid']
+
+
+def _key_range(key_cols, low, high) -> tuple[str, list]:
+    """SQL selecting src rows whose key is in (low, high], and its parameters.
+
+    A bound of None leaves that side open.
+    """
+    key = '(' + ', '.join(f's.{c}' for c in key_cols) + ')'
+    marks = '(' + ', '.join('?' for _ in key_cols) + ')'
+    terms, params = [], []
+    if low is not None:
+        terms.append(f'{key} > {marks}')
+        params.extend(low)
+    if high is not None:
+        terms.append(f'{key} <= {marks}')
+        params.extend(high)
+    return (' AND '.join(terms) or '1'), params
 
 
 def _route_legacy_budget_rows(conn) -> int:
@@ -367,8 +432,8 @@ def _report_conflicts(conflicts) -> None:
           file=sys.stderr)
 
 
-def _batch_conflict(conn, table, row_filter, low_rowid, high_rowid):
-    """A non-equivalent collision among src rows in (low_rowid, high_rowid].
+def _batch_conflict(conn, table, row_filter, key_cols, low, high):
+    """A non-equivalent collision among src rows whose key is in (low, high].
 
     Called inside the batch's own write transaction, so no other connection
     can commit between this check and the insert it validates.  Returns one
@@ -378,6 +443,7 @@ def _batch_conflict(conn, table, row_filter, low_rowid, high_rowid):
         return None
     budget_join = ('' if table == CANONICAL_TABLE
                    else ' AND m.solve_budget = s.solve_budget')
+    batch_range, range_params = _key_range(key_cols, low, high)
     rows = conn.execute(f"""
         SELECT s.branch_key, s.policy, s.solve_budget,
                m.best_guess, m.best_score, m.max_depth,
@@ -387,11 +453,11 @@ def _batch_conflict(conn, table, row_filter, low_rowid, high_rowid):
           ON m.branch_key     = s.branch_key
          AND m.policy         = s.policy
          AND m.answer_list_id = s.answer_list_id{budget_join}
-        WHERE s.rowid > ? AND s.rowid <= ?{row_filter}
+        WHERE {batch_range}{row_filter}
           AND (abs(m.best_score - s.best_score) > ?
                OR m.max_depth IS NOT s.max_depth)
         LIMIT 1
-    """, (low_rowid, high_rowid, EXACT_SCORE_TOLERANCE)).fetchall()
+    """, (*range_params, EXACT_SCORE_TOLERANCE)).fetchall()
     if not rows:
         return None
     row = rows[0]
@@ -401,12 +467,14 @@ def _batch_conflict(conn, table, row_filter, low_rowid, high_rowid):
 
 
 def _copy_table_with_progress(conn, table) -> int:
-    """Copy src.table -> main.table in rowid-paged batches with live progress.
+    """Copy src.table -> main.table in key-paged batches with live progress.
 
     INSERT OR IGNORE makes each batch idempotent, and each batch commits on
     its own, so an interrupted merge can simply be re-run to resume.  Paging
-    by rowid (rather than one opaque INSERT...SELECT of millions of rows) is
-    what lets us show a percentage and ETA instead of an apparent hang.
+    (rather than one opaque INSERT...SELECT of millions of rows) is what lets
+    us show a percentage and ETA instead of an apparent hang, and paging in
+    key order (_paging_key) is what keeps the rate from falling as the target
+    grows.
 
     For the two exact-result tables each batch validates inside its own write
     transaction: the preflight only describes the target as it was when the
@@ -437,24 +505,30 @@ def _copy_table_with_progress(conn, table) -> int:
         print(f'  {table}: source empty, skipping')
         return 0
 
+    key_cols = _paging_key(conn, table)
+    key_list = ', '.join(f's.{c}' for c in key_cols)
+    key_width = len(key_cols)
     inserted = scanned = 0
-    last_rowid = 0
+    last_key = None
     start = time.time()
+    recent_rate = _RecentRate(start)
     last_print = 0.0
     while True:
+        after_last, after_params = _key_range(key_cols, last_key, None)
         rows = conn.execute(
-            f'SELECT s.rowid, {col_list} FROM src.{table} s '
-            f'WHERE s.rowid > ?{row_filter} ORDER BY s.rowid LIMIT ?',
-            (last_rowid, BATCH)).fetchall()
+            f'SELECT {key_list}, {col_list} FROM src.{table} s '
+            f'WHERE {after_last}{row_filter} ORDER BY {key_list} LIMIT ?',
+            (*after_params, BATCH)).fetchall()
         if not rows:
             break
-        batch_low, last_rowid = last_rowid, rows[-1][0]
+        batch_low, last_key = last_key, tuple(rows[-1][:key_width])
         before = conn.total_changes
         conn.execute('BEGIN IMMEDIATE')
         try:
-            conn.executemany(insert_sql, [tuple(r[1:]) for r in rows])
-            conflict = _batch_conflict(conn, table, row_filter,
-                                       batch_low, last_rowid)
+            conn.executemany(insert_sql,
+                             [tuple(r[key_width:]) for r in rows])
+            conflict = _batch_conflict(conn, table, row_filter, key_cols,
+                                       batch_low, last_key)
             if conflict is not None:
                 conn.execute('ROLLBACK')
                 print()
@@ -470,9 +544,9 @@ def _copy_table_with_progress(conn, table) -> int:
         scanned += len(rows)
 
         now = time.time()
+        recent_rate.add(now, scanned)
         if now - last_print > 0.5 or scanned >= total:
-            el = now - start
-            rate = scanned / el if el > 0 else 0
+            rate = recent_rate.rows_per_second()
             eta = (total - scanned) / rate if rate > 0 else 0
             print(f'\r  {table}: {scanned:,}/{total:,} '
                   f'({100 * scanned / total:3.0f}%) scanned, '

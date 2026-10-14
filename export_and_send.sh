@@ -49,6 +49,11 @@
 # idempotent). The watermark file is updated only after the push succeeds:
 # if the export or the push fails, the watermark is left untouched so the
 # next run re-covers the same span.
+#
+# Each slow step says what it is doing before it starts and how long it took
+# when it ends, so a run that seems stuck names the step it is waiting on. On
+# a terminal the push also shows tailscale's own progress line, which it
+# draws only when its output is a terminal.
 
 set -euo pipefail
 
@@ -81,6 +86,20 @@ if ! flock -n "$taildrop_lock_fd"; then
     exit 1
 fi
 
+elapsed_since() {
+    local seconds=$(( SECONDS - $1 ))
+    if [ "$seconds" -lt 60 ]; then
+        printf '%ds' "$seconds"
+    else
+        printf '%dm%02ds' $(( seconds / 60 )) $(( seconds % 60 ))
+    fi
+}
+
+export_size() {
+    local megabytes=$(( ($(stat -c %s "$export_file") + 999999) / 1000000 ))
+    printf '%s MB' "$(printf '%d' "$megabytes" | sed ':a;s/\B[0-9]\{3\}\>/,&/;ta')"
+}
+
 cleanup_taildrop_container() {
     if [ -n "$taildrop_temporary_output" ]; then
         rm -f "$taildrop_temporary_output"
@@ -93,6 +112,8 @@ trap cleanup_taildrop_container EXIT
 trap 'exit 130' INT TERM
 
 start_taildrop_relay() {
+    local started=$SECONDS
+    echo "Starting the Taildrop relay..."
     local -a podman_args=(
         run --detach
         --name "$taildrop_container"
@@ -131,6 +152,7 @@ start_taildrop_relay() {
         status_json="$(podman exec "$taildrop_container" \
             tailscale status --json --peers=false 2>&1 || true)"
         if [[ "$status_json" =~ \"BackendState\"[[:space:]]*:[[:space:]]*\"Running\" ]]; then
+            echo "  connected in $(elapsed_since "$started")"
             return
         fi
         relay_running="$(podman container inspect --format '{{.State.Running}}' \
@@ -151,6 +173,16 @@ start_taildrop_relay() {
     return 1
 }
 
+report_taildrop_failure() {
+    local headline="$1" retry_instructions="$2"
+    echo "$headline" >&2
+    echo "The export was kept at $export_file; retrying will resend it." >&2
+    if "$retry_instructions"; then
+        echo "On the receiving device, open Tailscale and wait for it to report synchronized, then retry:" >&2
+        echo "  ./export_and_send.sh" >&2
+    fi
+}
+
 run_taildrop_command() {
     local headline="$1" retry_instructions="$2" command_status
     shift 2
@@ -164,18 +196,31 @@ run_taildrop_command() {
         command_status=$?
     fi
 
-    echo "$headline" >&2
-    echo "The export was kept at $export_file; retrying will resend it." >&2
-    if "$retry_instructions"; then
-        echo "On the receiving device, open Tailscale and wait for it to report synchronized, then retry:" >&2
-        echo "  ./export_and_send.sh" >&2
-    fi
+    report_taildrop_failure "$headline" "$retry_instructions"
     if [ -s "$taildrop_temporary_output" ]; then
         printf 'Details: %s\n' "$(<"$taildrop_temporary_output")" >&2
     fi
     rm -f "$taildrop_temporary_output"
     taildrop_temporary_output=""
     return "$command_status"
+}
+
+send_to_device() {
+    local headline="Taildrop could not reach $tailnet_device." command_status
+    local -a send_command=(tailscale file cp "/exports/$export_file" "${tailnet_device}:")
+    if [ -t 1 ] && [ -t 2 ]; then
+        # Its output is the progress line, already in front of the reader,
+        # so a failure has nothing further to show.
+        if podman exec --tty "$taildrop_container" "${send_command[@]}"; then
+            return
+        else
+            command_status=$?
+        fi
+        report_taildrop_failure "$headline" true
+        return "$command_status"
+    fi
+    run_taildrop_command "$headline" true \
+        podman exec "$taildrop_container" "${send_command[@]}"
 }
 
 since_args=()
@@ -187,11 +232,17 @@ next_watermark=$(( $(date +%s) - overlap_seconds ))
 
 start_taildrop_relay
 python3.13 export_cache.py "${since_args[@]}"
+
+step_started=$SECONDS
+echo "Copying the export ($(export_size)) into the relay..."
 run_taildrop_command "The Taildrop relay could not prepare the export." false \
     podman cp "$export_file" "$taildrop_container:/exports/$export_file"
-run_taildrop_command "Taildrop could not reach $tailnet_device." true \
-    podman exec "$taildrop_container" \
-    tailscale file cp "/exports/$export_file" "${tailnet_device}:"
+echo "  done in $(elapsed_since "$step_started")"
+
+step_started=$SECONDS
+echo "Sending the export ($(export_size)) to $tailnet_device. Keep Tailscale open there until this finishes..."
+send_to_device
+echo "  done in $(elapsed_since "$step_started")"
 echo "$next_watermark" > "$watermark_file"
 rm -f "$export_file" "$export_file-wal" "$export_file-shm"
 echo "Sent $export_file to $tailnet_device through the Taildrop relay and deleted the local copy."
