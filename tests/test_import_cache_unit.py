@@ -169,6 +169,182 @@ class TestCopyTableWithProgress(_TmpDB):
         self.assertEqual(n, 0)
 
 
+class TestRecentRate(unittest.TestCase):
+    def test_a_slowdown_shows_in_the_rate_not_averaged_away(self):
+        # 1,000 rows/s for 10 s, then 100 rows/s for 20 s.  Averaged from the
+        # start that is 400 rows/s; the last window ran at 100.
+        rate = import_cache._RecentRate(0.0)
+        for second in range(1, 11):
+            rate.add(float(second), 1000 * second)
+        for second in range(11, 31):
+            rate.add(float(second), 10000 + 100 * (second - 10))
+        self.assertAlmostEqual(rate.rows_per_second(), 100.0)
+
+    def test_before_a_full_window_the_rate_spans_everything_so_far(self):
+        rate = import_cache._RecentRate(0.0)
+        rate.add(1.0, 300)
+        rate.add(2.0, 400)
+        self.assertAlmostEqual(rate.rows_per_second(), 200.0)
+
+    def test_no_elapsed_time_is_no_rate(self):
+        rate = import_cache._RecentRate(5.0)
+        self.assertEqual(rate.rows_per_second(), 0.0)
+        rate.add(5.0, 100)
+        self.assertEqual(rate.rows_per_second(), 0.0)
+
+
+class TestPagingKey(_TmpDB):
+    def _paging_key(self, table):
+        self._cache("c.sqlite3").close()
+        conn = sqlite3.connect(":memory:")
+        conn.execute(f"ATTACH DATABASE '{self.path('c.sqlite3')}' AS src")
+        try:
+            return import_cache._paging_key(conn, table)
+        finally:
+            conn.close()
+
+    def test_the_primary_key_in_key_order_not_column_order(self):
+        # candidate_scores declares word second but keys on it last.
+        self.assertEqual(self._paging_key("candidate_scores"),
+                         ["subset_hash", "method", "answer_list_id", "word"])
+        self.assertEqual(self._paging_key("branch_best_by_policy_and_budget"),
+                         ["branch_key", "policy", "answer_list_id",
+                          "solve_budget"])
+
+    def test_a_nullable_key_pages_by_rowid(self):
+        # A row-value comparison against NULL is never true, so a NULL key
+        # column would make keyset paging skip that row.
+        self.assertEqual(self._paging_key("answer_list"), ["rowid"])
+
+
+class TestCopyPagesInKeyOrder(_TmpDB):
+    """The copy reads the source by its key, one batch at a time."""
+
+    KEYS = [ScoreCache.encode_subset(words) for words in
+            (WORDS, WORDS[:4], WORDS[:3], WORDS[:2], WORDS[1:])]
+
+    def _source_written_out_of_key_order(self):
+        sc = self._cache("source.sqlite3")
+        for key in self.KEYS:
+            sc.write(key, ERD_ALL, "crane", 1.5, max_depth=2, solve_budget=None)
+        sc.close()
+        self.assertNotEqual(self.KEYS, sorted(self.KEYS))
+
+    def _attach(self):
+        self._cache("target.sqlite3").close()
+        conn = sqlite3.connect(self.path("target.sqlite3"), isolation_level=None)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(f"ATTACH DATABASE '{self.path('source.sqlite3')}' AS src")
+        self.addCleanup(conn.close)
+        return conn
+
+    def test_every_row_arrives_and_in_key_order(self):
+        self._source_written_out_of_key_order()
+        conn = self._attach()
+        with mock.patch.object(import_cache, "BATCH", 2), \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            copied = import_cache._copy_table_with_progress(
+                conn, "branch_best_by_policy")
+        self.assertEqual(copied, len(self.KEYS))
+        arrival = [row[0] for row in conn.execute(
+            "SELECT branch_key FROM main.branch_best_by_policy ORDER BY rowid")]
+        self.assertEqual(arrival, sorted(self.KEYS))
+
+    def test_the_page_read_walks_the_key_index(self):
+        # A sort the index does not serve would re-sort the whole remaining
+        # source for every batch.
+        self._source_written_out_of_key_order()
+        conn = self._attach()
+        statements = []
+        conn.set_trace_callback(statements.append)
+        for table in ("branch_best_by_policy", "candidate_scores"):
+            statements.clear()
+            if table == "candidate_scores":
+                conn.executemany(
+                    "INSERT INTO src.candidate_scores VALUES (?,?,?,?,?,?)",
+                    [(f"h{n}", f"w{n}", "entropy_gain", 1.0, "a", 1)
+                     for n in (3, 1, 2)])
+            with mock.patch.object(import_cache, "BATCH", 1), \
+                    mock.patch("sys.stdout", new_callable=io.StringIO):
+                import_cache._copy_table_with_progress(conn, table)
+            pages = [sql for sql in statements
+                     if sql.startswith("SELECT") and "LIMIT" in sql]
+            self.assertTrue(any(" > (" in sql for sql in pages), pages)
+            for sql in pages:
+                with self.subTest(table=table, sql=sql):
+                    plan = " ".join(row[3] for row in conn.execute(
+                        f"EXPLAIN QUERY PLAN {sql}"))
+                    self.assertIn("sqlite_autoindex", plan)
+                    self.assertNotIn("TEMP B-TREE", plan)
+        conn.set_trace_callback(None)
+
+    def _source_with_contested(self, contested_index):
+        """Five rows, the one at contested_index (in key order) disputed.
+
+        The target already holds a different certificate for that branch, as
+        a live writer that beat the copy would leave it.
+        """
+        self._source_written_out_of_key_order()
+        conn = self._attach()
+        contested = sorted(self.KEYS)[contested_index]
+        live = ScoreCache(self.path("target.sqlite3"), WORDS,
+                          checkpoint_on_close=False)
+        live.write(contested, ERD_ALL, "slate", 1.0, max_depth=2,
+                   solve_budget=None)
+        live.close()
+        return conn
+
+    def _copy_expecting_conflict(self, conn):
+        with mock.patch.object(import_cache, "BATCH", 2), \
+                mock.patch("sys.stdout", new_callable=io.StringIO), \
+                mock.patch("sys.stderr", new_callable=io.StringIO):
+            with self.assertRaises(import_cache.ImportConflict):
+                import_cache._copy_table_with_progress(
+                    conn, "branch_best_by_policy")
+        return conn.execute(
+            "SELECT COUNT(*) FROM main.branch_best_by_policy").fetchone()[0]
+
+    def test_a_batch_checks_the_row_at_its_upper_edge(self):
+        # Second in key order is the last row of the first batch of two.
+        conn = self._source_with_contested(1)
+        self.assertEqual(self._copy_expecting_conflict(conn), 1)
+
+    def test_a_batch_checks_the_row_just_past_its_lower_edge(self):
+        # Third in key order opens the second batch; the first one stands.
+        conn = self._source_with_contested(2)
+        self.assertEqual(self._copy_expecting_conflict(conn), 3)
+
+
+class TestProgressLineFollowsRecentRate(_TmpDB):
+    def test_the_eta_follows_the_slowdown(self):
+        sc = self._cache("source.sqlite3")
+        for words in (WORDS, WORDS[:4], WORDS[:3], WORDS[:2]):
+            sc.write(ScoreCache.encode_subset(words), ERD_ALL, "crane", 1.5,
+                     max_depth=2, solve_budget=None)
+        sc.close()
+        self._cache("target.sqlite3").close()
+        conn = sqlite3.connect(self.path("target.sqlite3"), isolation_level=None)
+        conn.execute(f"ATTACH DATABASE '{self.path('source.sqlite3')}' AS src")
+        self.addCleanup(conn.close)
+
+        # Two batches in a millisecond each, then one that takes 20 s.  The
+        # last 10 s ran at one row per 20 s, so the remaining row is 20 s
+        # away; averaged from the start it would read 6 s.
+        clock = iter([0.0, 0.001, 0.002, 20.002, 20.003])
+        output = io.StringIO()
+        with mock.patch.object(import_cache, "BATCH", 1), \
+                mock.patch.object(import_cache.time, "time",
+                                  lambda: next(clock)), \
+                mock.patch("sys.stdout", output):
+            import_cache._copy_table_with_progress(
+                conn, "branch_best_by_policy")
+        # The line prints at most every half second, so the slow batch's is
+        # the first one written.
+        lines = output.getvalue().split("\r")[1:]
+        self.assertIn("3/4", lines[0])
+        self.assertIn("ETA 20s", lines[0])
+
+
 class TestDroppableIndexes(_TmpDB):
     def test_returns_secondary_indexes_excluding_primary_key(self):
         sc = self._cache("c.sqlite3")

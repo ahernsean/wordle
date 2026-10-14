@@ -1364,10 +1364,16 @@ class MergeTableIndexTest(_ImportFixture):
                       import_cache._droppable_indexes(conn, table))
 
     def _two_row_source(self, name, *, solve_budget=None):
-        """A source whose second row is the one the live writer will contest."""
+        """A source whose second row is the one the live writer will contest.
+
+        The copy pages in key order, so "second" means the uncontested row's
+        key sorts below the contested one's.
+        """
+        uncontested_key = ScoreCache.encode_subset(WORDS[:2])
+        self.assertLess(uncontested_key, self.key)
         path = os.path.join(self._dir, name)
         source = ScoreCache(path, WORDS, checkpoint_on_close=False)
-        source.write(ScoreCache.encode_subset(WORDS[:3]), ERD_ALL, "stale", 1.5,
+        source.write(uncontested_key, ERD_ALL, "crane", 1.5,
                      max_depth=2, solve_budget=solve_budget)
         source.write(self.key, ERD_ALL, "slate", 2.5,
                      max_depth=3, solve_budget=solve_budget)
