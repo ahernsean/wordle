@@ -10,9 +10,14 @@
   "matched_rows": 4,
   "rows": [
    {
+    "answer_count": 8,
     "best_erd": 2.25,
+    "best_erd_denominator": 8,
+    "best_erd_numerator": 18,
     "best_guess": "crane",
     "bound_erd": 2.5,
+    "bound_erd_denominator": 8,
+    "bound_erd_numerator": 20,
     "branch_key_hex": "02",
     "branch_reference": "222222222222",
     "cache_hit_count": 50,
@@ -72,9 +77,14 @@
     "worker_number": "1"
    },
    {
+    "answer_count": 8,
     "best_erd": 1.5,
+    "best_erd_denominator": 8,
+    "best_erd_numerator": 12,
     "best_guess": "cigar",
     "bound_erd": null,
+    "bound_erd_denominator": null,
+    "bound_erd_numerator": null,
     "branch_key_hex": "03",
     "branch_reference": "333333333333",
     "cache_hit_count": 10,

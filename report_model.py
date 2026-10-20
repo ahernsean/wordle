@@ -6,7 +6,6 @@ from dataclasses import dataclass, field, replace
 import base64
 import collections
 import datetime
-import math
 import os
 import re
 import sqlite3
@@ -37,7 +36,9 @@ from runtime_paths import (
     DEFAULT_QUEUE_PATH,
     DEFAULT_TELEMETRY_PATH,
 )
-from wordle_engine import ERD_ALL, GAME_GUESSES, ResponseCache, load_word_list
+from wordle_engine import (
+    ERD_ALL, GAME_GUESSES, ResponseCache, erd_display_numerator, load_word_list,
+)
 from wordle_ui import fmt_pattern, parse_pattern
 
 
@@ -1340,42 +1341,80 @@ def _mark_queue_opener_error(report, error):
     report["sources"]["telemetry"]["error"] = message
 
 
-# An ERD is a mean over a branch's answers, so an exact one lies on that
-# branch's own lattice: it is numerator/answer_count for an integer numerator
-# counting total guesses across the branch.  The margin is on the scaled value,
-# matching report_client.html's ERD_LATTICE_NOISE_MARGIN, and is float noise
-# only -- the worst deviation measured across the production leaderboard is
-# 3.3e-11 against a margin of 1e-6.
-ERD_LATTICE_NOISE_MARGIN = 1e-6
-
 # Every Wordle word is exactly five ASCII characters, which is the same
 # invariant `ScoreCache.encode_subset` slices branch keys on.  It lets the
 # ranking carry its words as one string instead of a list of them.
 WORD_WIDTH = 5
 
+# Report fields that hold an ERD on the lattice of the branch their row
+# describes.  An exact ERD is a mean of integer line lengths, so it is
+# numerator/answer_count for an integer count of guesses across the branch.  A
+# bound is the ceiling the solver derived, padded by `_CEIL_EPS` above the
+# lattice point it stands for, or an incumbent that is itself exact.
+EXACT_ERD_FIELDS = ("erd", "best_erd")
+ERD_BOUND_FIELDS = ("ceiling", "bound_erd", "available_bound", "wanted_ceiling")
 
-def erd_lattice_numerator(value, answer_count):
+
+def erd_lattice_numerator(value, answer_count, *, ceiling=False):
     """The exact numerator of `value` over `answer_count`, or None.
 
     None when the value is not finite, the count is unusable, or the value does
-    not sit on the lattice.  An off-lattice value is never snapped.
+    not sit on the lattice.  An off-lattice value is never snapped.  `ceiling`
+    admits the solver's ceiling padding and returns the lattice numerator
+    beneath it.
 
     What None *means* is the caller's to decide, because it differs by the
     quantity asked about.  An exact ERD is a mean of integer line lengths and
     is on its branch's lattice by construction, so None there is a defect.  A
-    derived ceiling carries an epsilon of padding and can legitimately sit
-    between lattice points, so None there is ordinary and the decimal stands
-    alone.
+    derived ceiling can legitimately sit between lattice points, so None there
+    is ordinary and the decimal stands alone.
     """
-    if value is None or answer_count is None or answer_count <= 0:
+    if (value is None or isinstance(answer_count, bool)
+            or not isinstance(answer_count, int) or answer_count <= 0):
         return None
-    if not math.isfinite(value):
-        return None
-    scaled = value * answer_count
-    numerator = round(scaled)
-    if abs(scaled - numerator) >= ERD_LATTICE_NOISE_MARGIN:
-        return None
-    return int(numerator)
+    return erd_display_numerator(value, answer_count, ceiling=ceiling)
+
+
+def attach_erd_fractions(row, answer_count):
+    """Set `<field>_numerator` and `<field>_denominator` beside every ERD field
+    `row` carries, over `answer_count`, the branch the values describe.
+
+    The fraction is unreduced: the denominator names the branch's population
+    and the numerator the guesses spent across it, so 54/18 never becomes 3/1.
+    Both are None for a value off the lattice or with no usable count, and the
+    decimal then stands alone.
+    """
+    for field in EXACT_ERD_FIELDS + ERD_BOUND_FIELDS:
+        if field not in row:
+            continue
+        numerator = erd_lattice_numerator(
+            row[field], answer_count, ceiling=field in ERD_BOUND_FIELDS)
+        row[f"{field}_numerator"] = numerator
+        row[f"{field}_denominator"] = None if numerator is None else answer_count
+    return row
+
+
+def _attach_report_erd_fractions(report):
+    """Attach ERD fractions to every row in `report` that names its own
+    branch's `answer_count`.
+
+    A row carrying `answer_count` describes one branch, and its ERD fields are
+    that branch's: a branch's incumbent and ceiling, a worker's current branch,
+    a response group, a finalization, a cut-reuse miss.  A payload whose branch
+    count lives elsewhere attaches its own fractions where it is built.
+    """
+    stack = [report]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            if "answer_count" in item:
+                attach_erd_fractions(item, item["answer_count"])
+            stack.extend(
+                value for value in item.values()
+                if isinstance(value, (dict, list)))
+        elif isinstance(item, list):
+            stack.extend(
+                value for value in item if isinstance(value, (dict, list)))
 
 
 def _response_group_key(row: dict, group_by: str) -> tuple:
@@ -1704,9 +1743,10 @@ def collect_word_report(sources: ReportOpeners, request: ReportRequest) -> dict:
             row["cache_state"] == "missing" for row in all_response_groups
         ),
     }
-    data["erd_summary"] = (
+    data["erd_summary"] = attach_erd_fractions(
         erd_summary if erd_summary is not None
-        else reduce_candidate_erd(all_response_groups, group_budget)
+        else reduce_candidate_erd(all_response_groups, group_budget),
+        len(resolved.answer_words),
     )
     data["total_rows"] = len(all_response_groups)
     data["matched_rows"] = len(matched_response_groups)
@@ -2790,6 +2830,11 @@ def collect_branch_report(sources: ReportOpeners, request: ReportRequest) -> dic
     finally:
         if cache is not None:
             cache.close()
+    # The incumbent, ceiling and cached result are the branch's own, and the
+    # branch payload is the one that names its answer count.
+    for payload in (data["queue"], data["cache"]):
+        if payload is not None:
+            attach_erd_fractions(payload, branch_payload["answer_count"])
     return report
 
 
@@ -3613,9 +3658,12 @@ def collect_cache_report(sources: ReportOpeners, request: ReportRequest) -> dict
             data.update({
                 "branch_key_hex": branch_key.hex(),
                 "branch_reference": branch_reference(branch_key),
-                "cache": _with_best_guess_is_answer(
-                    cache.report_branch_state(branch_key, ERD_ALL, budget),
-                    answer_set,
+                "cache": attach_erd_fractions(
+                    _with_best_guess_is_answer(
+                        cache.report_branch_state(branch_key, ERD_ALL, budget),
+                        answer_set,
+                    ),
+                    len(branch_key) // WORD_WIDTH,
                 ),
             })
         report["sources"]["cache"]["ok"] = True
@@ -4141,14 +4189,14 @@ def _opener_erd_summaries(sources, rows, report, queue, cache, all_answers):
                 if word not in stored:
                     continue
                 erd, max_remaining_depth, response_group_count = stored[word]
-                summaries[word] = {
+                summaries[word] = attach_erd_fractions({
                     "state": "complete",
                     "erd": erd,
                     "max_remaining_depth": max_remaining_depth,
                     "resolved_group_count": response_group_count,
                     "infeasible_group_count": 0,
                     "response_group_count": response_group_count,
-                }
+                }, len(all_answers))
                 continue
             groups = unqueued[word]
             summaries[word] = {
@@ -4160,6 +4208,8 @@ def _opener_erd_summaries(sources, rows, report, queue, cache, all_answers):
                     groups.solved_count + row["direct_done_branch_count"]),
                 "infeasible_group_count": groups.infeasible_count,
                 "response_group_count": groups.response_group_count,
+                "erd_numerator": None,
+                "erd_denominator": None,
             }
         report["sources"]["cache"]["ok"] = True
     except (sqlite3.Error, OSError) as error:
@@ -4553,6 +4603,12 @@ def collect_overview_report(
 
 
 def collect_report(sources: ReportOpeners, request: ReportRequest) -> dict:
+    report = _collect_report_of_kind(sources, request)
+    _attach_report_erd_fractions(report)
+    return report
+
+
+def _collect_report_of_kind(sources: ReportOpeners, request: ReportRequest) -> dict:
     if request.tree:
         if request.report_kind == "cache":
             raise ValueError("tree layout is unavailable for cache reports")

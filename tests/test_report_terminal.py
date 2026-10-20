@@ -461,6 +461,26 @@ class OverviewRendererTest(unittest.TestCase):
         self.assertIn("ERD 3.564  max-d=6", output)
         self.assertNotIn("3.564102564102564", output)
 
+    def test_word_report_renders_the_erd_as_its_exact_fraction(self):
+        report = self._word_report({
+            "state": "complete", "erd": 54 / 18, "erd_numerator": 54,
+            "erd_denominator": 18, "max_remaining_depth": 4,
+            "resolved_group_count": 4, "infeasible_group_count": 0,
+            "response_group_count": 4,
+        })
+        self.assertIn("ERD 3.000 54/18  max-d=4", render_report(report, width=100))
+
+    def test_word_report_shows_an_erd_without_a_fraction_as_its_decimal(self):
+        # The report left this value off the lattice; the renderer does not
+        # find a fraction of its own for it.
+        report = self._word_report({
+            "state": "complete", "erd": 2.1, "erd_numerator": None,
+            "erd_denominator": None, "max_remaining_depth": 4,
+            "resolved_group_count": 4, "infeasible_group_count": 0,
+            "response_group_count": 4,
+        })
+        self.assertIn("ERD 2.100  max-d=4", render_report(report, width=100))
+
     def test_word_report_renders_pending_erd(self):
         report = self._word_report({
             "state": "pending", "erd": None, "max_remaining_depth": None,
@@ -517,6 +537,26 @@ class OverviewRendererTest(unittest.TestCase):
         value_column = len(row) - len(row.split()[-1])
         self.assertEqual(header.index("Worst-case guesses"), value_column)
 
+    def test_leaderboard_report_renders_each_erd_with_its_fraction_aligned(self):
+        report = self._leaderboard_report(
+            [
+                {"word": "salet", "word_is_answer": False, "erd": 11433 / 3209,
+                 "erd_numerator": 11433, "erd_denominator": 3209,
+                 "max_remaining_depth": 6, "rank": 1},
+                {"word": "crane", "word_is_answer": True, "erd": 356 / 100,
+                 "erd_numerator": 356, "erd_denominator": 100,
+                 "max_remaining_depth": 5, "rank": 2},
+            ],
+            {"complete": 2, "pending": 14852, "infeasible": 1},
+        )
+        lines = render_report(report, width=100).splitlines()
+        self.assertTrue(any("3.563 11,433/3,209" in line for line in lines))
+        self.assertTrue(any("3.560 356/100" in line for line in lines))
+        header = next(line for line in lines if "Worst-case guesses" in line)
+        for row in (line for line in lines if line.strip()[:1] in ("1", "2")):
+            value_column = len(row.rstrip()) - len(row.split()[-1])
+            self.assertEqual(header.index("Worst-case guesses"), value_column)
+
     def test_leaderboard_report_renders_empty_fallback(self):
         report = self._leaderboard_report(
             [], {"complete": 0, "pending": 14855, "infeasible": 0}
@@ -557,6 +597,7 @@ class OverviewRendererTest(unittest.TestCase):
         self.assertIn("Rank 42 of 958 ranked openers", output)
         self.assertIn("better than 95.6%", output)
         self.assertIn("11,424/3,209 guesses", output)
+        self.assertIn("3.560 11,423/3,209", output)
         self.assertIn("worst case 5 guesses", output)
         self.assertIn("CRANE*", output)  # the bitmap's one answer
         marked = [line for line in output.splitlines()
@@ -822,6 +863,57 @@ class OverviewRendererTest(unittest.TestCase):
         self.assertIn("and 1 more reaching this same answer set", output)
         self.assertIn("cut reuse miss epoch=2 budget=4", output)
         self.assertNotIn("idx=", output)
+
+    def test_branch_report_renders_its_incumbent_ceiling_and_bounds_exactly(self):
+        report = overview_report()
+        report["report_kind"] = "branch"
+        report["data"] = {
+            "branch": {
+                "branch_reference": "0123456789ab", "branch_key_hex": "010203",
+                "spine": [], "guess_depth": 0, "answer_count": 19, "budget": 5,
+                "branch_status": "evaluating", "branch_worker_status": "active",
+            },
+            "queue": {
+                "branch_status": "evaluating", "branch_worker_status": "active",
+                "priority": 0, "budget": 5, "best_guess": "crane",
+                "best_erd": 52 / 19, "best_erd_numerator": 52,
+                "best_erd_denominator": 19,
+                "ceiling": 53 / 19 + 1e-9, "ceiling_numerator": 53,
+                "ceiling_denominator": 19, "search_node_count": 1200,
+                "candidate_count": None, "completed_candidate_count": 0,
+                "bulk_completed_candidate_count": 0,
+                "one_level_erd_pruned_candidate_count": 0,
+                "two_level_erd_pruned_candidate_count": 0,
+            },
+            "cache": {
+                "cache_state": "exact", "best_guess": "crane",
+                "best_erd": 54 / 18, "best_erd_numerator": 54,
+                "best_erd_denominator": 18, "max_remaining_depth": 4,
+            },
+            "workers": [],
+            "bundle_summary": {},
+            "candidate_eta": None,
+            "republished_candidates": [],
+            "claims": None,
+            "claim_summary": {},
+            "recent_finalizations": [],
+            "finalization_total_count": 0,
+            "cut_reuse_misses": [
+                {"epoch": 2, "budget": 4, "answer_count": 19,
+                 "available_bound": 47 / 19 + 1e-9,
+                 "available_bound_numerator": 47,
+                 "available_bound_denominator": 19},
+                {"epoch": 2, "budget": 4, "answer_count": 19,
+                 "available_bound": 2.5, "available_bound_numerator": None,
+                 "available_bound_denominator": None},
+            ],
+            "provenance_unknown": False,
+        }
+        output = render_report(report, width=120)
+        self.assertIn("best=CRANE/ERD 2.737 52/19 ceiling=2.789 53/19", output)
+        self.assertIn("best=CRANE/ERD 3.000 54/18", output)
+        self.assertIn("available ERD bound=2.474 47/19", output)
+        self.assertTrue(output.endswith("available ERD bound=2.500"), output)
 
     def test_unqueued_branch_renders_claim_progress_and_answer_preview(self):
         report = overview_report()
@@ -2866,8 +2958,8 @@ class TerminalUtilityTest(unittest.TestCase):
 
     def test_formatters_and_change_rules_cover_boundary_values(self):
         self.assertEqual(report_terminal._percentage(1, 0), "—")
-        self.assertEqual(report_terminal._format_metric_value("best_erd", 2.5), "2.500")
-        self.assertEqual(report_terminal._format_branch_erd(None, 2), "—")
+        self.assertEqual(report_terminal._format_erd({"best_erd": 2.5}, "best_erd"), "2.500")
+        self.assertEqual(report_terminal._format_erd({"best_erd": None}, "best_erd"), "—")
         self.assertEqual(report_terminal._abbreviate_number(None), "—")
         self.assertEqual(report_terminal._abbreviate_number(1_200), "1.2k")
         self.assertEqual(report_terminal._abbreviate_duration(-1), "—")
@@ -2970,6 +3062,10 @@ class TerminalUtilityTest(unittest.TestCase):
             "state": "complete", "erd": 2.5,
         }), "2.500")
         self.assertEqual(report_terminal._display_opener_erd({
+            "state": "complete", "erd": 2.5, "erd_numerator": 8025,
+            "erd_denominator": 3210,
+        }), "2.500 8,025/3,210")
+        self.assertEqual(report_terminal._display_opener_erd({
             "state": "infeasible",
         }), "∞")
         self.assertEqual(report_terminal._display_opener_erd({
@@ -3003,11 +3099,14 @@ class TerminalUtilityTest(unittest.TestCase):
             "since_seconds": 30, "sample_size": 2, "sampled_row_count": 1,
             "sample_truncated": False,
             "rows": [{"row_id": "bucket", "best_erd": 2.5,
-                      "spine": "RAISE -----"}],
+                      "best_erd_numerator": 20, "best_erd_denominator": 8,
+                      "answer_count": 8, "spine": "RAISE -----"}],
         }
         output = report_terminal.render_report(report, width=100)
         self.assertIn("bucket", output)
-        self.assertIn("best_erd=2.500", output)
+        # The fraction rides with its decimal, never as fields of its own.
+        self.assertIn("best_erd=2.500 20/8", output)
+        self.assertNotIn("numerator", output)
         report["report_kind"] = "cache"
         report["data"] = {
             "summary": {"exact_branch_count": 3, "loss_branch_count": 1,

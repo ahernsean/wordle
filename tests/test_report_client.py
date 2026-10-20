@@ -3765,7 +3765,8 @@ class ReportClientContract:
         for expected in (
             "Current work", "current-claim nodes 900", "nodes/s 46",
             "candidate index 7", "claim started", "Search state",
-            "candidate NURDY", "best CRANE/2.250 18/8", "cache hits 50",
+            "candidate NURDY", "best CRANE/2.250 18/8",
+            "effective bound 2.500 20/8", "cache hits 50",
             "cache misses 10",
             "Open branch",
         ):
@@ -3921,18 +3922,24 @@ class ReportClientContract:
     def test_branch_erd_values_show_unreduced_lattice_rationals(self):
         text = self.page.evaluate("""async () => {
           const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
-          branch.data.queue.best_erd=17/8;
-          branch.data.queue.ceiling=18/8+1e-9;
-          branch.data.cache.best_erd=17/8;
+          const eighths=numerator=>({numerator,denominator:8});
+          const exact=(field,value,{numerator,denominator})=>({
+            [field]:value,[field+'_numerator']:numerator,[field+'_denominator']:denominator,
+          });
+          Object.assign(branch.data.queue,
+            exact('best_erd',17/8,eighths(17)),exact('ceiling',18/8+1e-9,eighths(18)));
+          Object.assign(branch.data.cache,exact('best_erd',17/8,eighths(17)));
           branch.data.recent_finalizations[0]={
-            ...branch.data.recent_finalizations[0],best_guess:'cigar',best_erd:15/8,
+            ...branch.data.recent_finalizations[0],best_guess:'cigar',
+            ...exact('best_erd',15/8,eighths(15)),
           };
           branch.data.recent_finalizations[1]={
-            ...branch.data.recent_finalizations[1],ceiling:18/8+1e-9,
+            ...branch.data.recent_finalizations[1],...exact('ceiling',18/8+1e-9,eighths(18)),
           };
           branch.data.cut_reuse_misses[0]={
-            ...branch.data.cut_reuse_misses[0],wanted_ceiling:17/8+1e-9,
-            available_bound:18/8+1e-9,
+            ...branch.data.cut_reuse_misses[0],
+            ...exact('wanted_ceiling',17/8+1e-9,eighths(17)),
+            ...exact('available_bound',18/8+1e-9,eighths(18)),
           };
           applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
           return document.querySelector('#report').innerText;
@@ -3945,16 +3952,57 @@ class ReportClientContract:
         self.assertIn("available ERD bound 2.250 18/8", text)
         self.assertNotIn("3/2", text)
 
-    def test_branch_erd_ceiling_accepts_its_explicit_padding(self):
+    def test_word_erd_and_its_groups_show_fractions_over_their_own_answers(self):
+        # The word's ERD is over the branch it is played from, and each
+        # response group's over that group's own answers.  Neither is reduced:
+        # 54/18 names eighteen answers and fifty-four guesses across them.
+        text = self.page.evaluate("""async () => {
+          const report=await (await fetch('/api/view?branch_target=SALET')).json();
+          Object.assign(report.data.erd_summary,{state:'complete',erd:54/18,
+            max_remaining_depth:4,erd_numerator:54,erd_denominator:18});
+          Object.assign(report.data.response_groups[0],{best_guess:'crane',
+            best_erd:18/8,best_erd_numerator:18,best_erd_denominator:8});
+          applyReport(report,null,{...__reportClient.getState(),branch_target:'SALET'});
+          return document.querySelector('#report').innerText;
+        }""")
+        self.assertIn("3.000 54/18", text)
+        self.assertNotIn("3/1", text)
+        self.assertIn("CRANE/2.250 18/8", text)
+
+    def test_an_erd_fraction_is_never_a_fact_of_its_own(self):
+        # The pair renders beside its decimal, so a card that lists a row's
+        # fields does not list the numerator and denominator again.
         text = self.page.evaluate("""async () => {
           const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
-          branch.data.branch.answer_count=3209;
-          branch.data.queue.ceiling=3/3209+1e-9;
+          Object.assign(branch.data.cache,{best_erd:17/8,best_erd_numerator:17,best_erd_denominator:8});
           applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
           return document.querySelector('#report').innerText;
         }""")
-        self.assertIn("ERD ceiling", text)
-        self.assertIn("0.001 3/3,209", text)
+        self.assertIn("best guess CRANE/2.125 17/8", text)
+        self.assertNotIn("numerator", text)
+        self.assertNotIn("denominator", text)
+
+    def test_branch_erd_shows_the_fraction_the_report_carries_and_no_other(self):
+        # The report decides whether a value is on its branch's lattice.  The
+        # client renders the pair it was given, and a value the report left
+        # without one -- off the lattice, or with no known answer count --
+        # shows its decimal alone, however close it sits to a lattice point.
+        texts = self.page.evaluate("""async () => {
+          const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
+          const render=queue=>{
+            const report=structuredClone(branch);
+            Object.assign(report.data.queue,queue);
+            applyReport(report,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
+            return document.querySelector('#report').innerText;
+          };
+          return [
+            render({ceiling:3/3209+1e-9,ceiling_numerator:3,ceiling_denominator:3209}),
+            render({ceiling:18/8,ceiling_numerator:null,ceiling_denominator:null}),
+          ];
+        }""")
+        self.assertIn("ERD ceiling 0.001 3/3,209", texts[0])
+        self.assertIn("ERD ceiling 2.250\n", texts[1])
+        self.assertNotIn("18/8", texts[1])
 
     def test_cut_reuse_facts_wrap_between_complete_metrics(self):
         self.page.set_viewport_size({"width": 375, "height": 800})
@@ -3962,7 +4010,8 @@ class ReportClientContract:
           const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
           branch.data.cut_reuse_misses[0]={
             ...branch.data.cut_reuse_misses[0],answer_count:19,
-            available_bound:47/19+1e-9,available_budget:5,
+            available_bound:47/19+1e-9,available_bound_numerator:47,
+            available_bound_denominator:19,available_budget:5,
           };
           applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
         }""")
@@ -4043,7 +4092,8 @@ class ReportClientContract:
         facts = self.page.evaluate("""async () => {
           const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
           branch.data.recent_finalizations[0]={
-            ...branch.data.recent_finalizations[0],outcome:'loss',loss_proof:'ceiling_above_budget',budget:3,ceiling:3.25,wall_time_millis:374529,
+            ...branch.data.recent_finalizations[0],outcome:'loss',loss_proof:'ceiling_above_budget',budget:3,ceiling:3.25,
+            ceiling_numerator:26,ceiling_denominator:8,wall_time_millis:374529,
           };
           applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
           const card=document.querySelector('[data-grid-key="finalizations"] .card');
@@ -6540,6 +6590,7 @@ class ReportClientContract:
                 answer_count: 502, candidate_count: 14855,
                 completed_candidate_count: 6363, best_guess: 'clart',
                 best_guess_is_answer: false, best_erd: 1572 / 502,
+                best_erd_numerator: 1572, best_erd_denominator: 502,
                 worker_count: 1,
                 completed_candidate_bitmap: sweepBitmap(0, 14855),
                 spine: [{word: 'raise', pattern: '-----'}]}];
@@ -7461,8 +7512,8 @@ class ReportClientContract:
             for card in self.page.locator(".card.source-word").all()
         }
         # Complete: the exact ERD and the worst-case line it earned.
-        self.assertIn("ERD 3.421 · max 5", cards["RAISE"])
-        self.assertIn("ERD 3.389 · max 4", cards["CRANE"])
+        self.assertIn("ERD 3.421 10,977/3,209 · max 5", cards["RAISE"])
+        self.assertIn("ERD 3.389 10,876/3,209 · max 4", cards["CRANE"])
         # Still searching: how much of it is solved, not a number that moves.
         self.assertIn("ERD pending · 96/148 groups solved", cards["SALET"])
 

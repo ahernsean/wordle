@@ -26,7 +26,6 @@ from report_model import (
     leaderboard_rows,
     parse_report_branch_target,
 )
-from wordle_engine import erd_display_numerator
 
 
 GREEN = "\033[32m"
@@ -156,20 +155,25 @@ BOUND_FIELDS = frozenset(
 )
 
 
-def _format_metric_value(key, value):
-    if key in BOUND_FIELDS and isinstance(value, float):
-        return f"{value:.3f}"
-    return value
+# The exact fraction the report carries beside each ERD field, which the ERD
+# itself already renders.
+ERD_FRACTION_FIELDS = frozenset(
+    f"{field}_{part}" for field in BOUND_FIELDS
+    for part in ("numerator", "denominator")
+)
 
 
-def _format_branch_erd(value, answer_count, *, ceiling=False):
-    """Render a branch ERD with its unreduced answer-count denominator."""
+def _format_erd(row, field):
+    """Render an ERD field as its decimal and, where the report carries one,
+    its unreduced fraction over the branch's answer count."""
+    value = row.get(field)
     if value is None:
         return "—"
     text = f"{value:.3f}"
-    numerator = erd_display_numerator(value, answer_count, ceiling=ceiling)
-    if numerator is not None:
-        text += f" {numerator:,}/{answer_count:,}"
+    numerator = row.get(f"{field}_numerator")
+    denominator = row.get(f"{field}_denominator")
+    if numerator is not None and denominator is not None:
+        text += f" {numerator:,}/{denominator:,}"
     return text
 
 
@@ -848,6 +852,19 @@ def _display_erd_prunes(row):
     return f"{one_level:,}/{two_level:,}"
 
 
+def _display_queue_best(queue):
+    """A branch's running incumbent and the ceiling it searches under."""
+    if not queue.get("best_guess"):
+        best = "—"
+    else:
+        best = queue["best_guess"].upper()
+        if queue.get("best_erd") is not None:
+            best += f"/ERD {_format_erd(queue, 'best_erd')}"
+    if queue.get("ceiling") is not None:
+        best += f" ceiling={_format_erd(queue, 'ceiling')}"
+    return best
+
+
 def _display_best(row):
     if not row.get("best_guess"):
         return "—"
@@ -1002,7 +1019,10 @@ def _word_erd_line(erd_summary):
         return "ERD: n/a"
     state = erd_summary.get("state")
     if state == "complete":
-        return f"ERD {erd_summary['erd']:.3f}  max-d={erd_summary['max_remaining_depth']}"
+        return (
+            f"ERD {_format_erd(erd_summary, 'erd')}  "
+            f"max-d={erd_summary['max_remaining_depth']}"
+        )
     if state == "infeasible":
         return (
             f"ERD ∞: {erd_summary['infeasible_group_count']} of "
@@ -1149,7 +1169,7 @@ def _render_branch_sections(report, previous_report, color, width, display_order
             f"status={queue['branch_status']} "
             f"worker={queue['branch_worker_status'] or '—'}  "
             f"priority={queue['priority']} budget={queue.get('budget', '—')}  "
-            f"best={queue['best_guess'] or '—'} "
+            f"best={_display_queue_best(queue)} "
             f"nodes={_abbreviate_number(queue['search_node_count'])}"
         )
         if bundle_summary.get("wall_time_millis"):
@@ -1276,7 +1296,7 @@ def _render_branch_sections(report, previous_report, color, width, display_order
     if cache.get("best_guess"):
         cache_line += (
             f"  best={cache['best_guess'].upper()}/ERD "
-            f"{_format_branch_erd(cache['best_erd'], branch['answer_count'])}"
+            f"{_format_erd(cache, 'best_erd')}"
         )
     if cache.get("max_remaining_depth") is not None:
         cache_line += f"  max-d={cache['max_remaining_depth']}"
@@ -1355,9 +1375,7 @@ def _render_branch_sections(report, previous_report, color, width, display_order
             width,
         ))
     for miss in data.get("cut_reuse_misses", []):
-        available_bound = _format_branch_erd(
-            miss["available_bound"], miss["answer_count"], ceiling=True
-        )
+        available_bound = _format_erd(miss, "available_bound")
         telemetry_lines.append(_fit(
             f"  cut reuse miss epoch={miss['epoch']} budget={miss['budget']} "
             f"available ERD bound={available_bound}",
@@ -1585,11 +1603,12 @@ def _render_hotspot_sections(report, width, display_order):
         hotkey = _hotkey_label(display_order, row.get("branch_key_hex"))
         hotkey_prefix = f"{hotkey} " if hotkey else ""
         metrics = ", ".join(
-            f"{key}={_format_metric_value(key, value)}" for key, value in row.items()
+            f"{key}={_format_erd(row, key) if key in BOUND_FIELDS else value}"
+            for key, value in row.items()
             if key not in (
                 "row_id", "branch_key_hex", "branch_reference", "spine",
                 "best_guess_is_answer",
-            )
+            ) and key not in ERD_FRACTION_FIELDS
         )
         lines.append(_fit(f"  {hotkey_prefix}{identity}  {metrics}", width))
         spine_text = _display_spine(row)
@@ -1679,12 +1698,19 @@ def _render_work_distribution_sections(report, width):
     return [("header", header), ("summary", lines), ("bands", rows)]
 
 
+def _leaderboard_erd_cells(rows):
+    """Each ranked opener's ERD and fraction, and the column width that
+    aligns them."""
+    texts = [_format_erd(row, "erd") for row in rows]
+    return texts, max([len("ERD"), *map(len, texts)])
+
+
 def _display_opener_erd(summary):
     """A word's own ERD, once every one of its response groups is solved."""
     if not summary:
         return "—"
     if summary["state"] == "complete":
-        return f"{summary['erd']:.3f}"
+        return _format_erd(summary, "erd")
     if summary["state"] == "infeasible":
         return "∞"
     return f"{summary['resolved_group_count']:,}/{summary['response_group_count']:,}"
@@ -1863,14 +1889,15 @@ def _render_standing_lines(standing, width):
              f"{denominator:,} guesses  worst case "
              f"{standing['max_remaining_depth']} guesses", width),
     ]
-    rows = ["    Rank  Opener   ERD    Worst-case guesses"]
-    for index, row in enumerate(leaderboard_rows({"columns":
-                                                  standing["neighbourhood"]})):
+    neighbours = leaderboard_rows({"columns": standing["neighbourhood"]})
+    erd_texts, erd_width = _leaderboard_erd_cells(neighbours)
+    rows = [f"    Rank  Opener   {'ERD':<{erd_width}}  Worst-case guesses"]
+    for index, row in enumerate(neighbours):
         marker = "-> " if index == standing["position"] else "   "
         neighbour = row["word"].upper() + ("*" if row["word_is_answer"] else "")
         rows.append(_fit(
-            f"{marker}{row['rank']:>4}  {neighbour:<7}  {row['erd']:.3f}  "
-            f"{row['max_remaining_depth']}",
+            f"{marker}{row['rank']:>4}  {neighbour:<7}  "
+            f"{erd_texts[index]:<{erd_width}}  {row['max_remaining_depth']}",
             width,
         ))
     return lines + [""] + rows
@@ -1930,11 +1957,13 @@ def _render_leaderboard_sections(report, width):
             width,
         ),
     ]
-    rows = ["Rank  Opener   ERD    Worst-case guesses"]
-    for row in leaderboard_rows(data):
+    ranked = leaderboard_rows(data)
+    erd_texts, erd_width = _leaderboard_erd_cells(ranked)
+    rows = [f"Rank  Opener   {'ERD':<{erd_width}}  Worst-case guesses"]
+    for row, erd_text in zip(ranked, erd_texts):
         word = row["word"].upper() + ("*" if row["word_is_answer"] else "")
         rows.append(_fit(
-            f"{row['rank']:>4}  {word:<7}  {row['erd']:.3f}  "
+            f"{row['rank']:>4}  {word:<7}  {erd_text:<{erd_width}}  "
             f"{row['max_remaining_depth']}",
             width,
         ))
