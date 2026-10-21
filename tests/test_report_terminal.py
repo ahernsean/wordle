@@ -2802,21 +2802,38 @@ class RootProgressRendererTest(unittest.TestCase):
         output = render_report(root_progress_report(estimate={
             "remaining_candidate_count": 7171,
             "recent_candidate_count": 576,
-            "candidates_per_day": 576.0,
+            "candidates_per_second": 576 / 86400,
             "estimated_seconds": 1_075_650.0,
             "stalled_branch_count": 9,
             "stalled_remaining_candidate_count": 4256,
         }), width=120)
         self.assertIn("estimate ~12.4d", output)
         # Only groups still waiting hold work the estimate cannot see.
+        self.assertIn("for 7,171 candidates at ~24/h", output)
         self.assertIn("79 waiting groups", output)
-        self.assertIn("9 stalled branches", output)
+        self.assertIn("9 stalled branches (4,256 candidates)", output)
+
+    def test_rate_is_shown_per_the_shortest_span_holding_ten_events(self):
+        cases = (
+            (5_010_554 / 86400, "~58/s"),
+            (10, "~10/s"),
+            (9.9, "~594/min"),
+            (0.2, "~12/min"),
+            (0.1, "~360/h"),
+            (100 / 86400, "~100/day"),
+            (3 / 86400, "~3/day"),
+            (0, "~0/day"),
+        )
+        for events_per_second, expected in cases:
+            with self.subTest(events_per_second=events_per_second):
+                self.assertEqual(
+                    report_terminal.format_rate(events_per_second), expected)
 
     def test_provisional_estimate_states_its_sample_duration(self):
         output = render_report(root_progress_report(estimate={
             "remaining_candidate_count": 7171,
             "recent_candidate_count": 576,
-            "candidates_per_day": 576.0,
+            "candidates_per_second": 576 / 86400,
             "estimated_seconds": 1_075_650.0,
             "sample_duration_seconds": 600,
             "provisional": True,
@@ -3188,7 +3205,7 @@ class TerminalUtilityTest(unittest.TestCase):
                        "state_counts": {"waiting": 1, "evaluating": 2}},
             "estimate": {"provisional": True, "sample_duration_seconds": 60,
                          "estimated_seconds": 120, "remaining_candidate_count": 3,
-                         "candidates_per_day": 10, "stalled_branch_count": 1,
+                         "candidates_per_second": 0.025, "stalled_branch_count": 1,
                          "stalled_remaining_candidate_count": 2},
             "response_groups": [{"pattern": "-----", "state": "waiting",
                                  "answer_count": 2, "started": False,
@@ -3212,7 +3229,10 @@ class TerminalUtilityTest(unittest.TestCase):
         }
         output = report_terminal.render_report(report, width=120)
         self.assertIn("estimate ~2m", output)
-        self.assertIn("excludes 1 waiting groups and 1 stalled branches", output)
+        self.assertIn("at ~90/h", output)
+        self.assertIn(
+            "excludes 1 waiting group and 1 stalled branch (2 candidates)",
+            output)
 
 
 if __name__ == "__main__":

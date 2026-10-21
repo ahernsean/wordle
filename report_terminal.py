@@ -318,6 +318,20 @@ def _abbreviate_duration(seconds):
     return f"{seconds / 86400:.1f}d"
 
 
+# A rate is shown per the shortest span that holds at least ten events, so
+# it keeps two significant figures at any speed; slower than ten a day reads
+# per day.
+RATE_DISPLAY_UNITS = ((1, "s"), (60, "min"), (3600, "h"), (86400, "day"))
+
+
+def format_rate(events_per_second):
+    for span_seconds, unit in RATE_DISPLAY_UNITS:
+        events = events_per_second * span_seconds
+        if events >= 10:
+            break
+    return f"~{events:,.0f}/{unit}"
+
+
 DISK_RATE_FLOOR_BYTES = 10_000
 
 
@@ -2106,7 +2120,7 @@ def _render_root_progress_sections(report, width, display_order):
             f"  estimate ~{_abbreviate_duration(estimate['estimated_seconds'])}"
             f"{provisional_text}"
             f" for {estimate['remaining_candidate_count']:,} candidates"
-            f" at ~{estimate['candidates_per_day']:,.0f}/day",
+            f" at {format_rate(estimate['candidates_per_second'])}",
             width,
         ))
         # Only groups still waiting hold work the estimate cannot see.  A
@@ -2115,12 +2129,14 @@ def _render_root_progress_sections(report, width, display_order):
         excluded = []
         waiting = _state_counts(totals).get("waiting", 0)
         if waiting:
-            excluded.append(f"{waiting:,} waiting groups")
+            excluded.append(count_noun(waiting, "waiting group"))
         if estimate["stalled_branch_count"]:
             excluded.append(
-                f"{estimate['stalled_branch_count']:,} stalled branches"
-                f" ({estimate['stalled_remaining_candidate_count']:,}"
-                f" candidates)")
+                count_noun(estimate["stalled_branch_count"],
+                           "stalled branch", "stalled branches")
+                + " (" + count_noun(
+                    estimate["stalled_remaining_candidate_count"],
+                    "candidate") + ")")
         if excluded:
             summary.append(_fit("    excludes " + " and ".join(excluded),
                                 width))

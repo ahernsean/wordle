@@ -1822,7 +1822,7 @@ def _root_progress_estimate(active_branches, recent_window_seconds, now):
     return {
         "remaining_candidate_count": remaining,
         "recent_candidate_count": recent,
-        "candidates_per_day": rate_per_second * 86400,
+        "candidates_per_second": rate_per_second,
         "estimated_seconds": remaining / rate_per_second,
         "sample_duration_seconds": sample_duration_seconds,
         "provisional": sample_duration_seconds < recent_window_seconds,
