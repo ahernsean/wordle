@@ -1799,7 +1799,7 @@ class ReportClientContract:
                     self.assertAlmostEqual(part["width"], part["segmentWidth"],
                                            delta=0.5)
                 slivers = [part for part in parts[1:]
-                           if part["state"] != "work-unqueued"]
+                           if part["state"] in ("work-working", "work-queued")]
                 self.assertLess(max(part["width"] for part in slivers), 5)
                 for part in slivers:
                     self.assertNotEqual(part["color"], "rgba(0, 0, 0, 0)")
@@ -1814,16 +1814,27 @@ class ReportClientContract:
         }""")
         self.assertEqual(gap, 0)
 
-    def test_word_report_work_bar_gives_each_state_its_own_fill(self):
+    def test_word_report_work_bar_fills_only_work_in_hand(self):
+        # A finished group drops out of the bar, so the bar empties as the
+        # word's work completes; working and queued keep fills of their own.
         self._apply_word_breakdown([(40, "finished"), (30, "working"),
                                     (20, "queued"), (10, "unqueued")])
         colors = {part["state"]: part["color"]
                   for part in self._work_bar_against_strip()}
-        self.assertEqual(
-            colors["work-finished"],
-            self.page.evaluate("() => getComputedStyle(document.body).color"))
+        self.assertEqual(colors["work-finished"], "rgba(0, 0, 0, 0)")
         self.assertEqual(colors["work-unqueued"], "rgba(0, 0, 0, 0)")
-        self.assertEqual(len(set(colors.values())), 4, colors)
+        self.assertNotEqual(colors["work-working"], "rgba(0, 0, 0, 0)")
+        self.assertNotEqual(colors["work-queued"], "rgba(0, 0, 0, 0)")
+        self.assertNotEqual(colors["work-working"], colors["work-queued"])
+
+    def test_word_report_work_bar_keeps_each_part_over_its_group_once_finished(self):
+        # A finished group leaves its slot empty rather than closing it up, so
+        # the parts still unfinished stay over their own segments.
+        self._apply_word_breakdown([(40, "queued"), (30, "finished"),
+                                    (20, "working"), (10, "finished")])
+        for part in self._work_bar_against_strip():
+            self.assertAlmostEqual(part["left"], part["segmentLeft"], delta=0.5)
+            self.assertAlmostEqual(part["width"], part["segmentWidth"], delta=0.5)
 
     def test_a_finished_word_draws_no_work_bar(self):
         self._apply_word_breakdown([(40, "finished"), (10, "finished")])
