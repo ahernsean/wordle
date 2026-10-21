@@ -16,6 +16,8 @@
   },
   "erd_summary": {
    "erd": null,
+   "erd_denominator": null,
+   "erd_numerator": null,
    "infeasible_group_count": 1,
    "max_remaining_depth": null,
    "resolved_group_count": 2,
@@ -62,6 +64,8 @@
    {
     "answer_count": 8,
     "best_erd": 2.1,
+    "best_erd_denominator": null,
+    "best_erd_numerator": null,
     "best_guess": "crane",
     "best_guess_is_answer": true,
     "branch_key_hex": "01",
@@ -78,6 +82,8 @@
    {
     "answer_count": 5,
     "best_erd": null,
+    "best_erd_denominator": null,
+    "best_erd_numerator": null,
     "best_guess": null,
     "best_guess_is_answer": false,
     "branch_key_hex": "02",
@@ -94,6 +100,8 @@
    {
     "answer_count": 3,
     "best_erd": null,
+    "best_erd_denominator": null,
+    "best_erd_numerator": null,
     "best_guess": null,
     "best_guess_is_answer": false,
     "branch_key_hex": "03",
@@ -110,6 +118,8 @@
    {
     "answer_count": 1,
     "best_erd": null,
+    "best_erd_denominator": null,
+    "best_erd_numerator": null,
     "best_guess": null,
     "best_guess_is_answer": false,
     "branch_key_hex": "04",
