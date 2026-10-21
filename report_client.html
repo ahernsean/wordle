@@ -314,7 +314,6 @@
     .answer-segment:last-child { box-shadow:none; }
     .answer-work-bar { display:flex; width:100%; height:4px; border:solid transparent; border-width:0 1px; }
     .answer-work-bar > span { min-width:0; }
-    .answer-work-bar > .work-finished { background:var(--text); }
     .answer-work-bar > .work-working { background:var(--green); }
     .answer-work-bar > .work-queued { background:var(--dim); }
     .answer-strip[data-selectable] .answer-segment { cursor:pointer; }
@@ -2326,14 +2325,15 @@
       if(group.work_state==="finished")return group.solved?"solved":"lost";
       return WORK_STATE_TEXT[group.work_state];
     }
-    // Where each group stands in the swarm's work, on the strip's own scale:
-    // finished, being worked on, queued, or empty for a group nobody queued.
-    // Each state is a fill rather than a mark on the segment, so a one-pixel
-    // group still shows its state and a run of finished groups reads as one
-    // finished stretch.  It sits on its own track because the strip's size
-    // gradient passes through every hue the states could use.  A word with
-    // nothing left to do draws no bar, and neither does a report that sends no
-    // state.
+    // Where each group's unfinished work stands, on the strip's own scale:
+    // being worked on, queued, or empty for a group nobody queued.  A finished
+    // group keeps its place on the track with no fill, so the bar empties
+    // group by group as the word's work completes and every remaining part
+    // stays over its own segment.  Each state is a fill rather than a mark on
+    // the segment, so a one-pixel group still shows its state.  It sits on its
+    // own track because the strip's size gradient passes through every hue the
+    // states could use.  A word with nothing left to do draws no bar, and
+    // neither does a report that sends no state.
     function renderWorkBar(groups){
       if(!groups.some(group=>group.work_state&&group.work_state!=="finished"))return null;
       const bar=element("div","answer-work-bar");
