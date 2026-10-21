@@ -551,13 +551,21 @@
     const valueOrDash=value=>{if(value===null||value===undefined||value==="")return "—";if(typeof value==="number"&&Number.isInteger(value))return formatInteger(value);return String(value);};
     const numText=formatInteger;
     const boundFields=new Set(["best_erd","erd","ceiling","bound_erd","available_bound","wanted_ceiling"]);
-    const ERD_LATTICE_NOISE_MARGIN=1e-6, CEILING_EPS=1e-9;
     const fixed=(value,digits=3)=>value===null||value===undefined?null:Number(value).toFixed(digits);
-    const erdValue=(value,answerCount,{ceiling=false}={})=>{
-      const decimal=fixed(value);if(decimal===null||!Number.isFinite(Number(value))||!Number.isInteger(answerCount)||answerCount<=0)return decimal;
-      const scaled=Number(value)*answerCount,numerator=Math.round(scaled),allowance=ERD_LATTICE_NOISE_MARGIN+(ceiling?answerCount*CEILING_EPS:0);
-      return Math.abs(scaled-numerator)<allowance?decimal+" "+numText(numerator)+"/"+numText(answerCount):decimal;
+    // An ERD field's decimal and, where the report carries one, its exact
+    // unreduced fraction over the branch's answer count.  The report decides
+    // whether a value is on its lattice; a value it left without a fraction
+    // shows its decimal alone.
+    const erdFraction=(row,field)=>{
+      const numerator=row?.[field+"_numerator"],denominator=row?.[field+"_denominator"];
+      return Number.isInteger(numerator)&&Number.isInteger(denominator)?numText(numerator)+"/"+numText(denominator):null;
     };
+    const erdText=(row,field)=>{
+      const decimal=fixed(row?.[field]);if(decimal===null)return null;
+      const fraction=erdFraction(row,field);
+      return fraction?decimal+" "+fraction:decimal;
+    };
+    const isERDFractionField=key=>/_(numerator|denominator)$/.test(key)&&boundFields.has(key.replace(/_(numerator|denominator)$/,""));
     const displayValue=(key,value)=>boundFields.has(key)&&typeof value==="number"?fixed(value):value;
     const relativeAge=(seconds,now)=>{if(seconds===null||seconds===undefined)return null;const delta=Math.max(0,Math.round(now-seconds));if(delta<60)return delta+"s ago";if(delta<3600)return Math.floor(delta/60)+"m ago";if(delta<86400)return Math.floor(delta/3600)+"h ago";return Math.floor(delta/86400)+"d ago";};
     const absoluteTime=seconds=>seconds===null||seconds===undefined?"unknown time":new Date(seconds*1000).toLocaleString("en-GB",{dateStyle:"medium",timeStyle:"medium"});
@@ -1027,26 +1035,25 @@
       }
       return node;
     }
-    // The word/ERD pairing as one node: tiles for the word, text for the ERD it
-    // earned.  The word never splits from the decimal it earned, but an ERD on
-    // the lattice trails a rational whose width grows with the answer count --
-    // "/3.131 1572/502" is wider than a card -- so that rational is allowed to
-    // wrap away from the pair rather than carry it off the edge.
-    function bestGuessCell(row,answerCount=row.answer_count,prefix=""){
-      if(!row.best_guess)return null;
+    // The word/ERD pairing as one node: tiles for the word, then the ERD it
+    // earned.  The word never splits from its decimal, but an ERD on the
+    // lattice trails a rational whose width grows with the answer count --
+    // "CLART 3.131 1,572/502" is wider than a card -- so that rational is
+    // allowed to wrap away from the pair rather than carry it off the edge.
+    function wordErdCell(tiles,row,field,prefix=""){
       const cell=element("span","word-erd");
       if(prefix)cell.append(prefix);
-      const pair=element("span","word-erd-pair");
-      pair.append(wordTiles(row.best_guess,null,row.best_guess_is_answer));
-      let rational=null;
-      if(row.best_erd!==null&&row.best_erd!==undefined){
-        const [decimal,...lattice]=String(erdValue(row.best_erd,answerCount)).split(" ");
-        pair.append("/"+decimal);
-        if(lattice.length)rational=lattice.join(" ");
-      }
+      const pair=element("span","word-erd-pair"),decimal=fixed(row[field]);
+      pair.append(tiles);
+      if(decimal!==null)pair.append(" "+decimal);
       cell.append(pair);
+      const rational=decimal===null?null:erdFraction(row,field);
       if(rational)cell.append(" "+rational);
       return cell;
+    }
+    function bestGuessCell(row,prefix=""){
+      if(!row.best_guess)return null;
+      return wordErdCell(wordTiles(row.best_guess,null,row.best_guess_is_answer),row,"best_erd",prefix);
     }
     // The browser rounds a font's ascent and descent to whole pixels and snaps
     // the baseline it derives from them to a whole pixel, which can leave a
@@ -1196,7 +1203,7 @@
       fragment.append(banner,meta);
       return fragment;
     }
-    function bestText(row,answerCount=row.answer_count){return bestGuessCell(row,answerCount,"best ");}
+    function bestText(row){return bestGuessCell(row,"best ");}
     function statusChips(row){
       const chips=[element("span","chip",row.branch_status)];
       if(row.branch_worker_status)chips.push(element("span","chip",row.branch_worker_status));
@@ -1752,7 +1759,7 @@
         upButton.addEventListener("click",()=>setState({...currentState,kind:"auto",branch_target:spineText(contextSpine),tree:false,claims:false,answers:false,finalization_cursor:""}));
         fragment.append(upButton);
       }
-      const erd=data.erd_summary;if(erd){if(erd.state==="complete"){const erdMetrics=element("div","metrics");erdMetrics.append(metric("ERD",fixed(erd.erd,3)),metric("max remaining depth",erd.max_remaining_depth));fragment.append(erdMetrics);}else if(erd.state==="infeasible"){fragment.append(element("p","dim","ERD ∞: "+numText(erd.infeasible_group_count)+" of "+numText(erd.response_group_count)+" response groups unsolvable within budget"));}else{fragment.append(element("p","dim","ERD pending: "+numText(erd.resolved_group_count)+" of "+numText(erd.response_group_count)+" response groups solved"));}}
+      const erd=data.erd_summary;if(erd){if(erd.state==="complete"){const erdMetrics=element("div","metrics");erdMetrics.append(metric("ERD",erdText(erd,"erd")),metric("max remaining depth",erd.max_remaining_depth));fragment.append(erdMetrics);}else if(erd.state==="infeasible"){fragment.append(element("p","dim","ERD ∞: "+numText(erd.infeasible_group_count)+" of "+numText(erd.response_group_count)+" response groups unsolvable within budget"));}else{fragment.append(element("p","dim","ERD pending: "+numText(erd.resolved_group_count)+" of "+numText(erd.response_group_count)+" response groups solved"));}}
       const breakdown=data.response_group_breakdown;
       if(breakdown?.length){
         const panel=element("div","response-group-breakdown");
@@ -1848,7 +1855,7 @@
       }
       fragment.append(spineSection?sectionPair(spineSection,identitySection):identitySection);
       const bundleSummary=data.bundle_summary||{};
-      const queueFacts=data.queue?[["status",data.queue.branch_status],["worker",data.queue.branch_worker_status],["priority",data.queue.priority],["budget",data.queue.budget],["best",bestGuessCell(data.queue,branch.answer_count)||"none yet"],["ERD ceiling",erdValue(data.queue.ceiling,branch.answer_count,{ceiling:true})],["nodes",data.queue.search_node_count],...(bundleSummary.wall_time_millis?[['wall time',formatDuration(bundleSummary.wall_time_millis/1000)]]:[])]:null;
+      const queueFacts=data.queue?[["status",data.queue.branch_status],["worker",data.queue.branch_worker_status],["priority",data.queue.priority],["budget",data.queue.budget],["best",bestGuessCell(data.queue)||"none yet"],["ERD ceiling",erdText(data.queue,"ceiling")],["nodes",data.queue.search_node_count],...(bundleSummary.wall_time_millis?[['wall time',formatDuration(bundleSummary.wall_time_millis/1000)]]:[])]:null;
       fragment.append(section("Queue",queueFacts?labeledFacts(queueFacts):element("p","empty","No current queue state")));
       const claimSummary=data.claim_summary||{};
       if(data.queue&&data.queue.candidate_count){const liveWorkers=(data.workers||[]).filter(worker=>worker.is_live);const candidateFacts=[["candidates",formatInteger(data.queue.completed_candidate_count)+"/"+formatInteger(data.queue.candidate_count)+" ="],["evaluated",claimSummary.evaluated_count||0],["+ one-level ERD prunes",data.queue.one_level_erd_pruned_candidate_count??data.queue.bulk_completed_candidate_count],["+ two-level ERD prunes",data.queue.two_level_erd_pruned_candidate_count??0],...(claimSummary.provenance_unknown_count?[["+ unattributed",claimSummary.provenance_unknown_count]]:[])];const candidateStatusFacts=[...(claimSummary.in_flight_count?[["in flight",claimSummary.in_flight_count]]:[])],candidateETAFacts=[];const candidateETA=data.candidate_eta;if(candidateETA?.state==="ready"||candidateETA?.state==="rough"){const etaDataMinutes=Math.round(candidateETA.sample_duration_seconds/60),etaWorkers=candidateETA.worker_count_changed?"; scaling "+candidateETA.sample_worker_count+"→"+candidateETA.current_worker_count+" workers":"";candidateETAFacts.push([(candidateETA.state==="rough"?"Rough ETA":"ETA")+" ("+etaDataMinutes+" min data"+etaWorkers+")","~"+formatDuration(candidateETA.estimated_seconds)]);candidateETAFacts.push(["ETA work remaining","checks "+numText(candidateETA.remaining_inspection_count)+" · full evals ~"+numText(candidateETA.expected_full_evaluation_count)]);}else if(candidateETA?.state==="learning")candidateETAFacts.push(["ETA","learning: first 3 min of current work sample"]);const republishedList=data.republished_candidates||[];if(republishedList.length)candidateStatusFacts.push(["candidates re-queued",numText(republishedList.length)+" (up to "+Math.max(...republishedList.map(row=>row.republish_count))+"× each)"]);if(claimSummary.worker_contributions?.length)candidateStatusFacts.push(["worker evals",claimSummary.worker_contributions.map(row=>workerName({worker_id:row.worker_id})+":"+numText(row.done_count)).join(" ")]);const candidates=element("div");candidates.append(sweepStrip(data.queue.candidate_count,data.completed_candidate_bitmap,liveWorkers,previousBy(previous,"workers","worker_id")),labeledFacts(candidateFacts));if(candidateStatusFacts.length)candidates.append(labeledFacts(candidateStatusFacts));for(const fact of candidateETAFacts)candidates.append(labeledFacts([fact]));fragment.append(section("Candidates",candidates));}
@@ -1859,7 +1866,7 @@
       const bundleLabels={bundle_count:"bundles",censored_unit_count:"capped bundles",maximum_bundle_node_count:"max bundle nodes"};
       const bundlePairs=Object.entries(bundleSummary).filter(([key])=>key!=="node_count"&&key!=="wall_time_millis").map(([key,value])=>[bundleLabels[key]||label(key),value]);
       const bundlesSection=bundlePairs.length?section("Bundles",labeledFacts(bundlePairs)):null;
-      const cacheEntries=candidateErdKvEntries(data.cache,branch.answer_count,report.generated_at).map(([key,value])=>[key,value==="missing"?"not cached":value]);
+      const cacheEntries=candidateErdKvEntries(data.cache,report.generated_at).map(([key,value])=>[key,value==="missing"?"not cached":value]);
       const cacheSection=section("Cache",labeledFacts(cacheEntries));
       fragment.append(bundlesSection?sectionPair(bundlesSection,cacheSection):cacheSection);
       const ownership=data.branch_ownership||{};
@@ -1888,13 +1895,13 @@
           const facts=[];
           if(row.outcome==="exact"){
             if(row.best_guess){
-              facts.push(bestGuessCell(row,row.answer_count,"solved "));
+              facts.push(bestGuessCell(row,"solved "));
             }else{
               facts.push("solution not recorded");
             }
           }
-          if(row.loss_proof==="ceiling_above_budget")facts.push("ERD lower bound "+erdValue(row.ceiling,row.answer_count,{ceiling:true}),"exceeds budget "+valueOrDash(row.budget));
-          else if(row.ceiling!==null&&row.ceiling!==undefined)facts.push("ERD ceiling "+erdValue(row.ceiling,row.answer_count,{ceiling:true}));
+          if(row.loss_proof==="ceiling_above_budget")facts.push("ERD lower bound "+erdText(row,"ceiling"),"exceeds budget "+valueOrDash(row.budget));
+          else if(row.ceiling!==null&&row.ceiling!==undefined)facts.push("ERD ceiling "+erdText(row,"ceiling"));
           facts.push(numText(row.evaluated_candidate_count)+" evaluated",numText(row.one_level_erd_pruned_candidate_count??row.bulk_completed_candidate_count)+" one-level ERD prunes",numText(row.two_level_erd_pruned_candidate_count??0)+" two-level ERD prunes",numText(row.search_node_count)+" nodes");
           if(row.bundle_count)facts.push(numText(row.bundle_count)+" bundles");
           if(row.wall_time_millis)facts.push(formatDuration(row.wall_time_millis/1000));
@@ -1945,12 +1952,12 @@
           const title=element("div","card-title");
           title.append(element("h3","","Cut-reuse miss"));
           card.append(title);
-          const wanted=row.wanted_ceiling!==null&&row.wanted_ceiling!==undefined?"wanted ERD ceiling "+erdValue(row.wanted_ceiling,row.answer_count,{ceiling:true}):"wanted exact";
+          const wanted=row.wanted_ceiling!==null&&row.wanted_ceiling!==undefined?"wanted ERD ceiling "+erdText(row,"wanted_ceiling"):"wanted exact";
           card.append(statLine([
             numText(row.answer_count)+(row.answer_count===1?" answer":" answers"),
             "budget "+valueOrDash(row.budget),
             wanted,
-            "available ERD bound "+erdValue(row.available_bound,row.answer_count,{ceiling:true}),
+            "available ERD bound "+erdText(row,"available_bound"),
             "at budget "+valueOrDash(row.available_budget),
             "epoch "+valueOrDash(row.epoch),
             relativeAge(row.recorded_at,report.generated_at),
@@ -2027,8 +2034,8 @@
       const work=section("Current work",labeledFacts(currentWork));
       if(worker.descent?.length)work.append(renderSpine(worker.descent));
       fragment.append(work);
-      const best=bestGuessCell(worker,worker.answer_count);
-      const search=[["best",best],["effective bound",worker.bound_erd===null||worker.bound_erd===undefined?null:fixed(worker.bound_erd)],["solved",worker.solved_evaluation_count],["ERD cutoffs",worker.erd_cutoff_evaluation_count],["depth prunes",worker.remaining_depth_pruned_evaluation_count]];
+      const best=bestGuessCell(worker);
+      const search=[["best",best],["effective bound",erdText(worker,"bound_erd")],["solved",worker.solved_evaluation_count],["ERD cutoffs",worker.erd_cutoff_evaluation_count],["depth prunes",worker.remaining_depth_pruned_evaluation_count]];
       fragment.append(section("Search state",labeledFacts(search)));
       const cumulative=[["completed claims",worker.completed_claim_count],["cache hits",worker.cache_hit_count],["cache misses",worker.cache_miss_count],["opener work",worker.opener_work_id],["scheduling",worker.scheduling_role_reason||worker.scheduling_role]];
       fragment.append(section("Cumulative worker counters",labeledFacts(cumulative)));
@@ -2125,7 +2132,7 @@
       if(!summary)return null;
       // This fact wraps, unlike the others on the card, so it may break only
       // between its parts.
-      if(summary.state==="complete")return "ERD\u00a0"+fixed(summary.erd,3)+" · max\u00a0"+valueOrDash(summary.max_remaining_depth);
+      if(summary.state==="complete")return "ERD\u00a0"+erdText(summary,"erd")+" · max\u00a0"+valueOrDash(summary.max_remaining_depth);
       if(summary.state==="infeasible")return "ERD\u00a0∞ · "+countNoun(summary.infeasible_group_count,"unsolvable","unsolvable");
       return "ERD\u00a0pending · "+numText(summary.resolved_group_count)+"/"+numText(summary.response_group_count)+"\u00a0groups\u00a0solved";
     }
@@ -2233,22 +2240,22 @@
       return fragment;
     }
     function cacheRows(data){if(Array.isArray(data.recent_rows))return data.recent_rows;if(Array.isArray(data.rows))return data.rows;if(data.cache)return [{...data.cache,branch_key_hex:data.branch_key_hex,branch_reference:data.branch_reference}];return [];}
-    // A word and its ERD are folded into one "WORD*/2.809" entry rather than
+    // A word and its ERD are folded into one "WORD* 2.809" entry rather than
     // two separately labeled facts; best_erd is dropped once best_guess has
     // absorbed it, and best_guess_is_answer is metadata for that fold, never
     // a row of its own.
-    function candidateErdKvEntries(row,answerCount,generatedAt,skipKeys=[]){
+    function candidateErdKvEntries(row,generatedAt,skipKeys=[]){
       const skip=new Set(["branch_key_hex","best_guess_is_answer",...skipKeys]);
       const entries=[];
       for(const [key,value] of Object.entries(row||{})){
-        if(skip.has(key))continue;
+        if(skip.has(key)||isERDFractionField(key))continue;
         if(key==="best_erd"&&row.best_guess)continue;
-        if(key==="best_guess"){const pair=bestGuessCell(row,answerCount);if(pair)entries.push([timeLabel(key),pair]);continue;}
-        entries.push([timeLabel(key),key==="best_erd"?erdValue(value,answerCount):displayTimedValue(key,value,generatedAt)]);
+        if(key==="best_guess"){const pair=bestGuessCell(row);if(pair)entries.push([timeLabel(key),pair]);continue;}
+        entries.push([timeLabel(key),boundFields.has(key)&&typeof value==="number"?erdText(row,key):displayTimedValue(key,value,generatedAt)]);
       }
       return entries;
     }
-    function displayEntries(row,generatedAt){return candidateErdKvEntries(row,row.answer_count,generatedAt,["row_id","branch_reference","spine"]);}
+    function displayEntries(row,generatedAt){return candidateErdKvEntries(row,generatedAt,["row_id","branch_reference","spine"]);}
     function answerGroupColor(answerCount){if(answerCount>256)return "hsl(320 70% 42%)";const logarithmicPosition=Math.min(1,Math.log2(Math.max(1,answerCount))/9);return "hsl("+Math.round(210*(1-logarithmicPosition))+" 62% 43%)";}
     const RESPONSE_GROUP_BUCKETS=[
       {minimumAnswerCount:257,maximumAnswerCount:Infinity,labelText:"257+"},
@@ -2799,8 +2806,8 @@
     // way of showing the same row.
     function leaderboardCard(row,state,{breakdown=true,maximumResponseGroupCount=null}={}){
       const card=element("article","card leaderboard-card");card.dataset.identity=row.word;
-      const title=element("div","card-title"),entry=element("span","word-erd");
-      entry.append(wordTiles(row.word,null,row.word_is_answer,"word-md"),"/",element("span","erd-value",row.erdText));
+      const title=element("div","card-title");
+      const entry=wordErdCell(wordTiles(row.word,null,row.word_is_answer,"word-md"),row,"erd");
       title.append(element("span","leaderboard-rank","#"+numText(row.rank)),entry);
       card.append(title,element("div","leaderboard-worst-case dim","Worst-case solve: "+row.max_remaining_depth+" guesses"));
       if(breakdown)card.append(renderLeaderboardBreakdown(row,state,maximumResponseGroupCount));
@@ -2818,8 +2825,7 @@
     }
     function leaderboardNeighbourRow(row,redraw){
       const button=element("button","leaderboard-neighbour");button.type="button";button.dataset.identity=row.word;
-      const entry=element("span","word-erd");
-      entry.append(wordTiles(row.word,null,row.word_is_answer),"/",element("span","erd-value",row.erdText));
+      const entry=wordErdCell(wordTiles(row.word,null,row.word_is_answer),row,"erd");
       button.append(element("span","leaderboard-rank","#"+numText(row.rank)),entry);
       button.setAttribute("aria-label","#"+numText(row.rank)+" "+String(row.word).toUpperCase()+", show its response groups");
       button.setAttribute("aria-expanded","false");
@@ -3099,15 +3105,15 @@
       for(let index=0;index<count;index++){
         // An opener's ERD is total guesses over the answer list, so the
         // numerator is a count of guesses and the value is on the branch's
-        // lattice by construction.  erdValue renders both halves the way every
-        // other surface does.
-        const numerator=numerators[index],erd=numerator/denominator;
+        // lattice by construction, and the card renders both halves the way
+        // every other surface does.
+        const numerator=numerators[index];
         rows.push({
           word:words.slice(index*width,(index+1)*width),
           rank:firstRank+index,
+          erd:numerator/denominator,
           erd_numerator:numerator,
-          erd,
-          erdText:erdValue(erd,denominator),
+          erd_denominator:denominator,
           max_remaining_depth:depths[index],
           word_is_answer:!!(answerBits[index>>3]&(1<<(index&7))),
         });

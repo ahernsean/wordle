@@ -27,6 +27,8 @@
     "elapsed_time_millis": 120000,
     "erd_summary": {
      "erd": null,
+     "erd_denominator": null,
+     "erd_numerator": null,
      "infeasible_group_count": 0,
      "max_remaining_depth": null,
      "resolved_group_count": 96,
@@ -54,7 +56,9 @@
     "done_branch_count": 88,
     "elapsed_time_millis": 180000,
     "erd_summary": {
-     "erd": 3.4207,
+     "erd": 3.420691804300405,
+     "erd_denominator": 3209,
+     "erd_numerator": 10977,
      "infeasible_group_count": 0,
      "max_remaining_depth": 5,
      "resolved_group_count": 132,
@@ -82,7 +86,9 @@
     "done_branch_count": 40,
     "elapsed_time_millis": 480000,
     "erd_summary": {
-     "erd": 3.3891,
+     "erd": 3.38921782486756,
+     "erd_denominator": 3209,
+     "erd_numerator": 10876,
      "infeasible_group_count": 0,
      "max_remaining_depth": 4,
      "resolved_group_count": 141,
@@ -126,6 +132,8 @@
       "elapsed_time_millis": 120000,
       "erd_summary": {
        "erd": null,
+       "erd_denominator": null,
+       "erd_numerator": null,
        "infeasible_group_count": 0,
        "max_remaining_depth": null,
        "resolved_group_count": 96,
@@ -152,7 +160,9 @@
       "done_branch_count": 88,
       "elapsed_time_millis": 180000,
       "erd_summary": {
-       "erd": 3.4207,
+       "erd": 3.420691804300405,
+       "erd_denominator": 3209,
+       "erd_numerator": 10977,
        "infeasible_group_count": 0,
        "max_remaining_depth": 5,
        "resolved_group_count": 132,
@@ -194,7 +204,9 @@
       "done_branch_count": 40,
       "elapsed_time_millis": 480000,
       "erd_summary": {
-       "erd": 3.3891,
+       "erd": 3.38921782486756,
+       "erd_denominator": 3209,
+       "erd_numerator": 10876,
        "infeasible_group_count": 0,
        "max_remaining_depth": 4,
        "resolved_group_count": 141,

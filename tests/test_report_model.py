@@ -18,6 +18,7 @@ import erd_queue
 import erd_search
 import report_model
 from report_model import (
+    attach_erd_fractions,
     leaderboard_rows,
     breakdown_work_state,
     LEADERBOARD_NEIGHBOUR_COUNT,
@@ -59,7 +60,9 @@ from erd_reduction import (
     reduce_opener,
     response_group_is_solved,
 )
-from wordle_engine import ERD_ALL, GAME_GUESSES, ResponseCache, load_word_list
+from wordle_engine import (
+    _CEIL_EPS, ERD_ALL, GAME_GUESSES, ResponseCache, load_word_list,
+)
 from tests.opener_erds import store_opener_erds
 from wordle_ui import fmt_pattern, parse_pattern
 
@@ -1199,6 +1202,7 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(set(summary), {
             "state", "erd", "max_remaining_depth", "resolved_group_count",
             "infeasible_group_count", "response_group_count",
+            "erd_numerator", "erd_denominator",
         })
         self.assertIn(summary["state"], {"complete", "pending", "infeasible"})
         # The reduction walks every response group, not the filtered/limited view.
@@ -1224,11 +1228,79 @@ class ReportModelTest(unittest.TestCase):
         summary = report["data"]["erd_summary"]
         self.assertEqual(summary["state"], "complete")
         self.assertEqual(summary["erd"], 2.0)
+        # Over this branch's own answers, not the root's.
+        self.assertEqual(
+            (summary["erd_numerator"], summary["erd_denominator"]),
+            (2 * context["answer_count"], context["answer_count"]))
         self.assertLessEqual(summary["erd"], GAME_GUESSES - context["guess_depth"])
         self.assertEqual(
             summary["response_group_count"],
             report["data"]["response_group_counts"]["response_group_count"],
         )
+
+    def test_word_report_states_each_erd_over_its_own_branch(self):
+        # The word's ERD is over the branch it is played from -- the whole
+        # answer list at the root -- and each response group's over that
+        # group's own answers.  NURDY splits the four answers into itself,
+        # one other singleton, and a pair, cached here at 3/2.
+        pair = next(
+            words for words in ResponseCache(ANSWERS, score_cache=None)
+            .group_words("nurdy", ANSWERS).values() if len(words) == 2)
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        cache._conn.execute(
+            "INSERT INTO branch_best_by_policy (branch_key, policy, "
+            " answer_list_id, best_guess, best_score, max_depth, solve_budget, "
+            " updated_at) VALUES (?, ?, ?, ?, 1.5, 2, NULL, ?)",
+            (ScoreCache.encode_subset(pair), ERD_ALL, cache.answer_list_id,
+             pair[0], int(time.time())))
+        cache._conn.commit()
+        cache.close()
+
+        report = collect_report(self.sources, ReportRequest(
+            branch_target=parse_report_branch_target("nurdy"),
+        ))
+        summary = report["data"]["erd_summary"]
+        # One guess, then 0 + 1 + 3 more guesses across the four answers.
+        self.assertEqual(
+            (summary["state"], summary["erd"],
+             summary["erd_numerator"], summary["erd_denominator"]),
+            ("complete", 2.0, 8, 4))
+        group = next(row for row in report["data"]["response_groups"]
+                     if row["answer_count"] == 2)
+        self.assertEqual(
+            (group["best_erd"], group["best_erd_numerator"],
+             group["best_erd_denominator"]), (1.5, 3, 2))
+
+    def test_queue_and_branch_reports_carry_the_incumbent_and_ceiling_exactly(self):
+        # A ceiling carries the solver's padding above its lattice point, and
+        # the report names the point beneath it.
+        branch_words = ANSWERS[1:]
+        branch_key = ScoreCache.encode_subset(branch_words)
+        queue = self._open_queue()
+        queue.create_branch(branch_key, len(branch_words), 5, budget=4,
+                            ceiling=7 / 3 + _CEIL_EPS)
+        queue.update_branch_best(branch_key, "crane", 5 / 3, 2, budget=4)
+        queue.close()
+
+        overview = collect_report(self.sources, ReportRequest(
+            report_kind="overview",
+            filters=ReportFilters(branch_statuses=("evaluating", "queued", "done")),
+        ))
+        branch = collect_report(self.sources, ReportRequest(
+            report_kind="branch",
+            branch_target=parse_report_branch_target(
+                "@" + branch_reference(branch_key)),
+        ))
+
+        exact = {
+            "best_erd_numerator": 5, "best_erd_denominator": 3,
+            "ceiling_numerator": 7, "ceiling_denominator": 3,
+        }
+        row = next(row for row in overview["data"]["branches"]
+                   if row["branch_key_hex"] == branch_key.hex())
+        self.assertEqual({key: row[key] for key in exact}, exact)
+        self.assertEqual(
+            {key: branch["data"]["queue"][key] for key in exact}, exact)
 
     def test_reports_live_owner_priority_for_stale_promoted_branch(self):
         response_groups = ResponseCache(ANSWERS).group_words("salet", ANSWERS)
@@ -3411,6 +3483,75 @@ class ReportModelTest(unittest.TestCase):
         cache.close()
 
 
+class ERDFractionTest(unittest.TestCase):
+    def test_a_fraction_is_never_reduced(self):
+        # 54/18 is eighteen answers and fifty-four guesses across them; 3/1
+        # would name a different population.
+        self.assertEqual(
+            attach_erd_fractions({"erd": 54 / 18}, 18),
+            {"erd": 3.0, "erd_numerator": 54, "erd_denominator": 18})
+
+    def test_a_padded_ceiling_reports_the_lattice_point_beneath_it(self):
+        # At 3,209 answers the padding is 3.2e-6 in numerator units, beyond
+        # the noise an exact value is allowed, so only a bound admits it.
+        padded = 3 / 3209 + _CEIL_EPS
+        row = attach_erd_fractions(
+            {"ceiling": padded, "best_erd": padded}, 3209)
+        self.assertEqual(
+            (row["ceiling_numerator"], row["ceiling_denominator"]), (3, 3209))
+        self.assertEqual(
+            (row["best_erd_numerator"], row["best_erd_denominator"]),
+            (None, None))
+
+    def test_every_bound_field_admits_the_ceiling_padding(self):
+        row = attach_erd_fractions({
+            field: 52 / 19 + _CEIL_EPS for field in (
+                "ceiling", "bound_erd", "available_bound", "wanted_ceiling")
+        }, 19)
+        for field in ("ceiling", "bound_erd", "available_bound", "wanted_ceiling"):
+            self.assertEqual(
+                (row[f"{field}_numerator"], row[f"{field}_denominator"]),
+                (52, 19))
+
+    def test_an_off_lattice_value_keeps_its_decimal_and_no_fraction(self):
+        # 2.1 over eight answers is 16.8 guesses: no snapping to 17/8.
+        self.assertEqual(
+            attach_erd_fractions({"best_erd": 2.1}, 8),
+            {"best_erd": 2.1, "best_erd_numerator": None,
+             "best_erd_denominator": None})
+
+    def test_a_value_with_no_known_answer_count_stays_decimal_only(self):
+        for answer_count in (None, 0, True):
+            self.assertEqual(
+                attach_erd_fractions({"erd": 2.0, "ceiling": None}, answer_count),
+                {"erd": 2.0, "erd_numerator": None, "erd_denominator": None,
+                 "ceiling": None, "ceiling_numerator": None,
+                 "ceiling_denominator": None})
+
+    def test_a_report_row_is_expressed_over_its_own_answer_count(self):
+        # A branch, a worker's current branch, and a finalization each name
+        # their own answer count, at whatever depth they sit; a payload with
+        # no answer count of its own is left for its producer.
+        report = {"data": {
+            "branches": [{"answer_count": 19, "best_erd": 52 / 19,
+                          "ceiling": 53 / 19 + _CEIL_EPS}],
+            "workers": [{"answer_count": 8, "bound_erd": 2.5}],
+            "nested": {"rows": [[{"answer_count": 2, "erd": 1.5}]]},
+            "queue": {"best_erd": 1.5},
+            "statistic": {"answer_count": 4, "mean_erd": 2.0},
+        }}
+        report_model._attach_report_erd_fractions(report)
+        data = report["data"]
+        self.assertEqual(
+            (data["branches"][0]["best_erd_numerator"],
+             data["branches"][0]["ceiling_numerator"],
+             data["branches"][0]["ceiling_denominator"]), (52, 53, 19))
+        self.assertEqual(data["workers"][0]["bound_erd_numerator"], 20)
+        self.assertEqual(data["nested"]["rows"][0][0]["erd_numerator"], 3)
+        self.assertEqual(data["queue"], {"best_erd": 1.5})
+        self.assertEqual(data["statistic"], {"answer_count": 4, "mean_erd": 2.0})
+
+
 class OpenerReportTest(unittest.TestCase):
     setUp = ReportModelTest.setUp
     tearDown = ReportModelTest.tearDown
@@ -3799,6 +3940,8 @@ class OpenerReportTest(unittest.TestCase):
             "state": "complete", "erd": 2.5, "max_remaining_depth": 3,
             "resolved_group_count": 4, "infeasible_group_count": 0,
             "response_group_count": 4,
+            # Ten guesses across the whole four-answer list.
+            "erd_numerator": 10, "erd_denominator": 4,
         })
         # Finished with no stored row: there is nothing to read, and nothing
         # is derived in its place.
@@ -3823,6 +3966,7 @@ class OpenerReportTest(unittest.TestCase):
             "state": "pending", "erd": None, "max_remaining_depth": None,
             "resolved_group_count": 2, "infeasible_group_count": 0,
             "response_group_count": 3,
+            "erd_numerator": None, "erd_denominator": None,
         }
         self.assertEqual(self._openers()["summary"][0]["erd_summary"], expected)
 
