@@ -859,7 +859,7 @@ def _display_queue_best(queue):
     else:
         best = queue["best_guess"].upper()
         if queue.get("best_erd") is not None:
-            best += f"/ERD {_format_erd(queue, 'best_erd')}"
+            best += f" ERD {_format_erd(queue, 'best_erd')}"
     if queue.get("ceiling") is not None:
         best += f" ceiling={_format_erd(queue, 'ceiling')}"
     return best
@@ -872,7 +872,7 @@ def _display_best(row):
     if row.get("best_guess_is_answer"):
         best += "*"
     if row.get("best_erd") is not None:
-        best += f"/{row['best_erd']:.3f}"
+        best += f" {row['best_erd']:.3f}"
     return best
 
 
@@ -1295,7 +1295,7 @@ def _render_branch_sections(report, previous_report, color, width, display_order
     cache_line = f"  {'not cached' if cache['cache_state'] == 'missing' else cache['cache_state']}"
     if cache.get("best_guess"):
         cache_line += (
-            f"  best={cache['best_guess'].upper()}/ERD "
+            f"  best={cache['best_guess'].upper()} ERD "
             f"{_format_erd(cache, 'best_erd')}"
         )
     if cache.get("max_remaining_depth") is not None:

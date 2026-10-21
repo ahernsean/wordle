@@ -1943,6 +1943,11 @@ class ReportClientContract:
         # count, so every card states its fraction.
         self.assertIn("3.560 356/100", text)
         self.assertIn("3.710 371/100", text)
+        # The word and its ERD are joined by a space: a slash beside the
+        # fraction would read as a second division.
+        entries = self.page.locator(".leaderboard-card .word-erd-pair").all_inner_texts()
+        self.assertIn("SALET 3.560", entries)
+        self.assertNotIn("/3.", text)
         self.assertIn("Worst-case solve: 6 guesses", text)
         self.assertNotIn("max remaining depth", text)
         self.assertNotIn("expected guesses remaining", text)
@@ -3765,7 +3770,7 @@ class ReportClientContract:
         for expected in (
             "Current work", "current-claim nodes 900", "nodes/s 46",
             "candidate index 7", "claim started", "Search state",
-            "candidate NURDY", "best CRANE/2.250 18/8",
+            "candidate NURDY", "best CRANE 2.250 18/8",
             "effective bound 2.500 20/8", "cache hits 50",
             "cache misses 10",
             "Open branch",
@@ -3944,10 +3949,10 @@ class ReportClientContract:
           applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
           return document.querySelector('#report').innerText;
         }""")
-        self.assertIn("best CRANE/2.125 17/8", text)
-        self.assertIn("best guess CRANE/2.125 17/8", text)
+        self.assertIn("best CRANE 2.125 17/8", text)
+        self.assertIn("best guess CRANE 2.125 17/8", text)
         self.assertIn("2.250 18/8", text)
-        self.assertIn("solved CIGAR/1.875 15/8", text)
+        self.assertIn("solved CIGAR 1.875 15/8", text)
         self.assertIn("wanted ERD ceiling 2.125 17/8", text)
         self.assertIn("available ERD bound 2.250 18/8", text)
         self.assertNotIn("3/2", text)
@@ -3967,7 +3972,7 @@ class ReportClientContract:
         }""")
         self.assertIn("3.000 54/18", text)
         self.assertNotIn("3/1", text)
-        self.assertIn("CRANE/2.250 18/8", text)
+        self.assertIn("CRANE 2.250 18/8", text)
 
     def test_an_erd_fraction_is_never_a_fact_of_its_own(self):
         # The pair renders beside its decimal, so a card that lists a row's
@@ -3978,7 +3983,7 @@ class ReportClientContract:
           applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
           return document.querySelector('#report').innerText;
         }""")
-        self.assertIn("best guess CRANE/2.125 17/8", text)
+        self.assertIn("best guess CRANE 2.125 17/8", text)
         self.assertNotIn("numerator", text)
         self.assertNotIn("denominator", text)
 
@@ -4119,7 +4124,7 @@ class ReportClientContract:
           applyReport(branch,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
           return document.querySelector('#report').innerText;
         }""")
-        self.assertIn("solved CIGAR/1.875", text)
+        self.assertIn("solved CIGAR 1.875", text)
         self.assertNotIn("solution not recorded", text)
 
     def test_finalization_shows_best_first_scheduling_evidence(self):
@@ -4194,7 +4199,7 @@ class ReportClientContract:
             "section:has-text('Recent finalizations') .card"
         ).first
         self.assertIn("SLATE", card.inner_text())
-        self.assertIn("solved CRANE/1.875", card.inner_text())
+        self.assertIn("solved CRANE 1.875", card.inner_text())
         # The spine's CRANE and the solved CRANE are both marked; SLATE, which
         # is not in the answer set, is not.
         words = card.locator(".word")
@@ -6576,7 +6581,7 @@ class ReportClientContract:
 
     def test_a_lattice_rational_wraps_instead_of_leaving_the_card(self):
         # An ERD on the lattice trails a rational whose width grows with the
-        # answer count, so "best CLART/3.131 1572/502" is wider than a branch
+        # answer count, so "best CLART 3.131 1,572/502" is wider than a branch
         # card.  Held rigid it left the card; it may wrap after the decimal,
         # but the word must never split from the decimal it earned.
         for width in (390, 480, 700, 1200):
@@ -6611,9 +6616,9 @@ class ReportClientContract:
             self.assertLessEqual(
                 measured["overflow"], 0.5,
                 f"the ERD left the card at {width}px: {measured}")
-            # The pair is one unbroken run: CLART and /3.131 together.
+            # The pair is one unbroken run: CLART and 3.131 together.
             self.assertEqual(measured["pairLines"], 1, measured)
-            self.assertEqual(measured["pairText"], "CLART/3.131", measured)
+            self.assertEqual(measured["pairText"], "CLART 3.131", measured)
 
     def test_no_horizontal_scroll_at_required_widths(self):
         # Every view, not just whichever one setUp left loaded: the tree view

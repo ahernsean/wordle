@@ -198,7 +198,7 @@ class OverviewRendererTest(unittest.TestCase):
         self.assertIn("w2", output)
         self.assertNotIn("worker-2", output)
         self.assertIn("NURDY*", output)
-        self.assertIn("CRANE*/2.250", output)
+        self.assertIn("CRANE* 2.250", output)
         self.assertNotIn("guess_depth=", output)
         self.assertNotIn("worker=", output)
         self.assertNotIn("\033", output)
@@ -299,7 +299,7 @@ class OverviewRendererTest(unittest.TestCase):
         output = render_overview(
             current, previous_report=previous, color=True, width=100
         )
-        self.assertIn(report_terminal.GREEN + "CRANE*/2.125", output)
+        self.assertIn(report_terminal.GREEN + "CRANE* 2.125", output)
         self.assertNotIn(report_terminal.GREEN + "26/100", output)
 
     def test_stalled_worker_rate_is_highlighted_red(self):
@@ -910,8 +910,8 @@ class OverviewRendererTest(unittest.TestCase):
             "provenance_unknown": False,
         }
         output = render_report(report, width=120)
-        self.assertIn("best=CRANE/ERD 2.737 52/19 ceiling=2.789 53/19", output)
-        self.assertIn("best=CRANE/ERD 3.000 54/18", output)
+        self.assertIn("best=CRANE ERD 2.737 52/19 ceiling=2.789 53/19", output)
+        self.assertIn("best=CRANE ERD 3.000 54/18", output)
         self.assertIn("available ERD bound=2.474 47/19", output)
         self.assertTrue(output.endswith("available ERD bound=2.500"), output)
 
@@ -2891,7 +2891,7 @@ class TerminalUtilityTest(unittest.TestCase):
         display_order = report_terminal.DisplayOrder()
         self.assertEqual(report_terminal._display_done(branch), "2/4")
         self.assertEqual(report_terminal._display_erd_prunes({}), "0/0")
-        self.assertEqual(report_terminal._display_best(branch), "RAISE*/2.500")
+        self.assertEqual(report_terminal._display_best(branch), "RAISE* 2.500")
         self.assertEqual(report_terminal._branch_display_row(branch, 20, display_order)["display_status"], "final")
         worker = {
             "worker_id": "worker-2", "updated_at": 10, "current_candidate": "raise",

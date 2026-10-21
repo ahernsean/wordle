@@ -1036,25 +1036,25 @@
       }
       return node;
     }
-    // The word/ERD pairing as one node: tiles for the word, text for the ERD it
-    // earned.  The word never splits from the decimal it earned, but an ERD on
-    // the lattice trails a rational whose width grows with the answer count --
-    // "/3.131 1572/502" is wider than a card -- so that rational is allowed to
-    // wrap away from the pair rather than carry it off the edge.
-    function bestGuessCell(row,prefix=""){
-      if(!row.best_guess)return null;
+    // The word/ERD pairing as one node: tiles for the word, then the ERD it
+    // earned.  The word never splits from its decimal, but an ERD on the
+    // lattice trails a rational whose width grows with the answer count --
+    // "CLART 3.131 1,572/502" is wider than a card -- so that rational is
+    // allowed to wrap away from the pair rather than carry it off the edge.
+    function wordErdCell(tiles,row,field,prefix=""){
       const cell=element("span","word-erd");
       if(prefix)cell.append(prefix);
-      const pair=element("span","word-erd-pair");
-      pair.append(wordTiles(row.best_guess,null,row.best_guess_is_answer));
-      let rational=null;
-      if(row.best_erd!==null&&row.best_erd!==undefined){
-        pair.append("/"+fixed(row.best_erd));
-        rational=erdFraction(row,"best_erd");
-      }
+      const pair=element("span","word-erd-pair"),decimal=fixed(row[field]);
+      pair.append(tiles);
+      if(decimal!==null)pair.append(" "+decimal);
       cell.append(pair);
+      const rational=decimal===null?null:erdFraction(row,field);
       if(rational)cell.append(" "+rational);
       return cell;
+    }
+    function bestGuessCell(row,prefix=""){
+      if(!row.best_guess)return null;
+      return wordErdCell(wordTiles(row.best_guess,null,row.best_guess_is_answer),row,"best_erd",prefix);
     }
     // The browser rounds a font's ascent and descent to whole pixels and snaps
     // the baseline it derives from them to a whole pixel, which can leave a
@@ -2241,7 +2241,7 @@
       return fragment;
     }
     function cacheRows(data){if(Array.isArray(data.recent_rows))return data.recent_rows;if(Array.isArray(data.rows))return data.rows;if(data.cache)return [{...data.cache,branch_key_hex:data.branch_key_hex,branch_reference:data.branch_reference}];return [];}
-    // A word and its ERD are folded into one "WORD*/2.809" entry rather than
+    // A word and its ERD are folded into one "WORD* 2.809" entry rather than
     // two separately labeled facts; best_erd is dropped once best_guess has
     // absorbed it, and best_guess_is_answer is metadata for that fold, never
     // a row of its own.
@@ -2806,8 +2806,8 @@
     // way of showing the same row.
     function leaderboardCard(row,state,{breakdown=true,maximumResponseGroupCount=null}={}){
       const card=element("article","card leaderboard-card");card.dataset.identity=row.word;
-      const title=element("div","card-title"),entry=element("span","word-erd");
-      entry.append(wordTiles(row.word,null,row.word_is_answer,"word-md"),"/",element("span","erd-value",row.erdText));
+      const title=element("div","card-title");
+      const entry=wordErdCell(wordTiles(row.word,null,row.word_is_answer,"word-md"),row,"erd");
       title.append(element("span","leaderboard-rank","#"+numText(row.rank)),entry);
       card.append(title,element("div","leaderboard-worst-case dim","Worst-case solve: "+row.max_remaining_depth+" guesses"));
       if(breakdown)card.append(renderLeaderboardBreakdown(row,state,maximumResponseGroupCount));
@@ -2825,8 +2825,7 @@
     }
     function leaderboardNeighbourRow(row,redraw){
       const button=element("button","leaderboard-neighbour");button.type="button";button.dataset.identity=row.word;
-      const entry=element("span","word-erd");
-      entry.append(wordTiles(row.word,null,row.word_is_answer),"/",element("span","erd-value",row.erdText));
+      const entry=wordErdCell(wordTiles(row.word,null,row.word_is_answer),row,"erd");
       button.append(element("span","leaderboard-rank","#"+numText(row.rank)),entry);
       button.setAttribute("aria-label","#"+numText(row.rank)+" "+String(row.word).toUpperCase()+", show its response groups");
       button.setAttribute("aria-expanded","false");
@@ -3106,15 +3105,15 @@
       for(let index=0;index<count;index++){
         // An opener's ERD is total guesses over the answer list, so the
         // numerator is a count of guesses and the value is on the branch's
-        // lattice by construction.  erdText renders both halves the way every
-        // other surface does.
-        const numerator=numerators[index],erd=numerator/denominator;
-        const exact={erd,erd_numerator:numerator,erd_denominator:denominator};
+        // lattice by construction, and the card renders both halves the way
+        // every other surface does.
+        const numerator=numerators[index];
         rows.push({
           word:words.slice(index*width,(index+1)*width),
           rank:firstRank+index,
-          ...exact,
-          erdText:erdText(exact,"erd"),
+          erd:numerator/denominator,
+          erd_numerator:numerator,
+          erd_denominator:denominator,
           max_remaining_depth:depths[index],
           word_is_answer:!!(answerBits[index>>3]&(1<<(index&7))),
         });
