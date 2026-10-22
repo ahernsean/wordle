@@ -333,6 +333,7 @@
     /* Plain grid flow: every label stays in normal document flow, so none
        can overlap another regardless of the card's width. */
     .response-bucket-legend { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:.2rem .55rem; margin-top:.4rem; color:var(--dim); font-size:.72rem; }
+    .response-bucket-legend[hidden] { display:none; }
     .response-bucket-legend > span::before { content:""; display:inline-block; width:.55rem; height:.55rem; margin-right:.16rem; border-radius:1px; vertical-align:-.08rem; background:var(--bucket-color); }
     .leaderboard-worst-case { margin-top:.15rem; font-size:.8rem; }
     .progress-line { margin:.25rem 0; }
@@ -2381,6 +2382,13 @@
       }
       return chosen;
     }
+    // Runs `callback` once `node` is first laid out and again whenever its
+    // width changes, so labels fitted to a width follow a resize or a
+    // rotation across the narrow breakpoint.
+    function onWidthChange(node,callback){
+      let width=-1;
+      new ResizeObserver(([entry])=>{if(entry.contentRect.width===width)return;width=entry.contentRect.width;callback();}).observe(node);
+    }
     function renderAnswerStrip(row,selection=null){
       const groups=row.response_groups||[],answerCount=row.answer_count||groups.reduce((total,group)=>total+group.answer_count,0),strip=element("div","answer-strip");
       strip.setAttribute("aria-label","Answer probability by response group for "+String(row.word||"").toUpperCase());
@@ -2412,7 +2420,7 @@
         }
         strip.append(segment);
       }
-      requestAnimationFrame(()=>{
+      onWidthChange(strip,()=>{
         const narrow=matchMedia("(max-width: 600px)").matches;
         fitSegmentLabels([...strip.children],"answer-segment-label",(segment,index)=>{
           const answerCount=groups[index].answer_count,countText=numText(answerCount);
@@ -2455,16 +2463,19 @@
       }
       track.setAttribute("aria-label",numText(groups.length)+" response groups for "+String(row.word||"").toUpperCase()+(maximumResponseGroupCount?" out of the "+numText(maximumResponseGroupCount)+" the best guess splits this branch into":""));
       track.append(fill);
-      requestAnimationFrame(()=>{
+      const legendItems=[...legend.children];
+      onWidthChange(fill,()=>{
         const narrow=matchMedia("(max-width: 600px)").matches,segments=[...fill.children];
         const chosen=fitSegmentLabels(segments,"response-count-segment-label",segment=>{
           const countText=segment.dataset.countText,groupsWord=countText==="1"?"group":"groups";
           return narrow?[[countText]]:[[segment.dataset.wordLabel,countText+" "+groupsWord],[countText,groupsWord],[countText]];
         });
-        if(narrow){const legendItems=[...legend.children],leftColumnSize=Math.ceil(legendItems.length/2),mobileOrder=[];for(let index=0;index<leftColumnSize;index++){mobileOrder.push(legendItems[index]);if(legendItems[index+leftColumnSize])mobileOrder.push(legendItems[index+leftColumnSize]);}legend.append(...mobileOrder);}
+        // Narrow, the two columns read down: the first half, then the second.
+        const leftColumnSize=Math.ceil(legendItems.length/2),ordered=narrow?legendItems.flatMap((_,index)=>index<leftColumnSize?[legendItems[index],...(legendItems[index+leftColumnSize]?[legendItems[index+leftColumnSize]]:[])]:[]):legendItems;
         // A segment showing its full label needs no legend entry.
-        else for(const item of segments.filter((_,index)=>chosen[index]===0).map(segment=>legend.children[Number(segment.dataset.legendIndex)]))item?.remove();
-        if(!legend.children.length)legend.remove();
+        const labelled=new Set(narrow?[]:segments.filter((_,index)=>chosen[index]===0).map(segment=>legendItems[Number(segment.dataset.legendIndex)]));
+        legend.replaceChildren(...ordered.filter(item=>!labelled.has(item)));
+        legend.hidden=!legend.children.length;
       });
       return [track,legend];
     }

@@ -1665,6 +1665,37 @@ class ReportClientContract:
         self.assertEqual(counts["2–4 answers"], ["2"], counts)
         self.assertEqual(counts["1 answer"], ["1 word:\n98 groups"], counts)
 
+    def test_bars_refit_their_labels_when_the_page_narrows_and_widens(self):
+        self.page.evaluate("""row => {
+          const host = document.createElement('div');
+          host.id = 'refit-host';
+          host.append(renderResponseGroupBreakdown(row));
+          document.body.append(host);
+        }""", self._breakdown_row([513, 353, 287, 233, 186] + [1] * 60))
+        read = """async () => {
+          await new Promise(requestAnimationFrame);
+          await new Promise(requestAnimationFrame);
+          const host = document.getElementById('refit-host');
+          const segments = [...host.querySelectorAll(
+            '.answer-segment, .response-count-segment')];
+          return {
+            first: host.querySelector('.answer-segment').innerText,
+            overflowing: segments.filter(segment => segment.firstElementChild
+              && segment.firstElementChild.scrollWidth > segment.clientWidth).length,
+            legend: [...host.querySelectorAll('.response-bucket-legend > span')]
+              .map(item => item.textContent),
+          };
+        }"""
+        wide = self.page.evaluate(read)
+        self.assertEqual(wide["first"], "513\nwords", wide)
+        self.page.set_viewport_size({"width": 375, "height": 800})
+        narrow = self.page.evaluate(read)
+        self.assertEqual(narrow["first"], "513", narrow)
+        self.assertEqual(narrow["overflowing"], 0, narrow)
+        self.assertGreater(len(narrow["legend"]), len(wide["legend"]), narrow)
+        self.page.set_viewport_size({"width": 1200, "height": 800})
+        self.assertEqual(self.page.evaluate(read), wide)
+
     def test_narrow_bars_show_only_counts_that_fit(self):
         self.page.set_viewport_size({"width": 375, "height": 800})
         answer_counts = [513, 353, 287, 233, 186] + [1] * 60
