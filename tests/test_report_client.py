@@ -3596,6 +3596,49 @@ class ReportClientContract:
             self.page.locator(".grid.leaderboard > .leaderboard-card").count(), 2)
         self.assertNotIn("error", self.page.locator("#connection").inner_text().lower())
 
+    def test_word_report_poll_keeps_the_reading_position_below_the_legend(self):
+        # Wide, the response-count legend drops the entries its bar already
+        # labels, so it is shorter once fitted than as first drawn.  Native
+        # scroll anchoring would absorb a fit that landed after the reading
+        # position was restored, and Safari has none, so it is turned off: the
+        # restore alone must hold the reader in place, poll after poll.
+        self.page.set_viewport_size({"width": 1200, "height": 800})
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector(".response-bucket-legend", state="attached")
+        self.page.add_style_tag(content=(
+            "* { overflow-anchor: none !important; }"
+            " #report { padding-bottom: 4000px; }"))
+        self.page.evaluate("""() => {
+          const realFetch = window.fetch.bind(window);
+          let poll = 0;
+          window.fetch = (url, options) => realFetch(url, options).then(async response => {
+            if (!String(url).includes('/api/view?')) return response;
+            const report = await response.json();
+            poll += 1;
+            report.data.response_group_breakdown[0].answer_count += poll;
+            return new Response(JSON.stringify(report), {
+              status: 200, headers: {'Content-Type': 'application/json'},
+            });
+          });
+        }""")
+        self.page.evaluate("async () => { await window.__reportClient.fetchReport(); }")
+        legend = self.page.locator(".response-bucket-legend")
+        drawn = legend.evaluate("(node) => node.closest('#report').querySelectorAll('.response-count-segment').length")
+        self.assertLess(legend.evaluate("(node) => node.children.length"), drawn)
+        reading = self.page.locator("#report [data-identity]").first
+        self.assertGreater(
+            reading.evaluate("(node) => node.getBoundingClientRect().top"),
+            self.page.locator(".response-count-track").evaluate(
+                "(node) => node.getBoundingClientRect().bottom"))
+        reading.evaluate("(node) => window.scrollTo(0, window.scrollY + node.getBoundingClientRect().top - 100)")
+        before = self.page.evaluate("() => window.scrollY")
+        for _ in range(3):
+            self.page.evaluate("() => document.querySelector('#report').firstElementChild.dataset.testMarker = 'old'")
+            self.page.evaluate("async () => { await window.__reportClient.fetchReport(); }")
+            self.page.evaluate("() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
+            self.assertEqual(self.page.locator("#report [data-test-marker]").count(), 0)
+        self.assertEqual(self.page.evaluate("() => window.scrollY"), before)
+
     def test_unchanged_leaderboard_poll_keeps_the_reading_position(self):
         self.page.set_viewport_size({"width": 834, "height": 1112})
         self.page.evaluate("""() => {
