@@ -333,6 +333,7 @@
     /* Plain grid flow: every label stays in normal document flow, so none
        can overlap another regardless of the card's width. */
     .response-bucket-legend { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:.2rem .55rem; margin-top:.4rem; color:var(--dim); font-size:.72rem; }
+    .response-bucket-legend[hidden] { display:none; }
     .response-bucket-legend > span::before { content:""; display:inline-block; width:.55rem; height:.55rem; margin-right:.16rem; border-radius:1px; vertical-align:-.08rem; background:var(--bucket-color); }
     .leaderboard-worst-case { margin-top:.15rem; font-size:.8rem; }
     .progress-line { margin:.25rem 0; }
@@ -409,9 +410,7 @@
       header { position:static; }
     }
     @media (max-width:600px) {
-      .answer-segment, .response-count-segment { font-size:0; }
-      .answer-segment[data-answer-count]::after { content:attr(data-answer-count); font-size:.66rem; }
-      .response-count-segment[data-response-group-count]::after { content:attr(data-response-group-count); font-size:.66rem; }
+      .answer-segment, .response-count-segment { font-size:.66rem; }
     }
   </style>
 </head>
@@ -2362,6 +2361,34 @@
       }
       return bar;
     }
+    // Labels each segment with the first of its candidate labels that fits
+    // the width the segment was laid out at, or with none, and returns the
+    // index of the label each segment kept (-1 for none).  A candidate is a
+    // list of lines.  Every segment is written and then every segment
+    // measured, once per candidate rank, so a strip of a hundred segments
+    // forces a few layouts rather than one per segment.
+    function fitSegmentLabels(segments,labelClass,labelsFor){
+      const candidates=segments.map(labelsFor),chosen=segments.map(()=>-1);
+      let pending=segments.map((_,index)=>index);
+      for(let rank=0;pending.length;rank++){
+        pending=pending.filter(index=>{if(rank<candidates[index].length)return true;segments[index].replaceChildren();return false;});
+        const labels=pending.map(index=>{
+          const label=element("span",labelClass);
+          for(const [lineIndex,line] of candidates[index][rank].entries()){if(lineIndex)label.append(document.createElement("br"));label.append(line);}
+          segments[index].replaceChildren(label);
+          return label;
+        });
+        pending=pending.filter((index,position)=>{if(labels[position].scrollWidth+4<=segments[index].clientWidth){chosen[index]=rank;return false;}return true;});
+      }
+      return chosen;
+    }
+    // Runs `callback` once `node` is first laid out and again whenever its
+    // width changes, so labels fitted to a width follow a resize or a
+    // rotation across the narrow breakpoint.
+    function onWidthChange(node,callback){
+      let width=-1;
+      new ResizeObserver(([entry])=>{if(entry.contentRect.width===width)return;width=entry.contentRect.width;callback();}).observe(node);
+    }
     function renderAnswerStrip(row,selection=null){
       const groups=row.response_groups||[],answerCount=row.answer_count||groups.reduce((total,group)=>total+group.answer_count,0),strip=element("div","answer-strip");
       strip.setAttribute("aria-label","Answer probability by response group for "+String(row.word||"").toUpperCase());
@@ -2369,7 +2396,6 @@
       if(selection){strip.dataset.selectable="1";strip.setAttribute("role","listbox");}
       for(const [index,group] of groups.entries()){
         const probability=answerCount?group.answer_count/answerCount:0,segment=element("span","answer-segment");
-        if(index<2||probability>=.06){const label=element("span","answer-segment-label");label.append(numText(group.answer_count),document.createElement("br"),"words");segment.append(label);segment.dataset.answerCount=numText(group.answer_count);}
         segment.style.flexGrow=String(group.answer_count);segment.style.flexBasis="0";segment.style.backgroundColor=answerGroupColor(group.answer_count);
         segment.title=group.pattern+" · "+numText(group.answer_count)+(group.answer_count===1?" answer":" answers")+" · "+fixed(probability*100,1)+"% probability"+(workStateText(group)?" · "+workStateText(group):"");
         if(selection){
@@ -2394,6 +2420,13 @@
         }
         strip.append(segment);
       }
+      onWidthChange(strip,()=>{
+        const narrow=matchMedia("(max-width: 600px)").matches;
+        fitSegmentLabels([...strip.children],"answer-segment-label",(segment,index)=>{
+          const answerCount=groups[index].answer_count,countText=numText(answerCount);
+          return narrow?[[countText]]:[[countText,answerCount===1?"word":"words"],[countText]];
+        });
+      });
       return strip;
     }
     function responseVisualKey(){
@@ -2420,16 +2453,31 @@
       fill.style.width=(scale?100*groups.length/scale:0)+"%";
       for(const bucket of buckets){
         if(bucket.responseGroupCount){
-          const countText=numText(bucket.responseGroupCount),segment=element("span","response-count-segment"),label=element("span","response-count-segment-label"),wordLabel=bucket.labelText+(bucket.labelText==="1"?" word:":" words:");label.append(wordLabel,document.createElement("br"),countText+" groups");segment.append(label);
+          const countText=numText(bucket.responseGroupCount),segment=element("span","response-count-segment");
           segment.style.flexGrow=String(bucket.responseGroupCount);segment.style.flexBasis="0";segment.style.backgroundColor=bucket.color;
-          if(bucket.responseGroupCount/groups.length>=.06)segment.dataset.responseGroupCount=countText;
           segment.dataset.countText=countText;
+          segment.dataset.wordLabel=bucket.labelText+(bucket.labelText==="1"?" word:":" words:");
           segment.title=bucket.labelText+(bucket.labelText==="1"?" answer":" answers")+" · "+numText(bucket.responseGroupCount)+(bucket.responseGroupCount===1?" response group":" response groups");fill.append(segment);
           const legendItem=element("span","",bucket.labelText+(bucket.labelText==="1"?" word: ":" words: ")+countText);legendItem.style.setProperty("--bucket-color",bucket.color);legend.append(legendItem);segment.dataset.legendIndex=String(legend.children.length-1);
         }
       }
       track.setAttribute("aria-label",numText(groups.length)+" response groups for "+String(row.word||"").toUpperCase()+(maximumResponseGroupCount?" out of the "+numText(maximumResponseGroupCount)+" the best guess splits this branch into":""));
-      track.append(fill);requestAnimationFrame(()=>{if(matchMedia("(max-width: 600px)").matches){for(const segment of fill.children)segment.replaceChildren();const legendItems=[...legend.children],leftColumnSize=Math.ceil(legendItems.length/2),mobileOrder=[];for(let index=0;index<leftColumnSize;index++){mobileOrder.push(legendItems[index]);if(legendItems[index+leftColumnSize])mobileOrder.push(legendItems[index+leftColumnSize]);}legend.append(...mobileOrder);return;}for(const segment of [...fill.children].reverse()){const legendItem=legend.children[Number(segment.dataset.legendIndex)],fullLabel=segment.firstElementChild;if(fullLabel.scrollWidth+6<=segment.clientWidth){legendItem?.remove();continue;}const countText=segment.dataset.countText,label=element("span","response-count-segment-label");label.append(countText,document.createElement("br"),"groups");segment.replaceChildren(label);if(label.scrollWidth+4>segment.clientWidth)segment.replaceChildren();}if(!legend.children.length)legend.remove();});return [track,legend];
+      track.append(fill);
+      const legendItems=[...legend.children];
+      onWidthChange(fill,()=>{
+        const narrow=matchMedia("(max-width: 600px)").matches,segments=[...fill.children];
+        const chosen=fitSegmentLabels(segments,"response-count-segment-label",segment=>{
+          const countText=segment.dataset.countText,groupsWord=countText==="1"?"group":"groups";
+          return narrow?[[countText]]:[[segment.dataset.wordLabel,countText+" "+groupsWord],[countText,groupsWord],[countText]];
+        });
+        // Narrow, the two columns read down: the first half, then the second.
+        const leftColumnSize=Math.ceil(legendItems.length/2),ordered=narrow?legendItems.flatMap((_,index)=>index<leftColumnSize?[legendItems[index],...(legendItems[index+leftColumnSize]?[legendItems[index+leftColumnSize]]:[])]:[]):legendItems;
+        // A segment showing its full label needs no legend entry.
+        const labelled=new Set(narrow?[]:segments.filter((_,index)=>chosen[index]===0).map(segment=>legendItems[Number(segment.dataset.legendIndex)]));
+        legend.replaceChildren(...ordered.filter(item=>!labelled.has(item)));
+        legend.hidden=!legend.children.length;
+      });
+      return [track,legend];
     }
     function renderResponseGroupBridge(row,maximumResponseGroupCount){
       const groups=row.response_groups||[],answerCount=row.answer_count||groups.reduce((total,group)=>total+group.answer_count,0),buckets=responseGroupBuckets(groups),svg=svgElement("svg"),viewWidth=1000,viewHeight=48,bottomBarTop=viewHeight-8,scale=maximumResponseGroupCount||groups.length,fillWidth=scale?viewWidth*groups.length/scale:0,lowerPosition=(viewWidth-fillWidth)/2;
@@ -3538,7 +3586,7 @@
       addEventListener("resize",()=>{measureStickyTop();const root=byId("report");layoutSpines(root);layoutSweepMarkerDigits(root);if(openGroupMenuNode)positionGroupMenu(openGroupMenuNode.node,openGroupMenuNode.opener);if(currentState?.kind==="leaderboard"&&lastReport&&root.clientWidth!==leaderboardReportWidth&&!reportHasFocusedControl()&&!reportHasActiveSelection())applyReport(lastReport,lastReport,currentState);});
       addEventListener("popstate",()=>{abortActiveRequest();currentState=parsePageState(location);syncControls();redrawLeaderboardZoom();fetchReport();schedulePoll();});document.addEventListener("visibilitychange",()=>{if(!document.hidden){if(!skipAutomaticScan())fetchReport();schedulePoll();}});fetchReport();schedulePoll();
     }
-    window.parsePageState=parsePageState;window.buildAPIURL=buildAPIURL;window.rootProgressURL=rootProgressURL;window.renderRootProgressHeadline=renderRootProgressHeadline;window.rateText=rateText;window.applyReport=applyReport;window.spineTextFromSelection=spineTextFromSelection;window.__skipAutomaticScanProbe=()=>skipAutomaticScan();window.__reportClient={setState:state=>setState(state),getState:()=>({...currentState}),fetchReport};
+    window.parsePageState=parsePageState;window.buildAPIURL=buildAPIURL;window.rootProgressURL=rootProgressURL;window.renderRootProgressHeadline=renderRootProgressHeadline;window.rateText=rateText;window.applyReport=applyReport;window.renderResponseGroupBreakdown=renderResponseGroupBreakdown;window.spineTextFromSelection=spineTextFromSelection;window.__skipAutomaticScanProbe=()=>skipAutomaticScan();window.__reportClient={setState:state=>setState(state),getState:()=>({...currentState}),fetchReport};
     document.addEventListener("DOMContentLoaded",initialize);
   })();
   </script>
