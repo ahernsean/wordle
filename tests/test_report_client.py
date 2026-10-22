@@ -4853,7 +4853,7 @@ class ReportClientContract:
         self.assertEqual(self.page.locator("#branch-target-input").input_value(), "raise -----")
 
     def test_filter_change_leaves_typed_branch_target_untouched(self):
-        # A spine typed but not sent with Go stays uncommitted; toggling a
+        # A spine typed but not applied stays uncommitted; toggling a
         # filter applies against the current view, never navigating to the typed
         # text nor erasing it from the box.
         self.page.goto(self.base_url)
@@ -5957,12 +5957,10 @@ class ReportClientContract:
         self.assertNotIn("7×2", text)
 
     def _cleared_target_state(self):
-        # The Openers report holds no status filter either, so a word taken
-        # there and then cleared arrives at the overview with empty lists.
+        # A word report holds no status filter, so clearing its word arrives
+        # at the overview with empty lists.
         self.apply_branch_target("SALET")
         self.page.wait_for_selector("text=word report")
-        self.page.locator("[data-kind=openers]").click()
-        self.page.wait_for_selector('.report-meta h1:text-is("openers report")')
         self.assertEqual(self.page.evaluate(
             "() => __reportClient.getState().branch_status"), [])
         self.apply_branch_target("")
@@ -6036,17 +6034,22 @@ class ReportClientContract:
         self.assertEqual(
             self.page.locator(".branch-target button:text-is('Back')").count(), 0)
         self.assertFalse(clear.is_visible())
-        target.fill("SALET -----")
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("text=word report")
         self.assertTrue(clear.is_visible())
-        before = self.page.evaluate("() => __reportClient.getState()")
         clear.click()
         self.assertEqual(target.input_value(), "")
         self.assertFalse(clear.is_visible())
         self.assertTrue(self.page.evaluate(
             "() => document.activeElement.id === 'branch-target-input'"))
-        # Clearing edits the box; Go is what navigates.
+        # Clearing applies at once: an emptied target in the inferred report
+        # is the overview.
+        self.page.wait_for_selector("#report h1:text-is('overview report')")
+        self.assertNotIn("branch_target", self.page.url)
+
+    def test_target_box_is_applied_with_an_apply_button(self):
         self.assertEqual(
-            self.page.evaluate("() => __reportClient.getState()"), before)
+            self.page.locator(".branch-target > button").inner_text(), "Apply")
 
     def test_clear_button_tracks_a_target_set_by_navigation(self):
         self.apply_branch_target("SALET")
@@ -7851,6 +7854,51 @@ class ReportClientContract:
         )
         self.assertNotIn("branch_target", self.page.url)
         self.page.wait_for_selector(marked, state="detached")
+
+    def test_clearing_the_target_keeps_the_openers_view(self):
+        self.open_named_source()
+        self.page.locator("#clear-target").click()
+        self.page.wait_for_function(
+            "() => __reportClient.getState().branch_target === ''")
+        state = self.page.evaluate("() => __reportClient.getState()")
+        self.assertEqual(state["kind"], "openers")
+        # Back to the list as the Openers tab opens it, with its default
+        # state filter rather than every state.
+        self.assertEqual(state["opener_state"], ["active", "queued"])
+        self.assertNotIn("branch_target", self.page.url)
+        self.assertNotIn("opener_state", self.page.url)
+        self.page.wait_for_selector("#report h1:text-is('openers report')")
+        self.page.wait_for_selector(
+            ".card.source-word.filtered", state="detached")
+
+    def test_applying_a_word_keeps_the_openers_view(self):
+        self.open_sources()
+        self.apply_branch_target("SALET")
+        self.page.wait_for_function(
+            "() => __reportClient.getState().branch_target === 'SALET'")
+        self.assertEqual(
+            self.page.evaluate("() => __reportClient.getState().kind"),
+            "openers")
+        self.page.wait_for_selector(".card.source-word.filtered")
+
+    def test_applying_a_spine_from_openers_opens_the_inferred_report(self):
+        # Openers reads only a trailing word, so a branch spine would be
+        # dropped there; it opens the report the spine names instead.
+        self.open_sources()
+        self.apply_branch_target("RAISE -----")
+        self.page.wait_for_function(
+            "() => __reportClient.getState().branch_target === 'RAISE -----'")
+        self.assertEqual(
+            self.page.evaluate("() => __reportClient.getState().kind"), "auto")
+
+    def test_applying_a_word_from_the_leaderboard_opens_the_word_report(self):
+        self.page.locator("[data-kind=leaderboard]").click()
+        self.page.wait_for_function(
+            "() => __reportClient.getState().kind === 'leaderboard'")
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("text=word report")
+        self.assertEqual(
+            self.page.evaluate("() => __reportClient.getState().kind"), "auto")
 
     def test_sources_ownership_card_opens_the_branch_it_names(self):
         self.open_named_source()
