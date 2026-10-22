@@ -1596,6 +1596,87 @@ class ReportClientContract:
             top,
             self.page.locator(".grid > [data-identity]").first.bounding_box()["y"])
 
+    # Renders a breakdown into a 1,000px host and reports each bar's
+    # segments once both have fitted their labels: the text each shows, and
+    # whether that text overflows the segment.
+    _FITTED_BREAKDOWN_JS = """async row => {
+      const host = document.createElement('div');
+      host.style.width = '1000px';
+      host.append(renderResponseGroupBreakdown(row));
+      document.body.append(host);
+      await new Promise(requestAnimationFrame);
+      await new Promise(requestAnimationFrame);
+      const describe = selector => [...host.querySelectorAll(selector)].map(segment => ({
+        title: segment.title,
+        lines: [...segment.querySelectorAll('span')].map(label => label.innerText),
+        overflows: segment.firstElementChild
+          ? segment.firstElementChild.scrollWidth > segment.clientWidth : false,
+        afterContent: getComputedStyle(segment, '::after').content,
+      }));
+      const result = {
+        answers: describe('.answer-segment'),
+        counts: describe('.response-count-segment'),
+      };
+      host.remove();
+      return result;
+    }"""
+
+    @staticmethod
+    def _breakdown_row(answer_counts):
+        return {
+            "word": "payee", "available": True, "word_is_answer": False,
+            "answer_count": sum(answer_counts),
+            "response_groups": [
+                {"pattern": "p" + str(index), "answer_count": answer_count}
+                for index, answer_count in enumerate(answer_counts)
+            ],
+        }
+
+    def test_answer_strip_labels_every_segment_its_label_fits(self):
+        # 186 of 3,209 answers is 5.8%: wide enough at 1,000px for its two
+        # lines, under any cutoff by share that would leave it bare.
+        answer_counts = [513, 353, 287, 233, 186, 154, 129, 115] + [40] * 30 + [1] * 39
+        fitted = self.page.evaluate(
+            self._FITTED_BREAKDOWN_JS, self._breakdown_row(answer_counts))
+        labels = {segment["title"].split(" · ")[0]: segment["lines"]
+                  for segment in fitted["answers"]}
+        for index, answer_count in enumerate([186, 154, 129, 115]):
+            self.assertEqual(labels["p" + str(index + 4)],
+                             [str(answer_count) + "\nwords"], labels)
+        self.assertEqual(labels["p8"], [], labels)
+        self.assertEqual(labels["p76"], [], labels)
+        self.assertEqual(
+            [segment for segment in fitted["answers"] + fitted["counts"]
+             if segment["overflows"]], [])
+
+    def test_answer_strip_names_a_single_answer_in_the_singular(self):
+        fitted = self.page.evaluate(
+            self._FITTED_BREAKDOWN_JS, self._breakdown_row([1, 1]))
+        self.assertEqual([segment["lines"] for segment in fitted["answers"]],
+                         [["1\nword"], ["1\nword"]])
+
+    def test_count_bar_falls_back_to_a_bare_count_where_only_that_fits(self):
+        # 2 groups of 100 across 1,000px: room for "2", not for "groups".
+        answer_counts = [3, 3] + [1] * 98
+        fitted = self.page.evaluate(
+            self._FITTED_BREAKDOWN_JS, self._breakdown_row(answer_counts))
+        counts = {segment["title"].split(" · ")[0]: segment["lines"]
+                  for segment in fitted["counts"]}
+        self.assertEqual(counts["2–4 answers"], ["2"], counts)
+        self.assertEqual(counts["1 answer"], ["1 word:\n98 groups"], counts)
+
+    def test_narrow_bars_show_only_counts_that_fit(self):
+        self.page.set_viewport_size({"width": 375, "height": 800})
+        answer_counts = [513, 353, 287, 233, 186] + [1] * 60
+        fitted = self.page.evaluate(
+            self._FITTED_BREAKDOWN_JS, self._breakdown_row(answer_counts))
+        answers = [segment["lines"] for segment in fitted["answers"]]
+        self.assertEqual(answers[:2], [["513"], ["353"]], answers)
+        self.assertEqual(answers[-1], [], answers)
+        for segment in fitted["answers"] + fitted["counts"]:
+            self.assertFalse(segment["overflows"], segment)
+            self.assertEqual(segment["afterContent"], "none", segment)
+
     def _menu(self):
         return self.page.locator(".group-menu")
 
