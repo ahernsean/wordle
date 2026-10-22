@@ -432,7 +432,7 @@
         <input id="branch-target-input" placeholder="Spine or @branch" aria-label="Spine or @branch" autocomplete="off" spellcheck="false">
         <button type="button" id="clear-target" aria-label="Clear spine or @branch" hidden>×</button>
       </span>
-      <button id="apply">Go</button>
+      <button id="apply">Apply</button>
     </div>
     <details class="filters"><summary>Filters &amp; view</summary>
       <div class="control-group" id="filters-group">
@@ -758,6 +758,18 @@
       if(displayedState?.kind==="openers"&&state.kind==="openers"&&displayedState.group_by!==state.group_by)return "Showing groups by "+groupByLabel(displayedState)+" while regrouping by "+groupByLabel(state)+"…";
       return "Computing "+(state.kind==="openers"?"openers report":state.kind==="leaderboard"?"leaderboard":"report")+"…";
     }
+    // Applying a target stays in the current view when that view reads the
+    // target exactly as typed: Openers keeps a single word, and the queue,
+    // workers, cache and hotspot reports are scoped by any target.  A target
+    // the view would rewrite or drop -- a spine in Openers, anything in the
+    // leaderboard -- opens in the inferred report instead.  An Openers target
+    // that changes leaves the state filter to the default for what is shown.
+    function applyBranchTarget(branchTarget){
+      const controls={...readControls(),branch_target:branchTarget};
+      const keepsView=normalizeState(controls).branch_target===branchTarget.trim();
+      const openerStateResets=controls.kind==="openers"&&branchTarget.trim()!==currentState.branch_target;
+      setState({...controls,kind:keepsView?controls.kind:"auto",opener_state:openerStateResets?undefined:controls.opener_state});
+    }
     function syncTargetClear(){byId("clear-target").hidden=byId("branch-target-input").value==="";}
     // The views are tabs, so what is chosen in one is not carried into the next.
     // The status filters are where that bites: a word report and most other
@@ -784,7 +796,7 @@
     }
     function syncControls(){
       // Repaint the branch_target box only when the committed branch_target changed, so a
-      // filter commit never overwrites a spine typed but not yet sent with Go.
+      // filter commit never overwrites a spine typed but not yet applied.
       if(currentState.branch_target!==shownBranchTarget){byId("branch-target-input").value=currentState.branch_target;shownBranchTarget=currentState.branch_target;syncTargetClear();}
       byId("poll").value=currentState.poll;
       byId("layout-toggle").hidden=treelessKinds.has(currentState.kind);
@@ -3574,12 +3586,12 @@
       const addFilterControls=(containerId,names,dataName)=>{const container=byId(containerId);for(const name of names){const filterLabel=element("label"),input=element("input");input.type="checkbox";input.value=name;input.dataset[dataName]="1";filterLabel.append(input," "+name);container.append(filterLabel);}};
       addFilterControls("branch-statuses",branchStatusNames,"branchStatus");addFilterControls("branch-worker-statuses",branchWorkerStatusNames,"branchWorkerStatus");addFilterControls("source-states",sourceStateNames,"sourceState");
       currentState=parsePageState(location);syncControls();
-      byId("apply").addEventListener("click",()=>setState({...readControls(),kind:"auto"}));byId("branch-target-input").addEventListener("keydown",event=>{if(event.key==="Enter")byId("apply").click();});const targetInput=byId("branch-target-input");targetInput.addEventListener("input",syncTargetClear);byId("clear-target").addEventListener("click",()=>{targetInput.value="";syncTargetClear();targetInput.focus();});
+      byId("apply").addEventListener("click",()=>applyBranchTarget(readControls().branch_target));byId("branch-target-input").addEventListener("keydown",event=>{if(event.key==="Enter")byId("apply").click();});const targetInput=byId("branch-target-input");targetInput.addEventListener("input",syncTargetClear);byId("clear-target").addEventListener("click",()=>{targetInput.value="";syncTargetClear();targetInput.focus();applyBranchTarget("");});
       byId("layout-flat").addEventListener("click",()=>setState({...readControls(),tree:false}));
       byId("layout-tree").addEventListener("click",()=>setState({...readControls(),tree:true,limit:10}));
       // Filters and view controls commit on change against the committed
       // branch_target, so a filter tweak never navigates to text typed but not yet
-      // sent with Go/Enter.  replaceState keeps a run of tweaks to one Back step.
+      // applied with Apply/Enter.  replaceState keeps a run of tweaks to one Back step.
       const commitControls=()=>setState({...readControls(),branch_target:currentState.branch_target},false);
       document.querySelector("details.filters").addEventListener("change",commitControls);
       byId("poll").addEventListener("change",commitControls);
