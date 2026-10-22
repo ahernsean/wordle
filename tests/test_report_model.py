@@ -4203,22 +4203,26 @@ class OpenerReportTest(unittest.TestCase):
             self.assertEqual(summarized, [["crane", "nurdy", "salet"]])
         self.assertIsNotNone(page[0]["erd_summary"])
 
-    def test_the_list_projects_the_sweep_from_the_last_days_finishes(self):
-        # Two of four words finished, one within the last day: two words
-        # remain at one a day.  A finish is the request completing, whatever
-        # the cache's timing summary says: CRANE's summary is days old (its
-        # last group was resolved under another word's spine) and SALET has
-        # none at all.  The projection is over every word whatever the view
-        # filters.
+    def test_the_list_projects_the_sweep_from_the_windows_finishes(self):
+        # Three of five words finished, two within the three-day window: two
+        # words remain at two every three days, so three days to go.  SALET
+        # finished two days ago, outside a one-day window and inside this one;
+        # NURDY four days ago, outside it.  A finish is the request
+        # completing, whatever the cache's timing summary says: CRANE's
+        # summary is days old (its last group was resolved under another
+        # word's spine) and SALET has none at all.  The projection is over
+        # every word whatever the view filters.
+        self.assertEqual(report_model.OPENER_ETA_WINDOW_DAYS, 3)
         self._queue_words(("crane", 1, 1), ("salet", 2, 1), ("nurdy", 3, 1),
-                          ("abbey", 4, 1))
-        self._finish("crane", "salet")
+                          ("abbey", 4, 1), ("tarse", 5, 1))
+        self._finish("crane", "salet", "nurdy")
         now = int(time.time())
         queue = self._open_queue()
         queue._conn.execute(
             "UPDATE opener_work SET completed_at = CASE opener "
-            "WHEN 'crane' THEN ? WHEN 'salet' THEN ? END "
-            "WHERE state = 'complete'", (now - 3600, now - 2 * 24 * 3600))
+            "WHEN 'crane' THEN ? WHEN 'salet' THEN ? WHEN 'nurdy' THEN ? END "
+            "WHERE state = 'complete'",
+            (now - 3600, now - 2 * 24 * 3600, now - 4 * 24 * 3600))
         queue._conn.commit()
         queue.close()
         cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
@@ -4230,9 +4234,10 @@ class OpenerReportTest(unittest.TestCase):
         for filters in ({}, {"opener_states": ("complete",)}):
             data = self._openers(**filters)
             self.assertEqual(
-                (data["finished_last_day_count"], data["unfinished_opener_count"],
-                 data["eta_seconds"]), (1, 2, 2 * 24 * 3600))
-        self.assertIsNone(report_model._opener_eta_seconds(5, 0))
+                (data["eta_window_days"], data["finished_in_eta_window_count"],
+                 data["unfinished_opener_count"], data["eta_seconds"]),
+                (3, 2, 2, 3 * 24 * 3600))
+        self.assertIsNone(report_model._opener_eta_seconds(5, 0, 3))
 
     def test_branch_totals_count_only_words_with_unfinished_work(self):
         self._queue_words(("crane", 1, 2), ("salet", 5, 3))

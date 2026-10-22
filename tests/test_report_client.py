@@ -7630,8 +7630,8 @@ class ReportClientContract:
     def test_the_opener_list_shows_the_pace_and_where_it_ends(self):
         self.open_sources()
         metrics = " ".join(self.page.locator(".metrics").first.inner_text().split())
-        # The fixture: two finished in the last day, a day to go.
-        self.assertIn("2 finished in the last 24 h", metrics)
+        # The fixture: two finished in the three-day window, a day to go.
+        self.assertIn("2 finished in the last 3 days", metrics)
         self.assertIn("1.0d", metrics)
         self.assertIn("ETA at that rate", metrics)
         text = self.page.evaluate("""async () => {
@@ -7642,7 +7642,7 @@ class ReportClientContract:
             .find(node => node.textContent.includes('ETA at that rate'))
             .querySelector('strong').textContent;
         }""")
-        # Nothing finished in the last day projects no end, and no date.
+        # Nothing finished in the window projects no end, and no date.
         self.assertEqual(text, "—")
 
     def test_sources_card_opens_the_word_report_where_its_erd_lives(self):

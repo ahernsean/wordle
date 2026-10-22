@@ -2015,7 +2015,8 @@ class OpenersCommandEndToEndTest(unittest.TestCase):
                        "generated_at": 1_800_000_000,
                        "branch_target": {"trailing_word": None}})
         report["data"] = {"summary": [], "total_opener_count": 0,
-                          "finished_last_day_count": 253,
+                          "eta_window_days": 3,
+                          "finished_in_eta_window_count": 253,
                           "eta_seconds": 86_400 * 48, "rows": []}
         with patch.dict(os.environ, {"TZ": "UTC"}):
             time.tzset()
@@ -2023,13 +2024,13 @@ class OpenersCommandEndToEndTest(unittest.TestCase):
                 text = report_terminal.render_report(report, width=120)
             finally:
                 time.tzset()
-        self.assertIn("Finished in the last 24 h: 253   "
+        self.assertIn("Finished in the last 3 days: 253   "
                       "ETA at that rate: 48.0d (", text)
         report["data"]["eta_seconds"] = None
         self.assertIn("ETA at that rate: —",
                       report_terminal.render_report(report, width=120))
         report["branch_target"]["trailing_word"] = "raise"
-        self.assertNotIn("Finished in the last 24 h",
+        self.assertNotIn("Finished in the last",
                          report_terminal.render_report(report, width=120))
 
     def test_opener_state_filter_and_sort_reach_the_rendered_table(self):
