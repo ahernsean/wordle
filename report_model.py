@@ -4377,20 +4377,25 @@ def _opener_membership_payload(row, owner_count, answer_set):
     }
 
 
+# Branches per opener vary several-fold between openers, so one day's
+# finishes (about a hundred openers) move the projection by weeks; three days'
+# hold it to a few.
+OPENER_ETA_WINDOW_DAYS = 3
 _ONE_DAY_SECONDS = 24 * 60 * 60
 
 
-def _opener_eta_seconds(unfinished, finished_last_day):
-    """When the unfinished openers would all be done at the last day's rate.
+def _opener_eta_seconds(unfinished, finished_in_window, window_days):
+    """When the unfinished openers would all be done at the window's rate.
 
     A projection, not a forecast: openers differ in cost by orders of
-    magnitude, so it moves with whichever ones the last day happened to
-    finish.  None when nothing finished in the last day, which projects no
+    magnitude, so it moves with whichever ones the window happened to
+    finish.  None when nothing finished in the window, which projects no
     end at all.
     """
-    if not finished_last_day:
+    if not finished_in_window:
         return None
-    return int(unfinished * _ONE_DAY_SECONDS / finished_last_day)
+    return int(unfinished * window_days * _ONE_DAY_SECONDS
+               / finished_in_window)
 
 
 def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dict:
@@ -4405,8 +4410,9 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
     alongside each owner's individually requested priority."""
     generated_at = int(time.time())
     data = {"summary": [], "total_opener_count": 0,
-            "finished_last_day_count": None, "unfinished_opener_count": None,
-            "eta_seconds": None,
+            "eta_window_days": OPENER_ETA_WINDOW_DAYS,
+            "finished_in_eta_window_count": None,
+            "unfinished_opener_count": None, "eta_seconds": None,
             "matched_opener_count": 0, "matched_branch_count": 0,
             "matched_open_branch_count": 0, "opener_offset": 0,
             "matched_rows": 0, "shared_branch_count": 0,
@@ -4428,10 +4434,11 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
         # same wherever it is read.
         data["unfinished_opener_count"] = sum(
             1 for row in summary_rows if row["has_incomplete_request"])
-        data["finished_last_day_count"] = queue.openers_finished_since(
-            generated_at - _ONE_DAY_SECONDS)
+        data["finished_in_eta_window_count"] = queue.openers_finished_since(
+            generated_at - OPENER_ETA_WINDOW_DAYS * _ONE_DAY_SECONDS)
         data["eta_seconds"] = _opener_eta_seconds(
-            data["unfinished_opener_count"], data["finished_last_day_count"])
+            data["unfinished_opener_count"],
+            data["finished_in_eta_window_count"], OPENER_ETA_WINDOW_DAYS)
         if opener is not None:
             summary_rows = [row for row in summary_rows
                             if (row["opener"] or "").lower() == opener]

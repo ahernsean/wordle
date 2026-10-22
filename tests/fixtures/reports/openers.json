@@ -9,7 +9,8 @@
  "data": {
   "branch_row_offset": 0,
   "eta_seconds": 86400,
-  "finished_last_day_count": 2,
+  "eta_window_days": 3,
+  "finished_in_eta_window_count": 2,
   "matched_branch_count": 1376,
   "matched_open_branch_count": 1211,
   "matched_opener_count": 3,

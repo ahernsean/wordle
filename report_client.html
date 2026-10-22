@@ -1446,7 +1446,7 @@
       return (seconds/86400).toFixed(1)+"d";
     };
     // How long, and on what day, the unfinished openers would take at the
-    // last day's rate; a dash when nothing finished in it.
+    // ETA window's rate; a dash when nothing finished in it.
     const openerETAText=(etaSeconds,generatedAt)=>etaSeconds===null||etaSeconds===undefined?null:formatDuration(etaSeconds)+"\u00a0("+new Date((generatedAt+etaSeconds)*1000).toLocaleDateString("en-GB",{dateStyle:"medium"}).replace(/ /g,"\u00a0")+")";
     const formatNodeCount=value=>{
       if(value===null||value===undefined)return "—";
@@ -2182,8 +2182,8 @@
       // double-count a branch two words own.
       metrics.append(metric("openers",matchedWords),metric("branches (unfinished)",data.matched_branch_count),metric("open",data.matched_open_branch_count));
       // The pace of the whole sweep, so only on the list of every opener.
-      if(!state.branch_target&&data.finished_last_day_count!==null&&data.finished_last_day_count!==undefined)
-        metrics.append(metric("finished in the last 24 h",data.finished_last_day_count),metric("ETA at that rate",openerETAText(data.eta_seconds,report.generated_at)));
+      if(!state.branch_target&&data.finished_in_eta_window_count!==null&&data.finished_in_eta_window_count!==undefined)
+        metrics.append(metric("finished in the last "+countNoun(data.eta_window_days,"day"),data.finished_in_eta_window_count),metric("ETA at that rate",openerETAText(data.eta_seconds,report.generated_at)));
       fragment.append(metrics,element("h2","","Openers"));
       if(matchedWords!==totalWords)fragment.append(element("p","dim",numText(matchedWords)+" of "+countNoun(totalWords,"word")+" match this state filter."));
       const namedWord=(state.branch_target||"").trim();
