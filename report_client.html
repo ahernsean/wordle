@@ -2396,10 +2396,21 @@
     }
     // Runs `callback` once `node` is first laid out and again whenever its
     // width changes, so labels fitted to a width follow a resize or a
-    // rotation across the narrow breakpoint.
+    // rotation across the narrow breakpoint.  A fit changes the height of what
+    // it labels -- the legend loses the entries the bar already shows -- so a
+    // report drawn by applyReport is fitted there, before the reading position
+    // is restored against it; the observer's first delivery comes after that
+    // restore, and finds the width already fitted.
+    const pendingWidthFits=new Set();
     function onWidthChange(node,callback){
       let width=-1;
-      new ResizeObserver(([entry])=>{if(entry.contentRect.width===width)return;width=entry.contentRect.width;callback();}).observe(node);
+      const fit=()=>{const current=node.getBoundingClientRect().width;if(current===width)return;width=current;callback();};
+      const pending={node,fit};pendingWidthFits.add(pending);
+      new ResizeObserver(()=>{pendingWidthFits.delete(pending);fit();}).observe(node);
+    }
+    function fitConnectedWidths(){
+      for(const {node,fit} of pendingWidthFits)if(node.isConnected)fit();
+      pendingWidthFits.clear();
     }
     function renderAnswerStrip(row,selection=null){
       const groups=row.response_groups||[],answerCount=row.answer_count||groups.reduce((total,group)=>total+group.answer_count,0),strip=element("div","answer-strip");
@@ -3429,7 +3440,7 @@
       // A render the guard let through takes the menu's node with the old
       // report, so the handle to it goes too rather than being left dangling.
       openGroupMenuNode=null;
-      centerLetters();root.replaceChildren(content);layoutSpines(root);layoutSweepMarkerDigits(root);animateSweepMarkers(root);recordGridColumnCounts(root,state);if(report.report_kind==="leaderboard")leaderboardReportWidth=root.clientWidth;if(readingPosition)requestAnimationFrame(()=>restoreReadingPosition(root,readingPosition));if(report.report_kind!=="leaderboard")animateGridTransitions(root,beforeCards,sameView);setTimeout(()=>document.querySelectorAll(".flash-added,.flash-improved,.flash-changed").forEach(node=>node.classList.remove("flash-added","flash-improved","flash-changed")),1500);return root;
+      centerLetters();root.replaceChildren(content);fitConnectedWidths();layoutSpines(root);layoutSweepMarkerDigits(root);animateSweepMarkers(root);recordGridColumnCounts(root,state);if(report.report_kind==="leaderboard")leaderboardReportWidth=root.clientWidth;if(readingPosition)requestAnimationFrame(()=>restoreReadingPosition(root,readingPosition));if(report.report_kind!=="leaderboard")animateGridTransitions(root,beforeCards,sameView);setTimeout(()=>document.querySelectorAll(".flash-added,.flash-improved,.flash-changed").forEach(node=>node.classList.remove("flash-added","flash-improved","flash-changed")),1500);return root;
     }
     function workerMarkerImage(workerNumber,halo,ink){
       const svg='<svg xmlns="http://www.w3.org/2000/svg"><text x="50%" y="50%" text-anchor="middle" dominant-baseline="central" font-family="ui-monospace,SFMono-Regular,Consolas,monospace" font-size="8.45" font-weight="bold" paint-order="stroke" stroke="'+halo+'" stroke-width="2.5" stroke-linejoin="round" fill="'+ink+'">'+workerNumber+'</text></svg>';
