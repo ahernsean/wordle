@@ -786,6 +786,37 @@ class ReportClientContract:
 
         self.assertIn("~1.0h remaining (provisional)", headline)
 
+    def test_root_progress_rate_is_shown_per_the_shortest_span_holding_ten(self):
+        rates = self.page.evaluate("""() => [5010554/86400, 10, 9.9, 0.2, 0.1,
+          100/86400, 3/86400, 0].map(rateText)""")
+
+        self.assertEqual(rates, ["~58/s", "~10/s", "~594/min", "~12/min",
+                                 "~360/h", "~100/day", "~3/day", "~0/day"])
+
+    def test_root_progress_estimate_counts_agree_with_their_nouns(self):
+        def one_of_each(route):
+            response = route.fetch()
+            progress = response.json()
+            data = progress["data"]
+            data["totals"]["display_state_counts"] = {"waiting": 1}
+            data["estimate"].update({
+                "remaining_candidate_count": 43249,
+                "candidates_per_second": 5010554 / 86400,
+                "stalled_branch_count": 1})
+            route.fulfill(response=response, json=progress)
+
+        self.page.route("**/api/view/root-progress**", one_of_each)
+        try:
+            self.apply_branch_target("SALET")
+            self.page.wait_for_selector("table.root-progress")
+            text = self.page.locator(".root-progress-panel").inner_text()
+        finally:
+            self.page.unroute("**/api/view/root-progress**")
+
+        self.assertIn("43,249 candidates at ~58/s", text)
+        self.assertIn(
+            "excludes 1\u00a0waiting group and 1\u00a0stalled branch", text)
+
     def test_completed_root_progress_replaces_an_inapplicable_estimate(self):
         def completed_progress(route):
             response = route.fetch()

@@ -27,7 +27,7 @@
   ],
   "epoch": 11,
   "estimate": {
-   "candidates_per_day": 569.0,
+   "candidates_per_second": 0.006585648148148148,
    "estimated_seconds": 1080075.9226713532,
    "recent_candidate_count": 569,
    "remaining_candidate_count": 7113,

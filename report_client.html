@@ -1538,9 +1538,19 @@
     // swarm never opened because it needed no search is not missing work.
     function excludedText(totals,estimate){
       const waiting=(totals.display_state_counts||totals.state_counts||{}).waiting||0,parts=[];
-      if(waiting)parts.push(numText(waiting)+" waiting groups");
-      if(estimate.stalled_branch_count)parts.push(numText(estimate.stalled_branch_count)+" stalled branches");
+      if(waiting)parts.push(countNoun(waiting,"waiting group"));
+      if(estimate.stalled_branch_count)parts.push(countNoun(estimate.stalled_branch_count,"stalled branch","stalled branches"));
       return parts.length?"excludes "+parts.join(" and "):"";
+    }
+    // A rate is shown per the shortest span that holds at least ten events, so
+    // it keeps two significant figures at any speed; slower than ten a day
+    // reads per day.
+    const RATE_DISPLAY_UNITS=[[1,"s"],[60,"min"],[3600,"h"],[86400,"day"]];
+    function rateText(eventsPerSecond){
+      let index=0;
+      while(index<RATE_DISPLAY_UNITS.length-1&&eventsPerSecond*RATE_DISPLAY_UNITS[index][0]<10)index++;
+      const [spanSeconds,unit]=RATE_DISPLAY_UNITS[index];
+      return "~"+numText(Math.round(eventsPerSecond*spanSeconds))+"/"+unit;
     }
     // The headline sits outside the collapsible panel so the numbers worth a
     // glance are readable with the table closed.  It carries no coverage
@@ -1605,7 +1615,7 @@
       if(estimate){
         fragment.append(statLine([
           "~"+formatDuration(estimate.estimated_seconds)+" remaining"+(estimate.provisional?" (provisional; "+formatDuration(estimate.sample_duration_seconds)+" sample)":""),
-          numText(estimate.remaining_candidate_count)+" candidates at ~"+numText(Math.round(estimate.candidates_per_day))+"/day",
+          numText(estimate.remaining_candidate_count)+" candidates at "+rateText(estimate.candidates_per_second),
           excludedText(totals,estimate)]));
       }else if(data.completed_at!==null&&data.completed_at!==undefined){
         fragment.append(element("p","dim","Completed "+relativeAge(data.completed_at,Math.floor(Date.now()/1000))+"."));
@@ -3528,7 +3538,7 @@
       addEventListener("resize",()=>{measureStickyTop();const root=byId("report");layoutSpines(root);layoutSweepMarkerDigits(root);if(openGroupMenuNode)positionGroupMenu(openGroupMenuNode.node,openGroupMenuNode.opener);if(currentState?.kind==="leaderboard"&&lastReport&&root.clientWidth!==leaderboardReportWidth&&!reportHasFocusedControl()&&!reportHasActiveSelection())applyReport(lastReport,lastReport,currentState);});
       addEventListener("popstate",()=>{abortActiveRequest();currentState=parsePageState(location);syncControls();redrawLeaderboardZoom();fetchReport();schedulePoll();});document.addEventListener("visibilitychange",()=>{if(!document.hidden){if(!skipAutomaticScan())fetchReport();schedulePoll();}});fetchReport();schedulePoll();
     }
-    window.parsePageState=parsePageState;window.buildAPIURL=buildAPIURL;window.rootProgressURL=rootProgressURL;window.renderRootProgressHeadline=renderRootProgressHeadline;window.applyReport=applyReport;window.spineTextFromSelection=spineTextFromSelection;window.__skipAutomaticScanProbe=()=>skipAutomaticScan();window.__reportClient={setState:state=>setState(state),getState:()=>({...currentState}),fetchReport};
+    window.parsePageState=parsePageState;window.buildAPIURL=buildAPIURL;window.rootProgressURL=rootProgressURL;window.renderRootProgressHeadline=renderRootProgressHeadline;window.rateText=rateText;window.applyReport=applyReport;window.spineTextFromSelection=spineTextFromSelection;window.__skipAutomaticScanProbe=()=>skipAutomaticScan();window.__reportClient={setState:state=>setState(state),getState:()=>({...currentState}),fetchReport};
     document.addEventListener("DOMContentLoaded",initialize);
   })();
   </script>

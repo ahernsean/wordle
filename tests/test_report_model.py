@@ -5043,7 +5043,7 @@ class RootProgressReportTest(unittest.TestCase):
         ], 86400, 86400)
 
         self.assertEqual(estimate["remaining_candidate_count"], 400)
-        self.assertEqual(estimate["candidates_per_day"], 100)
+        self.assertEqual(estimate["candidates_per_second"], 100 / 86400)
         self.assertEqual(estimate["estimated_seconds"], 4 * 86400)
         self.assertEqual(estimate["stalled_branch_count"], 1)
         self.assertEqual(estimate["stalled_remaining_candidate_count"], 10)
@@ -5056,7 +5056,7 @@ class RootProgressReportTest(unittest.TestCase):
 
         self.assertEqual(estimate["sample_duration_seconds"], 600)
         self.assertTrue(estimate["provisional"])
-        self.assertEqual(estimate["candidates_per_day"], 14_400)
+        self.assertEqual(estimate["candidates_per_second"], 100 / 600)
         self.assertEqual(estimate["estimated_seconds"], 5400)
 
     def test_estimate_is_absent_when_nothing_completed_in_the_window(self):
