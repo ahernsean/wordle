@@ -2539,7 +2539,35 @@
     // is paged by rank, so any place in it -- the worst openers included,
     // which the histogram's sparse tail never gathers into one bar -- is a
     // page away.
-    const LEADERBOARD_HISTOGRAM_MAXIMUM_BINS=60,LEADERBOARD_PAGE_ROWS=100;
+    const LEADERBOARD_HISTOGRAM_MAXIMUM_BINS=60,LEADERBOARD_PAGE_ROWS=25;
+    // The slice of the ranking a state lists: the openers in its ERD range,
+    // and which page of them is on screen.
+    function leaderboardPaging(rows,state){
+      // The ranking is sorted by ERD, so its ends are the field's range.
+      const field=rows.length&&Number.isInteger(rows[0].erd_numerator)?{from:rows[0].erd_numerator,to:rows[rows.length-1].erd_numerator}:null,
+        requested=field&&parseERDNumeratorRange(state.erd_numerator_range),
+        range=requested||field,
+        inRange=requested?rows.filter(row=>row.erd_numerator>=range.from&&row.erd_numerator<=range.to):rows,
+        listsAll=!range||inRange.length<=LEADERBOARD_PAGE_ROWS||range.from===range.to,
+        pageCount=listsAll?1:Math.ceil(inRange.length/LEADERBOARD_PAGE_ROWS),
+        // A page past the end, as an old URL can name, shows the last.
+        page=Math.min(state.leaderboard_page||1,pageCount);
+      return {field,requested,range,inRange,listsAll,pageCount,page};
+    }
+    // The page a new range opens on.  A page the viewer moved to is anchored
+    // by its first opener: the new range opens on the page holding it, or, when
+    // the range has left it behind, on the end nearest it.  The first page is
+    // the top of whatever range is shown, and stays there.
+    function anchoredLeaderboardPage(rows,state,range){
+      const before=leaderboardPaging(rows,state);
+      if(before.page<=1)return null;
+      const anchor=before.inRange[(before.page-1)*LEADERBOARD_PAGE_ROWS],
+        after=leaderboardPaging(rows,{...state,erd_numerator_range:erdNumeratorRangeText(range),leaderboard_page:null});
+      if(after.pageCount<=1)return null;
+      const index=after.inRange.findIndex(row=>row.word===anchor.word);
+      if(index>=0)return Math.floor(index/LEADERBOARD_PAGE_ROWS)+1;
+      return anchor.erd_numerator>after.range.to?after.pageCount:null;
+    }
     function renderLeaderboard(report,previous,state){
       const data=report.data,fragment=document.createDocumentFragment(),counts=data.counts||{},metrics=element("div","metrics");
       metrics.append(metric("complete",counts.complete),metric("pending",counts.pending),metric("candidates",data.candidate_count));
@@ -2551,12 +2579,7 @@
       // one replaces.
       breakdownObserver?.disconnect();breakdownFetchQueue.length=0;
       const denominator=data.columns?.erd_denominator||data.answer_count,
-        // The ranking is sorted by ERD, so its ends are the field's range.
-        field=Number.isInteger(rows[0].erd_numerator)?{from:rows[0].erd_numerator,to:rows[rows.length-1].erd_numerator}:null,
-        requested=field&&parseERDNumeratorRange(state.erd_numerator_range),
-        range=requested||field,
-        inRange=requested?rows.filter(row=>row.erd_numerator>=range.from&&row.erd_numerator<=range.to):rows,
-        listsAll=!range||inRange.length<=LEADERBOARD_PAGE_ROWS||range.from===range.to,
+        {field,requested,range,inRange,listsAll,pageCount,page}=leaderboardPaging(rows,state),
         trail=requested?erdZoomTrail(field,requested)??[requested]:[],
         // A zoomed view always has a histogram to navigate by.  A range of
         // one ERD has only one bar of its own, so it shows the histogram it
@@ -2565,9 +2588,6 @@
         // when short enough to list, goes without one.
         chartRange=!range?null:range.from<range.to?(requested||!listsAll?range:null)
           :(trail.length>1?trail[trail.length-2]:field),
-        pageCount=listsAll?1:Math.ceil(inRange.length/LEADERBOARD_PAGE_ROWS),
-        // A page past the end, as an old URL can name, shows the last.
-        page=Math.min(state.leaderboard_page||1,pageCount),
         listed=listsAll?inRange:inRange.slice((page-1)*LEADERBOARD_PAGE_ROWS,page*LEADERBOARD_PAGE_ROWS),
         rangeText=requested?" with ERD "+erdRangeText(range,denominator):"";
       if(requested)fragment.append(renderERDZoomTrail(trail,denominator));
@@ -2905,7 +2925,8 @@
     // undisturbed.  Each step is a history entry, so Back zooms out.
     function zoomLeaderboard(range,start=null){
       abortActiveRequest();
-      currentState=normalizeState({...currentState,erd_numerator_range:range,leaderboard_page:null});
+      const page=lastReport?.report_kind==="leaderboard"?anchoredLeaderboardPage(leaderboardRows(lastReport.data),currentState,range):null;
+      currentState=normalizeState({...currentState,erd_numerator_range:range,leaderboard_page:page});
       const query=stateQuery(currentState,true).toString();
       history.pushState(null,"",location.pathname+(query?"?"+query:""));
       redrawLeaderboardZoom(start);
