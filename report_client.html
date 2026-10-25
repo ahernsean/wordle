@@ -259,6 +259,9 @@
     .leaderboard-neighbour { display:flex; align-items:center; gap:.55rem; width:100%; text-align:left; background:var(--panel); padding:.35rem .75rem; }
     .leaderboard-card .card-title.clickable { cursor:pointer; }
     .leaderboard-breakdown-retry { display:block; width:100%; margin:.4rem 0; text-align:left; }
+    .leaderboard-pager { display:flex; flex-wrap:wrap; align-items:center; gap:.4rem; margin:.4rem 0 .6rem; scroll-margin-top:calc(var(--sticky-top,0px) + 3rem); }
+    .leaderboard-page-box { display:inline-flex; align-items:center; white-space:nowrap; }
+    .leaderboard-page-input { width:4.5em; }
     .opener-lookup-form { display:flex; flex-wrap:wrap; align-items:center; gap:.4rem .5rem; }
     .opener-lookup-form input { width:7rem; text-transform:uppercase; letter-spacing:.12em; font-family:inherit; }
     .opener-lookup-answer { margin-top:.6rem; }
@@ -649,7 +652,7 @@
     const isOverviewState=(kind,branchTarget,tree)=>kind==="auto"&&String(branchTarget||"").trim()===""&&!tree;
 
     function normalizeState(state){
-      const normalized={kind:explicitKinds.has(state.kind)?state.kind:"auto",branch_target:(state.branch_target||"").trim(),tree:!!state.tree,branch_status:branchValues(state.branch_status,branchStatusNames),branch_worker_status:branchValues(state.branch_worker_status,branchWorkerStatusNames),opener_state:branchValues(state.opener_state,sourceStateNames),opener_offset:intOrNull(state.opener_offset),branch_row_offset:intOrNull(state.branch_row_offset),minimum_answer_count:intOrNull(state.minimum_answer_count),maximum_answer_count:intOrNull(state.maximum_answer_count),budget:intOrNull(state.budget),priority:intOrNull(state.priority),sort:state.sort||"",group_by:state.group_by||"",limit:intOrNull(state.limit),by:state.by||"",epoch:intOrNull(state.epoch),since_seconds:intOrNull(state.since_seconds),sample_size:intOrNull(state.sample_size),poll:Math.max(200,intOrNull(state.poll)||DEFAULT_POLL),answers:!!state.answers,claims:!!state.claims,worker_id:state.worker_id||null,finalization_cursor:String(state.finalization_cursor||""),tree_cursor:state.tree_cursor||null,erd_numerator_range:erdNumeratorRangeText(state.erd_numerator_range)};
+      const normalized={kind:explicitKinds.has(state.kind)?state.kind:"auto",branch_target:(state.branch_target||"").trim(),tree:!!state.tree,branch_status:branchValues(state.branch_status,branchStatusNames),branch_worker_status:branchValues(state.branch_worker_status,branchWorkerStatusNames),opener_state:branchValues(state.opener_state,sourceStateNames),opener_offset:intOrNull(state.opener_offset),branch_row_offset:intOrNull(state.branch_row_offset),minimum_answer_count:intOrNull(state.minimum_answer_count),maximum_answer_count:intOrNull(state.maximum_answer_count),budget:intOrNull(state.budget),priority:intOrNull(state.priority),sort:state.sort||"",group_by:state.group_by||"",limit:intOrNull(state.limit),by:state.by||"",epoch:intOrNull(state.epoch),since_seconds:intOrNull(state.since_seconds),sample_size:intOrNull(state.sample_size),poll:Math.max(200,intOrNull(state.poll)||DEFAULT_POLL),answers:!!state.answers,claims:!!state.claims,worker_id:state.worker_id||null,finalization_cursor:String(state.finalization_cursor||""),tree_cursor:state.tree_cursor||null,erd_numerator_range:erdNumeratorRangeText(state.erd_numerator_range),leaderboard_page:intOrNull(state.leaderboard_page)};
       const overviewState=normalized.kind==="auto"&&normalized.branch_target===""&&!normalized.tree;
       if(normalized.branch_status===undefined)normalized.branch_status=overviewState?[...overviewBranchStatusNames]:[];
       if(normalized.branch_worker_status===undefined)normalized.branch_worker_status=overviewState?[...overviewBranchWorkerStatusNames]:[];
@@ -663,6 +666,7 @@
       if(normalized.tree&&normalized.limit!==null&&![10,25,50,100].includes(normalized.limit))normalized.limit=10;
       if(normalized.kind==="cache"){normalized.branch_status=[];normalized.branch_worker_status=[];normalized.minimum_answer_count=null;normalized.maximum_answer_count=null;normalized.priority=null;normalized.sort="";}
       if(normalized.kind!=="leaderboard")normalized.erd_numerator_range="";
+      if(normalized.kind!=="leaderboard"||!(normalized.leaderboard_page>1))normalized.leaderboard_page=null;
       // The leaderboard reads the whole ranking and pages it by its histogram,
       // so a row limit -- typed, or carried from another report -- would
       // present the leading slice as the whole field.
@@ -712,7 +716,7 @@
     function parsePageState(locationObject){
       const query=new URLSearchParams(locationObject.search||"");
       const parseFilter=name=>query.has(name)?(query.get(name)==="all"?[]:query.get(name).split(",")):undefined;
-      return normalizeState({kind:query.get("kind")||"auto",branch_target:query.get("branch_target")||"",tree:bool(query.get("tree")),branch_status:parseFilter("branch_status"),branch_worker_status:parseFilter("branch_worker_status"),opener_state:parseFilter("opener_state"),group_offsets:Object.fromEntries(query.getAll("group_offset").map(value=>{const separator=value.indexOf(":");return [value.slice(separator+1),value.slice(0,separator)];}).filter(([label,offset])=>label&&offset)),opener_offset:query.get("opener_offset"),branch_row_offset:query.get("branch_row_offset"),minimum_answer_count:query.get("minimum_answer_count"),maximum_answer_count:query.get("maximum_answer_count"),budget:query.get("budget"),priority:query.get("priority"),sort:query.get("sort"),group_by:query.get("group_by"),limit:query.get("limit"),by:query.get("by"),epoch:query.get("epoch"),since_seconds:query.get("since_seconds"),sample_size:query.get("sample_size"),poll:query.get("poll"),answers:bool(query.get("answers")),claims:bool(query.get("claims")),worker_id:query.get("worker"),finalization_cursor:query.get("finalization_cursor"),tree_cursor:query.get("tree_cursor"),erd_numerator_range:query.get("erd_numerator_range")});
+      return normalizeState({kind:query.get("kind")||"auto",branch_target:query.get("branch_target")||"",tree:bool(query.get("tree")),branch_status:parseFilter("branch_status"),branch_worker_status:parseFilter("branch_worker_status"),opener_state:parseFilter("opener_state"),group_offsets:Object.fromEntries(query.getAll("group_offset").map(value=>{const separator=value.indexOf(":");return [value.slice(separator+1),value.slice(0,separator)];}).filter(([label,offset])=>label&&offset)),opener_offset:query.get("opener_offset"),branch_row_offset:query.get("branch_row_offset"),minimum_answer_count:query.get("minimum_answer_count"),maximum_answer_count:query.get("maximum_answer_count"),budget:query.get("budget"),priority:query.get("priority"),sort:query.get("sort"),group_by:query.get("group_by"),limit:query.get("limit"),by:query.get("by"),epoch:query.get("epoch"),since_seconds:query.get("since_seconds"),sample_size:query.get("sample_size"),poll:query.get("poll"),answers:bool(query.get("answers")),claims:bool(query.get("claims")),worker_id:query.get("worker"),finalization_cursor:query.get("finalization_cursor"),tree_cursor:query.get("tree_cursor"),erd_numerator_range:query.get("erd_numerator_range"),leaderboard_page:query.get("leaderboard_page")});
     }
     function stateQuery(state,includeClient=true){
       const query=new URLSearchParams();
@@ -738,9 +742,10 @@
       if(state.finalization_cursor)query.set("finalization_cursor",state.finalization_cursor);
       if(state.tree_cursor)query.set("tree_cursor",state.tree_cursor);
       if(includeClient&&state.poll!==DEFAULT_POLL)query.set("poll",String(state.poll));
-      // The leaderboard's zoom is drawn from the ranking the client already
-      // holds, so it travels in the page URL and never in the request.
+      // The leaderboard's zoom and page are drawn from the ranking the client
+      // already holds, so they travel in the page URL and never in the request.
       if(includeClient&&state.erd_numerator_range)query.set("erd_numerator_range",state.erd_numerator_range);
+      if(includeClient&&state.leaderboard_page)query.set("leaderboard_page",String(state.leaderboard_page));
       return query;
     }
     function buildAPIURL(state){
@@ -2530,9 +2535,39 @@
     // the question most readers bring is where the good openers lie.  The
     // histogram is drawn from the ranking the client already holds, so
     // choosing a bar narrows what is drawn without asking the server
-    // anything.  A range narrow enough to read is listed in full; a wider one
-    // shows its best few beneath its own histogram.
-    const LEADERBOARD_HISTOGRAM_MAXIMUM_BINS=60,LEADERBOARD_LIST_MAXIMUM_ROWS=100,LEADERBOARD_PREVIEW_ROWS=20;
+    // anything.  A range of one page or less is listed in full; a longer one
+    // is paged by rank, so any place in it -- the worst openers included,
+    // which the histogram's sparse tail never gathers into one bar -- is a
+    // page away.
+    const LEADERBOARD_HISTOGRAM_MAXIMUM_BINS=60,LEADERBOARD_PAGE_ROWS=25;
+    // The slice of the ranking a state lists: the openers in its ERD range,
+    // and which page of them is on screen.
+    function leaderboardPaging(rows,state){
+      // The ranking is sorted by ERD, so its ends are the field's range.
+      const field=rows.length&&Number.isInteger(rows[0].erd_numerator)?{from:rows[0].erd_numerator,to:rows[rows.length-1].erd_numerator}:null,
+        requested=field&&parseERDNumeratorRange(state.erd_numerator_range),
+        range=requested||field,
+        inRange=requested?rows.filter(row=>row.erd_numerator>=range.from&&row.erd_numerator<=range.to):rows,
+        listsAll=!range||inRange.length<=LEADERBOARD_PAGE_ROWS||range.from===range.to,
+        pageCount=listsAll?1:Math.ceil(inRange.length/LEADERBOARD_PAGE_ROWS),
+        // A page past the end, as an old URL can name, shows the last.
+        page=Math.min(state.leaderboard_page||1,pageCount);
+      return {field,requested,range,inRange,listsAll,pageCount,page};
+    }
+    // The page a new range opens on.  A page the viewer moved to is anchored
+    // by its first opener: the new range opens on the page holding it, or, when
+    // the range has left it behind, on the end nearest it.  The first page is
+    // the top of whatever range is shown, and stays there.
+    function anchoredLeaderboardPage(rows,state,range){
+      const before=leaderboardPaging(rows,state);
+      if(before.page<=1)return null;
+      const anchor=before.inRange[(before.page-1)*LEADERBOARD_PAGE_ROWS],
+        after=leaderboardPaging(rows,{...state,erd_numerator_range:erdNumeratorRangeText(range),leaderboard_page:null});
+      if(after.pageCount<=1)return null;
+      const index=after.inRange.findIndex(row=>row.word===anchor.word);
+      if(index>=0)return Math.floor(index/LEADERBOARD_PAGE_ROWS)+1;
+      return anchor.erd_numerator>after.range.to?after.pageCount:null;
+    }
     function renderLeaderboard(report,previous,state){
       const data=report.data,fragment=document.createDocumentFragment(),counts=data.counts||{},metrics=element("div","metrics");
       metrics.append(metric("complete",counts.complete),metric("pending",counts.pending),metric("candidates",data.candidate_count));
@@ -2544,12 +2579,7 @@
       // one replaces.
       breakdownObserver?.disconnect();breakdownFetchQueue.length=0;
       const denominator=data.columns?.erd_denominator||data.answer_count,
-        // The ranking is sorted by ERD, so its ends are the field's range.
-        field=Number.isInteger(rows[0].erd_numerator)?{from:rows[0].erd_numerator,to:rows[rows.length-1].erd_numerator}:null,
-        requested=field&&parseERDNumeratorRange(state.erd_numerator_range),
-        range=requested||field,
-        inRange=requested?rows.filter(row=>row.erd_numerator>=range.from&&row.erd_numerator<=range.to):rows,
-        listsAll=!range||inRange.length<=LEADERBOARD_LIST_MAXIMUM_ROWS||range.from===range.to,
+        {field,requested,range,inRange,listsAll,pageCount,page}=leaderboardPaging(rows,state),
         trail=requested?erdZoomTrail(field,requested)??[requested]:[],
         // A zoomed view always has a histogram to navigate by.  A range of
         // one ERD has only one bar of its own, so it shows the histogram it
@@ -2558,7 +2588,7 @@
         // when short enough to list, goes without one.
         chartRange=!range?null:range.from<range.to?(requested||!listsAll?range:null)
           :(trail.length>1?trail[trail.length-2]:field),
-        listed=listsAll?inRange:inRange.slice(0,LEADERBOARD_PREVIEW_ROWS),
+        listed=listsAll?inRange:inRange.slice((page-1)*LEADERBOARD_PAGE_ROWS,page*LEADERBOARD_PAGE_ROWS),
         rangeText=requested?" with ERD "+erdRangeText(range,denominator):"";
       if(requested)fragment.append(renderERDZoomTrail(trail,denominator));
       if(chartRange&&chartRange.from<chartRange.to)fragment.append(renderERDHistogram(
@@ -2571,13 +2601,39 @@
         listsAll
           ?(requested?"Ranked by ERD · "+numText(inRange.length)+(inRange.length===1?" opener":" openers")+rangeText
             :"Ranked by ERD · showing "+numText(rows.length)+" of "+numText(data.total_rows??rows.length)+" complete")
-          :"Ranked by ERD · best "+numText(listed.length)+" of "+numText(inRange.length)
-            +(requested?rangeText:" complete")+" · choose a bar to see the rest"));
+          :"Ranked by ERD · "+numText((page-1)*LEADERBOARD_PAGE_ROWS+1)+"–"+numText((page-1)*LEADERBOARD_PAGE_ROWS+listed.length)
+            +" of "+numText(inRange.length)+(requested?rangeText:" complete")));
       markLookedUpOpener(fragment);
       if(!listed.length){fragment.append(element("p","empty","No ranked opener has an ERD in this range"));return fragment;}
+      if(pageCount>1)fragment.append(leaderboardPager(page,pageCount));
       const grid=element("div","grid leaderboard");
       for(const row of listed)grid.append(leaderboardCard(row,state,{maximumResponseGroupCount}));
-      fragment.append(grid);return fragment;
+      fragment.append(grid);
+      if(pageCount>1)fragment.append(leaderboardPager(page,pageCount));
+      return fragment;
+    }
+    // First and last are always one tap; any page between is typed.  The
+    // box shows the page in view and goes to the one entered when it is
+    // committed, so a half-typed number moves nothing.
+    function leaderboardPager(page,pageCount){
+      const pager=element("nav","leaderboard-pager");pager.setAttribute("aria-label","Leaderboard pages");
+      const step=(text,target,label)=>{
+        const button=element("button","",text);button.type="button";button.setAttribute("aria-label",label);
+        button.disabled=target===page;button.addEventListener("click",()=>pageLeaderboard(target));
+        return button;
+      };
+      const input=document.createElement("input");
+      Object.assign(input,{type:"number",min:"1",max:String(pageCount),step:"1",value:String(page),inputMode:"numeric"});
+      input.className="leaderboard-page-input";input.setAttribute("aria-label","Page");
+      input.addEventListener("change",()=>{
+        const target=Number.parseInt(input.value,10);
+        if(!Number.isInteger(target)){input.value=String(page);return;}
+        pageLeaderboard(Math.max(1,Math.min(pageCount,target)));
+      });
+      const box=element("label","leaderboard-page-box");box.append("Page\u00a0",input,"\u00a0of\u00a0"+numText(pageCount));
+      pager.append(step("First",1,"First page"),step("Prev",Math.max(1,page-1),"Previous page"),box,
+        step("Next",Math.min(pageCount,page+1),"Next page"),step("Last",pageCount,"Last page"));
+      return pager;
     }
     const erdRangeText=(range,denominator)=>range.from===range.to
       ?fixed(range.from/denominator,4)
@@ -2869,11 +2925,22 @@
     // undisturbed.  Each step is a history entry, so Back zooms out.
     function zoomLeaderboard(range,start=null){
       abortActiveRequest();
-      currentState=normalizeState({...currentState,erd_numerator_range:range});
+      const page=lastReport?.report_kind==="leaderboard"?anchoredLeaderboardPage(leaderboardRows(lastReport.data),currentState,range):null;
+      currentState=normalizeState({...currentState,erd_numerator_range:range,leaderboard_page:page});
       const query=stateQuery(currentState,true).toString();
       history.pushState(null,"",location.pathname+(query?"?"+query:""));
       redrawLeaderboardZoom(start);
       byId("report").querySelector(".erd-zoom-trail,.erd-histogram,.leaderboard-caption")?.scrollIntoView({block:"nearest"});
+    }
+    // A page within the range on screen, from the ranking already held.  The
+    // new page opens at its top, whichever pager it was chosen from.
+    function pageLeaderboard(page){
+      abortActiveRequest();
+      currentState=normalizeState({...currentState,leaderboard_page:page});
+      const query=stateQuery(currentState,true).toString();
+      history.pushState(null,"",location.pathname+(query?"?"+query:""));
+      redrawLeaderboardZoom();
+      byId("report").querySelector(".leaderboard-pager")?.scrollIntoView({block:"start"});
     }
     function redrawLeaderboardZoom(start=null){
       if(currentState.kind!=="leaderboard"||lastReport?.report_kind!=="leaderboard"||contextKey(currentState)!==lastContext)return;
@@ -2885,11 +2952,22 @@
     // One card, drawn the same way wherever a ranked opener appears, so a
     // neighbourhood reads as a slice of the ranking rather than as a second
     // way of showing the same row.
-    function leaderboardCard(row,state,{breakdown=true,maximumResponseGroupCount=null}={}){
+    function leaderboardCard(row,state,{breakdown=true,maximumResponseGroupCount=null,titleOpensReport=true}={}){
       const card=element("article","card leaderboard-card");card.dataset.identity=row.word;
       const title=element("div","card-title");
       const entry=wordErdCell(wordTiles(row.word,null,row.word_is_answer,"word-md"),row,"erd");
       title.append(element("span","leaderboard-rank","#"+numText(row.rank)),entry);
+      // The title leads to the word's report.  The breakdown beneath it is a
+      // picture of its own, so a tap there is not taken as leaving the page.
+      // A neighbour unfolded in a lookup answer gives its title to folding
+      // back instead.
+      if(titleOpensReport){
+        const word=String(row.word).toUpperCase(),openReport=()=>setState({...state,kind:"auto",branch_target:word,tree:false,claims:false,answers:false,finalization_cursor:""});
+        title.classList.add("clickable");title.tabIndex=0;title.setAttribute("role","link");
+        title.setAttribute("aria-label","#"+numText(row.rank)+" "+word+", open its word report");
+        title.addEventListener("click",openReport);
+        title.addEventListener("keydown",event=>{if(event.key==="Enter"){event.preventDefault();openReport();}});
+      }
       card.append(title,element("div","leaderboard-worst-case dim","Worst-case solve: "+row.max_remaining_depth+" guesses"));
       if(breakdown)card.append(renderLeaderboardBreakdown(row,state,maximumResponseGroupCount));
       return card;
@@ -2987,7 +3065,7 @@
             card.classList.add("looked-up");grid.append(card);return;
           }
           if(!expandedNeighbours.has(row.word)){grid.append(leaderboardNeighbourRow(row,draw));return;}
-          const card=leaderboardCard(row,state,{maximumResponseGroupCount});
+          const card=leaderboardCard(row,state,{maximumResponseGroupCount,titleOpensReport:false});
           const title=card.querySelector(".card-title");
           title.classList.add("clickable");title.title="Fold back to one line";
           title.setAttribute("role","button");title.tabIndex=0;title.setAttribute("aria-expanded","true");

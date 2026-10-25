@@ -2225,11 +2225,11 @@ class ReportClientContract:
         return self.page.locator(".leaderboard-caption").inner_text()
 
     def test_a_long_leaderboard_opens_on_its_distribution(self):
-        """Overview first: the field's shape, then its best few.
+        """Overview first: the field's shape, then its first page.
 
         300 openers on consecutive numerators 350..649 bin five to a bar, the
-        narrowest width within the 60-bar budget, and the cards below are only
-        the best 20.
+        narrowest width within the 60-bar budget, and the cards below are the
+        first page of 25.
         """
         self._open_long_leaderboard(300)
         bars = self.page.locator(".erd-histogram-bar")
@@ -2238,9 +2238,9 @@ class ReportClientContract:
                          "350-354")
         self.assertEqual(bars.last.get_attribute("data-erd-numerator-range"),
                          "645-649")
-        self.assertIn("best 20 of 300 complete", self._caption())
+        self.assertIn("1–25 of 300 complete", self._caption())
         cards = self.page.locator(".grid.leaderboard > .leaderboard-card")
-        self.assertEqual(cards.count(), 20)
+        self.assertEqual(cards.count(), 25)
         self.assertEqual(cards.first.locator(".leaderboard-rank").inner_text(), "#1")
         axis = self.page.locator(".erd-histogram-axis").inner_text()
         self.assertIn("3.5000", axis)
@@ -2346,7 +2346,7 @@ class ReportClientContract:
         self.assertIsNone(state["limit"])
         self.assertNotIn("limit", self.page.evaluate(
             "() => window.buildAPIURL(window.__reportClient.getState())"))
-        self.assertIn("best 20 of 300 complete", self._caption())
+        self.assertIn("1–25 of 300 complete", self._caption())
 
     def test_a_breakdown_that_failed_to_load_is_retried_on_a_tap(self):
         """A failure is not the card's last word, and not a retry loop.
@@ -2421,10 +2421,151 @@ class ReportClientContract:
         self.page.keyboard.press(" ")
         answer.locator(".leaderboard-neighbour[data-identity=crane]").wait_for()
 
+    def test_a_card_title_opens_the_word_report(self):
+        """Tapping a ranked word goes to its report, from the tiles or by key.
+
+        The title is the link: a tap on the breakdown beneath it stays on the
+        leaderboard.
+        """
+        self._open_long_leaderboard(300, query="&poll=600000")
+        card = self.page.locator(".grid.leaderboard > .leaderboard-card").nth(2)
+        word = card.get_attribute("data-identity").upper()
+        card.locator(".answer-segment").first.wait_for()
+        card.locator(".leaderboard-breakdown").click()
+        self.assertIn("kind=leaderboard", self.page.url)
+        card.locator(".card-title .letter").first.click()
+        self.page.wait_for_function(
+            "() => !location.search.includes('kind=leaderboard')")
+        self.assertIn("branch_target=" + word, self.page.url)
+        self.page.go_back()
+        self.page.wait_for_selector(".leaderboard-caption")
+        title = self.page.locator(
+            ".grid.leaderboard > .leaderboard-card .card-title").first
+        title.focus()
+        self.page.keyboard.press("Enter")
+        self.page.wait_for_function(
+            "() => !location.search.includes('kind=leaderboard')")
+        self.assertIn("branch_target=AAAAA", self.page.url)
+
+    def test_the_looked_up_opener_title_opens_its_word_report(self):
+        self._look_up_opener("salet")
+        self.page.locator(".leaderboard-card.looked-up .card-title").click()
+        self.page.wait_for_function(
+            "() => !location.search.includes('kind=leaderboard')")
+        self.assertIn("branch_target=SALET", self.page.url)
+
+    def test_the_ranking_is_paged_to_its_last_opener(self):
+        """Every page of the ranking is reachable, the worst included.
+
+        Last is one tap from the field, a typed page goes straight there,
+        Back retraces pages, and a page past the end shows the last.
+        """
+        self._open_long_leaderboard(300, query="&poll=600000")
+        cards = self.page.locator(".grid.leaderboard > .leaderboard-card")
+        ranks = lambda: (cards.first.locator(".leaderboard-rank").inner_text(),
+                         cards.last.locator(".leaderboard-rank").inner_text())
+        self.assertEqual(self.page.locator(".leaderboard-pager").count(), 2)
+        self.page.locator(".leaderboard-pager").first.get_by_role(
+            "button", name="Last page").click()
+        self.assertIn("276–300 of 300 complete", self._caption())
+        self.assertEqual(ranks(), ("#276", "#300"))
+        self.assertIn("leaderboard_page=12", self.page.url)
+        self.assertTrue(self.page.locator(".leaderboard-pager").first.get_by_role(
+            "button", name="Next page").is_disabled())
+
+        box = self.page.locator(".leaderboard-pager").last.locator("input")
+        box.fill("2")
+        box.press("Enter")
+        self.assertIn("26–50 of 300 complete", self._caption())
+        self.assertEqual(ranks(), ("#26", "#50"))
+        self.assertEqual(
+            self.page.locator(".leaderboard-pager").first.locator("input").input_value(), "2")
+
+        self.page.go_back()
+        self.page.wait_for_function(
+            "() => document.querySelector('.leaderboard-caption')"
+            ".textContent.includes('276–300 of 300')")
+        self.page.go_back()
+        self.page.wait_for_function(
+            "() => document.querySelector('.leaderboard-caption')"
+            ".textContent.includes('1–25 of 300')")
+        self.assertNotIn("leaderboard_page", self.page.url)
+
+        self.page.goto(self.base_url + "?kind=leaderboard&poll=600000&leaderboard_page=99")
+        self.page.wait_for_selector(".leaderboard-caption")
+        self.assertIn("276–300 of 300 complete", self._caption())
+
+    def _open_dense_leaderboard(self, query):
+        """6,000 openers, 60 to each numerator from 350 to 449.
+
+        Rank r sits on 350 + (r - 1) // 60, and each of the field's 50 bars
+        holds two numerators: 120 openers, five pages of them.
+        """
+        self._open_long_leaderboard(
+            6000, per_numerator=60, query="&poll=600000" + query)
+        return self.page.locator(".grid.leaderboard > .leaderboard-card")
+
+    def _ranks(self, cards):
+        return cards.locator(".leaderboard-rank").all_inner_texts()
+
+    def test_a_bar_opens_on_the_page_holding_the_first_opener_shown(self):
+        """Page 7 opens on #151, the 31st of the bar 352..353: its page 2."""
+        cards = self._open_dense_leaderboard("&leaderboard_page=7")
+        self.assertIn("151–175 of 6,000 complete", self._caption())
+        self.page.locator(".erd-histogram-bar[data-erd-numerator-range='352-353']").click()
+        self.assertIn("26–50 of 120 with ERD 3.5200–3.5300", self._caption())
+        self.assertIn("#151", self._ranks(cards))
+        self.assertIn("leaderboard_page=2", self.page.url)
+
+    def test_the_whole_field_opens_on_the_page_holding_the_first_opener_shown(self):
+        """Page 3 of 352..353 opens on #171, which is on the field's page 7."""
+        cards = self._open_dense_leaderboard(
+            "&erd_numerator_range=352-353&leaderboard_page=3")
+        self.assertEqual(self._ranks(cards)[0], "#171")
+        self.page.locator(".erd-zoom-trail button", has_text="All openers").click()
+        self.assertIn("151–175 of 6,000 complete", self._caption())
+        self.assertIn("#171", self._ranks(cards))
+        self.assertIn("leaderboard_page=7", self.page.url)
+
+    def test_a_range_left_below_the_opener_shown_opens_on_its_last_page(self):
+        """#151 is worse than all of 350..351, so the nearest end is the last."""
+        self._open_dense_leaderboard("&leaderboard_page=7")
+        self.page.locator(".erd-histogram-bar[data-erd-numerator-range='350-351']").click()
+        self.assertIn("101–120 of 120 with ERD 3.5000–3.5100", self._caption())
+        self.assertIn("leaderboard_page=5", self.page.url)
+
+    def test_a_range_left_above_the_opener_shown_opens_on_its_first_page(self):
+        """#151 is better than all of 354..355, so the nearest end is the first."""
+        self._open_dense_leaderboard("&leaderboard_page=7")
+        self.page.locator(".erd-histogram-bar[data-erd-numerator-range='354-355']").click()
+        self.assertIn("1–25 of 120 with ERD 3.5400–3.5500", self._caption())
+        self.assertNotIn("leaderboard_page", self.page.url)
+
+    def test_the_first_page_stays_at_the_top_of_a_new_range(self):
+        """Page 1 is the top of whatever range is shown, not an anchored place.
+
+        The whole field still holds #121, the first opener of 352..353, on its
+        page 5, but the field opens at its own top.
+        """
+        self._open_dense_leaderboard("&erd_numerator_range=352-353")
+        self.page.locator(".erd-zoom-trail button", has_text="All openers").click()
+        self.assertIn("1–25 of 6,000 complete", self._caption())
+        self.assertNotIn("leaderboard_page", self.page.url)
+
+    def test_a_range_short_enough_to_list_whole_has_no_page(self):
+        """One ERD lists whole, so a page carries nowhere."""
+        cards = self._open_dense_leaderboard(
+            "&erd_numerator_range=352-353&leaderboard_page=3")
+        self.page.locator(".erd-histogram-bar[data-erd-numerator-range='352-352']").click()
+        self.assertEqual(self._caption(), "Ranked by ERD · 60 openers with ERD 3.5200")
+        self.assertEqual(cards.count(), 60)
+        self.assertNotIn("leaderboard_page", self.page.url)
+        self.assertEqual(self.page.locator(".leaderboard-pager").count(), 0)
+
     def test_cards_fetch_their_breakdowns_as_they_come_on_screen(self):
         """A card costs a request only once the reader nears it.
 
-        Jumping from the top of twenty cards to the last passes the middle
+        Jumping from the top of a page of cards to the last passes the middle
         ones without bringing them near the screen, so they are still unasked
         until the reader goes back to them.
         """
@@ -2489,7 +2630,7 @@ class ReportClientContract:
 
         self.page.locator("button.erd-histogram-bar").first.click()
         self.assertIn("erd_numerator_range=350-351", self.page.url)
-        self.assertIn("best 20 of 120 with ERD 3.5000–3.5100", self._caption())
+        self.assertIn("1–25 of 120 with ERD 3.5000–3.5100", self._caption())
         self.assertEqual(self.page.locator(".erd-histogram-bar").count(), 2)
         self.assertEqual(
             " ".join(self.page.locator(".erd-zoom-trail").inner_text().split()),
@@ -2516,7 +2657,7 @@ class ReportClientContract:
 
         # The trail climbs; Back retraces.
         self.page.locator(".erd-zoom-trail button", has_text="3.5100").click()
-        self.assertIn("best 20 of 120", self._caption())
+        self.assertIn("1–25 of 120", self._caption())
         self.assertEqual(self.page.evaluate("() => window.__rankingFetches"),
                          rankings)
         self.page.go_back()
@@ -2527,7 +2668,7 @@ class ReportClientContract:
         self.page.go_back()
         self.page.wait_for_function(
             "() => document.querySelector('.leaderboard-caption')"
-            ".textContent.includes('best 20 of 6,000 complete')")
+            ".textContent.includes('1–25 of 6,000 complete')")
         self.assertNotIn("erd_numerator_range", self.page.url)
 
     def test_a_zoom_animates_from_where_the_chosen_bar_was(self):
@@ -2700,7 +2841,7 @@ class ReportClientContract:
         self.assertAlmostEqual(offset, -width / 2, places=1)
         self.assertEqual((scale, rise), (2, 1))
         self.assertIn("erd_numerator_range=425-574", self.page.url)
-        self.assertIn("best 20 of 150 with ERD 4.2500–5.7400", self._caption())
+        self.assertIn("1–25 of 150 with ERD 4.2500–5.7400", self._caption())
         self.assertEqual(
             " ".join(self.page.locator(".erd-zoom-trail").inner_text().split()),
             "All openers › ERD 4.2500–5.7400")
@@ -2748,7 +2889,7 @@ class ReportClientContract:
         self.page.evaluate(self.PINCH_JS, [[0.25, 0.75], [0.375, 0.625], True])
         self.page.wait_for_function(
             "() => !location.search.includes('erd_numerator_range')")
-        self.assertIn("best 20 of 300 complete", self._caption())
+        self.assertIn("1–25 of 300 complete", self._caption())
         self.assertFalse(self.page.locator(".erd-zoom-trail").count())
 
         self.page.evaluate(self.PINCH_JS, [[0.25, 0.75], [0.3, 0.7], True])
@@ -2857,7 +2998,7 @@ class ReportClientContract:
         self.page.evaluate(self.PINCH_JS, [[0.25, 0.75], [1, 1], True])
         self.page.wait_for_function(
             "() => !location.search.includes('erd_numerator_range')")
-        self.assertIn("best 20 of 300 complete", self._caption())
+        self.assertIn("1–25 of 300 complete", self._caption())
 
     def test_a_pinch_that_changes_nothing_settles_without_moving_under_reduced_motion(self):
         """Settling back is motion like any other."""
@@ -2947,7 +3088,7 @@ class ReportClientContract:
         """The range is in the page URL, so a zoomed view can be shared."""
         self._open_long_leaderboard(
             6000, per_numerator=60, query="&erd_numerator_range=350-351")
-        self.assertIn("best 20 of 120 with ERD 3.5000–3.5100", self._caption())
+        self.assertIn("1–25 of 120 with ERD 3.5000–3.5100", self._caption())
         self.assertNotIn(
             "erd_numerator_range",
             self.page.evaluate(
@@ -3013,9 +3154,10 @@ class ReportClientContract:
         crane = answer.locator(".leaderboard-card[data-identity=crane]")
         crane.locator(".answer-segment").first.wait_for()
         self.assertNotIn("looked-up", crane.get_attribute("class").split())
-        # Its title folds it back.
+        # Its title folds it back, and does not leave for the word report.
         crane.locator(".card-title").click()
         answer.locator(".leaderboard-neighbour[data-identity=crane]").wait_for()
+        self.assertIn("kind=leaderboard", self.page.url)
         self.assertEqual(
             " ".join(self.page.locator(".opener-lookup-form").inner_text().split()),
             "Look up Search Clear")
