@@ -65,7 +65,7 @@ ANSWER_FILE = DEFAULT_ANSWER_LIST_PATH
 WORDS_FILE = DEFAULT_CANDIDATE_LIST_PATH
 ENGINE_PATH = wordle_engine.__file__
 LOG_FILE = DEFAULT_DEBUG_LOG_PATH
-BUILD = "b142"
+BUILD = "b143"
 
 # Diagnostic log for background solver threads (ERDSolver,
 # BranchPrecacheSolver) — periodic progress, lifecycle events, and any
@@ -2049,9 +2049,14 @@ def _live_candidate_erd(word, soln, erd_policy, erd_score_cache, guesses,
     return cost if status == SOLVED else None
 
 
+# Words the test command compares side by side: four columns fit a 49-column
+# phone console, five do not.
+MAX_COMPARE_WORDS = 4
+
+
 def _compare_words(words, soln, step2_pool=None, constraint_compliant=False,
                    all_words=None, erd_cache=None, gs=None):
-    """Compare 2–4 words side by side."""
+    """Compare 2 to MAX_COMPARE_WORDS words side by side."""
     n = len(soln.current_words)
 
     print(f'\n  Computing {", ".join(w.upper() for w in words)}...', flush=True)
@@ -2165,6 +2170,17 @@ def cmd_test(gs, inline=''):
         print("Words to test? ", end="")
         line = input().strip()
 
+    words = line.lower().split()
+    if not 1 <= len(words) <= MAX_COMPARE_WORDS:
+        print_error(f"Test takes 1 to {MAX_COMPARE_WORDS} words, "
+                    f"not {len(words):,}.")
+        return
+    wrong_length = [w for w in words if len(w) != 5]
+    if wrong_length:
+        print_error("Not 5 letters: "
+                    + ", ".join(w.upper() for w in wrong_length) + ".")
+        return
+
     # Derive step-2 pool and hard-mode flag from the current grid selection
     erd_cache = None
     if _is_hard_mode(gs):
@@ -2190,13 +2206,10 @@ def cmd_test(gs, inline=''):
         else:
             step2_pool = soln.all_answers
 
-    words = line.lower().split()
     try:
-        if 2 <= len(words) <= 4:
-            assert all(len(w) == 5 for w in words)
+        if len(words) > 1:
             _compare_words(words, soln, step2_pool, constraint_compliant, gs.all_words, erd_cache, gs)
             return
-        assert len(words) == 1 and len(words[0]) == 5
         word = words[0]
 
         # Show pattern if answer is set
@@ -2326,8 +2339,6 @@ def cmd_test(gs, inline=''):
                 cur = '    ' + pair
         print(cur)
 
-    except AssertionError:
-        print_error("Word must be 5 letters.")
     except Exception as e:
         print_error(f"Error: {e}")
         raise
@@ -2670,7 +2681,7 @@ def cmd_help(gs):
   b = Board (entropy vs max group size)
   l = Lookahead (two-step entropy)
   d = Display remaining words
-  t = Test a word (all methods + lookahead)
+  t = Test 1 to 4 words (all methods + lookahead)
   i = Include letters (filter)
   x = eXclude letters (filter)
   u = Undo last guess  ({nguesses} guesses so far)

@@ -5,7 +5,10 @@ wordle.py.  Drives the helpers through cmd_test (interactive and inline paths)
 across the candidate modes (possible-answers, hard mode, unfiltered), fresh and
 mid-game, plus comparison of 2-4 words and conflict explanations.
 """
+import io
 import unittest
+from contextlib import redirect_stdout
+from unittest import mock
 
 import wordle
 from wordle import cmd_test, GuessUniverse, ComplianceFilter
@@ -43,9 +46,41 @@ class TestCmdTestSingle(CliTestCase):
         self.assertIn("5 letters", out)
 
     def test_bad_length_word_via_compare_branch(self):
-        # 2-4 tokens but one is the wrong length -> assertion -> error message.
         out = self.run_cmd(cmd_test, inputs=["crane sla"])
-        self.assertIn("5 letters", out)
+        self.assertIn("Not 5 letters: SLA.", out)
+        self.assertNotIn("Computing", out)
+
+    def test_every_wrong_length_word_is_named(self):
+        out = self.run_cmd(cmd_test, inputs=["cat crane brains"])
+        self.assertIn("Not 5 letters: CAT, BRAINS.", out)
+
+    def test_too_many_words_names_the_limit_not_the_length(self):
+        out = self.run_cmd(
+            cmd_test, inputs=["crane slate trace stale tales"])
+        self.assertIn(
+            f"Test takes 1 to {wordle.MAX_COMPARE_WORDS} words, not 5.", out)
+        self.assertNotIn("5 letters", out)
+        self.assertNotIn("Computing", out)
+
+    def test_no_words(self):
+        out = self.run_cmd(cmd_test, inputs=[""])
+        self.assertIn("Test takes 1 to", out)
+        self.assertNotIn("5 letters", out)
+
+    def test_solver_assertion_is_not_reported_as_bad_input(self):
+        def failing(*_args, **_kwargs):
+            raise AssertionError("engine invariant")
+
+        for line, target in (("crane", "_multistep_stats"),
+                             ("crane slate", "_compare_words")):
+            with self.subTest(line=line), \
+                    mock.patch.object(wordle, target, failing):
+                buf = io.StringIO()
+                with redirect_stdout(buf), \
+                        self.assertRaisesRegex(AssertionError,
+                                               "engine invariant"):
+                    wordle.cmd_test(self.gs, line)
+                self.assertNotIn("5 letters", buf.getvalue())
 
 
 class TestCmdTestInline(CliTestCase):
