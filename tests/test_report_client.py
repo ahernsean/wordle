@@ -2552,15 +2552,80 @@ class ReportClientContract:
         self.assertIn("1–25 of 6,000 complete", self._caption())
         self.assertNotIn("leaderboard_page", self.page.url)
 
-    def test_a_range_short_enough_to_list_whole_has_no_page(self):
-        """One ERD lists whole, so a page carries nowhere."""
+    def test_a_range_short_enough_to_list_whole_is_one_page(self):
+        """One ERD lists whole, so a page carries nowhere, and the pager
+        stays for its widening buttons."""
         cards = self._open_dense_leaderboard(
             "&erd_numerator_range=352-353&leaderboard_page=3")
         self.page.locator(".erd-histogram-bar[data-erd-numerator-range='352-352']").click()
         self.assertEqual(self._caption(), "Ranked by ERD · 60 openers with ERD 3.5200")
         self.assertEqual(cards.count(), 60)
         self.assertNotIn("leaderboard_page", self.page.url)
-        self.assertEqual(self.page.locator(".leaderboard-pager").count(), 0)
+        pager = self.page.locator(".leaderboard-pager")
+        self.assertEqual(pager.count(), 1)
+        self.assertIn("of\u00a01", pager.inner_text())
+        self.assertTrue(pager.get_by_role("button", name="Last page").is_disabled())
+
+    def _widen(self, end):
+        self.page.locator(".leaderboard-pager").first.get_by_role(
+            "button", name="Include 10 %s openers" % end).click()
+
+    def test_a_short_range_widens_by_ten_openers_at_either_end(self):
+        """Five openers on 425..429, #76 to #80, grow ten at a time.
+
+        Ten worse reaches #90 on 439, then ten better reaches #66 on 415.
+        Each step redraws the histogram over the new range, and Back undoes it.
+        """
+        self._open_long_leaderboard(
+            300, query="&poll=600000&erd_numerator_range=425-429")
+        self._widen("worse")
+        self.assertEqual(self._caption(), "Ranked by ERD · 15 openers with ERD 4.2500–4.3900")
+        self.assertIn("erd_numerator_range=425-439", self.page.url)
+        bars = self.page.locator(".erd-histogram-bar")
+        self.assertTrue(bars.first.get_attribute("data-erd-numerator-range").startswith("425-"))
+        self.assertTrue(bars.last.get_attribute("data-erd-numerator-range").endswith("-439"))
+        self._widen("better")
+        self.assertEqual(self._caption(), "Ranked by ERD · 25 openers with ERD 4.1500–4.3900")
+        self.assertEqual(self.page.locator(
+            ".grid.leaderboard > .leaderboard-card .leaderboard-rank").first.inner_text(), "#66")
+        self.page.go_back()
+        self.page.wait_for_function(
+            "() => location.search.includes('erd_numerator_range=425-439')")
+        self.assertEqual(self._caption(), "Ranked by ERD · 15 openers with ERD 4.2500–4.3900")
+
+    def test_widening_takes_every_opener_tied_at_the_new_end(self):
+        """Ten better than #121 is #111 on 351, and all 60 on 351 come in."""
+        self._open_dense_leaderboard("&erd_numerator_range=352-353")
+        self._widen("better")
+        self.assertIn("erd_numerator_range=351-353", self.page.url)
+        self.assertIn("1–25 of 180 with ERD 3.5100–3.5300", self._caption())
+
+    def test_an_end_of_the_field_cannot_widen(self):
+        cards = self._open_dense_leaderboard("")
+        pager = self.page.locator(".leaderboard-pager").first
+        self.assertTrue(pager.get_by_role("button", name="Include 10 better openers").is_disabled())
+        self.assertTrue(pager.get_by_role("button", name="Include 10 worse openers").is_disabled())
+        self.page.locator(".erd-histogram-bar[data-erd-numerator-range='350-351']").click()
+        pager = self.page.locator(".leaderboard-pager").first
+        self.assertTrue(pager.get_by_role("button", name="Include 10 better openers").is_disabled())
+        self.assertFalse(pager.get_by_role("button", name="Include 10 worse openers").is_disabled())
+
+    def test_widening_to_the_whole_field_zooms_out(self):
+        """350..644 is all but the last five; ten worse is the whole field."""
+        self._open_long_leaderboard(
+            300, query="&poll=600000&erd_numerator_range=350-644")
+        self._widen("worse")
+        self.assertNotIn("erd_numerator_range", self.page.url)
+        self.assertIn("1–25 of 300 complete", self._caption())
+        self.assertEqual(self.page.locator(".erd-zoom-trail").count(), 0)
+
+    def test_widening_keeps_the_page_holding_the_first_opener_shown(self):
+        """#171 opens page 3 of 352..353; with 351 added it is on page 5."""
+        cards = self._open_dense_leaderboard(
+            "&erd_numerator_range=352-353&leaderboard_page=3")
+        self._widen("better")
+        self.assertIn("101–125 of 180", self._caption())
+        self.assertIn("#171", self._ranks(cards))
 
     def test_cards_fetch_their_breakdowns_as_they_come_on_screen(self):
         """A card costs a request only once the reader nears it.
