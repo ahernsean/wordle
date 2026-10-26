@@ -166,8 +166,8 @@ class TestCmdTestCompare(CliTestCase):
             out = self.run_cmd(lambda gs: wordle.cmd_test(gs, "crane slate"))
         # Ent. 1 and Tot. ent, which repeats it: one green cell in each.
         self.assertEqual(len(greens), 2)
-        ent_row = next(l for l in out.splitlines() if l.startswith("  Ent. 1"))
-        self.assertEqual(ent_row.split()[2:], ["1.500", "1.500"])
+        entropy_row = next(l for l in out.splitlines() if l.startswith("  Ent. 1"))
+        self.assertEqual(entropy_row.split()[2:], ["1.500", "1.500"])
 
     def test_header_words_end_at_the_column_edge(self):
         # A word's last character, its letter or its answer-set marker,
@@ -175,12 +175,12 @@ class TestCmdTestCompare(CliTestCase):
         out = self.run_cmd(lambda gs: wordle.cmd_test(gs, "brain crane"))
         lines = out.split("words:", 1)[1].splitlines()
         header = next(l for l in lines if "CRANE" in l)
-        ent_row = next(l for l in lines if l.startswith("  Ent. 1"))
+        entropy_row = next(l for l in lines if l.startswith("  Ent. 1"))
         self.assertTrue(header.endswith("CRANE*"))
-        self.assertEqual(len(header), len(ent_row))
+        self.assertEqual(len(header), len(entropy_row))
         brain_end = header.index("BRAIN") + len("BRAIN")
-        self.assertNotEqual(ent_row[brain_end - 1], " ")
-        self.assertEqual(ent_row[brain_end], " ")
+        self.assertNotEqual(entropy_row[brain_end - 1], " ")
+        self.assertEqual(entropy_row[brain_end], " ")
 
     def test_compare_buckets(self):
         # Bucket rows (1:, 2-4:, etc.) print when any bucket is non-empty.
