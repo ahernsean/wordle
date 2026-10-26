@@ -2049,9 +2049,11 @@ def _live_candidate_erd(word, soln, erd_policy, erd_score_cache, guesses,
     return cost if status == SOLVED else None
 
 
-# Words the test command compares side by side: four columns fit a 49-column
-# phone console, five do not.
-MAX_COMPARE_WORDS = 4
+# Words the test command compares side by side.  Five columns fit the phone's
+# 49-column console because every value is formatted to at most six
+# characters, the labels to at most eight, and the label column is followed
+# by one space rather than two.
+MAX_COMPARE_WORDS = 5
 
 
 def _compare_words(words, soln, step2_pool=None, constraint_compliant=False,
@@ -2067,7 +2069,7 @@ def _compare_words(words, soln, step2_pool=None, constraint_compliant=False,
         all_stats.append(_multistep_stats(w, soln, step2_pool, constraint_compliant,
                                            all_words, erd_cache))
 
-    lw = 9  # "Entropy 1" = 9, "10-49:" = 6
+    lw = 8  # "+ ent. 2" = 8
 
     # Build all data rows up front so we can measure max column width
     totals = [s['step1'] + s['step2'] + s['step3'] for s in all_stats]
@@ -2088,19 +2090,19 @@ def _compare_words(words, soln, step2_pool=None, constraint_compliant=False,
                 for w in words
             ]
     data_rows = [
-        ('Wt avg',    [s['wt_avg']      for s in all_stats], '{:.2f}', False),
+        ('Wt avg',    [s['wt_avg']      for s in all_stats], '{:.1f}', False),
         (_METHOD_SHORT[ScoringMethod.MAX_GROUP_SIZE],
          [s['max_group_size'] for s in all_stats], '{:d}', False),
-        ('Solve%',    [s['prob_finish'] for s in all_stats], '{:.2%}', True),
+        ('Solve%',    [s['prob_finish'] for s in all_stats], '{:.1%}', True),
     ]
     if any(v is not None for v in erd_vals):
         data_rows.append(('ERD', erd_vals, '{:.3f}', False))
-    data_rows.append(('Entropy 1', [s['step1'] for s in all_stats], '{:.4f}', True))
+    data_rows.append(('Ent. 1', [s['step1'] for s in all_stats], '{:.3f}', True))
     if n > 2:
         data_rows += [
-            ('+ ent. 2', [s['step2'] for s in all_stats], '{:.4f}', True),
-            ('+ ent. 3', [s['step3'] for s in all_stats], '{:.4f}', True),
-            ('Total ent', totals,                          '{:.4f}', True),
+            ('+ ent. 2', [s['step2'] for s in all_stats], '{:.3f}', True),
+            ('+ ent. 3', [s['step3'] for s in all_stats], '{:.3f}', True),
+            ('Tot. ent', totals,                           '{:.3f}', True),
         ]
 
     bucket_labels = ['1:', '2-4:', '5-9:', '10-49:', '50+:']
@@ -2123,18 +2125,21 @@ def _compare_words(words, soln, step2_pool=None, constraint_compliant=False,
     def print_row(label, values, fmt, higher_better=True):
         padded = [('—'.rjust(cw) if v is None else fmt.format(v).rjust(cw))
                   for v in values]
+        # Ties are judged on the printed text, so two values that print
+        # alike are both highlighted or neither is.
         valid = [v for v in values if v is not None]
-        if len(valid) < 2 or all(v == valid[0] for v in valid):
-            all_tied = True
-            best = None
+        shown = {fmt.format(v) for v in valid}
+        if len(valid) < 2 or len(shown) == 1:
+            best_text = None
         else:
             best = max(valid) if higher_better else min(valid)
-            all_tied = False
-        print(f'  {label:<{lw}}  ', end='')
+            best_text = fmt.format(best)
+        print(f'  {label:<{lw}} ', end='')
         for i, (p, v) in enumerate(zip(padded, values)):
             if i:
                 print('  ', end='')
-            if not all_tied and v is not None and v == best:
+            if (best_text is not None and v is not None
+                    and fmt.format(v) == best_text):
                 with colored_text('green'):
                     print(p, end='')
             else:
@@ -2142,7 +2147,7 @@ def _compare_words(words, soln, step2_pool=None, constraint_compliant=False,
         print()
 
     print(f'\n  {n:,} words:')
-    print(f'  {"":>{lw}}  '
+    print(f'  {"":>{lw}} '
           + '  '.join((w.upper() + _mark(w)).rjust(cw) for w in words))
 
     for label, values, fmt, hb in data_rows:
@@ -2681,7 +2686,7 @@ def cmd_help(gs):
   b = Board (entropy vs max group size)
   l = Lookahead (two-step entropy)
   d = Display remaining words
-  t = Test 1 to 4 words (all methods + lookahead)
+  t = Test 1 to 5 words (all methods + lookahead)
   i = Include letters (filter)
   x = eXclude letters (filter)
   u = Undo last guess  ({nguesses} guesses so far)
