@@ -259,7 +259,12 @@
     .leaderboard-neighbour { display:flex; align-items:center; gap:.55rem; width:100%; text-align:left; background:var(--panel); padding:.35rem .75rem; }
     .leaderboard-card .card-title.clickable { cursor:pointer; }
     .leaderboard-breakdown-retry { display:block; width:100%; margin:.4rem 0; text-align:left; }
-    .leaderboard-pager { display:flex; flex-wrap:wrap; align-items:center; gap:.4rem; margin:.4rem 0 .6rem; scroll-margin-top:calc(var(--sticky-top,0px) + 3rem); }
+    /* The pager is as wide as its page row, so the widening buttons sit
+       under that row's ends at any width. */
+    .leaderboard-pager { display:inline-flex; flex-direction:column; gap:.4rem; max-width:100%; margin:.4rem 0 .6rem; scroll-margin-top:calc(var(--sticky-top,0px) + 3rem); }
+    .leaderboard-page-row { display:flex; flex-wrap:wrap; align-items:center; gap:.4rem; }
+    .leaderboard-widen-row { display:flex; justify-content:space-between; gap:.6rem; }
+    .leaderboard-widen { border-radius:999px; border-color:var(--blue); color:var(--blue); font-weight:600; padding:.25rem .75rem; }
     .leaderboard-page-box { display:inline-flex; align-items:center; white-space:nowrap; }
     .leaderboard-page-input { width:4.5em; }
     .opener-lookup-form { display:flex; flex-wrap:wrap; align-items:center; gap:.4rem .5rem; }
@@ -2539,7 +2544,7 @@
     // is paged by rank, so any place in it -- the worst openers included,
     // which the histogram's sparse tail never gathers into one bar -- is a
     // page away.
-    const LEADERBOARD_HISTOGRAM_MAXIMUM_BINS=60,LEADERBOARD_PAGE_ROWS=25;
+    const LEADERBOARD_HISTOGRAM_MAXIMUM_BINS=60,LEADERBOARD_PAGE_ROWS=25,LEADERBOARD_WIDEN_ROWS=10;
     // The slice of the ranking a state lists: the openers in its ERD range,
     // and which page of them is on screen.
     function leaderboardPaging(rows,state){
@@ -2604,18 +2609,34 @@
           :"Ranked by ERD · "+numText((page-1)*LEADERBOARD_PAGE_ROWS+1)+"–"+numText((page-1)*LEADERBOARD_PAGE_ROWS+listed.length)
             +" of "+numText(inRange.length)+(requested?rangeText:" complete")));
       markLookedUpOpener(fragment);
+      const widening=field&&leaderboardWidening(rows,field,range);
+      fragment.append(leaderboardPager(page,pageCount,widening));
       if(!listed.length){fragment.append(element("p","empty","No ranked opener has an ERD in this range"));return fragment;}
-      if(pageCount>1)fragment.append(leaderboardPager(page,pageCount));
       const grid=element("div","grid leaderboard");
       for(const row of listed)grid.append(leaderboardCard(row,state,{maximumResponseGroupCount}));
       fragment.append(grid);
-      if(pageCount>1)fragment.append(leaderboardPager(page,pageCount));
+      if(pageCount>1)fragment.append(leaderboardPager(page,pageCount,widening));
       return fragment;
     }
     // First and last are always one tap; any page between is typed.  The
     // box shows the page in view and goes to the one entered when it is
     // committed, so a half-typed number moves nothing.
-    function leaderboardPager(page,pageCount){
+    // The ranges one step wider at each end: the range stretched to the ERD of
+    // the opener LEADERBOARD_WIDEN_ROWS ranks past that end.  A range holds
+    // whole ERDs, so openers tied with that one come in too.  An end that is
+    // already the field's has nothing past it, and reads null.
+    function leaderboardWidening(rows,field,range){
+      let first=rows.findIndex(row=>row.erd_numerator>=range.from);
+      if(first<0)first=rows.length;
+      let last=first-1;
+      while(last+1<rows.length&&rows[last+1].erd_numerator<=range.to)last++;
+      const asRange=(from,to)=>from===field.from&&to===field.to?null:{from,to};
+      return {
+        better:first>0?asRange(rows[Math.max(0,first-LEADERBOARD_WIDEN_ROWS)].erd_numerator,range.to):undefined,
+        worse:last<rows.length-1?asRange(range.from,rows[Math.min(rows.length-1,last+LEADERBOARD_WIDEN_ROWS)].erd_numerator):undefined,
+      };
+    }
+    function leaderboardPager(page,pageCount,widening){
       const pager=element("nav","leaderboard-pager");pager.setAttribute("aria-label","Leaderboard pages");
       const step=(text,target,label)=>{
         const button=element("button","",text);button.type="button";button.setAttribute("aria-label",label);
@@ -2631,8 +2652,22 @@
         pageLeaderboard(Math.max(1,Math.min(pageCount,target)));
       });
       const box=element("label","leaderboard-page-box");box.append("Page\u00a0",input,"\u00a0of\u00a0"+numText(pageCount));
-      pager.append(step("First",1,"First page"),step("Prev",Math.max(1,page-1),"Previous page"),box,
+      // Widening changes what the list holds rather than moving through it,
+      // so it is styled apart from paging, with better openers to the left as
+      // on the histogram.  A widened range of the whole field is no range at
+      // all, so null zooms out.
+      const widen=(text,end,label)=>{
+        const button=element("button","leaderboard-widen",text);button.type="button";button.setAttribute("aria-label",label);
+        const target=widening?.[end];
+        button.disabled=target===undefined;button.addEventListener("click",()=>zoomLeaderboard(target));
+        return button;
+      };
+      const pageRow=element("div","leaderboard-page-row"),widenRow=element("div","leaderboard-widen-row");
+      pageRow.append(step("First",1,"First page"),step("Prev",Math.max(1,page-1),"Previous page"),box,
         step("Next",Math.min(pageCount,page+1),"Next page"),step("Last",pageCount,"Last page"));
+      widenRow.append(widen("+"+LEADERBOARD_WIDEN_ROWS+"\u00a0better","better","Include "+LEADERBOARD_WIDEN_ROWS+" better openers"),
+        widen("+"+LEADERBOARD_WIDEN_ROWS+"\u00a0worse","worse","Include "+LEADERBOARD_WIDEN_ROWS+" worse openers"));
+      pager.append(pageRow,widenRow);
       return pager;
     }
     const erdRangeText=(range,denominator)=>range.from===range.to
