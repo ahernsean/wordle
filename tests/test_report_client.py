@@ -2593,6 +2593,30 @@ class ReportClientContract:
             "() => location.search.includes('erd_numerator_range=425-439')")
         self.assertEqual(self._caption(), "Ranked by ERD · 15 openers with ERD 4.2500–4.3900")
 
+    def test_the_widening_buttons_sit_under_the_page_rows_ends(self):
+        """At any width, +10 better starts where the page controls start and
+        +10 worse ends where they end, rather than at the far edge of a wide
+        screen."""
+        self._open_long_leaderboard(
+            300, query="&poll=600000&erd_numerator_range=425-429")
+        for width in (375, 390, 800, 1200):
+            with self.subTest(width=width):
+                self.page.set_viewport_size({"width": width, "height": 800})
+                edges = self.page.evaluate("""() => {
+                  const pager = document.querySelector('.leaderboard-pager');
+                  const box = node => node.getBoundingClientRect();
+                  const controls = [...pager.querySelector('.leaderboard-page-row').children].map(box),
+                    [better, worse] = [...pager.querySelectorAll('.leaderboard-widen')].map(box);
+                  return [Math.min(...controls.map(control => control.left)), better.left,
+                          Math.max(...controls.map(control => control.right)), worse.right,
+                          document.documentElement.scrollWidth, document.documentElement.clientWidth];
+                }""")
+                self.assertAlmostEqual(edges[0], edges[1], delta=1)
+                self.assertAlmostEqual(edges[2], edges[3], delta=1)
+                self.assertLessEqual(edges[4], edges[5])
+        widen = self.page.locator(".leaderboard-pager").first.locator(".leaderboard-widen")
+        self.assertEqual(widen.all_inner_texts(), ["+10\u00a0better", "+10\u00a0worse"])
+
     def test_widening_takes_every_opener_tied_at_the_new_end(self):
         """Ten better than #121 is #111 on 351, and all 60 on 351 come in."""
         self._open_dense_leaderboard("&erd_numerator_range=352-353")
