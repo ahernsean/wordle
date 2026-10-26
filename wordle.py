@@ -2125,21 +2125,18 @@ def _compare_words(words, soln, step2_pool=None, constraint_compliant=False,
     def print_row(label, values, fmt, higher_better=True):
         padded = [('—'.rjust(cw) if v is None else fmt.format(v).rjust(cw))
                   for v in values]
-        # Ties are judged on the printed text, so two values that print
-        # alike are both highlighted or neither is.
+        # The best value is chosen by its full precision, so a cell can be
+        # green beside one that prints the same.
         valid = [v for v in values if v is not None]
-        shown = {fmt.format(v) for v in valid}
-        if len(valid) < 2 or len(shown) == 1:
-            best_text = None
+        if len(valid) < 2 or all(v == valid[0] for v in valid):
+            best = None
         else:
             best = max(valid) if higher_better else min(valid)
-            best_text = fmt.format(best)
         print(f'  {label:<{lw}} ', end='')
         for i, (p, v) in enumerate(zip(padded, values)):
             if i:
                 print('  ', end='')
-            if (best_text is not None and v is not None
-                    and fmt.format(v) == best_text):
+            if best is not None and v is not None and v == best:
                 with colored_text('green'):
                     print(p, end='')
             else:
@@ -2148,7 +2145,8 @@ def _compare_words(words, soln, step2_pool=None, constraint_compliant=False,
 
     print(f'\n  {n:,} words:')
     print(f'  {"":>{lw}} '
-          + '  '.join((w.upper() + _mark(w)).rjust(cw) for w in words))
+          + '  '.join((_mark(w).strip() + w.upper()).rjust(cw)
+                      for w in words))
 
     for label, values, fmt, hb in data_rows:
         print_row(label, values, fmt, hb)

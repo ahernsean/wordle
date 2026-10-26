@@ -5,6 +5,7 @@ wordle.py.  Drives the helpers through cmd_test (interactive and inline paths)
 across the candidate modes (possible-answers, hard mode, unfiltered), fresh and
 mid-game, plus comparison of 2-5 words and conflict explanations.
 """
+import contextlib
 import io
 import unittest
 from contextlib import redirect_stdout
@@ -143,27 +144,41 @@ class TestCmdTestCompare(CliTestCase):
         table = out.split("words:", 1)[1]
         self.assertEqual(max(len(row) for row in table.splitlines()), 49)
 
-    def test_values_that_print_alike_are_tied(self):
-        # Entropies differing only past the printed precision print alike,
-        # so both are green or neither is: never one of two identical cells.
-        def run(entropies):
-            stats = iter([{'wt_avg': 1.0, 'max_group_size': 1,
-                           'prob_finish': 0.5, 'step1': step1,
-                           'step2': 0.0, 'step3': 0.0,
-                           'buckets': [1, 0, 0, 0, 0]}
-                          for step1 in entropies])
-            words = " ".join(["crane", "slate", "trace"][:len(entropies)])
-            with mock.patch.object(wordle, '_multistep_stats',
-                                   lambda *_a, **_k: next(stats)), \
-                    mock.patch.object(wordle, '_erd_cache_and_policy',
-                                      return_value=(None, None)), \
-                    mock.patch.object(wordle, 'colored_text') as colored:
-                self.run_cmd(lambda gs: wordle.cmd_test(gs, words))
-            return colored.call_count
+    def test_green_follows_full_precision_not_the_printed_digits(self):
+        # 1.50004 and 1.50001 both print 1.500; only the larger is best.
+        stats = iter([{'wt_avg': 1.0, 'max_group_size': 1,
+                       'prob_finish': 0.5, 'step1': step1,
+                       'step2': 0.0, 'step3': 0.0,
+                       'buckets': [1, 0, 0, 0, 0]}
+                      for step1 in (1.50001, 1.50004)])
+        greens = []
 
-        self.assertEqual(run((1.50004, 1.50001)), 0)
-        # Ent. 1 and Tot. ent, which repeats it: two green cells in each.
-        self.assertEqual(run((1.50004, 1.50001, 1.2)), 4)
+        def record(color):
+            greens.append(color)
+            return contextlib.nullcontext()
+
+        with mock.patch.object(wordle, '_multistep_stats',
+                               lambda *_a, **_k: next(stats)), \
+                mock.patch.object(wordle, '_erd_cache_and_policy',
+                                  return_value=(None, None)), \
+                mock.patch.object(wordle, 'colored_text', record), \
+                mock.patch.object(wordle, 'SUPPORTS_COLOR', False):
+            out = self.run_cmd(lambda gs: wordle.cmd_test(gs, "crane slate"))
+        # Ent. 1 and Tot. ent, which repeats it: one green cell in each.
+        self.assertEqual(len(greens), 2)
+        ent_row = next(l for l in out.splitlines() if l.startswith("  Ent. 1"))
+        self.assertEqual(ent_row.split()[2:], ["1.500", "1.500"])
+
+    def test_header_words_end_at_the_column_edge(self):
+        out = self.run_cmd(lambda gs: wordle.cmd_test(gs, "crane brain"))
+        lines = out.split("words:", 1)[1].splitlines()
+        header = next(l for l in lines if "CRANE" in l)
+        ent_row = next(l for l in lines if l.startswith("  Ent. 1"))
+        # Both words end where the column's values end; CRANE is an answer,
+        # so its marker leads it rather than trailing past the edge.
+        self.assertIn("*CRANE", header)
+        self.assertEqual(len(header), len(ent_row))
+        self.assertTrue(header.endswith("BRAIN"))
 
     def test_compare_buckets(self):
         # Bucket rows (1:, 2-4:, etc.) print when any bucket is non-empty.
