@@ -4241,8 +4241,8 @@ class TestCompareWordsDisplay(unittest.TestCase):
         header = next(l for l in out.splitlines()
                       if l.strip().startswith('CRANE') and 'BRAIN' in l)
         self.assertIn('CRANE*', header)
-        self.assertIn('BRAIN ', header)
         self.assertNotIn('BRAIN*', header)
+        self.assertTrue(header.endswith('BRAIN'))
 
 
 # ---------------------------------------------------------------------------

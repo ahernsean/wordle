@@ -3,9 +3,13 @@
 Covers cmd_test, _compare_words, _multistep_stats, and _explain_conflict in
 wordle.py.  Drives the helpers through cmd_test (interactive and inline paths)
 across the candidate modes (possible-answers, hard mode, unfiltered), fresh and
-mid-game, plus comparison of 2-4 words and conflict explanations.
+mid-game, plus comparison of 2-5 words and conflict explanations.
 """
+import contextlib
+import io
 import unittest
+from contextlib import redirect_stdout
+from unittest import mock
 
 import wordle
 from wordle import cmd_test, GuessUniverse, ComplianceFilter
@@ -43,9 +47,41 @@ class TestCmdTestSingle(CliTestCase):
         self.assertIn("5 letters", out)
 
     def test_bad_length_word_via_compare_branch(self):
-        # 2-4 tokens but one is the wrong length -> assertion -> error message.
         out = self.run_cmd(cmd_test, inputs=["crane sla"])
-        self.assertIn("5 letters", out)
+        self.assertIn("Not 5 letters: SLA.", out)
+        self.assertNotIn("Computing", out)
+
+    def test_every_wrong_length_word_is_named(self):
+        out = self.run_cmd(cmd_test, inputs=["cat crane brains"])
+        self.assertIn("Not 5 letters: CAT, BRAINS.", out)
+
+    def test_too_many_words_names_the_limit_not_the_length(self):
+        out = self.run_cmd(
+            cmd_test, inputs=["crane slate trace stale tales least"])
+        self.assertIn(
+            f"Test takes 1 to {wordle.MAX_COMPARE_WORDS} words, not 6.", out)
+        self.assertNotIn("5 letters", out)
+        self.assertNotIn("Computing", out)
+
+    def test_no_words(self):
+        out = self.run_cmd(cmd_test, inputs=[""])
+        self.assertIn("Test takes 1 to", out)
+        self.assertNotIn("5 letters", out)
+
+    def test_solver_assertion_is_not_reported_as_bad_input(self):
+        def failing(*_args, **_kwargs):
+            raise AssertionError("engine invariant")
+
+        for line, target in (("crane", "_multistep_stats"),
+                             ("crane slate", "_compare_words")):
+            with self.subTest(line=line), \
+                    mock.patch.object(wordle, target, failing):
+                buf = io.StringIO()
+                with redirect_stdout(buf), \
+                        self.assertRaisesRegex(AssertionError,
+                                               "engine invariant"):
+                    wordle.cmd_test(self.gs, line)
+                self.assertNotIn("5 letters", buf.getvalue())
 
 
 class TestCmdTestInline(CliTestCase):
@@ -66,25 +102,85 @@ class TestCmdTestCompare(CliTestCase):
     def test_compare_two(self):
         out = self.run_cmd(cmd_test, inputs=["crane slate"])
         self.assertIn("Computing", out)
-        self.assertIn("Entropy 1", out)
+        self.assertIn("Ent. 1", out)
         self.assertIn("Wt avg", out)
         self.assertIn("max-grp", out)
         self.assertIn("Solve%", out)
-        # n == 2 path: the "+ ent. 2/3"/"Total ent" rows are gated on n > 2,
+        # n == 2 path: the "+ ent. 2/3"/"Tot. ent" rows are gated on n > 2,
         # which holds here (n = 10), so they should appear.
-        self.assertIn("Total ent", out)
+        self.assertIn("Tot. ent", out)
         self.assertIn("+ ent. 2", out)
 
     def test_compare_three(self):
         out = self.run_cmd(cmd_test, inputs=["crane slate trace"])
         self.assertIn("[1/3]", out)
         self.assertIn("[3/3]", out)
-        self.assertIn("Total ent", out)
+        self.assertIn("Tot. ent", out)
 
     def test_compare_four(self):
         out = self.run_cmd(cmd_test, inputs=["crane slate trace stale"])
         self.assertIn("[4/4]", out)
         self.assertIn("TRACE", out)
+
+    def test_compare_five(self):
+        out = self.run_cmd(
+            cmd_test, inputs=["crane slate trace stale tales"])
+        self.assertIn("[5/5]", out)
+        self.assertIn("TALES", out)
+
+    def test_five_widest_columns_fit_the_phone_console(self):
+        # The widest value each row can print over the full 3,209-word
+        # answer list: every word in one response group, maximal entropy.
+        widest = {'wt_avg': 3209.0, 'max_group_size': 3209,
+                  'prob_finish': 1.0, 'step1': 9.999, 'step2': 9.999,
+                  'step3': 9.999, 'buckets': [3209] * 5, 'erd': 9.999}
+        line = " ".join(["crane", "slate", "trace", "stale", "tales"])
+        with mock.patch.object(wordle, '_multistep_stats',
+                               lambda *_a, **_k: dict(widest)), \
+                mock.patch.object(wordle, 'SUPPORTS_COLOR', False):
+            out = self.run_cmd(lambda gs: wordle.cmd_test(gs, line))
+        self.assertIn("Tot. ent", out)
+        self.assertIn("ERD", out)
+        table = out.split("words:", 1)[1]
+        self.assertEqual(max(len(row) for row in table.splitlines()), 49)
+
+    def test_green_follows_full_precision_not_the_printed_digits(self):
+        # 1.50004 and 1.50001 both print 1.500; only the larger is best.
+        stats = iter([{'wt_avg': 1.0, 'max_group_size': 1,
+                       'prob_finish': 0.5, 'step1': step1,
+                       'step2': 0.0, 'step3': 0.0,
+                       'buckets': [1, 0, 0, 0, 0]}
+                      for step1 in (1.50001, 1.50004)])
+        greens = []
+
+        def record(color):
+            greens.append(color)
+            return contextlib.nullcontext()
+
+        with mock.patch.object(wordle, '_multistep_stats',
+                               lambda *_a, **_k: next(stats)), \
+                mock.patch.object(wordle, '_erd_cache_and_policy',
+                                  return_value=(None, None)), \
+                mock.patch.object(wordle, 'colored_text', record), \
+                mock.patch.object(wordle, 'SUPPORTS_COLOR', False):
+            out = self.run_cmd(lambda gs: wordle.cmd_test(gs, "crane slate"))
+        # Ent. 1 and Tot. ent, which repeats it: one green cell in each.
+        self.assertEqual(len(greens), 2)
+        entropy_row = next(l for l in out.splitlines() if l.startswith("  Ent. 1"))
+        self.assertEqual(entropy_row.split()[2:], ["1.500", "1.500"])
+
+    def test_header_words_end_at_the_column_edge(self):
+        # A word's last character, its letter or its answer-set marker,
+        # sits where the values beneath it end.
+        out = self.run_cmd(lambda gs: wordle.cmd_test(gs, "brain crane"))
+        lines = out.split("words:", 1)[1].splitlines()
+        header = next(l for l in lines if "CRANE" in l)
+        entropy_row = next(l for l in lines if l.startswith("  Ent. 1"))
+        self.assertTrue(header.endswith("CRANE*"))
+        self.assertEqual(len(header), len(entropy_row))
+        brain_end = header.index("BRAIN") + len("BRAIN")
+        self.assertNotEqual(entropy_row[brain_end - 1], " ")
+        self.assertEqual(entropy_row[brain_end], " ")
 
     def test_compare_buckets(self):
         # Bucket rows (1:, 2-4:, etc.) print when any bucket is non-empty.
@@ -100,7 +196,7 @@ class TestCmdTestCompare(CliTestCase):
         therefore its columns, out of step with every other row. This is
         the exact defect a too-long "Max group size" label caused."""
         out = self.run_cmd(cmd_test, inputs=["crane slate"])
-        labels = ["Wt avg", "max-grp", "Solve%", "Entropy 1"]
+        labels = ["Wt avg", "max-grp", "Solve%", "Ent. 1", "Tot. ent"]
         lengths = {}
         for line in out.splitlines():
             for label in labels:
