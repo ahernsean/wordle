@@ -170,15 +170,17 @@ class TestCmdTestCompare(CliTestCase):
         self.assertEqual(ent_row.split()[2:], ["1.500", "1.500"])
 
     def test_header_words_end_at_the_column_edge(self):
-        out = self.run_cmd(lambda gs: wordle.cmd_test(gs, "crane brain"))
+        # A word's last character, its letter or its answer-set marker,
+        # sits where the values beneath it end.
+        out = self.run_cmd(lambda gs: wordle.cmd_test(gs, "brain crane"))
         lines = out.split("words:", 1)[1].splitlines()
         header = next(l for l in lines if "CRANE" in l)
         ent_row = next(l for l in lines if l.startswith("  Ent. 1"))
-        # Both words end where the column's values end; CRANE is an answer,
-        # so its marker leads it rather than trailing past the edge.
-        self.assertIn("*CRANE", header)
+        self.assertTrue(header.endswith("CRANE*"))
         self.assertEqual(len(header), len(ent_row))
-        self.assertTrue(header.endswith("BRAIN"))
+        brain_end = header.index("BRAIN") + len("BRAIN")
+        self.assertNotEqual(ent_row[brain_end - 1], " ")
+        self.assertEqual(ent_row[brain_end], " ")
 
     def test_compare_buckets(self):
         # Bucket rows (1:, 2-4:, etc.) print when any bucket is non-empty.

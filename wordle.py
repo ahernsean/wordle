@@ -2145,7 +2145,7 @@ def _compare_words(words, soln, step2_pool=None, constraint_compliant=False,
 
     print(f'\n  {n:,} words:')
     print(f'  {"":>{lw}} '
-          + '  '.join((_mark(w).strip() + w.upper()).rjust(cw)
+          + '  '.join((w.upper() + _mark(w).strip()).rjust(cw)
                       for w in words))
 
     for label, values, fmt, hb in data_rows:
