@@ -115,8 +115,43 @@ jobs:
       - name: Install dependencies
         run: python -m pip install coverage numpy playwright
 
+      # WebKit's system libraries are about 117 MB of Ubuntu packages, and the
+      # runner's mirror serves them anywhere from 20 seconds to 48 minutes.
+      # The downloaded .deb files are cached between runs; apt installs from
+      # a cached file whose version and checksum match its index, and
+      # downloads anything else, so a stale cache costs time, not
+      # correctness.  The key follows the Playwright release, which is what
+      # changes the package list.
+      - name: Find the Playwright version and runner image
+        id: playwright
+        run: |
+          echo "version=$(python -c 'import importlib.metadata; print(importlib.metadata.version("playwright"))')" >> "$GITHUB_OUTPUT"
+          echo "image=$ImageOS" >> "$GITHUB_OUTPUT"
+
+      - name: Restore WebKit's system packages
+        uses: actions/cache@v4
+        with:
+          path: ~/webkit-packages
+          key: webkit-packages-${{ steps.playwright.outputs.image }}-playwright-${{ steps.playwright.outputs.version }}
+
+      - name: Seed apt with the restored packages
+        run: |
+          echo 'APT::Keep-Downloaded-Packages "true";' | sudo tee /etc/apt/apt.conf.d/99keep-downloaded-packages
+          mkdir -p ~/webkit-packages
+          shopt -s nullglob
+          packages=(~/webkit-packages/*.deb)
+          echo "Restored ${#packages[@]} packages"
+          if (( ${#packages[@]} )); then sudo cp "${packages[@]}" /var/cache/apt/archives/; fi
+
       - name: Install Playwright WebKit
         run: python -m playwright install --with-deps webkit
+
+      - name: Keep WebKit's system packages for the cache
+        run: |
+          shopt -s nullglob
+          packages=(/var/cache/apt/archives/*.deb)
+          echo "Keeping ${#packages[@]} packages"
+          if (( ${#packages[@]} )); then cp "${packages[@]}" ~/webkit-packages/; fi
 
       # _launch_webkit (tests/test_report_client.py) launches this native
       # build directly; the Microsoft Playwright container
