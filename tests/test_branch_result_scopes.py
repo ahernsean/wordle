@@ -492,12 +492,14 @@ class ResultTotalsTest(_CacheTest):
             self.assertNotRegex(
                 plan, r"INDEX idx_branch_best_by_policy(_and_budget)? ")
             if "NOT EXISTS" in statement:
-                self.assertRegex(plan, r"AS earlier USING (COVERING )?INDEX "
+                self.assertRegex(plan, r"\bearlier USING (COVERING )?INDEX "
                                        r"sqlite_autoindex_\w+ \(branch_key=\?\)")
             if "updated_at" in statement:
                 self.assertRegex(plan, r"INDEX idx_branch_(budget_)?updated ")
             else:
-                self.assertRegex(plan, r"INTEGER PRIMARY KEY \(rowid>\?\)")
+                self.assertRegex(plan, r"\b(counted|branch_\w+) USING INTEGER "
+                                       r"PRIMARY KEY \(rowid>\?\)")
+                self.assertNotRegex(plan, r"SCAN (TABLE )?(counted|branch_)")
 
 
 class ReportingTest(_CacheTest):

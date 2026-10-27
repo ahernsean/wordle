@@ -1718,21 +1718,22 @@ class ScoreCache:
             else:
                 floor = previous["highest_rowid"]
 
-                # The unary plus keeps the (answer_list_id, policy) index out
-                # of the plan, which would otherwise walk every result to
-                # find the few above the mark.
+                # NOT INDEXED leaves the rowid range as the only way in.  Any
+                # index on these tables -- (answer_list_id, policy) for the
+                # filter, the primary key for DISTINCT's order -- walks every
+                # result to find the few above the mark.
                 def count(table):
                     return self._conn.execute(f"""
-                        SELECT COUNT(*) FROM {table}
-                        WHERE rowid > ? AND +policy = ? AND +answer_list_id = ?
+                        SELECT COUNT(*) FROM {table} NOT INDEXED
+                        WHERE rowid > ? AND policy = ? AND answer_list_id = ?
                     """, (floor[table], *parameters)).fetchone()[0]
 
                 # A branch is new when no row below the mark already holds it.
                 floor_budgeted = floor["branch_best_by_policy_and_budget"]
                 budgeted_branches = self._conn.execute("""
                     SELECT COUNT(DISTINCT branch_key)
-                    FROM branch_best_by_policy_and_budget AS counted
-                    WHERE rowid > ? AND +policy = ? AND +answer_list_id = ?
+                    FROM branch_best_by_policy_and_budget AS counted NOT INDEXED
+                    WHERE rowid > ? AND policy = ? AND answer_list_id = ?
                       AND NOT EXISTS (
                           SELECT 1
                           FROM branch_best_by_policy_and_budget AS earlier
