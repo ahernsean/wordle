@@ -2584,6 +2584,81 @@ class TestOpenBranchOwnersAreFoundByBranch(_TmpQueue):
                                r"\(branch_id=\?\)")
 
 
+class TestQueueReportBuildsOnlyHotBranches(_TmpQueue):
+    """A queued or done branch is read from its pending row alone, and a page
+    is chosen before any row joins the branch registry."""
+
+    SORTS = (None, "age", "size", "workers", "priority", "nodes", "slowest")
+
+    def setUp(self):
+        super().setUp()
+        # Sizes rise against insertion order and repeat, and priorities are
+        # equal throughout, so a page taken in table order is the wrong page
+        # and every sort ends in ties that hot and cold branches share.
+        keys = [ScoreCache.encode_subset(list(pair))
+                for pair in itertools.combinations(WORDS, 2)]
+        self.q.add_pending_many(
+            [(key, 2 + index % 3, 5, "crane", index)
+             for index, key in enumerate(keys[:8])])
+        ids = {key: self.q._intern_branch(key) for key in keys[:8]}
+        done, in_progress, opened, self.watched = keys[1], keys[3], keys[5], keys[6]
+        ProductionERDQueue.mark_done(self.q, done)
+        self.q._conn.execute("UPDATE pending_branches SET status = 'in_progress' "
+                             "WHERE branch_id = ?", (ids[in_progress],))
+        self.q.create_branch(opened, 3, N_CANDIDATES)
+        self.q.create_branch(keys[8], 3, N_CANDIDATES)
+        # A worker standing on a branch that is only queued.
+        self.q.heartbeat("worker-0", 1, self.watched, 2, int(time.time()), 0)
+        self.q._conn.commit()
+        self.ids = {key: self.q._intern_branch(key) for key in keys[:9]}
+
+    def _report(self, sort, limit):
+        return self.q.report_queue_rows({}, sort, limit, generated_at=int(time.time()))
+
+    def test_a_page_is_the_start_of_the_whole_ordering(self):
+        for sort in self.SORTS:
+            whole = self._report(sort, None)
+            self.assertEqual(whole["matched_rows"], 9)
+            for limit in range(1, 10):
+                with self.subTest(sort=sort, limit=limit):
+                    page = self._report(sort, limit)
+                    self.assertEqual(page["rows"], whole["rows"][:limit])
+                    self.assertEqual(page["summary"], whole["summary"])
+
+    def test_ties_break_on_branch_id(self):
+        rows = self._report("size", None)["rows"]
+        order = [(-row["answer_count"], self.ids[row["branch_key"]]) for row in rows]
+        self.assertEqual(order, sorted(order))
+        self.assertLess(len({size for size, _branch_id in order}), len(order))
+
+    def test_a_queued_branch_with_a_worker_counts_it(self):
+        rows = self._report("workers", None)["rows"]
+        self.assertEqual(rows[0]["branch_key"], self.watched)
+        self.assertEqual(rows[0]["worker_count"], 1)
+        self.assertEqual(rows[0]["branch_status"], "queued")
+        self.assertEqual(
+            [row["worker_count"] for row in rows[1:]], [0] * (len(rows) - 1))
+
+    def test_no_statement_scans_the_registry_or_the_claims(self):
+        # The registry holds a key blob for every branch ever seen and the
+        # claims a row per candidate; a page looks up only its own rows.
+        statements = []
+        self.q._conn.set_trace_callback(statements.append)
+        try:
+            for sort in self.SORTS:
+                self._report(sort, 2)
+        finally:
+            self.q._conn.set_trace_callback(None)
+        reads = [statement for statement in statements if "hot_ids AS" in statement]
+        self.assertEqual(len(reads), 2 * len(self.SORTS))
+        for statement in reads:
+            plan = " ".join(row[3] for row in self.q._conn.execute(
+                "EXPLAIN QUERY PLAN " + statement))
+            self.assertNotRegex(plan, r"SCAN (TABLE )?(branches|candidate_claims)\b")
+            self.assertNotRegex(plan, r"(SCAN|SEARCH) (TABLE )?(branches|candidate_claims)"
+                                      r"( AS \w+)? USING (COVERING )?INDEX \S+ \(\)")
+
+
 class TestInProgressReportsReadOnlyInProgressBranches(_TmpQueue):
 
     def setUp(self):
@@ -2643,7 +2718,8 @@ class TestInProgressReportsReadOnlyInProgressBranches(_TmpQueue):
         finally:
             self.q._conn.set_trace_callback(None)
         reads = [statement for statement in statements
-                 if "branch_ids AS" in statement]
+                 if "branch_ids AS" in statement or "hot_ids AS" in statement]
         self.assertEqual(len(reads), 3)
         for statement in reads:
             self.assertIn("WHERE status = 'in_progress'", statement)
+            self.assertNotIn("FROM cold_rows", statement)

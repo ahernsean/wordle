@@ -311,6 +311,17 @@ a few hundred openers stopped reports there, and must not come back:
   full depth against 0.2 ms now.  `TestOpenBranchOwnersAreFoundByBranch` checks
   the plan.
 
+- **A queue report builds only its hot branches.**  `report_queue_rows`
+  joins the active row, the live workers and the opener priority only for
+  branches that are active, in progress or have a worker on them -- a few
+  dozen.  Every other branch is queued or done and is read from its
+  `pending_branches` row alone; it is counted grouped by its own status and
+  paged before it meets the hot rows.  Ties break on `branch_id`, so a page
+  is chosen from integers, and only the page's rows look up their key and
+  count their completed candidates.  Building every branch's full row to
+  count statuses and keep a page of fifty was 4-11 s per poll at 600,000
+  branches; this is 0.4-0.7 s.
+
 The tree views still read every queue row, about 8 s today and 32 s at full
 depth; computing a tree page in SQL is the remaining step.
 
