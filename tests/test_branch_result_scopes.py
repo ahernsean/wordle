@@ -7,6 +7,7 @@ destroy the other, because an ancestor may already have reduced the one being
 replaced and nothing records which it reduced (issue #302).
 """
 import io
+import itertools
 import os
 import shutil
 import sqlite3
@@ -412,6 +413,91 @@ class MigrationTest(_CacheTest):
         self.assertEqual(after._conn.execute(
             "SELECT sql FROM sqlite_master WHERE name = ?",
             (CANONICAL,)).fetchone()[0], original_sql)
+
+
+class ResultTotalsTest(_CacheTest):
+    """Totals counted on from an earlier count agree with counting afresh."""
+
+    TOTALS = ("exact_branch_count", "budgeted_result_count",
+              "budgeted_branch_count", "loss_branch_count")
+
+    def setUp(self):
+        super().setUp()
+        self.keys = [ScoreCache.encode_subset(list(pair))
+                     for pair in itertools.combinations(WORDS, 2)]
+
+    def totals(self, score_cache, previous=None):
+        totals = score_cache.erd_result_totals(ERD_ALL, previous)
+        return {name: totals[name] for name in self.TOTALS}, totals
+
+    def test_counting_on_agrees_with_counting_from_nothing(self):
+        score_cache = self.cache()
+        score_cache.write(self.keys[0], ERD_ALL, "crane", 2.0, max_depth=4)
+        score_cache.write(self.keys[1], ERD_ALL, "slate", 2.5, max_depth=3,
+                          solve_budget=3)
+        score_cache.write_loss(self.keys[2], ERD_ALL, 2)
+        _counted, earlier = self.totals(score_cache)
+
+        score_cache.write(self.keys[3], ERD_ALL, "trace", 2.0, max_depth=4)
+        # Another budget of a branch already counted, and a branch new to
+        # the table twice over.
+        score_cache.write(self.keys[1], ERD_ALL, "stale", 2.2, max_depth=2,
+                          solve_budget=2)
+        score_cache.write(self.keys[4], ERD_ALL, "tales", 2.5, max_depth=3,
+                          solve_budget=3)
+        score_cache.write(self.keys[4], ERD_ALL, "tales", 2.4, max_depth=2,
+                          solve_budget=2)
+        # A loss raised in place, and a new one.
+        score_cache.write_loss(self.keys[2], ERD_ALL, 3)
+        score_cache.write_loss(self.keys[5], ERD_ALL, 2)
+
+        counted_on, totals = self.totals(score_cache, earlier)
+        self.assertFalse(totals["counted_from_nothing"])
+        self.assertEqual(counted_on, self.totals(score_cache)[0])
+        self.assertEqual(counted_on, {
+            "exact_branch_count": 2, "budgeted_result_count": 4,
+            "budgeted_branch_count": 2, "loss_branch_count": 2})
+
+    def test_rows_gone_from_the_top_are_recounted(self):
+        score_cache = self.cache()
+        for key in self.keys[:3]:
+            score_cache.write(key, ERD_ALL, "crane", 2.0, max_depth=4)
+        _counted, earlier = self.totals(score_cache)
+        score_cache._conn.execute(
+            f"DELETE FROM {CANONICAL} WHERE rowid = "
+            f"(SELECT MAX(rowid) FROM {CANONICAL})")
+        counted_on, totals = self.totals(score_cache, earlier)
+        self.assertTrue(totals["counted_from_nothing"])
+        self.assertEqual(counted_on["exact_branch_count"], 2)
+
+    def test_counting_on_reads_only_the_rows_above_the_mark(self):
+        # A walk of the (answer_list_id, policy) index visits every stored
+        # result -- about two million in production -- to find a handful.
+        score_cache = self.cache()
+        score_cache.write(self.keys[0], ERD_ALL, "crane", 2.0, max_depth=4)
+        _counted, earlier = self.totals(score_cache)
+        statements = []
+        score_cache._conn.set_trace_callback(statements.append)
+        try:
+            score_cache.erd_result_totals(ERD_ALL, earlier)
+            score_cache.erd_report_summary(ERD_ALL, 0, earlier)
+        finally:
+            score_cache._conn.set_trace_callback(None)
+        counts = [statement for statement in statements
+                  if "COUNT(" in statement]
+        self.assertEqual(len(counts), 6)
+        for statement in counts:
+            plan = " ".join(row[3] for row in score_cache._conn.execute(
+                "EXPLAIN QUERY PLAN " + statement))
+            self.assertNotRegex(
+                plan, r"INDEX idx_branch_best_by_policy(_and_budget)? ")
+            if "NOT EXISTS" in statement:
+                self.assertRegex(plan, r"AS earlier USING (COVERING )?INDEX "
+                                       r"sqlite_autoindex_\w+ \(branch_key=\?\)")
+            if "updated_at" in statement:
+                self.assertRegex(plan, r"INDEX idx_branch_(budget_)?updated ")
+            else:
+                self.assertRegex(plan, r"INTEGER PRIMARY KEY \(rowid>\?\)")
 
 
 class ReportingTest(_CacheTest):

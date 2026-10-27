@@ -2053,6 +2053,26 @@ class TestCostModel(_TmpQueue):
         done = {r['idx'] for r in rows if r['done'] == 1}
         self.assertEqual(done, {0, 2, 4})
 
+    def test_completed_candidate_indexes_are_found_per_branch(self):
+        # The registry hands out ids in the opposite order to the keys, so a
+        # lookup that pairs ids with keys by position gives each branch the
+        # other's indexes.
+        later, earlier = (ScoreCache.encode_subset(WORDS[1:]),
+                          ScoreCache.encode_subset(WORDS[:-1]))
+        self.assertGreater(later, earlier)
+        for branch_key, indexes in ((later, [5, 1, 3]), (earlier, [2, 0])):
+            self.q.create_branch(branch_key, len(WORDS) - 1, N_CANDIDATES, budget=5)
+            self.q.mark_claims_done(branch_key, indexes)
+        # A claim a worker holds unfinished.
+        self.q._conn.execute(
+            "INSERT INTO candidate_claims (branch_id, idx, claimed_by, done) "
+            "VALUES (?, 7, 'worker-0', 0)", (self.q._intern_branch(earlier),))
+        unregistered = ScoreCache.encode_subset(WORDS[:2])
+        self.assertEqual(
+            self.q.completed_candidate_indexes_by_branch(
+                [earlier, unregistered, later]),
+            {earlier: [0, 2], unregistered: [], later: [1, 3, 5]})
+
     def test_mark_claims_done_skips_finalized_branch(self):
         # A publisher call that races finalization must not re-create claim
         # rows: delete_branch has removed the active row, so a fresh insert

@@ -5,6 +5,7 @@ import os
 import sqlite3
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 
 from tests.queue_invariants import add_second_request
@@ -368,6 +369,7 @@ class ReportModelTest(unittest.TestCase):
         cache.report_recent_rows.return_value = [{
             "branch_key": branch_key, "best_guess": "salet",
         }]
+        cache.erd_result_totals.return_value = {"counted_from_nothing": True}
         cache.erd_report_summary.return_value = {"exact_branch_count": 1}
         cache.report_cache_distributions.return_value = {"answer_count": []}
         with (
@@ -3390,6 +3392,36 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(ReportRequest().report_kind, "auto")
         with self.assertRaisesRegex(ValueError, "unsupported report kind: hotspot"):
             collect_report(self.sources, ReportRequest("hotspot"))
+
+    def test_result_totals_are_carried_and_recounted_on_schedule(self):
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        self.addCleanup(cache.close)
+        sources = SimpleNamespace(cache_path=self.cache_path)
+
+        def insert(branch_key):
+            cache._conn.execute(
+                "INSERT INTO branch_best_by_policy (branch_key, policy, "
+                "answer_list_id, best_guess, best_score, updated_at) "
+                "VALUES (?, ?, ?, 'salet', 2.0, 1)",
+                (branch_key, ERD_ALL, cache.answer_list_id))
+
+        def exact_count(generated_at):
+            return report_model._erd_result_totals(
+                cache, sources, generated_at)["exact_branch_count"]
+
+        for branch_key in (b"first", b"second"):
+            insert(branch_key)
+        started_at = 1_000_000
+        self.assertEqual(exact_count(started_at), 2)
+        insert(b"third")
+        self.assertEqual(exact_count(started_at + 2), 3)
+        # A repair deletes below the mark: counting on cannot see it, and the
+        # scheduled recount does.
+        cache._conn.execute(
+            "DELETE FROM branch_best_by_policy WHERE branch_key = ?", (b"first",))
+        recount_at = started_at + report_model.RESULT_TOTALS_RECOUNT_SECONDS
+        self.assertEqual(exact_count(recount_at), 3)
+        self.assertEqual(exact_count(recount_at + 1), 2)
 
     def test_cache_reference_resolves_finalized_branch_without_a_spine(self):
         branch_key = b"finalized branch"

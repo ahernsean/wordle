@@ -322,6 +322,15 @@ a few hundred openers stopped reports there, and must not come back:
   count statuses and keep a page of fifty was 4-11 s per poll at 600,000
   branches; this is 0.4-0.7 s.
 
+- **The overview's cache totals are counted on, not recounted.**  Every
+  stored result is about two million rows, and counting them on each
+  two-second poll cost 1.9 s.  `ScoreCache.erd_result_totals` counts only
+  the rows above the highest rowid an earlier count saw, which on the
+  normal path are exactly the new ones, since results are only inserted.
+  The report server carries the last totals per cache file and recounts
+  from nothing every `RESULT_TOTALS_RECOUNT_SECONDS`, which is how a
+  repair or migration that deletes results reaches the totals.
+
 The tree views still read every queue row, about 8 s today and 32 s at full
 depth; computing a tree page in SQL is the remaining step.
 

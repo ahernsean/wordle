@@ -1675,38 +1675,124 @@ class ScoreCache:
         """, (self.answer_list_id, self.answer_list_id)).fetchone()
         return row["m"] if row else None
 
-    def erd_report_summary(self, policy: str, recent_since: int) -> dict:
-        """Return bounded aggregate ERD counts for the current answer list."""
-        exact = self._conn.execute("""
-            SELECT COUNT(*) AS exact_branch_count,
-                   COUNT(CASE WHEN updated_at >= ? THEN 1 END)
-                       AS recent_exact_branch_count
-            FROM branch_best_by_policy
-            WHERE policy = ? AND answer_list_id = ?
-        """, (recent_since, policy, self.answer_list_id)).fetchone()
+    def erd_result_totals(self, policy: str, previous=None) -> dict:
+        """Count a policy's stored results, counting on from `previous`.
+
+        On the normal path a result row is only ever inserted, and an insert
+        takes a rowid above every row present, so the rows an earlier count
+        has not seen are exactly those above the highest rowid it saw.  Given
+        totals an earlier call returned, this reads only those rows.  A row
+        deleted below that mark -- a repair, a migration, a verification
+        pass -- goes unseen, so a caller counting on recounts from nothing
+        often enough to bound how long one can.  A highest rowid that has
+        fallen, or another answer list, is recounted at once.
+        """
+        opened_snapshot = not self._conn.in_transaction
+        if opened_snapshot:
+            self._conn.execute("BEGIN DEFERRED")
+        try:
+            highest = {
+                table: self._conn.execute(
+                    f"SELECT COALESCE(MAX(rowid), 0) FROM {table}").fetchone()[0]
+                for table in ("branch_best_by_policy",
+                              "branch_best_by_policy_and_budget",
+                              "branch_loss_by_policy")
+            }
+            if (previous is None
+                    or previous["answer_list_id"] != self.answer_list_id
+                    or previous["policy"] != policy
+                    or any(highest[table] < previous["highest_rowid"][table]
+                           for table in highest)):
+                previous = None
+            parameters = (policy, self.answer_list_id)
+            if previous is None:
+                def count(table, counted="COUNT(*)"):
+                    return self._conn.execute(f"""
+                        SELECT {counted} FROM {table}
+                        WHERE policy = ? AND answer_list_id = ?
+                    """, parameters).fetchone()[0]
+
+                budgeted_branches = count(
+                    "branch_best_by_policy_and_budget",
+                    "COUNT(DISTINCT branch_key)")
+            else:
+                floor = previous["highest_rowid"]
+
+                # The unary plus keeps the (answer_list_id, policy) index out
+                # of the plan, which would otherwise walk every result to
+                # find the few above the mark.
+                def count(table):
+                    return self._conn.execute(f"""
+                        SELECT COUNT(*) FROM {table}
+                        WHERE rowid > ? AND +policy = ? AND +answer_list_id = ?
+                    """, (floor[table], *parameters)).fetchone()[0]
+
+                # A branch is new when no row below the mark already holds it.
+                floor_budgeted = floor["branch_best_by_policy_and_budget"]
+                budgeted_branches = self._conn.execute("""
+                    SELECT COUNT(DISTINCT branch_key)
+                    FROM branch_best_by_policy_and_budget AS counted
+                    WHERE rowid > ? AND +policy = ? AND +answer_list_id = ?
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM branch_best_by_policy_and_budget AS earlier
+                          WHERE earlier.branch_key = counted.branch_key
+                            AND +earlier.policy = counted.policy
+                            AND +earlier.answer_list_id = counted.answer_list_id
+                            AND earlier.rowid <= ?)
+                """, (floor_budgeted, *parameters, floor_budgeted)).fetchone()[0]
+            exact = count("branch_best_by_policy")
+            budgeted = count("branch_best_by_policy_and_budget")
+            loss = count("branch_loss_by_policy")
+        finally:
+            if opened_snapshot:
+                self._conn.execute("COMMIT")
+        counted = {
+            "exact_branch_count": exact,
+            "budgeted_result_count": budgeted,
+            "budgeted_branch_count": budgeted_branches,
+            "loss_branch_count": loss,
+        }
+        if previous is not None:
+            counted = {name: previous[name] + count
+                       for name, count in counted.items()}
+        return {
+            "policy": policy,
+            "answer_list_id": self.answer_list_id,
+            "highest_rowid": highest,
+            "counted_from_nothing": previous is None,
+            **counted,
+        }
+
+    def erd_report_summary(self, policy: str, recent_since: int,
+                           totals=None) -> dict:
+        """Return bounded aggregate ERD counts for the current answer list.
+
+        `totals` is what erd_result_totals returned for this policy; without
+        it the results are counted here.  The recent counts are range reads
+        of the updated_at indexes, so they cost what was recently written.
+        """
+        if totals is None:
+            totals = self.erd_result_totals(policy)
         # Counted separately, never unioned: a branch holding results at three
         # budgets is one branch, and adding the rows up would report it as four.
-        budgeted = self._conn.execute("""
-            SELECT COUNT(*) AS budgeted_result_count,
-                   COUNT(DISTINCT branch_key) AS budgeted_branch_count,
-                   COUNT(CASE WHEN updated_at >= ? THEN 1 END)
-                       AS recent_budgeted_result_count
-            FROM branch_best_by_policy_and_budget
-            WHERE policy = ? AND answer_list_id = ?
-        """, (recent_since, policy, self.answer_list_id)).fetchone()
-        loss = self._conn.execute("""
-            SELECT COUNT(*) AS loss_branch_count
-            FROM branch_loss_by_policy
-            WHERE policy = ? AND answer_list_id = ?
-        """, (policy, self.answer_list_id)).fetchone()
+        # The unary plus leaves the (answer_list_id, updated_at) index as the
+        # only one that fits, so the read covers only recent rows.
+        recent_exact, recent_budgeted = (
+            self._conn.execute(f"""
+                SELECT COUNT(*) FROM {table}
+                WHERE answer_list_id = ? AND updated_at >= ? AND +policy = ?
+            """, (self.answer_list_id, recent_since, policy)).fetchone()[0]
+            for table in ("branch_best_by_policy",
+                          "branch_best_by_policy_and_budget")
+        )
         return {
-            "exact_branch_count": exact["exact_branch_count"],
-            "recent_exact_branch_count": exact["recent_exact_branch_count"],
-            "budgeted_result_count": budgeted["budgeted_result_count"],
-            "budgeted_branch_count": budgeted["budgeted_branch_count"],
-            "recent_budgeted_result_count":
-                budgeted["recent_budgeted_result_count"],
-            "loss_branch_count": loss["loss_branch_count"],
+            "exact_branch_count": totals["exact_branch_count"],
+            "recent_exact_branch_count": recent_exact,
+            "budgeted_result_count": totals["budgeted_result_count"],
+            "budgeted_branch_count": totals["budgeted_branch_count"],
+            "recent_budgeted_result_count": recent_budgeted,
+            "loss_branch_count": totals["loss_branch_count"],
         }
 
     @staticmethod

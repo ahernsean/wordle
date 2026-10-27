@@ -3048,22 +3048,26 @@ class ERDQueue:
 
     def completed_candidate_indexes_by_branch(self, branch_keys) -> dict:
         """Return completed candidate indexes for the requested branches."""
-        branch_ids = self._branch_ids_for_keys(branch_keys)
         indexes_by_branch = {bytes(branch_key): [] for branch_key in branch_keys}
-        if not branch_ids:
+        keys_by_branch_id = {}
+        for branch_key in indexes_by_branch:
+            branch_id = self._intern_branch(branch_key)
+            if branch_id is not None:
+                keys_by_branch_id[branch_id] = branch_key
+        if not keys_by_branch_id:
             return indexes_by_branch
-        placeholders = ",".join("?" for _ in branch_ids)
+        # Read in the primary key's own order: joining the registry to order
+        # by key carried every claim's key blob through a sort, which at a
+        # few hundred thousand claims cost most of an overview poll.
+        placeholders = ",".join("?" for _ in keys_by_branch_id)
         rows = self._conn.execute(
-            f"""SELECT branches.branch_key, candidate_claims.idx
-                FROM candidate_claims
-                JOIN branches USING (branch_id)
-                WHERE candidate_claims.branch_id IN ({placeholders})
-                  AND candidate_claims.done = 1
-                ORDER BY branches.branch_key, candidate_claims.idx""",
-            branch_ids,
+            f"""SELECT branch_id, idx FROM candidate_claims
+                WHERE branch_id IN ({placeholders}) AND done = 1
+                ORDER BY branch_id, idx""",
+            list(keys_by_branch_id),
         ).fetchall()
         for row in rows:
-            indexes_by_branch[bytes(row["branch_key"])].append(row["idx"])
+            indexes_by_branch[keys_by_branch_id[row["branch_id"]]].append(row["idx"])
         return indexes_by_branch
 
     def heartbeats_with_branch(self):
