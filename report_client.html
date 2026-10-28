@@ -425,7 +425,7 @@
 <body>
   <header>
     <div class="nav" id="report-nav">
-      <button data-kind="auto" data-overview="1">Overview</button><button data-kind="queue">Queue</button><button data-kind="workers">Workers</button><button data-kind="cache">Cache</button><button data-kind="hotspots">Hotspots</button><button data-kind="work_distribution">Distribution</button><button data-kind="leaderboard">Leaderboard</button><button data-kind="openers">Openers</button><span class="layout-toggle" id="layout-toggle" role="group" aria-label="View layout"><span class="cap">View as</span><span class="seg"><button id="layout-flat" aria-pressed="true">Flat</button><button id="layout-tree" aria-pressed="false">Tree</button></span></span>
+      <button data-kind="auto" data-overview="1">Overview</button><button data-kind="queue">Queue</button><button data-kind="workers">Workers</button><button data-kind="cache">Cache</button><button data-kind="hotspots">Hotspots</button><button data-kind="work_distribution">Distribution</button><button data-kind="leaderboard">Leaderboard</button><button data-kind="openers">Openers</button><button id="target-tab" hidden aria-current="false"></button><span class="layout-toggle" id="layout-toggle" role="group" aria-label="View layout"><span class="cap">View as</span><span class="seg"><button id="layout-flat" aria-pressed="true">Flat</button><button id="layout-tree" aria-pressed="false">Tree</button></span></span>
       <span class="conn-wrap">
         <span id="connection" aria-label="Poll status; opens refresh interval">●</span>
         <div class="refresh-pop">
@@ -832,6 +832,12 @@
       sortSelect.value=currentState.sort||(isSources?"default":"");byId("by").value=currentState.by;groupSelect.value=currentState.group_by;
       const isOverview=currentState.kind==="auto"&&currentState.branch_target===""&&!currentState.tree;
       document.querySelectorAll("[data-kind]").forEach(button=>button.setAttribute("aria-current",(button.dataset.overview?isOverview:button.dataset.kind===currentState.kind)?"page":"false"));
+      // A report on one word or branch belongs to none of the tabs above, so it
+      // gets a tab of its own for as long as it is the page.
+      const targetReport=currentState.kind==="auto"&&currentState.branch_target!=="",targetTab=byId("target-tab");
+      targetTab.hidden=!targetReport;
+      targetTab.textContent=isWordTarget(currentState.branch_target)?"Word":"Branch";
+      targetTab.setAttribute("aria-current",targetReport?"page":"false");
       document.querySelectorAll("[data-branch-status]").forEach(input=>{input.checked=currentState.branch_status.includes(input.value);input.parentElement.hidden=input.value==="unqueued"?!wordReport||currentState.tree:isOverview&&!overviewBranchStatusNames.includes(input.value);});
       // Worker presence distinguishes only evaluating and finalizing branches,
       // so a status filter selecting neither leaves these nothing to narrow.
