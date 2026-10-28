@@ -546,19 +546,17 @@ class ReportClientContract:
         self.assertEqual(result["defaultOverview"], "/api/view")
         self.assertEqual(result["allOverview"], "/api/view?branch_worker_status=all")
 
-    def test_tree_of_a_branch_starts_without_the_overviews_worker_filter(self):
+    def test_tree_of_a_branch_is_a_layout_the_server_never_sees(self):
+        report_queries = []
+        self.page.on("request", lambda request: report_queries.append(request.url)
+                     if "/api/view?" in request.url else None)
         self.apply_branch_target("RAISE .....")
         self.page.locator("#layout-tree").click()
-        self.page.wait_for_selector("ul.tree > li")
+        self.page.wait_for_selector("ul.response-tree > li")
         self.assertIn("tree=1", self.page.url)
         self.assertNotIn("branch_worker_status", self.page.url)
-        self.assertGreater(self.page.locator("text=waiting").count(), 0)
-        base_words = self.page.locator("ul.tree > li")
-        self.assertGreater(base_words.count(), 0)
-        self.assertEqual(
-            base_words.count(),
-            self.page.locator("ul.tree > li.word-group").count(),
-        )
+        self.assertTrue(report_queries)
+        self.assertFalse([url for url in report_queries if "tree=1" in url])
 
     def test_tree_groups_patterns_under_their_word_at_every_level(self):
         self.page.locator("[data-kind=queue]").click()
@@ -741,6 +739,79 @@ class ReportClientContract:
         for note in notes[2:]:
             self.assertNotIn("not split", note)
             self.assertNotIn("solved", note)
+
+    def test_word_tree_draws_its_groups_through_each_best_guess(self):
+        requested = []
+        self.page.on("request", lambda request: requested.append(request.url))
+        self.apply_branch_target("QUEUE")
+        self.page.wait_for_selector("text=word report")
+        flat_sections = self.page.locator(".response-group-breakdown").count()
+        self.page.locator("#layout-tree").click()
+        rows = self.page.locator("#report ul.response-tree > li")
+        rows.first.wait_for()
+        self.assertEqual(
+            self.page.locator(".response-group-breakdown").count(), flat_sections)
+        self.assertEqual(self.page.locator("#report article.card").count(), 0)
+        # The group with an exact best opens onto that guess's own groups; a
+        # lone answer is solved and has nothing below it.
+        solved = rows.filter(has=self.page.locator("> details"))
+        self.assertEqual(solved.count(), 1)
+        self.assertIn("solved", " ".join(rows.nth(3).inner_text().split()))
+        solved.locator("> details > summary").click()
+        solved.locator(".tree-children ul.response-tree > li").first.wait_for()
+        self.assertTrue(any(
+            "branch_target=QUEUE+-----+CRANE" in url
+            or "branch_target=QUEUE%20-----%20CRANE" in url for url in requested))
+
+    def test_word_tree_follows_a_live_best_as_provisional(self):
+        def live_best(route):
+            report = route.fetch().json()
+            for row in report["data"]["response_groups"]:
+                if row["pattern"] == "y----":
+                    row.update(live_best_guess="abbey", live_best_erd=1.5,
+                               live_best_guess_is_answer=True)
+            route.fulfill(json=report)
+
+        self.page.route("**/api/view?*branch_target=*", live_best)
+        self.apply_branch_target("QUEUE")
+        self.page.locator("#layout-tree").click()
+        rows = self.page.locator("#report ul.response-tree > li")
+        rows.first.wait_for()
+        live = rows.filter(has_text="best so far")
+        self.assertEqual(live.count(), 1)
+        self.assertIn("provisional", live.inner_text())
+        self.assertEqual(live.locator("> details").count(), 1)
+        # Without a best of either kind, the row says why it cannot open.
+        missing = rows.nth(2)
+        self.assertEqual(missing.locator("details").count(), 0)
+        self.assertIn("not solved yet", " ".join(missing.inner_text().split()))
+
+    def test_branch_best_guess_is_exact_from_the_cache_or_provisional_from_the_swarm(self):
+        self.apply_branch_target("RAISE .....")
+        section = self.page.locator("section", has=self.page.locator("h2", has_text="Best guess"))
+        section.locator("ul.response-tree > li").first.wait_for()
+        self.assertEqual(
+            section.locator("p .word").first.get_attribute("data-spine"), "CRANE")
+        self.assertEqual(section.locator(".chip", has_text="provisional").count(), 0)
+        # In the flat layout the rows are a list: nothing opens.
+        self.assertEqual(section.locator("details").count(), 0)
+
+        requested = []
+        self.page.on("request", lambda request: requested.append(request.url))
+
+        def unsolved(route):
+            report = route.fetch().json()
+            report["data"]["cache"].update(cache_state="missing", best_guess=None)
+            report["data"]["queue"].update(best_guess="slate", best_erd=2.1,
+                                           best_guess_is_answer=True, status="open")
+            route.fulfill(json=report)
+
+        self.page.route("**/api/view?*branch_target=RAISE*.....*", unsolved)
+        self.page.evaluate("__reportClient.fetchReport()")
+        section.locator("p .word[data-spine=SLATE]").wait_for()
+        self.assertEqual(section.locator(".chip", has_text="provisional").count(), 1)
+        self.page.wait_for_timeout(200)
+        self.assertTrue(any("RAISE" in url and "SLATE" in url for url in requested))
 
     def test_word_group_click_builds_full_branch_spine(self):
         self.apply_branch_target("CACHE")
@@ -4883,21 +4954,15 @@ class ReportClientContract:
         # of nine, so the last one trails the ellipsis that says so.
         self.assertEqual(result["marks"], [",", ",", "\u2026"])
 
-    def test_branch_target_subtitle_returns_in_tree_layout(self):
+    def test_a_branch_report_has_the_same_sections_in_either_layout(self):
         self.apply_branch_target("RAISE .....")
         self.page.wait_for_selector("section:has-text('Identity')")
-        # Flat branch view: the Identity section names the branch, so the meta
-        # subtitle omits the spine.
-        self.assertEqual(self.page.locator(".report-meta .word").count(), 0)
-        # Tree layout routes to renderTree and never renders the Identity /
-        # "Reached via" sections, so the meta subtitle must name the branch
-        # target again — otherwise nothing on the page identifies the branch.
+        flat = self.page.locator("section > h2").all_inner_texts()
         self.page.locator("#layout-tree").click()
-        self.page.wait_for_selector("ul.tree > li")
-        self.assertEqual(
-            self.page.locator(".report-meta .tiles .word").first.get_attribute(
-                "data-spine"),
-            "RAISE -----")
+        self.page.wait_for_selector("ul.response-tree > li > details")
+        self.assertEqual(self.page.locator("section > h2").all_inner_texts(), flat)
+        # The Identity section names the branch, so the meta subtitle omits it.
+        self.assertEqual(self.page.locator(".report-meta .word").count(), 0)
 
     def test_finalization_spines_and_pager_range_render(self):
         self.apply_branch_target("RAISE .....")
@@ -6526,7 +6591,7 @@ class ReportClientContract:
         self.assertEqual(states["word"]["branch_status"], ["unqueued", "done"])
         self.assertEqual(states["overview"]["branch_status"], [])
         self.assertEqual(states["queue"]["branch_status"], ["done"])
-        self.assertEqual(states["wordTree"]["branch_status"], [])
+        self.assertEqual(states["wordTree"]["branch_status"], ["unqueued"])
         self.assertEqual(states["branch"]["branch_status"], [])
 
     def test_unqueued_checkbox_is_shown_only_for_word_reports(self):

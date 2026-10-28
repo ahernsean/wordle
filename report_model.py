@@ -1716,6 +1716,20 @@ def collect_word_report(sources: ReportOpeners, request: ReportRequest) -> dict:
             "max_remaining_depth": cache_state["max_remaining_depth"],
             "updated_at": cache_state["updated_at"],
         })
+        # The swarm's best so far on a group it is still solving: a candidate
+        # becomes it only once fully evaluated, so its own response groups
+        # are solved, but a better candidate can still replace it.
+        live_best_guess = (
+            _row_value(active_row, "best_guess")
+            if _row_value(active_row, "status") == "open" else None
+        )
+        group_row.update({
+            "live_best_guess": live_best_guess.lower() if live_best_guess else None,
+            "live_best_guess_is_answer": _is_answer(live_best_guess, answer_set),
+            "live_best_erd": (
+                _row_value(active_row, "best_erd") if live_best_guess else None
+            ),
+        })
         if request.include_answers:
             group_row["answer_words"] = answer_words
         data["response_groups"].append(group_row)
