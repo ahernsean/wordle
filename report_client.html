@@ -425,7 +425,7 @@
 <body>
   <header>
     <div class="nav" id="report-nav">
-      <button data-kind="auto" data-overview="1">Overview</button><button data-kind="queue">Queue</button><button data-kind="workers">Workers</button><button data-kind="cache">Cache</button><button data-kind="hotspots">Hotspots</button><button data-kind="work_distribution">Distribution</button><button data-kind="leaderboard">Leaderboard</button><button data-kind="openers">Openers</button><button id="target-tab" hidden aria-current="false"></button><span class="layout-toggle" id="layout-toggle" role="group" aria-label="View layout"><span class="cap">View as</span><span class="seg"><button id="layout-flat" aria-pressed="true">Flat</button><button id="layout-tree" aria-pressed="false">Tree</button></span></span>
+      <button data-kind="auto" data-overview="1">Overview</button><button data-kind="word">Word</button><button data-kind="branch">Branch</button><button data-kind="queue">Queue</button><button data-kind="workers">Workers</button><button data-kind="cache">Cache</button><button data-kind="hotspots">Hotspots</button><button data-kind="work_distribution">Distribution</button><button data-kind="leaderboard">Leaderboard</button><button data-kind="openers">Openers</button><span class="layout-toggle" id="layout-toggle" role="group" aria-label="View layout"><span class="cap">View as</span><span class="seg"><button id="layout-flat" aria-pressed="true">Flat</button><button id="layout-tree" aria-pressed="false">Tree</button></span></span>
       <span class="conn-wrap">
         <span id="connection" aria-label="Poll status; opens refresh interval">●</span>
         <div class="refresh-pop">
@@ -514,8 +514,12 @@
     const OPENER_ONLY_SORT_VALUES=new Set(SORT_OPTIONS_OPENERS.map(([value])=>value).filter(value=>value&&!SORT_OPTIONS_DEFAULT.some(([defaultValue])=>defaultValue===value)));
     const GROUP_BY_OPTIONS_WORD=[["","none"],["status","status"],["answer_count","answer count"],["cache_state","cache state"],["worker_presence","worker"],["priority","priority"]];
     const GROUP_BY_OPTIONS_OPENERS=[["state","state (default)"],["completed","completion date"],["elapsed","elapsed time"],["worker_time","total worker time"],["requested","time since request"],["worker_presence","worker"],["queue_position","queue position"],["none","none"]];
-    const explicitKinds=new Set(["queue","workers","cache","hotspots","work_distribution","leaderboard","openers"]);
-    const treelessKinds=new Set(["cache","hotspots","work_distribution","leaderboard","openers"]);
+    const explicitKinds=new Set(["word","branch","queue","workers","cache","hotspots","work_distribution","leaderboard","openers"]);
+    // The Word and Branch tabs stay as their own kinds only while the target
+    // box gives them nothing to report on; they then ask for a target rather
+    // than fetch.
+    const targetPromptKinds=new Set(["word","branch"]);
+    const treelessKinds=new Set(["word","branch","cache","hotspots","work_distribution","leaderboard","openers"]);
     const populationNames={current_queue_branches:"current queue branches",recent_branch_finalizations:"recent branch finalizations",recent_cut_reuse_misses:"recent cut-reuse misses",epoch_finalized_branches:"finalized branches"};
     const collapsedNodes=new Set(), initializedNodes=new Set(), collapsedWordGroups=new Set(), initializedWordGroups=new Set(), collapsedResponseGroups=new Set(), stickyOrders=new Map(), packedOrders=new Map(), gridColumnCounts=new Map(), treePageHistory=new Map(), treeGroupPages=new Map(),
       openerBreakdowns=new Map(),
@@ -656,8 +660,23 @@
     const isInferredWordState=(kind,branchTarget)=>kind==="auto"&&isWordTarget(branchTarget);
     const isOverviewState=(kind,branchTarget,tree)=>kind==="auto"&&String(branchTarget||"").trim()===""&&!tree;
 
+    // The target the Word or Branch tab reports on, read from the target box:
+    // a word is its own word report, and a spine ending in a response is the
+    // branch report, whose word is the guess that spine last played.  Null
+    // when the box names nothing that tab can show.
+    function targetForTab(kind,branchTarget){
+      if(!branchTarget)return null;
+      if(branchTarget.startsWith("@"))return kind==="branch"?branchTarget:null;
+      const parts=branchTarget.split(/\s+/).filter(Boolean);
+      if(kind==="word")return parts.length%2===1?branchTarget:parts.slice(0,-1).join(" ");
+      return parts.length%2===0?branchTarget:null;
+    }
     function normalizeState(state){
       const normalized={kind:explicitKinds.has(state.kind)?state.kind:"auto",branch_target:(state.branch_target||"").trim(),tree:!!state.tree,branch_status:branchValues(state.branch_status,branchStatusNames),branch_worker_status:branchValues(state.branch_worker_status,branchWorkerStatusNames),opener_state:branchValues(state.opener_state,sourceStateNames),opener_offset:intOrNull(state.opener_offset),branch_row_offset:intOrNull(state.branch_row_offset),minimum_answer_count:intOrNull(state.minimum_answer_count),maximum_answer_count:intOrNull(state.maximum_answer_count),budget:intOrNull(state.budget),priority:intOrNull(state.priority),sort:state.sort||"",group_by:state.group_by||"",limit:intOrNull(state.limit),by:state.by||"",epoch:intOrNull(state.epoch),since_seconds:intOrNull(state.since_seconds),sample_size:intOrNull(state.sample_size),poll:Math.max(200,intOrNull(state.poll)||DEFAULT_POLL),answers:!!state.answers,claims:!!state.claims,worker_id:state.worker_id||null,finalization_cursor:String(state.finalization_cursor||""),tree_cursor:state.tree_cursor||null,erd_numerator_range:erdNumeratorRangeText(state.erd_numerator_range),leaderboard_page:intOrNull(state.leaderboard_page)};
+      if(targetPromptKinds.has(normalized.kind)){
+        const tabTarget=targetForTab(normalized.kind,normalized.branch_target);
+        if(tabTarget!==null){normalized.kind="auto";normalized.branch_target=tabTarget;}
+      }
       // The overview is a dashboard, not a list of branches, so it has no tree.
       if(normalized.kind==="auto"&&normalized.branch_target==="")normalized.tree=false;
       const overviewState=normalized.kind==="auto"&&normalized.branch_target==="";
@@ -833,13 +852,9 @@
       }
       sortSelect.value=currentState.sort||(isSources?"default":"");byId("by").value=currentState.by;groupSelect.value=currentState.group_by;
       const isOverview=currentState.kind==="auto"&&currentState.branch_target===""&&!currentState.tree;
-      document.querySelectorAll("[data-kind]").forEach(button=>button.setAttribute("aria-current",(button.dataset.overview?isOverview:button.dataset.kind===currentState.kind)?"page":"false"));
-      // A report on one word or branch belongs to none of the tabs above, so it
-      // gets a tab of its own for as long as it is the page.
-      const targetReport=currentState.kind==="auto"&&currentState.branch_target!=="",targetTab=byId("target-tab");
-      targetTab.hidden=!targetReport;
-      targetTab.textContent=isWordTarget(currentState.branch_target)?"Word":"Branch";
-      targetTab.setAttribute("aria-current",targetReport?"page":"false");
+      const targetReport=currentState.kind==="auto"&&currentState.branch_target!=="";
+      const currentTab=isOverview?"overview":targetReport?(isWordTarget(currentState.branch_target)?"word":"branch"):currentState.kind;
+      document.querySelectorAll("[data-kind]").forEach(button=>button.setAttribute("aria-current",(button.dataset.overview?"overview":button.dataset.kind)===currentTab?"page":"false"));
       document.querySelectorAll("[data-branch-status]").forEach(input=>{input.checked=currentState.branch_status.includes(input.value);input.parentElement.hidden=input.value==="unqueued"?!wordReport||currentState.tree:isOverview&&!overviewBranchStatusNames.includes(input.value);});
       // Worker presence distinguishes only evaluating and finalizing branches,
       // so a status filter selecting neither leaves these nothing to narrow.
@@ -3580,8 +3595,23 @@
       for(const digit of digits)digit.style.backgroundImage=workerMarkerImage(digit.dataset.workerNumber,halo,ink);
     }
     function connection(ok,message,disconnected=!ok){const chip=byId("connection");chip.classList.toggle("disconnected",disconnected);chip.textContent=ok?"●":"● "+message;const status=ok?"connected":message;chip.title=status;chip.setAttribute("aria-label",status+"; opens refresh interval");}
+    function renderTargetPrompt(state){
+      const context="prompt:"+state.kind+":"+state.branch_target;
+      if(context===lastContext)return;
+      lastContext=context;lastReport=null;displayedState=state;setReportStatus(null);
+      document.querySelector("details.filters").hidden=true;
+      const meta=element("section","report-meta");
+      meta.append(element("h1","",state.kind+" report"));
+      const message=state.kind==="word"
+        ?(state.branch_target?"A queue reference names a branch, not a word, so it has no word report. The Branch tab shows it."
+                             :"Enter a word, or a spine ending in a word, in the box above to see its word report.")
+        :(state.branch_target?state.branch_target+" ends in a word, not a response. Choose one of its response groups on the Word tab to open a branch."
+                             :"Enter a spine ending in a response, such as CRANE -y--g, in the box above to see its branch report.");
+      byId("report").replaceChildren(meta,element("p","empty target-prompt",message));
+    }
     async function fetchReport(){
       if(document.hidden)return;
+      if(targetPromptKinds.has(currentState.kind)){renderTargetPrompt(currentState);return;}
       if(activeRequestController){
         if(Date.now()-activeRequestStartedAt<STUCK_REQUEST_TIMEOUT_MILLIS)return;
         abortActiveRequest();
