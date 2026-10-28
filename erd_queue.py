@@ -5828,7 +5828,7 @@ class ERDQueue:
             **dict(evaluation_row),
         }
 
-    def report_root_progress(self, spine_prefix, epoch, recent_window_seconds,
+    def report_word_progress(self, spine_prefix, epoch, recent_window_seconds,
                              active_branch_limit=10, now=None) -> dict:
         """Per-response-group work totals for one spine, plus live rates.
 
@@ -5843,8 +5843,8 @@ class ERDQueue:
         idx_branch_finalize_log_spine and costs the subtree, not the log.
 
         Branches are selected by spine prefix alone rather than by opener word.
-        A opener word identifies the root a branch was requested under, which
-        for a deeper spine is still the root -- selecting on it would scope the
+        An opener word identifies the opener a branch was requested under, which
+        for a deeper spine is still that opener -- selecting on it would scope the
         open branches to the wrong subtree.  active_branches holds thousands of
         rows, not millions, so scanning it costs single-digit milliseconds.
 
@@ -5859,8 +5859,8 @@ class ERDQueue:
 
         `work_started_at` is the earliest branch *creation* across both, which
         is when the swarm first opened work under the prefix -- a different
-        question from when the root was requested, which can precede it by days
-        while higher-priority roots hold the queue.  A branch created before the
+        question from when the opener was requested, which can precede it by days
+        while higher-priority openers hold the queue.  A branch created before the
         selected telemetry keeps its original creation time, so this can
         predate the epoch that produced a later finalization.
 
@@ -5876,7 +5876,7 @@ class ERDQueue:
         branch is `n_candidates` claims wide, and `recent_done_count` over
         `recent_window_seconds` gives the rate that turns the remainder into an
         estimate.  Claim rows carry no epoch, so the window is the only fence.
-        Counting claims costs a scan per branch and a root can hold thousands
+        Counting claims costs a scan per branch and a word can hold thousands
         of open branches at once, so only the `active_branch_limit` widest are
         counted -- claims are handed out widest-branch-first, so those are the
         ones carrying the work an estimate depends on.
