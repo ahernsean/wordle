@@ -556,6 +556,18 @@ class ReportClientContract:
         self.page.wait_for_selector("text=branch report")
         self.assertEqual(self.current_tabs(), ["branch"])
 
+    def test_word_and_branch_tabs_take_a_target_typed_but_not_applied(self):
+        self.page.locator("#branch-target-input").fill("CRANE .y..g")
+        self.page.locator('[data-kind="branch"]').click()
+        self.page.wait_for_selector("text=branch report")
+        self.assertEqual(self.current_tabs(), ["branch"])
+        self.page.locator("#branch-target-input").fill("RAISE")
+        self.page.locator('[data-kind="word"]').click()
+        self.page.wait_for_function(
+            "() => __reportClient.getState().branch_target === 'RAISE'")
+        self.page.wait_for_selector("text=word report")
+        self.assertEqual(self.current_tabs(), ["word"])
+
     def test_word_and_branch_tabs_read_their_target_from_the_box(self):
         result = self.page.evaluate("""() => {
           const resolve=(kind,target)=>{
