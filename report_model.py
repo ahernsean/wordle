@@ -1182,12 +1182,38 @@ def _queue_overview(sources, generated_at, answer_set, report):
             queue.close()
 
 
+#: How long a running count of the cache's results is carried before it is
+#: recounted from nothing.  Counting on sees only inserts, so this bounds how
+#: long a repair or migration that deletes results can leave a total high.
+RESULT_TOTALS_RECOUNT_SECONDS = 120
+
+# The last result totals per cache file, and when each was counted from
+# nothing.  A server process polls the same cache every two seconds, and a
+# full count walks every stored result; counting on reads only the new ones.
+_result_totals_by_cache_path = {}
+
+
+def _erd_result_totals(cache, sources, generated_at):
+    """The cache's ERD result totals, counted on from the last ones taken."""
+    carried = _result_totals_by_cache_path.get(sources.cache_path)
+    previous = None
+    if (carried is not None
+            and generated_at - carried[1] <= RESULT_TOTALS_RECOUNT_SECONDS):
+        previous = carried[0]
+    totals = cache.erd_result_totals(ERD_ALL, previous)
+    counted_at = (
+        generated_at if totals["counted_from_nothing"] else carried[1])
+    _result_totals_by_cache_path[sources.cache_path] = (totals, counted_at)
+    return totals
+
+
 def _cache_overview(sources, generated_at, answer_words, report):
     cache = None
     try:
         cache = _open_report_cache(sources, answer_words)
         report["data"]["cache_summary"] = cache.erd_report_summary(
-            ERD_ALL, generated_at - 300
+            ERD_ALL, generated_at - 300,
+            _erd_result_totals(cache, sources, generated_at),
         )
         report["sources"]["cache"]["ok"] = True
     except (sqlite3.Error, OSError) as error:
@@ -3602,7 +3628,10 @@ def collect_cache_report(sources: ReportOpeners, request: ReportRequest) -> dict
                 ERD_ALL, generated_at - 300, limit
             )
             data.update({
-                "summary": cache.erd_report_summary(ERD_ALL, generated_at - 300),
+                "summary": cache.erd_report_summary(
+                    ERD_ALL, generated_at - 300,
+                    _erd_result_totals(cache, sources, generated_at),
+                ),
                 "distributions": cache.report_cache_distributions(ERD_ALL),
                 "recent_rows": [
                     {

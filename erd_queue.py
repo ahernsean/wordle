@@ -3048,22 +3048,26 @@ class ERDQueue:
 
     def completed_candidate_indexes_by_branch(self, branch_keys) -> dict:
         """Return completed candidate indexes for the requested branches."""
-        branch_ids = self._branch_ids_for_keys(branch_keys)
         indexes_by_branch = {bytes(branch_key): [] for branch_key in branch_keys}
-        if not branch_ids:
+        keys_by_branch_id = {}
+        for branch_key in indexes_by_branch:
+            branch_id = self._intern_branch(branch_key)
+            if branch_id is not None:
+                keys_by_branch_id[branch_id] = branch_key
+        if not keys_by_branch_id:
             return indexes_by_branch
-        placeholders = ",".join("?" for _ in branch_ids)
+        # Read in the primary key's own order: joining the registry to order
+        # by key carried every claim's key blob through a sort, which at a
+        # few hundred thousand claims cost most of an overview poll.
+        placeholders = ",".join("?" for _ in keys_by_branch_id)
         rows = self._conn.execute(
-            f"""SELECT branches.branch_key, candidate_claims.idx
-                FROM candidate_claims
-                JOIN branches USING (branch_id)
-                WHERE candidate_claims.branch_id IN ({placeholders})
-                  AND candidate_claims.done = 1
-                ORDER BY branches.branch_key, candidate_claims.idx""",
-            branch_ids,
+            f"""SELECT branch_id, idx FROM candidate_claims
+                WHERE branch_id IN ({placeholders}) AND done = 1
+                ORDER BY branch_id, idx""",
+            list(keys_by_branch_id),
         ).fetchall()
         for row in rows:
-            indexes_by_branch[bytes(row["branch_key"])].append(row["idx"])
+            indexes_by_branch[keys_by_branch_id[row["branch_id"]]].append(row["idx"])
         return indexes_by_branch
 
     def heartbeats_with_branch(self):
@@ -4855,52 +4859,50 @@ class ERDQueue:
               OR active_status = 'open' OR pending_status = 'in_progress'
                 THEN CASE WHEN worker_count > 0 THEN 'active' ELSE 'waiting' END
             ELSE NULL END"""
-        active_only = branch_worker_statuses == ("active",)
-        # A branch being evaluated or finalized has an active row or an
-        # in-progress pending one, so a filter asking for nothing else starts
-        # there: every other branch the queue holds -- most of them, at a
-        # whole sweep's depth -- could only be built to be filtered away.
-        in_progress_only = bool(branch_statuses) and set(branch_statuses) <= {
-            "evaluating", "finalizing"}
-        branch_ids_query = (
-            """SELECT branch_id FROM active_branches
-                UNION
-                SELECT branch_id FROM pending_branches
-                WHERE status = 'in_progress'"""
-            if in_progress_only else
-            """SELECT branch_id FROM pending_branches
-                UNION
-                SELECT branch_id FROM active_branches""")
-        completed_query = """
-                SELECT branch_id, COUNT(*) AS completed_candidate_count
-                FROM candidate_claims
-                WHERE done = 1 AND branch_id IN (SELECT branch_id FROM branch_ids)
-                GROUP BY branch_id
+        # Most of a whole sweep's branches are cold: a pending row with no
+        # active row, no claim in progress and no worker, whose every report
+        # column is read from that row alone.  Only the few hot branches pay
+        # for the joins, and the cold ones are counted and paged in a pass
+        # over pending_branches with nothing joined to it.  A filter that no
+        # cold branch can satisfy skips that pass as well.
+        include_cold = not (
+            branch_worker_statuses
+            or budget is not None
+            or (branch_statuses and not set(branch_statuses) & {
+                "done", "queued", "unqueued"})
+        )
+        normalized_columns = f"""
+                branch_id, pending_status, active_status, claimed_at,
+                completed_at, candidate_count, budget, best_guess, best_erd,
+                best_max_depth, nodes_spent, bulk_done_candidates,
+                one_level_erd_pruned_candidates,
+                two_level_erd_pruned_candidates, ceiling, spine, created_at,
+                worker_count,
+                {branch_status_expression} AS branch_status,
+                {branch_worker_status_expression} AS branch_worker_status,
+                COALESCE(active_priority, pending_priority, 0) AS priority,
+                COALESCE(active_answer_count, pending_answer_count) AS answer_count,
+                COALESCE(active_opener, pending_opener) AS opener,
+                COALESCE(active_opener_pattern, pending_opener_pattern) AS opener_pattern
         """
-        if active_only:
-            completed_query = """
-                SELECT branch_id, COUNT(*) AS completed_candidate_count
-                FROM candidate_claims
-                WHERE done = 1 AND branch_id IN (
-                    SELECT branch_id FROM workers
-                )
-                GROUP BY branch_id
-            """
         base_query = f"""
-            WITH branch_ids AS (
-                {branch_ids_query}
-            ),
-            workers AS (
+            WITH workers AS (
                 SELECT current_branch_id AS branch_id, COUNT(*) AS worker_count
                 FROM worker_heartbeat
                 WHERE current_branch_id IS NOT NULL AND updated_at >= ?
                 GROUP BY current_branch_id
             ),
-            completed AS (
-                {completed_query}
+            hot_ids AS (
+                SELECT branch_id FROM active_branches
+                UNION
+                SELECT branch_id FROM pending_branches
+                WHERE status = 'in_progress'
+                UNION
+                SELECT branch_id FROM pending_branches
+                WHERE branch_id IN (SELECT branch_id FROM workers)
             ),
-            joined_rows AS (
-                SELECT registry.branch_key,
+            hot_joined AS (
+                SELECT keys.branch_id,
                        pending.status AS pending_status,
                        active.status AS active_status,
                        pending.priority AS pending_priority,
@@ -4931,26 +4933,44 @@ class ERDQueue:
                        active.ceiling,
                        active.spine,
                        active.created_at,
-                       COALESCE(completed.completed_candidate_count, 0)
-                           AS completed_candidate_count,
                        COALESCE(workers.worker_count, 0) AS worker_count
-                FROM branch_ids AS keys
-                JOIN branches AS registry USING (branch_id)
+                FROM hot_ids AS keys
                 LEFT JOIN pending_branches AS pending USING (branch_id)
                 LEFT JOIN active_branches AS active USING (branch_id)
-                LEFT JOIN completed USING (branch_id)
                 LEFT JOIN workers USING (branch_id)
             ),
-            normalized AS (
-                SELECT *,
-                       {branch_status_expression} AS branch_status,
-                       {branch_worker_status_expression} AS branch_worker_status,
-                       COALESCE(active_priority, pending_priority, 0) AS priority,
-                       COALESCE(active_answer_count, pending_answer_count) AS answer_count,
-                       COALESCE(active_opener, pending_opener) AS opener,
-                       COALESCE(active_opener_pattern, pending_opener_pattern) AS opener_pattern
-                FROM joined_rows
-            )
+            cold_joined AS (
+                SELECT branch_id,
+                       status AS pending_status,
+                       NULL AS active_status,
+                       priority AS pending_priority,
+                       NULL AS active_priority,
+                       n_words AS pending_answer_count,
+                       NULL AS active_answer_count,
+                       opener AS pending_opener,
+                       NULL AS active_opener,
+                       opener_pattern AS pending_opener_pattern,
+                       NULL AS active_opener_pattern,
+                       claimed_at,
+                       completed_at,
+                       NULL AS candidate_count,
+                       NULL AS budget,
+                       NULL AS best_guess,
+                       NULL AS best_erd,
+                       NULL AS best_max_depth,
+                       NULL AS nodes_spent,
+                       NULL AS bulk_done_candidates,
+                       NULL AS one_level_erd_pruned_candidates,
+                       NULL AS two_level_erd_pruned_candidates,
+                       NULL AS ceiling,
+                       NULL AS spine,
+                       NULL AS created_at,
+                       0 AS worker_count
+                FROM pending_branches
+                WHERE branch_id NOT IN (SELECT branch_id FROM hot_ids)
+            ),
+            hot_rows AS (SELECT {normalized_columns} FROM hot_joined),
+            cold_rows AS (SELECT {normalized_columns} FROM cold_joined)
         """
         conditions = []
         parameters = [
@@ -4988,42 +5008,92 @@ class ERDQueue:
             )
             scope_parameters.append(opener.lower())
         if branch_key is not None:
-            scope_conditions.append("branch_key = ?")
+            scope_conditions.append(
+                "branch_id = (SELECT branch_id FROM branches WHERE branch_key = ?)"
+            )
             scope_parameters.append(bytes(branch_key))
         if scope_conditions:
             conditions.append("(" + " OR ".join(scope_conditions) + ")")
             parameters.extend(scope_parameters)
         where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
-        summary_query = (
-            base_query
-            + " SELECT branch_status, branch_worker_status, COUNT(*) AS branch_count"
-            + " FROM normalized"
-            + where_clause
-            + " GROUP BY branch_status, branch_worker_status"
-        )
         sort_name = sort or self._report_filter_value(filters, "sort") or "default"
+        # Ties break on branch_id, the registry's integer for each branch, so
+        # a page is chosen from integers alone; only its own rows then join
+        # the registry for their key and count their completed candidates.
         order_by = {
-            "age": "COALESCE(created_at, claimed_at, 0), branch_key",
-            "size": "answer_count DESC, branch_key",
-            "workers": "worker_count DESC, answer_count DESC, branch_key",
-            "priority": "priority DESC, answer_count DESC, branch_key",
-            "nodes": "nodes_spent DESC, answer_count DESC, branch_key",
-            "slowest": "nodes_spent DESC, created_at, branch_key",
+            "age": "COALESCE(created_at, claimed_at, 0), branch_id",
+            "size": "answer_count DESC, branch_id",
+            "workers": "worker_count DESC, answer_count DESC, branch_id",
+            "priority": "priority DESC, answer_count DESC, branch_id",
+            "nodes": "nodes_spent DESC, answer_count DESC, branch_id",
+            "slowest": "nodes_spent DESC, created_at, branch_id",
             "default": (
                 "CASE branch_worker_status WHEN 'active' THEN 0 ELSE 1 END, "
-                "priority DESC, answer_count DESC, branch_key"
+                "priority DESC, answer_count DESC, branch_id"
             ),
         }[sort_name]
         effective_limit = (
             limit if limit is not None
             else self._report_filter_value(filters, "limit")
         )
-        row_query = base_query + " SELECT * FROM normalized" + where_clause
-        row_query += " ORDER BY " + order_by
-        row_parameters = list(parameters)
-        if effective_limit is not None:
-            row_query += " LIMIT ?"
-            row_parameters.append(effective_limit)
+        liveness_parameters = parameters[:1]
+        where_parameters = parameters[1:]
+        summary_query = base_query + f"""
+            SELECT branch_status, branch_worker_status,
+                   SUM(branch_count) AS branch_count
+            FROM (
+                SELECT branch_status, branch_worker_status,
+                       COUNT(*) AS branch_count
+                FROM hot_rows{where_clause}
+                GROUP BY branch_status, branch_worker_status
+        """
+        summary_parameters = liveness_parameters + where_parameters
+        if include_cold:
+            # A cold branch's statuses follow from its pending status alone,
+            # so grouping on that column walks the status index in order
+            # instead of sorting every cold row by the derived pair.
+            summary_query += f"""
+                UNION ALL
+                SELECT MIN(branch_status), MIN(branch_worker_status),
+                       COUNT(*) AS branch_count
+                FROM cold_rows{where_clause}
+                GROUP BY pending_status
+            """
+            summary_parameters += where_parameters
+        summary_query += """
+            )
+            GROUP BY branch_status, branch_worker_status
+        """
+        limit_clause = "" if effective_limit is None else " LIMIT ?"
+        limit_parameters = [] if effective_limit is None else [effective_limit]
+        # The cold half is paged on its own before it meets the hot rows, so
+        # the sort that chooses the page sees at most a page of cold rows.
+        candidates_query = f"SELECT * FROM hot_rows{where_clause}"
+        row_parameters = liveness_parameters + where_parameters
+        if include_cold:
+            candidates_query += f"""
+                UNION ALL
+                SELECT * FROM (
+                    SELECT * FROM cold_rows{where_clause}
+                    ORDER BY {order_by}{limit_clause}
+                )
+            """
+            row_parameters += where_parameters + limit_parameters
+        row_parameters += limit_parameters
+        row_query = base_query + f""",
+            page AS (
+                SELECT * FROM ({candidates_query})
+                ORDER BY {order_by}{limit_clause}
+            )
+            SELECT page.*,
+                   (SELECT branch_key FROM branches AS registry
+                    WHERE registry.branch_id = page.branch_id) AS branch_key,
+                   (SELECT COUNT(*) FROM candidate_claims AS claims
+                    WHERE claims.branch_id = page.branch_id AND claims.done = 1)
+                       AS completed_candidate_count
+            FROM page
+            ORDER BY {order_by}
+        """
         # The count and the page must describe the same instant.  A limited
         # page cannot be counted by measuring itself, so the totals come from
         # their own aggregate -- and a swarm moves branches between statuses
@@ -5036,7 +5106,9 @@ class ERDQueue:
         if opened_snapshot:
             self._conn.execute("BEGIN DEFERRED")
         try:
-            summary_rows = self._conn.execute(summary_query, parameters).fetchall()
+            summary_rows = self._conn.execute(
+                summary_query, summary_parameters
+            ).fetchall()
             joined_rows = self._conn.execute(row_query, row_parameters).fetchall()
         finally:
             if opened_snapshot:
