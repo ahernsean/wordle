@@ -3828,13 +3828,34 @@ def collect_hotspot_report(sources: ReportOpeners, request: ReportRequest) -> di
 WORK_DISTRIBUTION_BAND_EDGE_SECONDS = (2, 30, 300, 3600)
 
 
+_BAND_EDGE_UNITS = ((86400, "d"), (3600, "h"), (60, "m"), (1, "s"))
+
+
+def _band_edge_parts(seconds):
+    """A bound as a count of the largest unit that divides it exactly."""
+    for unit_seconds, unit in _BAND_EDGE_UNITS:
+        if seconds % unit_seconds == 0:
+            return f"{seconds // unit_seconds:,}", unit
+    return f"{seconds:,}", "s"
+
+
+def _band_range_label(low, high):
+    """``2-30s`` when both bounds share a unit, ``30s-5m`` when they do not."""
+    low_count, low_unit = _band_edge_parts(low)
+    high_count, high_unit = _band_edge_parts(high)
+    if low_unit == high_unit:
+        return f"{low_count}-{high_count}{high_unit}"
+    return f"{low_count}{low_unit}-{high_count}{high_unit}"
+
+
 def work_distribution_band_labels(edge_seconds=WORK_DISTRIBUTION_BAND_EDGE_SECONDS):
-    """Band bounds as the display conventions render every other quantity."""
-    labels = [f"<={edge_seconds[0]:,}s"]
+    """Band bounds, each in the largest unit that states it as a whole number."""
+    labels = ["<=" + "".join(_band_edge_parts(edge_seconds[0]))]
     labels.extend(
-        f"{low:,}-{high:,}s" for low, high in zip(edge_seconds, edge_seconds[1:])
+        _band_range_label(low, high)
+        for low, high in zip(edge_seconds, edge_seconds[1:])
     )
-    labels.append(f">{edge_seconds[-1]:,}s")
+    labels.append(">" + "".join(_band_edge_parts(edge_seconds[-1])))
     return labels
 
 

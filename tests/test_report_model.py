@@ -5850,11 +5850,20 @@ class WorkDistributionReportTest(unittest.TestCase):
             work_distribution_band_labels((2, 30)),
             ["<=2s", "2-30s", ">30s"],
         )
-        # Bounds are quantities, so they carry separators like every other
-        # number shown to a reader.
+        # Each bound takes the largest unit that states it as a whole number,
+        # and a range names its unit once when both bounds share it.
         self.assertEqual(
-            work_distribution_band_labels((300, 3600, 86400)),
-            ["<=300s", "300-3,600s", "3,600-86,400s", ">86,400s"],
+            work_distribution_band_labels((2, 30, 300, 3600)),
+            ["<=2s", "2-30s", "30s-5m", "5m-1h", ">1h"],
+        )
+        self.assertEqual(
+            work_distribution_band_labels((90, 120, 7200, 86400)),
+            ["<=90s", "90s-2m", "2m-2h", "2h-1d", ">1d"],
+        )
+        # Counts in the chosen unit still carry separators.
+        self.assertEqual(
+            work_distribution_band_labels((61, 86400 * 1500)),
+            ["<=61s", "61s-1,500d", ">1,500d"],
         )
         self.assertEqual(
             len(work_distribution_band_labels()),
