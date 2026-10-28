@@ -273,11 +273,11 @@ def validate_report_request(request: ReportRequest) -> None:
         raise ValueError(f"--tree cannot be used with --{report_kind}")
     if (request.tree_parent or request.tree_cursor) and not request.tree:
         raise ValueError("tree_parent and tree_cursor require tree")
-    # Only root progress attributes inherited work, so only it can price it.
+    # Only word progress attributes inherited work, so only it can price it.
     # Accepting the flag elsewhere would answer a question the report does not
     # ask, and answer it silently.
-    if request.inherited_cost and report_kind != "root_progress":
-        raise ValueError("--inherited-cost requires a root progress report")
+    if request.inherited_cost and report_kind != "word_progress":
+        raise ValueError("--inherited-cost requires a word progress report")
     if request.include_claims and (
         request.tree
         or report_kind != "auto"
@@ -302,17 +302,17 @@ def validate_report_request(request: ReportRequest) -> None:
         raise ValueError(
             "--sort for word reports must be default, size, workers, or priority"
         )
-    # Refused rather than substituted: a root progress report reads its sort
+    # Refused rather than substituted: a word progress report reads its sort
     # through a dispatch table, and quietly falling back would render a
     # successful report in an order nobody asked for.
     if (
-        report_kind == "root_progress"
+        report_kind == "word_progress"
         and request.filters.sort is not None
-        and request.filters.sort not in ROOT_PROGRESS_SORT_FIELDS
+        and request.filters.sort not in WORD_PROGRESS_SORT_FIELDS
     ):
         raise ValueError(
-            "--sort for root progress reports must be "
-            + " or ".join(ROOT_PROGRESS_SORT_FIELDS)
+            "--sort for word progress reports must be "
+            + " or ".join(WORD_PROGRESS_SORT_FIELDS)
         )
     if request.filters.group_by is not None and report_kind == "openers":
         if request.filters.group_by not in OPENER_GROUP_BY_STRATEGIES:
@@ -427,14 +427,14 @@ def validate_report_request(request: ReportRequest) -> None:
                 "--work-distribution cannot use --budget: budget is not "
                 "recorded per claim"
             )
-    if report_kind == "root_progress":
+    if report_kind == "word_progress":
         if request.tree:
-            raise ValueError("--tree cannot be used with --root-progress")
+            raise ValueError("--tree cannot be used with --word-progress")
         # Any spine ending in a word works: the rollup scopes telemetry by
         # spine prefix, and a deeper spine is simply a longer prefix.  A target
         # that does not end in a word has no response groups to report.
         if branch_target_kind != "word":
-            raise ValueError("--root-progress requires a target ending in a word")
+            raise ValueError("--word-progress requires a target ending in a word")
     if report_kind == "openers" and branch_target_kind not in ("root", "word"):
         raise ValueError(
             "--openers accepts only a trailing word or no branch target"
@@ -1813,10 +1813,10 @@ def collect_word_report(sources: ReportOpeners, request: ReportRequest) -> dict:
     return report
 
 
-ROOT_PROGRESS_RECENT_WINDOW_SECONDS = 86400
+WORD_PROGRESS_RECENT_WINDOW_SECONDS = 86400
 
 
-def _root_progress_estimate(active_branches, recent_window_seconds, now):
+def _word_progress_estimate(active_branches, recent_window_seconds, now):
     """A completion estimate for the branches currently carrying the work.
 
     Only in-flight branches can be estimated: their candidate lists have a
@@ -1833,13 +1833,13 @@ def _root_progress_estimate(active_branches, recent_window_seconds, now):
     Those branches are reported as stalled instead, so excluding them hides
     nothing.
 
-    A newly opened root has less history than the window.  Its rate therefore
+    A newly opened word has less history than the window.  Its rate therefore
     uses the observed span from its first sampled branch through `now`, rather
     than treating the unseen part of the window as idle time.  Such an estimate
     is explicitly provisional until the full window has elapsed.
 
     Returns None when nothing has completed inside the window, which is the
-    honest answer for an idle or just-restarted root.
+    honest answer for an idle or just-restarted word.
     """
     remaining = 0
     recent = 0
@@ -1900,10 +1900,10 @@ def breakdown_work_state(row, group_budget):
     return "unqueued"
 
 
-ROOT_PROGRESS_GROUP_STATES = ("waiting", "working", "solved", "loss")
+WORD_PROGRESS_GROUP_STATES = ("waiting", "working", "solved", "loss")
 
 
-def _root_progress_group_state(row, cache_state, group_budget):
+def _word_progress_group_state(row, cache_state, group_budget):
     """Where a response group sits in the work, from the cache's view.
 
     `solved` and `loss` both mean there is no more work to do here -- one
@@ -1932,7 +1932,7 @@ def _root_progress_group_state(row, cache_state, group_budget):
     return "working" if row["started"] else "waiting"
 
 
-ROOT_PROGRESS_GROUP_PROVENANCES = (
+WORD_PROGRESS_GROUP_PROVENANCES = (
     "worked", "inherited", "trivial", "unattributed", "none",
 )
 
@@ -1941,12 +1941,12 @@ ROOT_PROGRESS_GROUP_PROVENANCES = (
 # searched.  State and provenance stay separate facts -- the cache's verdict
 # and who reached the branch first -- and this is the single column derived
 # from them, so the terminal and the web client cannot disagree about it.
-ROOT_PROGRESS_DISPLAY_STATES = (
+WORD_PROGRESS_DISPLAY_STATES = (
     "waiting", "working", "solved", "inherited", "trivial", "loss",
 )
 
 
-def _root_progress_display_state(state, provenance):
+def _word_progress_display_state(state, provenance):
     """The one word the table shows for a response group.
 
     A proven loss outranks its provenance: a dead end matters more than how it
@@ -1964,9 +1964,9 @@ def _root_progress_display_state(state, provenance):
 # once another opener has paid for part of the tree, so each gets an ordering
 # rather than one standing in for both.  Both names say whose nodes they
 # count: "nodes" alone would not distinguish them.
-ROOT_PROGRESS_SORT_FIELDS = ("tree_nodes", "own_nodes")
-ROOT_PROGRESS_DEFAULT_SORT = "tree_nodes"
-_ROOT_PROGRESS_SORT_KEYS = {
+WORD_PROGRESS_SORT_FIELDS = ("tree_nodes", "own_nodes")
+WORD_PROGRESS_DEFAULT_SORT = "tree_nodes"
+_WORD_PROGRESS_SORT_KEYS = {
     # The tree's cost, whoever paid: what the group was worth solving.
     "tree_nodes": lambda row: (
         -(row["search_node_count"] + row["inherited_search_node_count"]),
@@ -1978,7 +1978,7 @@ _ROOT_PROGRESS_SORT_KEYS = {
 }
 
 
-def _root_progress_group_provenance(row, state, finalizing_spine, opener):
+def _word_progress_group_provenance(row, state, finalizing_spine, opener):
     """Who paid for a response group, which `state` cannot say.
 
     `state` reads the cache and answers whether a group is finished.  A group
@@ -2013,7 +2013,7 @@ def _root_progress_group_provenance(row, state, finalizing_spine, opener):
     return "inherited", payer
 
 
-def collect_root_progress_report(sources: ReportOpeners,
+def collect_word_progress_report(sources: ReportOpeners,
                                  request: ReportRequest) -> dict:
     """Work totals and a completion estimate for one opener.
 
@@ -2028,7 +2028,7 @@ def collect_root_progress_report(sources: ReportOpeners,
     word = resolved.trailing_word
     if word is None:
         raise ValueError(
-            "root progress report requires a branch target ending in a word")
+            "word progress report requires a branch target ending in a word")
     # Spines record words uppercase and patterns as written, so the prefix is
     # built rather than upper-cased whole: upper-casing would corrupt the y in
     # a pattern.
@@ -2045,7 +2045,7 @@ def collect_root_progress_report(sources: ReportOpeners,
                           if answer_words}
     answer_counts = {pattern: len(answer_words)
                      for pattern, answer_words in group_answer_words.items()}
-    # No branch context here: a root target's branch_key_hex encodes the whole
+    # No branch context here: a word target's branch_key_hex encodes the whole
     # answer subset, which is tens of kilobytes the panel never reads.  Request
     # detail likewise stays in the opener report; only the earliest request
     # time is carried, in totals.
@@ -2061,7 +2061,7 @@ def collect_root_progress_report(sources: ReportOpeners,
         "epoch": request.epoch,
     }
     report = _semantic_report(
-        "root_progress", sources, request.branch_target, generated_at, data,
+        "word_progress", sources, request.branch_target, generated_at, data,
         request
     )
     branch_keys_by_pattern = {
@@ -2072,11 +2072,11 @@ def collect_root_progress_report(sources: ReportOpeners,
     try:
         queue = _open_report_queue(sources)
         active_epoch = queue.epoch
-        progress = queue.report_root_progress(
-            spine_prefix, request.epoch, ROOT_PROGRESS_RECENT_WINDOW_SECONDS,
+        progress = queue.report_word_progress(
+            spine_prefix, request.epoch, WORD_PROGRESS_RECENT_WINDOW_SECONDS,
             now=generated_at)
-        # Work under a deeper spine is still requested under its root, so the
-        # request time is the root's however deep the target sits.
+        # Work under a deeper spine is still requested under its opener, so the
+        # request time is the opener's however deep the target sits.
         requests = queue.opener_work_requests_for_word(
             resolved.steps[0].word if resolved.steps else word)
         finalizing_spines = queue.first_finalizing_spines(
@@ -2150,12 +2150,12 @@ def collect_root_progress_report(sources: ReportOpeners,
                                   if totals else None),
             "telemetry_epochs": totals["telemetry_epochs"] if totals else [],
         }
-        row["state"] = _root_progress_group_state(
+        row["state"] = _word_progress_group_state(
             row, cache_states.get(branch_keys_by_pattern[pattern]),
             group_budget)
         finalizing_spine = finalizing_spines.get(
             branch_keys_by_pattern[pattern])
-        row["provenance"], row["paid_by"] = _root_progress_group_provenance(
+        row["provenance"], row["paid_by"] = _word_progress_group_provenance(
             row, row["state"], finalizing_spine, word)
         # The spine that finalized the branch, which is where the work
         # actually happened: a branch is solved once and read from cache
@@ -2177,7 +2177,7 @@ def collect_root_progress_report(sources: ReportOpeners,
             payer_steps[0].pattern if len(payer_steps) == 1 else None)
         row["paid_by_is_answer"] = (
             row["paid_by"].lower() in answer_set if row["paid_by"] else False)
-        row["display_state"] = _root_progress_display_state(
+        row["display_state"] = _word_progress_display_state(
             row["state"], row["provenance"])
         rollup = (subtree_rollups.get(finalizing_spine)
                   if row["provenance"] == "inherited" else None)
@@ -2216,8 +2216,8 @@ def collect_root_progress_report(sources: ReportOpeners,
     # groups the attribution exists to surface -- but that ranking is the
     # right one for "what did my request cost", so it stays available.  With
     # no rollup requested the two orders coincide.
-    rows.sort(key=_ROOT_PROGRESS_SORT_KEYS[
-        request.filters.sort or ROOT_PROGRESS_DEFAULT_SORT])
+    rows.sort(key=_WORD_PROGRESS_SORT_KEYS[
+        request.filters.sort or WORD_PROGRESS_DEFAULT_SORT])
     # Two totals, deliberately: `node_total` is this opener's own measured
     # work and is what the totals report, while the share is a fraction of
     # what the table shows, so it still sums to one across the visible rows
@@ -2242,18 +2242,18 @@ def collect_root_progress_report(sources: ReportOpeners,
     data["work_latest_at"] = max(
         (row["last_finalized_at"] for row in rows
          if row["last_finalized_at"] is not None), default=None)
-    root_is_complete = (
+    word_is_complete = (
         progress["open_branch_count"] == 0
         and all(row["state"] in ("solved", "loss") for row in rows)
     )
-    data["completed_at"] = data["work_latest_at"] if root_is_complete else None
-    if root_is_complete and not resolved.steps:
+    data["completed_at"] = data["work_latest_at"] if word_is_complete else None
+    if word_is_complete and not resolved.steps:
         data["completed_at"] = max(
             (entry["completed_at"] for entry in requests
              if entry["completed_at"] is not None),
             default=data["completed_at"],
         )
-    data["estimate"] = _root_progress_estimate(
+    data["estimate"] = _word_progress_estimate(
         progress["active_branches"],
         progress["recent_window_seconds"], generated_at)
     data["active_branches"] = progress["active_branches"]
@@ -4794,6 +4794,6 @@ def _collect_report_of_kind(sources: ReportOpeners, request: ReportRequest) -> d
         return collect_leaderboard_report(sources, request)
     if report_kind == "openers":
         return collect_opener_report(sources, request)
-    if report_kind == "root_progress":
-        return collect_root_progress_report(sources, request)
+    if report_kind == "word_progress":
+        return collect_word_progress_report(sources, request)
     raise ValueError(f"unsupported report kind: {request.report_kind}")

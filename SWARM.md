@@ -134,10 +134,10 @@ python3.13 erd_search.py view --work-distribution --epoch 17
 python3.13 erd_search.py view --work-distribution --minimum-answer-count 200
 python3.13 erd_search.py view --openers
 python3.13 erd_search.py view --openers CRANE
-python3.13 erd_search.py view --root-progress CRANE
-python3.13 erd_search.py view --root-progress CRANE --epoch 10
-python3.13 erd_search.py view --root-progress CRANE --inherited-cost
-python3.13 erd_search.py view --root-progress CRANE --inherited-cost --sort own_nodes
+python3.13 erd_search.py view --word-progress CRANE
+python3.13 erd_search.py view --word-progress CRANE --epoch 10
+python3.13 erd_search.py view --word-progress CRANE --inherited-cost
+python3.13 erd_search.py view --word-progress CRANE --inherited-cost --sort own_nodes
 ```
 
 `--work-distribution` answers a question about the population rather than about
@@ -197,12 +197,12 @@ budget; `--sample-size` because nothing here samples; and `--priority`,
 `--sort`, `--limit`, `--branch-status` and `--branch-worker-status` because
 they describe or order individual branches rather than the population.
 
-`--root-progress` reports one opener's work: every response group with the
+`--word-progress` reports one word's work: every response group with the
 branches, search nodes, and node share spent under it, which groups have not
 been opened at all, when work actually began on it, and a completion estimate.
 It is the report that answers "why is
-this root taking so long" — cost concentrates hard, and the node-share column
-names the group holding it. It takes any spine ending in a word: a bare root,
+this word taking so long" — cost concentrates hard, and the node-share column
+names the group holding it. It takes any spine ending in a word: a bare opener,
 or a deeper spine such as `SCOPE -y--- LUBES`, which asks the same question at
 a greater guess_depth. The rollup scopes telemetry by spine prefix, so a longer
 spine is simply a longer prefix.
@@ -258,13 +258,13 @@ columns are named for the lifecycle phases the rest of the report uses:
 `Evaluating` counts branches in flight, `Done` counts branches that have
 finalized. Both span every depth under the group, so promoted sub-branches are
 included — unlike the word report's own response-group count, which sees only
-the root's direct groups. A started group that has finalized nothing shows
+the word's direct groups. A started group that has finalized nothing shows
 measured zeros for those columns but `—` for elapsed and worker-time, which
 exist only at finalize; an unopened group shows `—` throughout.
 
 Node, share, elapsed and worker-time figures are fenced to one telemetry epoch,
 which the report names. Work that finalized under an earlier epoch is not
-counted, so a root whose work began before the current epoch shows a start time
+counted, so a word whose work began before the current epoch shows a start time
 older than any of its costs.
 
 A request time appears only when the queue holds one that precedes the work it
@@ -301,7 +301,7 @@ and `solved/total` groups while it is still being searched. The reduction is don
 only for the rows on the page — about 6 ms a word against the full answer list
 — so a long queue costs no more than a short one. In the browser the same
 number is on each card, and clicking the card opens that word's full report,
-where its response groups and root progress are; the card's own `Branches`
+where its response groups and word progress are; the card's own `Branches`
 control is what lists the branches it owns. `Direct` counts the branches the word asked for outright
 — its own response groups; `Branches` spans every depth beneath it, so
 sub-branches promoted during the search are included too, and the two are

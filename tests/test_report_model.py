@@ -50,7 +50,7 @@ from report_model import (
     _grouped_response_groups,
     _response_group_key,
     _response_group_rollup,
-    _root_progress_estimate,
+    _word_progress_estimate,
     validate_report_request,
     branch_reference,
     collect_overview_report,
@@ -92,7 +92,7 @@ class ReportModelTest(unittest.TestCase):
             (ReportRequest(report_kind="cache", tree=True), "cannot be used"),
             (ReportRequest(tree_parent="RAISE -----"), "require tree"),
             (ReportRequest(worker_id="w1"), "workers report"),
-            (ReportRequest(report_kind="root_progress", branch_target=root), "requires a target"),
+            (ReportRequest(report_kind="word_progress", branch_target=root), "requires a target"),
         )
         for request, message in cases:
             with self.subTest(request=request):
@@ -149,16 +149,16 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(report_model.branch_status_and_worker_status("pending", None, 0), ("queued", None))
         self.assertEqual(report_model.branch_status_and_worker_status(None, "open", 1), ("evaluating", "active"))
         self.assertEqual(report_model._response_group_key({}, "none"), (0, "all"))
-        self.assertEqual(report_model._root_progress_group_state(
+        self.assertEqual(report_model._word_progress_group_state(
             {"answer_count": 3, "started": False},
             {"best_erd": 2, "max_remaining_depth": 3, "cache_state": "exact"}, 2), "solved")
-        self.assertEqual(report_model._root_progress_group_state(
+        self.assertEqual(report_model._word_progress_group_state(
             {"answer_count": 3, "started": False},
             {"best_erd": None, "max_remaining_depth": None, "cache_state": "loss"}, 2), "loss")
         self.assertEqual(report_model.branch_status_and_worker_status(None, "finalized", 0), ("finalizing", "waiting"))
 
     def test_display_state_folds_provenance_into_one_word_without_losing_a_loss(self):
-        display = report_model._root_progress_display_state
+        display = report_model._word_progress_display_state
         # A group solved by this opener's own search is just solved; the two
         # cases where "solved" says least are named instead.
         self.assertEqual(display("solved", "worked"), "solved")
@@ -175,12 +175,12 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(display("waiting", "none"), "waiting")
         self.assertLessEqual(
             {display(state, provenance)
-             for state in report_model.ROOT_PROGRESS_GROUP_STATES
-             for provenance in report_model.ROOT_PROGRESS_GROUP_PROVENANCES},
-            set(report_model.ROOT_PROGRESS_DISPLAY_STATES))
+             for state in report_model.WORD_PROGRESS_GROUP_STATES
+             for provenance in report_model.WORD_PROGRESS_GROUP_PROVENANCES},
+            set(report_model.WORD_PROGRESS_DISPLAY_STATES))
 
     def test_group_provenance_separates_who_solved_a_branch_from_whether_it_is_solved(self):
-        provenance = report_model._root_progress_group_provenance
+        provenance = report_model._word_progress_group_provenance
         worked = {"answer_count": 40, "started": True}
         idle = {"answer_count": 40, "started": False}
         # Work of this opener's own is `worked` whatever the log says, and a
@@ -525,10 +525,10 @@ class ReportModelTest(unittest.TestCase):
         self.assertTrue(report["sources"]["queue"]["ok"])
         self.assertEqual(report["sources"]["cache"]["error"], "cache offline")
 
-    def test_root_progress_report_handles_an_opener_without_started_work(self):
-        report = report_model.collect_root_progress_report(
+    def test_word_progress_report_handles_an_opener_without_started_work(self):
+        report = report_model.collect_word_progress_report(
             self.sources, ReportRequest(
-                report_kind="root_progress",
+                report_kind="word_progress",
                 branch_target=parse_report_branch_target("RAISE")))
         self.assertEqual(report["data"]["word"], "raise")
         self.assertEqual(report["data"]["estimate"], None)
@@ -708,7 +708,7 @@ class ReportModelTest(unittest.TestCase):
             ("hotspots", "collect_hotspot_report"),
             ("work_distribution", "collect_work_distribution_report"),
             ("leaderboard", "collect_leaderboard_report"), ("openers", "collect_opener_report"),
-            ("root_progress", "collect_root_progress_report"),
+            ("word_progress", "collect_word_progress_report"),
         ):
             with self.subTest(kind=kind), patch("report_model." + function_name,
                                                 return_value={"kind": kind}):
@@ -1513,21 +1513,21 @@ class ReportModelTest(unittest.TestCase):
             summary["answer_count"],
         )
 
-    def test_word_and_root_progress_reports_need_a_target_ending_in_a_word(self):
+    def test_word_and_word_progress_reports_need_a_target_ending_in_a_word(self):
         branch = parse_report_branch_target("salet -----")
         with self.assertRaisesRegex(ValueError, "ending in a word"):
             report_model.collect_word_report(
                 self.sources, ReportRequest(branch_target=branch)
             )
         with self.assertRaisesRegex(ValueError, "ending in a word"):
-            report_model.collect_root_progress_report(
+            report_model.collect_word_progress_report(
                 self.sources,
-                ReportRequest(report_kind="root_progress", branch_target=branch),
+                ReportRequest(report_kind="word_progress", branch_target=branch),
             )
 
-    def test_root_progress_report_degrades_when_a_store_is_unavailable(self):
+    def test_word_progress_report_degrades_when_a_store_is_unavailable(self):
         request = ReportRequest(
-            report_kind="root_progress",
+            report_kind="word_progress",
             branch_target=parse_report_branch_target("salet"),
         )
         with patch.object(report_model, "_open_report_queue",
@@ -1539,13 +1539,13 @@ class ReportModelTest(unittest.TestCase):
             report = collect_report(self.sources, request)
         self.assertFalse(report["sources"]["cache"]["ok"])
 
-    def test_a_root_progress_group_is_working_only_while_a_worker_holds_it(self):
+    def test_a_word_progress_group_is_working_only_while_a_worker_holds_it(self):
         row = {"answer_count": 5, "pattern": "-y---", "started": 1}
         self.assertEqual(
-            report_model._root_progress_group_state(row, None, 4), "working"
+            report_model._word_progress_group_state(row, None, 4), "working"
         )
         self.assertEqual(
-            report_model._root_progress_group_state({**row, "started": 0},
+            report_model._word_progress_group_state({**row, "started": 0},
                                                     None, 4),
             "waiting",
         )
@@ -1568,10 +1568,10 @@ class ReportModelTest(unittest.TestCase):
             (1, "worker-x"),
         )
 
-    def test_root_progress_is_not_a_tree_and_a_reference_needs_the_queue(self):
+    def test_word_progress_is_not_a_tree_and_a_reference_needs_the_queue(self):
         with self.assertRaisesRegex(ValueError, "tree cannot be used"):
             validate_report_request(
-                ReportRequest(report_kind="root_progress", tree=True)
+                ReportRequest(report_kind="word_progress", tree=True)
             )
         with self.assertRaisesRegex(ValueError, "requires queue resolution"):
             report_model.resolve_branch_target(
@@ -4837,7 +4837,7 @@ class OpenerReportTest(unittest.TestCase):
         self.assertEqual(worker["scheduling_role"], "preferred")
 
 
-class RootProgressReportTest(unittest.TestCase):
+class WordProgressReportTest(unittest.TestCase):
     setUp = ReportModelTest.setUp
     tearDown = ReportModelTest.tearDown
     _open_queue = ReportModelTest._open_queue
@@ -4867,7 +4867,7 @@ class RootProgressReportTest(unittest.TestCase):
 
     def _request(self, epoch=None, branch_target=("salet",)):
         return ReportRequest(
-            report_kind="root_progress",
+            report_kind="word_progress",
             branch_target=parse_report_branch_target(list(branch_target)),
             epoch=epoch)
 
@@ -4993,7 +4993,7 @@ class RootProgressReportTest(unittest.TestCase):
         # the two answer different questions and their sum is a third.
         self.assertEqual(totals["search_node_count"], 0)
 
-    def test_every_root_progress_sort_orders_by_the_nodes_it_names(self):
+    def test_every_word_progress_sort_orders_by_the_nodes_it_names(self):
         """Both orders are declared, and the dispatch table is checked.
 
         "What did this group cost" and "what did my request cost" are the same
@@ -5015,9 +5015,9 @@ class RootProgressReportTest(unittest.TestCase):
             "own_nodes": ["-y---", self.INHERITED_PATTERN],
         }
         self.assertEqual(sorted(expected),
-                         sorted(report_model._ROOT_PROGRESS_SORT_KEYS))
+                         sorted(report_model._WORD_PROGRESS_SORT_KEYS))
         self.assertEqual(sorted(expected),
-                         sorted(report_model.ROOT_PROGRESS_SORT_FIELDS))
+                         sorted(report_model.WORD_PROGRESS_SORT_FIELDS))
         for sort, order in expected.items():
             with self.subTest(sort=sort):
                 data = collect_report(self.sources, replace(
@@ -5031,12 +5031,12 @@ class RootProgressReportTest(unittest.TestCase):
             self._request(), inherited_cost=True))["data"]
         self.assertEqual(
             [row["pattern"] for row in data["response_groups"]][:2],
-            expected[report_model.ROOT_PROGRESS_DEFAULT_SORT])
+            expected[report_model.WORD_PROGRESS_DEFAULT_SORT])
 
     def test_inherited_cost_is_refused_by_reports_that_cannot_price_it(self):
         """An option only one report honours must be refused by the rest.
 
-        Only root progress attributes inherited work, so only it can price it.
+        Only word progress attributes inherited work, so only it can price it.
         Accepted elsewhere the flag would answer a question the report never
         asks — and answer it silently, which is how a request reaches the
         server, changes nothing, and reports success.
@@ -5047,13 +5047,13 @@ class RootProgressReportTest(unittest.TestCase):
                 with self.assertRaises(ValueError) as raised:
                     validate_report_request(ReportRequest(
                         report_kind=report_kind, inherited_cost=True))
-                self.assertIn("root progress", str(raised.exception))
+                self.assertIn("word progress", str(raised.exception))
         # The report that does attribute inherited work accepts it, and every
         # report accepts its absence.
         validate_report_request(replace(self._request(), inherited_cost=True))
         validate_report_request(ReportRequest(report_kind="openers"))
 
-    def test_root_progress_refuses_a_sort_it_cannot_serve(self):
+    def test_word_progress_refuses_a_sort_it_cannot_serve(self):
         # Substituting a default here would render a successful report in an
         # order nobody asked for, which is the failure the openers ERD sort
         # shipped with.
@@ -5061,7 +5061,7 @@ class RootProgressReportTest(unittest.TestCase):
             validate_report_request(replace(
                 self._request(), filters=replace(ReportFilters(), sort="erd")))
         self.assertIn("tree_nodes", str(raised.exception))
-        for sort in report_model.ROOT_PROGRESS_SORT_FIELDS:
+        for sort in report_model.WORD_PROGRESS_SORT_FIELDS:
             validate_report_request(replace(
                 self._request(), filters=replace(ReportFilters(), sort=sort)))
 
@@ -5104,7 +5104,7 @@ class RootProgressReportTest(unittest.TestCase):
         self._finalize(queue, "SALET -y---", 1, 5, 1_000, 100, 200)
         queue.close()
 
-        with patch("report_model._root_progress_group_state",
+        with patch("report_model._word_progress_group_state",
                    return_value="solved"):
             data = collect_report(self.sources, self._request())["data"]
 
@@ -5120,7 +5120,7 @@ class RootProgressReportTest(unittest.TestCase):
         queue.set_epoch(1)
         queue.close()
 
-        with patch("report_model._root_progress_group_state",
+        with patch("report_model._word_progress_group_state",
                    return_value="solved"):
             data = collect_report(self.sources, self._request(epoch=1))["data"]
 
@@ -5158,7 +5158,7 @@ class RootProgressReportTest(unittest.TestCase):
         self.assertEqual(rows["-----"]["search_node_count"], 500)
         self.assertEqual(rows["-----"]["telemetry_epochs"], [1])
 
-    def test_root_progress_prefers_queue_telemetry_to_cached_summary(self):
+    def test_word_progress_prefers_queue_telemetry_to_cached_summary(self):
         cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
         cache.add_opener_response_group_summary(
             "salet", "-y---", ERD_ALL, 900, 9_000, 1, 2, 0)
@@ -5173,7 +5173,7 @@ class RootProgressReportTest(unittest.TestCase):
         self.assertEqual(rows["-y---"]["search_node_count"], 100)
         self.assertEqual(rows["-y---"]["open_branch_count"], 0)
 
-    def test_root_progress_uses_cached_summary_without_queue_telemetry(self):
+    def test_word_progress_uses_cached_summary_without_queue_telemetry(self):
         cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
         cache.add_opener_response_group_summary(
             "salet", "-y---", ERD_ALL, 100, 1_000, 10, 20, 0)
@@ -5223,7 +5223,7 @@ class RootProgressReportTest(unittest.TestCase):
         self.assertIsNone(data["totals"]["requested_at"])
 
     def test_estimate_excludes_stalled_branches_from_both_rate_and_remainder(self):
-        estimate = _root_progress_estimate([
+        estimate = _word_progress_estimate([
             # Progressing: 400 of 1,000 candidates left, 100/day observed.
             {"candidate_count": 1000, "done_candidate_count": 600,
              "recent_done_candidate_count": 100, "created_at": 0},
@@ -5241,7 +5241,7 @@ class RootProgressReportTest(unittest.TestCase):
         self.assertEqual(estimate["stalled_remaining_candidate_count"], 10)
 
     def test_estimate_uses_the_available_sample_span_until_the_window_fills(self):
-        estimate = _root_progress_estimate([
+        estimate = _word_progress_estimate([
             {"candidate_count": 1000, "done_candidate_count": 100,
              "recent_done_candidate_count": 100, "created_at": 1000},
         ], 86400, 1600)
@@ -5252,23 +5252,23 @@ class RootProgressReportTest(unittest.TestCase):
         self.assertEqual(estimate["estimated_seconds"], 5400)
 
     def test_estimate_is_absent_when_nothing_completed_in_the_window(self):
-        self.assertIsNone(_root_progress_estimate([
+        self.assertIsNone(_word_progress_estimate([
             {"candidate_count": 1000, "done_candidate_count": 10,
              "recent_done_candidate_count": 0, "created_at": 0},
         ], 86400, 86400))
 
-    def test_root_progress_requires_a_word_target(self):
+    def test_word_progress_requires_a_word_target(self):
         with self.assertRaises(ValueError):
             validate_report_request(ReportRequest(
-                report_kind="root_progress",
+                report_kind="word_progress",
                 branch_target=parse_report_branch_target(None)))
 
-    def test_root_progress_accepts_a_spine_of_more_than_one_guess(self):
+    def test_word_progress_accepts_a_spine_of_more_than_one_guess(self):
         # The rollup scopes telemetry by spine prefix and a longer spine is
         # simply a longer prefix, so "why is CRANE --g-- SALET taking so long"
         # is the same question at a greater guess_depth.
         validate_report_request(ReportRequest(
-            report_kind="root_progress",
+            report_kind="word_progress",
             branch_target=parse_report_branch_target(
                 ["crane", "--g--", "salet"])))
 

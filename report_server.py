@@ -56,8 +56,8 @@ FIXTURE_FILENAMES = (
     "work_distribution.json",
     "leaderboard.json",
     "leaderboard-word.json",
-    "root_progress.json",
-    "root_progress-inherited.json",
+    "word_progress.json",
+    "word_progress-inherited.json",
     "openers.json",
     "openers-word.json",
 )
@@ -178,7 +178,7 @@ def parse_report_request(path, query):
         "/api/view/work-distribution": "work_distribution",
         "/api/view/leaderboard": "leaderboard",
         "/api/view/openers": "openers",
-        "/api/view/root-progress": "root_progress",
+        "/api/view/word-progress": "word_progress",
     }.get(path)
     if explicit_kind is None:
         raise KeyError(path)
@@ -383,7 +383,7 @@ def parse_report_request(path, query):
 # the client renders, so each needs its own fixture, named by suffixing the
 # stage.  Add a report here when it grows a second stage; the client half is
 # `attachProgressiveStage`.
-PROGRESSIVE_STAGE_FLAGS = {"root_progress": (("inherited_cost", "inherited"),)}
+PROGRESSIVE_STAGE_FLAGS = {"word_progress": (("inherited_cost", "inherited"),)}
 
 
 def progressive_stage_suffix(request):

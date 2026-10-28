@@ -48,47 +48,47 @@
     #branch-target-input { flex:1 1 auto; min-width:0; padding-right:2.1rem; }
     #clear-target { position:absolute; right:.3rem; top:50%; transform:translateY(-50%); min-height:0; width:1.5rem; height:1.5rem; padding:0; border-radius:999px; line-height:1; color:var(--dim); }
     #clear-target[hidden] { display:none; }
-    details.root-progress-panel { border:1px solid var(--border); border-radius:6px; background:var(--panel); padding:.4rem .5rem; margin:.5rem 0; }
-    details.root-progress-panel > summary { cursor:pointer; font-weight:bold; }
+    details.word-progress-panel { border:1px solid var(--border); border-radius:6px; background:var(--panel); padding:.4rem .5rem; margin:.5rem 0; }
+    details.word-progress-panel > summary { cursor:pointer; font-weight:bold; }
     /* The table is wider than a phone and longer than a screen; it scrolls
        inside this box on both axes so the page body never does. */
-    .root-progress-scroll { overflow:auto; max-height:60vh; overscroll-behavior:contain; margin-top:.4rem; }
-    table.root-progress { border-collapse:collapse; white-space:nowrap; }
-    table.root-progress th, table.root-progress td { padding:.15rem .5rem; text-align:right; }
-    table.root-progress td { border-bottom:1px solid var(--border); }
+    .word-progress-scroll { overflow:auto; max-height:60vh; overscroll-behavior:contain; margin-top:.4rem; }
+    table.word-progress { border-collapse:collapse; white-space:nowrap; }
+    table.word-progress th, table.word-progress td { padding:.15rem .5rem; text-align:right; }
+    table.word-progress td { border-bottom:1px solid var(--border); }
     /* A collapsed border does not travel with a sticky header, so the rule
        under the header row is drawn as an inset shadow. */
-    table.root-progress thead th { position:sticky; top:0; z-index:1; background:var(--panel); box-shadow:inset 0 -1px 0 var(--border); }
-    table.root-progress th:first-child, table.root-progress td:first-child { text-align:left; }
+    table.word-progress thead th { position:sticky; top:0; z-index:1; background:var(--panel); box-shadow:inset 0 -1px 0 var(--border); }
+    table.word-progress th:first-child, table.word-progress td:first-child { text-align:left; }
     /* The tiles name the row, so they stay put while the measurements scroll
        under them.  An opaque background is required, not decoration: without
        it the scrolled cells show through.  The header's own sticky rule wins
        on the top-left cell, so it carries the higher z-index. */
-    table.root-progress th:first-child, table.root-progress td:first-child {
+    table.word-progress th:first-child, table.word-progress td:first-child {
       position:sticky; left:0; background:var(--panel); z-index:1;
       box-shadow:inset -1px 0 0 var(--border); }
-    table.root-progress thead th:first-child { z-index:2; }
+    table.word-progress thead th:first-child { z-index:2; }
     /* The payer column holds a word rather than a measurement, and takes two
        forms -- tiles, or the text "self".  Centring the whole column keeps
        them on one axis; the numeric right-alignment would strand "self" at
        the edge while the tiles sat wherever their own rule put them. */
-    table.root-progress th:last-child, table.root-progress td:last-child { text-align:center; }
+    table.word-progress th:last-child, table.word-progress td:last-child { text-align:center; }
     /* How many guesses that opener needed to reach this branch.  Without it a
        bare opener reads as having isolated the branch with its first guess. */
     .payer-depth { margin-left:.25rem; color:var(--dim); font-size:.85em; }
-    table.root-progress tr.dim td { color:var(--dim); }
-    table.root-progress td.state-solved { color:var(--green); }
-    table.root-progress td.state-loss { color:var(--red); }
-    table.root-progress td.state-waiting { color:var(--dim); }
-    table.root-progress td.state-inherited { color:var(--accent, var(--green)); }
-    table.root-progress td.state-trivial { color:var(--dim); }
-    details.root-progress-legend-panel { margin-top:.4rem; }
-    details.root-progress-legend-panel > summary { cursor:pointer; color:var(--dim); font-size:.9em; }
-    dl.root-progress-legend { margin:.4rem 0 0; display:grid; grid-template-columns:max-content 1fr; gap:.15rem .6rem; font-size:.9em; }
-    dl.root-progress-legend dt { font-weight:bold; }
-    dl.root-progress-legend dd { margin:0; color:var(--dim); }
-    @media (max-width:560px) { dl.root-progress-legend { grid-template-columns:1fr; }
-      dl.root-progress-legend dd { margin:0 0 .35rem; } }
+    table.word-progress tr.dim td { color:var(--dim); }
+    table.word-progress td.state-solved { color:var(--green); }
+    table.word-progress td.state-loss { color:var(--red); }
+    table.word-progress td.state-waiting { color:var(--dim); }
+    table.word-progress td.state-inherited { color:var(--accent, var(--green)); }
+    table.word-progress td.state-trivial { color:var(--dim); }
+    details.word-progress-legend-panel { margin-top:.4rem; }
+    details.word-progress-legend-panel > summary { cursor:pointer; color:var(--dim); font-size:.9em; }
+    dl.word-progress-legend { margin:.4rem 0 0; display:grid; grid-template-columns:max-content 1fr; gap:.15rem .6rem; font-size:.9em; }
+    dl.word-progress-legend dt { font-weight:bold; }
+    dl.word-progress-legend dd { margin:0; color:var(--dim); }
+    @media (max-width:560px) { dl.word-progress-legend { grid-template-columns:1fr; }
+      dl.word-progress-legend dd { margin:0 0 .35rem; } }
     .work-distribution-scroll { overflow-x:auto; margin-top:.4rem; }
     table.work-distribution { border-collapse:collapse; white-space:nowrap; }
     table.work-distribution th, table.work-distribution td { padding:.15rem .5rem; text-align:right; }
@@ -540,18 +540,18 @@
     const COMPLETED_BRANCH_HOLD_DURATION_MILLIS=5000;
     const recentOverviewCompletionRows=new Map();
     let completionExpiryTimer=null;
-    let currentState, lastReport=null, lastContext=null, displayedState=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,shownBranchTarget=null,rootProgressOpen=true,rootProgressSort="tree_nodes",leaderboardReportWidth=null;
+    let currentState, lastReport=null, lastContext=null, displayedState=null, failureCount=0, lastSuccess=null, pollTimer=null, comparisonAvailable=false,requestGeneration=0,activeRequestController=null,activeRequestStartedAt=0,shownBranchTarget=null,wordProgressOpen=true,wordProgressSort="tree_nodes",leaderboardReportWidth=null;
     // A report an interaction kept from being drawn is still banked, because
     // `lastReport` and the stored entity tag describe what the server holds.
     // Nothing downstream would then notice the screen is a report behind, so
     // the debt is carried here and settled by the first poll that finds the
     // interaction over.
     let renderOwed=false;
-    // Root progress is fetched with every poll, like the report around it: it
+    // Word progress is fetched with every poll, like the report around it: it
     // takes milliseconds, and a panel held from an earlier moment contradicts
     // the header above it once a group finishes.  The latest answer per target
     // is kept only so a re-render shows it while the next one is in flight.
-    const rootProgressLatest=new Map(), rootProgressInFlight=new Map(), rootProgressScroll=new Map(), rootProgressFailure=new Map();
+    const wordProgressLatest=new Map(), wordProgressInFlight=new Map(), wordProgressScroll=new Map(), wordProgressFailure=new Map();
     const byId=id=>document.getElementById(id);
     const element=(tag,className,text)=>{const node=document.createElement(tag);if(className)node.className=className;if(text!==undefined)node.textContent=String(text);return node;};
     const formatInteger=value=>value===null||value===undefined?"—":Number(value).toLocaleString("en-US");
@@ -755,7 +755,7 @@
     }
     function buildAPIURL(state){
       // Report kinds are snake_case; their routes are hyphenated, the same
-      // spelling root-progress already uses.
+      // spelling word-progress already uses.
       const endpoint=state.kind==="auto"?"/api/view":"/api/view/"+state.kind.replaceAll("_","-");
       const query=stateQuery(state,false); query.delete("kind");
       return endpoint+(query.size?"?"+query.toString():"");
@@ -1150,15 +1150,15 @@
     // The target a report answered, drawn the way every other word in the
     // report is drawn.  Its steps come from the server's own parse rather than
     // the text in the branch target box, so the header names what was actually
-    // asked for.  A target that names no word -- a queue reference, or the
-    // root -- has nothing to draw and stays as the text it was asked as.  A
-    // target carries no answer-set membership either, so these tiles take no
-    // notch; the report body draws that where it knows it.
+    // asked for.  A target that names no word, a queue reference, has nothing
+    // to draw and stays as the text it was asked as.  A target carries no
+    // answer-set membership either, so these tiles take no notch; the report
+    // body draws that where it knows it.
     function branchTargetLabel(report,state){
       const target=report.branch_target;
       const steps=[...(target&&target.steps||[])];
       if(target&&target.trailing_word)steps.push({word:target.trailing_word,pattern:null});
-      return steps.length?renderSpine(steps,"word-sm"):element("span","dim",state.branch_target||"root");
+      return steps.length?renderSpine(steps,"word-sm"):element("span","dim",state.branch_target);
     }
     function branchContextSummary(worker){
       if(Array.isArray(worker.branch_context)&&worker.branch_context.length){
@@ -1214,9 +1214,8 @@
     function reportHeader(report,state){
       const meta=element("section","report-meta");
       meta.append(element("h1","",report.report_kind+" report"));
-      // The list of every opener names no target; "root" would say nothing.
-      const openerList=report.report_kind==="openers"&&!state.branch_target;
-      if((report.report_kind!=="branch"||report.tree)&&!openerList)meta.append(branchTargetLabel(report,state));
+      // A report with no target covers everything, so its header names none.
+      if((report.report_kind!=="branch"||report.tree)&&state.branch_target)meta.append(branchTargetLabel(report,state));
       meta.append(element("span","dim","sorted by "+activeSortLabel(state)));
       // A report served from revalidation is not refreshed by the poll: its
       // data is as old as the last time its signal moved.  Saying so is the
@@ -1481,34 +1480,34 @@
       for(const [size,suffix] of [[1e9,"G"],[1e6,"M"],[1e3,"K"]])if(value>=size)return (value/size).toFixed(1)+suffix;
       return String(value);
     };
-    // The panel reads only which root and which epoch; every other key in
+    // The panel reads only which word and which epoch; every other key in
     // stateQuery is word-view display state that this report rejects rather
     // than ignores, so it is built from a whitelist, not by subtraction.
     // Keeping it minimal also means changing sort or grouping keeps the same
     // target, so its latest answer stays on screen.
-    function rootProgressURL(state){
+    function wordProgressURL(state){
       const query=new URLSearchParams();
       if(state.branch_target)query.set("branch_target",state.branch_target);
       if(state.epoch!==null&&state.epoch!=="")query.set("epoch",String(state.epoch));
       // With what other openers spent on the groups this one inherited: one
       // request answers the whole panel.
       query.set("inherited_cost","1");
-      return "/api/view/root-progress"+(query.size?"?"+query.toString():"");
+      return "/api/view/word-progress"+(query.size?"?"+query.toString():"");
     }
     // What a group cost and what this opener spent on it stop being the same
     // number once another opener has paid for part of the tree.  Ordering is a
     // display choice over data already fetched -- re-requesting would re-run
     // the rollup just to reorder rows -- so these comparators mirror
-    // `_ROOT_PROGRESS_SORT_KEYS`, and the option values are pinned against
-    // ROOT_PROGRESS_SORT_FIELDS by a contract test.
-    const ROOT_PROGRESS_SORT_OPTIONS=[
+    // `_WORD_PROGRESS_SORT_KEYS`, and the option values are pinned against
+    // WORD_PROGRESS_SORT_FIELDS by a contract test.
+    const WORD_PROGRESS_SORT_OPTIONS=[
       ["tree_nodes","nodes: whole tree (default)"],
       ["own_nodes","nodes: this opener only"]];
-    const ROOT_PROGRESS_SORT_KEYS={
+    const WORD_PROGRESS_SORT_KEYS={
       tree_nodes:row=>[-((row.search_node_count||0)+(row.inherited_search_node_count||0)),-row.answer_count,row.pattern],
       own_nodes:row=>[-(row.search_node_count||0),-row.answer_count,row.pattern]};
     function sortedResponseGroups(rows,sort){
-      const key=ROOT_PROGRESS_SORT_KEYS[sort]||ROOT_PROGRESS_SORT_KEYS.tree_nodes;
+      const key=WORD_PROGRESS_SORT_KEYS[sort]||WORD_PROGRESS_SORT_KEYS.tree_nodes;
       return rows.map(row=>[key(row),row]).sort((left,right)=>{
         for(let index=0;index<left[0].length;index++){
           if(left[0][index]<right[0][index])return -1;
@@ -1517,7 +1516,7 @@
         return 0;
       }).map(entry=>entry[1]);
     }
-    const ROOT_PROGRESS_GROUP_STATES=["waiting","working","solved","inherited","trivial","loss"];
+    const WORD_PROGRESS_GROUP_STATES=["waiting","working","solved","inherited","trivial","loss"];
     // `worked` is an affirmative answer -- this opener did the search -- and
     // needs to read as one: a dash there is the same mark an unstarted group
     // carries, which turns "I paid for this" and "nobody has paid for this
@@ -1587,7 +1586,7 @@
     // solvedGroupCount is the count the ERD line above already shows.  Solved,
     // in progress, and not started partition the same response groups, so
     // reporting the remainder here leaves neither line restating the other.
-    function renderRootProgressHeadline(data,solvedGroupCount){
+    function renderWordProgressHeadline(data,solvedGroupCount){
       const totals=data.totals||{},estimate=data.estimate,parts=[];
       const counts=totals.display_state_counts||totals.state_counts||{};
       if(estimate)parts.push("~"+formatDuration(estimate.estimated_seconds)+" remaining"+(estimate.provisional?" (provisional)":""));
@@ -1596,11 +1595,11 @@
       parts.push("began "+absoluteTime(data.work_started_at));
       return statLine(parts);
     }
-    function renderRootProgressPanel(data,url,state,headlineHost,host,solvedGroupCount){
+    function renderWordProgressPanel(data,url,state,headlineHost,host,solvedGroupCount){
       const fragment=document.createDocumentFragment(),totals=data.totals||{};
       const metrics=element("div","metrics");
       metrics.append(
-        ...ROOT_PROGRESS_GROUP_STATES.filter(state=>(totals.display_state_counts||{})[state])
+        ...WORD_PROGRESS_GROUP_STATES.filter(state=>(totals.display_state_counts||{})[state])
             .map(state=>metric(state,(totals.display_state_counts||{})[state])),
         metric("branches evaluating",totals.open_branch_count),
         metric("nodes",formatNodeCount(totals.search_node_count)),
@@ -1649,26 +1648,26 @@
       }else{
         fragment.append(element("p","dim","No completion estimate: no candidates finished in the last "+formatDuration(totals.recent_window_seconds)+"."));
       }
-      const sortField=element("label","field root-progress-sort");
+      const sortField=element("label","field word-progress-sort");
       sortField.append(element("span","fieldlabel","Order by"));
       const sortSelect=element("select","");
-      sortSelect.id="root-progress-sort";
-      sortSelect.replaceChildren(...ROOT_PROGRESS_SORT_OPTIONS.map(([value,text])=>{
+      sortSelect.id="word-progress-sort";
+      sortSelect.replaceChildren(...WORD_PROGRESS_SORT_OPTIONS.map(([value,text])=>{
         const option=element("option","",text);option.value=value;return option;}));
-      sortSelect.value=rootProgressSort;
+      sortSelect.value=wordProgressSort;
       // Reordering rows already in hand, so no refetch: the second stage costs
       // a scan of the finalize log and must not be paid again for a sort.
       sortSelect.addEventListener("change",()=>{
-        rootProgressSort=sortSelect.value;
-        renderRootProgressInto(headlineHost,host,url,data,solvedGroupCount,state);});
+        wordProgressSort=sortSelect.value;
+        renderWordProgressInto(headlineHost,host,url,data,solvedGroupCount,state);});
       sortField.append(sortSelect);
       fragment.append(sortField);
-      const table=element("table","root-progress"),head=element("thead",""),headRow=element("tr","");
+      const table=element("table","word-progress"),head=element("thead",""),headRow=element("tr","");
       for(const columnName of ["Response","State","Answers","Done","Eval.","Nodes","Share","Elapsed","Workers","Paid by"])headRow.append(element("th","",columnName));
       head.append(headRow);
       table.append(head);
       const body=element("tbody","");
-      for(const row of sortedResponseGroups(data.response_groups||[],rootProgressSort)){
+      for(const row of sortedResponseGroups(data.response_groups||[],wordProgressSort)){
         const line=element("tr",row.started||row.provenance==="inherited"?"":"dim");
         const response=element("td","");
         const responseButton=element("button","tile-button");
@@ -1696,17 +1695,17 @@
         body.append(line);
       }
       table.append(body);
-      const scroller=element("div","root-progress-scroll");
+      const scroller=element("div","word-progress-scroll");
       scroller.append(table);
       // Every poll rebuilds the word report, so the scroller is a new element
       // each time; without carrying its offsets the view snaps back to the
       // top-left mid-read.
-      scroller.addEventListener("scroll",()=>rootProgressScroll.set(url,{left:scroller.scrollLeft,top:scroller.scrollTop}));
+      scroller.addEventListener("scroll",()=>wordProgressScroll.set(url,{left:scroller.scrollLeft,top:scroller.scrollTop}));
       fragment.append(scroller);
       // A legend rather than a sentence: the columns count four different
       // things (branches, nodes, wall-clock, worker-time) and which one a
       // column holds is not recoverable from its header.
-      const legend=element("dl","root-progress-legend");
+      const legend=element("dl","word-progress-legend");
       for(const [term,definition] of [
         ["State","Where the group stands. "+
           "solved: this opener's search finished it. "+
@@ -1725,27 +1724,27 @@
       ]){
         legend.append(element("dt","",term),element("dd","",definition));
       }
-      const legendDetails=element("details","root-progress-legend-panel");
+      const legendDetails=element("details","word-progress-legend-panel");
       legendDetails.append(element("summary","clickable","Table legend"),legend);
       fragment.append(legendDetails);
       fragment.append(element("p","dim","Counts cover "+telemetryEpochText+"."));
       return fragment;
     }
-    function renderRootProgressInto(headlineHost,host,url,data,solvedGroupCount,state){
-      headlineHost.replaceChildren(renderRootProgressHeadline(data,solvedGroupCount));
-      host.replaceChildren(renderRootProgressPanel(data,url,state,headlineHost,host,solvedGroupCount));
+    function renderWordProgressInto(headlineHost,host,url,data,solvedGroupCount,state){
+      headlineHost.replaceChildren(renderWordProgressHeadline(data,solvedGroupCount));
+      host.replaceChildren(renderWordProgressPanel(data,url,state,headlineHost,host,solvedGroupCount));
       // The panel is built before the report is mounted, and scroll offsets do
       // not apply to a detached element.  A microtask runs after the mount and
       // before the paint, so the restored position is never seen scrolling.
       queueMicrotask(()=>{
-        const scroller=host.querySelector(".root-progress-scroll"),saved=rootProgressScroll.get(url);
+        const scroller=host.querySelector(".word-progress-scroll"),saved=wordProgressScroll.get(url);
         if(scroller&&saved){scroller.scrollLeft=saved.left;scroller.scrollTop=saved.top;}
       });
     }
     // A failure stays on screen while the next polls retry, rather than giving
     // way to the computing notice between them: the two wrap to different
     // heights, so alternating would shift the whole page below the panel.
-    function renderRootProgressFailure(headlineHost,host,message){
+    function renderWordProgressFailure(headlineHost,host,message){
       headlineHost.replaceChildren();
       host.replaceChildren(element("p","error",message));
     }
@@ -1754,32 +1753,32 @@
     // target, replacing it when it lands.  A request still unanswered after
     // STUCK_REQUEST_TIMEOUT_MILLIS is abandoned and replaced, as the main
     // report's is: nothing else would ever ask again.
-    function attachRootProgress(headlineHost,host,url,solvedGroupCount,state){
-      const latest=rootProgressLatest.get(url),failure=rootProgressFailure.get(url);
-      if(latest)renderRootProgressInto(headlineHost,host,url,latest,solvedGroupCount,state);
-      else if(failure!==undefined)renderRootProgressFailure(headlineHost,host,failure);
-      else host.replaceChildren(element("p","dim","Computing root progress…"));
-      const inFlight=rootProgressInFlight.get(url);
+    function attachWordProgress(headlineHost,host,url,solvedGroupCount,state){
+      const latest=wordProgressLatest.get(url),failure=wordProgressFailure.get(url);
+      if(latest)renderWordProgressInto(headlineHost,host,url,latest,solvedGroupCount,state);
+      else if(failure!==undefined)renderWordProgressFailure(headlineHost,host,failure);
+      else host.replaceChildren(element("p","dim","Computing word progress…"));
+      const inFlight=wordProgressInFlight.get(url);
       if(inFlight){
         if(Date.now()-inFlight.startedAt<STUCK_REQUEST_TIMEOUT_MILLIS)return;
         inFlight.controller.abort();
       }
       const request={startedAt:Date.now(),controller:new AbortController()};
-      rootProgressInFlight.set(url,request);
+      wordProgressInFlight.set(url,request);
       fetch(url,{headers:{Accept:"application/json"},signal:request.controller.signal})
-        .then(response=>{if(!response.ok)throw new Error("Root progress request failed ("+response.status+")");return response.json();})
+        .then(response=>{if(!response.ok)throw new Error("Word progress request failed ("+response.status+")");return response.json();})
         .then(progress=>{
-          rootProgressLatest.set(url,progress.data);
-          rootProgressFailure.delete(url);
-          if(host.isConnected)renderRootProgressInto(headlineHost,host,url,progress.data,solvedGroupCount,state);})
+          wordProgressLatest.set(url,progress.data);
+          wordProgressFailure.delete(url);
+          if(host.isConnected)renderWordProgressInto(headlineHost,host,url,progress.data,solvedGroupCount,state);})
         .catch(error=>{
           // An abandoned request has a replacement, which owns the panel.
           if(request.controller.signal.aborted)return;
-          rootProgressFailure.set(url,error.message);
-          // An earlier answer still describes the root better than an error
+          wordProgressFailure.set(url,error.message);
+          // An earlier answer still describes the word better than an error
           // does; it stays until a request succeeds.
-          if(host.isConnected&&!rootProgressLatest.has(url))renderRootProgressFailure(headlineHost,host,error.message);})
-        .finally(()=>{if(rootProgressInFlight.get(url)===request)rootProgressInFlight.delete(url);});
+          if(host.isConnected&&!wordProgressLatest.has(url))renderWordProgressFailure(headlineHost,host,error.message);})
+        .finally(()=>{if(wordProgressInFlight.get(url)===request)wordProgressInFlight.delete(url);});
     }
     function renderWord(report,previous,state){
       const fragment=document.createDocumentFragment(),data=report.data;const heading=element("h2","");heading.append(wordTiles(data.word,null,data.word_is_answer,"word-lg"));fragment.append(heading);
@@ -1812,16 +1811,16 @@
         summary.append(metric("branches",responseSummary.branch_count),metric("answers",responseSummary.answer_count),metric("trivial",responseSummary.trivial_count),metric("exact",responseSummary.exact_count),metric("loss",responseSummary.loss_count),metric("not cached",responseSummary.missing_count));
         fragment.append(summary);
       }
-      const progressURL=rootProgressURL(state),progressDetails=element("details","root-progress-panel");
-      progressDetails.open=rootProgressOpen;
-      const progressHeadline=element("div","root-progress-headline"),progressHost=element("div","root-progress-host");
-      progressDetails.append(element("summary","clickable","Root progress"),progressHost);
-      progressDetails.addEventListener("toggle",()=>{rootProgressOpen=progressDetails.open;});
+      const progressURL=wordProgressURL(state),progressDetails=element("details","word-progress-panel");
+      progressDetails.open=wordProgressOpen;
+      const progressHeadline=element("div","word-progress-headline"),progressHost=element("div","word-progress-host");
+      progressDetails.append(element("summary","clickable","Word progress"),progressHost);
+      progressDetails.addEventListener("toggle",()=>{wordProgressOpen=progressDetails.open;});
       // Fetched whether or not the panel is open: the headline outside it
       // carries the same result.  The solved-group count is only passed on
       // when the ERD line above is the one that shows it, so the headline
       // reports the same partition.
-      attachRootProgress(progressHeadline,progressHost,progressURL,
+      attachWordProgress(progressHeadline,progressHost,progressURL,
         erd&&erd.state!=="complete"&&erd.state!=="infeasible"?erd.resolved_group_count:null,state);
       fragment.append(progressHeadline,progressDetails);
       const shownRows=data.response_groups||[],matchedRows=data.matched_rows??shownRows.length,totalRows=data.total_rows??responseSummary?.branch_count??matchedRows;fragment.append(element("p","dim","Shown "+numText(shownRows.length)+" of "+numText(matchedRows)+" matched · "+numText(totalRows)+" total response groups"));
@@ -3728,7 +3727,7 @@
       addEventListener("resize",()=>{measureStickyTop();const root=byId("report");layoutSpines(root);layoutSweepMarkerDigits(root);if(openGroupMenuNode)positionGroupMenu(openGroupMenuNode.node,openGroupMenuNode.opener);if(currentState?.kind==="leaderboard"&&lastReport&&root.clientWidth!==leaderboardReportWidth&&!reportHasFocusedControl()&&!reportHasActiveSelection())applyReport(lastReport,lastReport,currentState);});
       addEventListener("popstate",()=>{abortActiveRequest();currentState=parsePageState(location);syncControls();redrawLeaderboardZoom();fetchReport();schedulePoll();});document.addEventListener("visibilitychange",()=>{if(!document.hidden){if(!skipAutomaticScan())fetchReport();schedulePoll();}});fetchReport();schedulePoll();
     }
-    window.parsePageState=parsePageState;window.buildAPIURL=buildAPIURL;window.rootProgressURL=rootProgressURL;window.renderRootProgressHeadline=renderRootProgressHeadline;window.rateText=rateText;window.applyReport=applyReport;window.renderResponseGroupBreakdown=renderResponseGroupBreakdown;window.spineTextFromSelection=spineTextFromSelection;window.__skipAutomaticScanProbe=()=>skipAutomaticScan();window.__reportClient={setState:state=>setState(state),getState:()=>({...currentState}),fetchReport};
+    window.parsePageState=parsePageState;window.buildAPIURL=buildAPIURL;window.wordProgressURL=wordProgressURL;window.renderWordProgressHeadline=renderWordProgressHeadline;window.rateText=rateText;window.applyReport=applyReport;window.renderResponseGroupBreakdown=renderResponseGroupBreakdown;window.spineTextFromSelection=spineTextFromSelection;window.__skipAutomaticScanProbe=()=>skipAutomaticScan();window.__reportClient={setState:state=>setState(state),getState:()=>({...currentState}),fetchReport};
     document.addEventListener("DOMContentLoaded",initialize);
   })();
   </script>

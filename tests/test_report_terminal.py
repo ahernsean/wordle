@@ -2543,10 +2543,10 @@ class ViewParserTest(unittest.TestCase):
         self.assertTrue(request.include_answers)
 
 
-def root_progress_report(estimate=None, requested_at=1_798_000_000,
+def word_progress_report(estimate=None, requested_at=1_798_000_000,
                          inherited=None, inherited_cost_known=False,
                          payer_pattern="-y-y-"):
-    """A root progress report.
+    """A word progress report.
 
     `inherited` names response groups another opener paid for, as
     {pattern: (payer, nodes)}; by default nothing is inherited, which is the
@@ -2555,7 +2555,7 @@ def root_progress_report(estimate=None, requested_at=1_798_000_000,
     None for a payer that arrived deeper and so is named by its opener alone.
     """
     report = {
-        "report_kind": "root_progress",
+        "report_kind": "word_progress",
         "schema_version": 3,
         "generated_at": 1_800_000_000,
         "tree": False,
@@ -2643,7 +2643,7 @@ def root_progress_report(estimate=None, requested_at=1_798_000_000,
         row["inherited_branch_count"] = 2 if row["inherited_cost_known"] else 0
         row["inherited_search_node_count"] = nodes if row["inherited_cost_known"] else 0
         row["inherited_wall_time_millis"] = nodes * 2 if row["inherited_cost_known"] else 0
-        row["display_state"] = report_model._root_progress_display_state(
+        row["display_state"] = report_model._word_progress_display_state(
             row["state"], row["provenance"])
         row["inherited_elapsed_time_millis"] = (
             row["inherited_wall_time_millis"] // 2
@@ -2681,19 +2681,19 @@ def root_progress_report(estimate=None, requested_at=1_798_000_000,
     return report
 
 
-class RootProgressInheritanceRendererTest(unittest.TestCase):
+class WordProgressInheritanceRendererTest(unittest.TestCase):
     INHERITED = {"--y--": ("TARSE", 4_991_722)}
 
     def test_first_mover_says_nothing_about_inheritance(self):
         # Every group this opener worked itself: naming a payer column full of
         # dashes is noise, and the summary must not imply work was inherited.
-        output = render_report(root_progress_report(), width=130)
+        output = render_report(word_progress_report(), width=130)
         self.assertNotIn("inherited", output)
         self.assertNotIn("tree total", output)
 
     def test_inherited_group_names_its_payer_without_claiming_its_cost(self):
         output = render_report(
-            root_progress_report(inherited=self.INHERITED), width=130)
+            word_progress_report(inherited=self.INHERITED), width=130)
         self.assertIn("TARSE", output)
         self.assertIn("inherited 1", output)
         # The State column and the summary line use one vocabulary, so a group
@@ -2706,7 +2706,7 @@ class RootProgressInheritanceRendererTest(unittest.TestCase):
 
     def test_measured_inheritance_reports_the_tree_total_apart_from_its_own(self):
         output = render_report(
-            root_progress_report(inherited=self.INHERITED,
+            word_progress_report(inherited=self.INHERITED,
                                  inherited_cost_known=True),
             width=130)
         self.assertIn("inherited 5.0M nodes", output)
@@ -2721,7 +2721,7 @@ class RootProgressInheritanceRendererTest(unittest.TestCase):
         # Dashes would read as "this group cost nothing", which is the one
         # thing an inherited group certainly did not do.
         rows = render_report(
-            root_progress_report(inherited=self.INHERITED),
+            word_progress_report(inherited=self.INHERITED),
             width=130).splitlines()
         inherited_row = next(line for line in rows if line.startswith("--y--"))
         self.assertIn("TARSE", inherited_row)
@@ -2732,7 +2732,7 @@ class RootProgressInheritanceRendererTest(unittest.TestCase):
         # A group is worked or inherited, never both, so the payer's branches,
         # nodes and times occupy cells this opener left empty.
         rows = render_report(
-            root_progress_report(inherited=self.INHERITED,
+            word_progress_report(inherited=self.INHERITED,
                                  inherited_cost_known=True),
             width=130).splitlines()
         inherited_row = next(line for line in rows if line.startswith("--y--"))
@@ -2742,9 +2742,9 @@ class RootProgressInheritanceRendererTest(unittest.TestCase):
         self.assertNotIn("?", inherited_row)
 
 
-class RootProgressRendererTest(unittest.TestCase):
+class WordProgressRendererTest(unittest.TestCase):
     def test_reports_request_time_and_work_start_as_separate_facts(self):
-        output = render_report(root_progress_report(), width=120)
+        output = render_report(word_progress_report(), width=120)
         self.assertIn("active-epoch=11  telemetry-epochs=9,11", output)
         self.assertIn("Requested", output)
         self.assertIn("work began", output)
@@ -2753,7 +2753,7 @@ class RootProgressRendererTest(unittest.TestCase):
         self.assertIn("2026-", output)
 
     def test_shows_worst_group_share_and_both_time_bases(self):
-        output = render_report(root_progress_report(), width=120)
+        output = render_report(word_progress_report(), width=120)
         self.assertIn("-y---", output)
         self.assertIn("129.9G", output)
         self.assertIn("98.9%", output)
@@ -2762,7 +2762,7 @@ class RootProgressRendererTest(unittest.TestCase):
         self.assertIn("39.4d", output)
 
     def test_unstarted_group_shows_no_measured_cost(self):
-        output = render_report(root_progress_report(), width=120)
+        output = render_report(word_progress_report(), width=120)
         unstarted = next(line for line in output.splitlines()
                          if line.startswith("--y--"))
         self.assertIn("—", unstarted)
@@ -2771,7 +2771,7 @@ class RootProgressRendererTest(unittest.TestCase):
     def test_open_group_with_nothing_finalized_reads_as_started(self):
         # Distinct from unstarted: its zeros are measured, and only the
         # figures that exist solely at finalize stay unknown.
-        output = render_report(root_progress_report(), width=120)
+        output = render_report(word_progress_report(), width=120)
         fresh = next(line for line in output.splitlines()
                      if line.startswith("-gg--"))
         self.assertIn("0.0%", fresh)
@@ -2783,14 +2783,14 @@ class RootProgressRendererTest(unittest.TestCase):
         # Carving work into a sub-branch raises the count without any answer
         # being closer to solved, so the absolute total tracks scheduling as
         # much as progress.
-        output = render_report(root_progress_report(), width=120)
+        output = render_report(word_progress_report(), width=120)
         summary = output.split("Pattern")[0]
         self.assertNotIn("550,292", summary)
         self.assertIn("nodes", summary)
         self.assertIn("worker-time", summary)
 
     def test_open_branch_count_is_its_own_column(self):
-        output = render_report(root_progress_report(), width=120)
+        output = render_report(word_progress_report(), width=120)
         # Named for the lifecycle phase the branches are in, so the column
         # beside it can be named for the phase they reach.
         self.assertIn("Eval.", output.splitlines()[7])
@@ -2800,7 +2800,7 @@ class RootProgressRendererTest(unittest.TestCase):
         self.assertIn("8,584", hot)
 
     def test_estimate_states_what_it_excludes(self):
-        output = render_report(root_progress_report(estimate={
+        output = render_report(word_progress_report(estimate={
             "remaining_candidate_count": 7171,
             "recent_candidate_count": 576,
             "candidates_per_second": 576 / 86400,
@@ -2831,7 +2831,7 @@ class RootProgressRendererTest(unittest.TestCase):
                     report_terminal.format_rate(events_per_second), expected)
 
     def test_provisional_estimate_states_its_sample_duration(self):
-        output = render_report(root_progress_report(estimate={
+        output = render_report(word_progress_report(estimate={
             "remaining_candidate_count": 7171,
             "recent_candidate_count": 576,
             "candidates_per_second": 576 / 86400,
@@ -2845,20 +2845,20 @@ class RootProgressRendererTest(unittest.TestCase):
         self.assertIn("provisional; 10m sample", output)
 
     def test_absent_estimate_is_stated_rather_than_guessed(self):
-        output = render_report(root_progress_report(), width=120)
+        output = render_report(word_progress_report(), width=120)
         self.assertIn("estimate unavailable", output)
 
     def test_absent_request_time_is_omitted_rather_than_shown_as_unknown(self):
         # The queue has no trustworthy request time for this root, so the line
         # reports only what is known instead of printing a placeholder that
         # would read as a measurement.
-        output = render_report(root_progress_report(requested_at=None),
+        output = render_report(word_progress_report(requested_at=None),
                                width=120)
         self.assertNotIn("Requested", output)
         self.assertIn("work began", output)
 
     def test_counts_are_rendered_with_thousands_separators(self):
-        output = render_report(root_progress_report(), width=120)
+        output = render_report(word_progress_report(), width=120)
         self.assertIn("of 117 response groups", output)
         self.assertIn("branches evaluating 8,632", output)
         # Per-pattern branch counts stay: comparing patterns is what they are
@@ -3193,9 +3193,9 @@ class TerminalUtilityTest(unittest.TestCase):
         # ownership row mark it -- the same fact the web client notches.
         self.assertEqual(output.count("RAISE*"), 2)
 
-    def test_root_progress_renderer_shows_its_estimate(self):
+    def test_word_progress_renderer_shows_its_estimate(self):
         report = overview_report()
-        report.update({"report_kind": "root_progress", "tree": False})
+        report.update({"report_kind": "word_progress", "tree": False})
         report["data"] = {
             "word": "raise", "word_is_answer": True, "epoch": 4,
             "selected_telemetry_epoch": None, "telemetry_epochs": [2, 4],

@@ -1006,11 +1006,11 @@ class SourcesRequestTest(unittest.TestCase):
         self.assertTrue(worded["data"]["rows"])
 
 
-class RootProgressRequestTest(unittest.TestCase):
+class WordProgressRequestTest(unittest.TestCase):
     def test_bare_word_target_is_accepted(self):
         request = parse_report_request(
-            "/api/view/root-progress", "branch_target=SCOPE")
-        self.assertEqual(request.report_kind, "root_progress")
+            "/api/view/word-progress", "branch_target=SCOPE")
+        self.assertEqual(request.report_kind, "word_progress")
         self.assertEqual(request.branch_target.trailing_word, "scope")
         self.assertEqual(request.branch_target.steps, ())
 
@@ -1018,9 +1018,9 @@ class RootProgressRequestTest(unittest.TestCase):
         # "Why is RAISE ----- SALET taking so long" is the same question the
         # report answers for a root, at a greater guess_depth.
         request = parse_report_request(
-            "/api/view/root-progress",
+            "/api/view/word-progress",
             "branch_target=RAISE+-----+SALET")
-        self.assertEqual(request.report_kind, "root_progress")
+        self.assertEqual(request.report_kind, "word_progress")
         self.assertEqual(request.branch_target.trailing_word, "salet")
 
     def test_target_without_a_trailing_word_is_rejected(self):
@@ -1028,7 +1028,7 @@ class RootProgressRequestTest(unittest.TestCase):
         # groups of its own to report.
         with self.assertRaisesRegex(InvalidRequest, "ending in a word"):
             parse_report_request(
-                "/api/view/root-progress",
+                "/api/view/word-progress",
                 "branch_target=RAISE+-----")
 
     def test_word_view_display_state_is_rejected_not_ignored(self):
@@ -1043,7 +1043,7 @@ class RootProgressRequestTest(unittest.TestCase):
         ):
             with self.subTest(query=query):
                 with self.assertRaises(InvalidRequest):
-                    parse_report_request("/api/view/root-progress", query)
+                    parse_report_request("/api/view/word-progress", query)
 
 
 if __name__ == "__main__":

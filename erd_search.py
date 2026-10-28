@@ -102,7 +102,7 @@ from report_model import (
     applied_branch_filters,
     is_overview_request,
     OPENER_SORT_FIELDS,
-    ROOT_PROGRESS_SORT_FIELDS,
+    WORD_PROGRESS_SORT_FIELDS,
     OPENER_LIST_DEFAULT_STATES,
     OPENER_LIST_PAGE_SIZE,
     OPENER_STATES,
@@ -1720,12 +1720,12 @@ def main():
         '--openers', action='store_true',
         help='Show opener-work requests and branch ownership/lineage')
     view_kind.add_argument(
-        '--root-progress', dest='root_progress', action='store_true',
+        '--word-progress', dest='word_progress', action='store_true',
         help='Show per-response-group work totals and a completion estimate '
              'for one opener')
     p_view.add_argument(
         '--inherited-cost', dest='inherited_cost', action='store_true',
-        help='With --root-progress, roll up what other openers spent on the '
+        help='With --word-progress, roll up what other openers spent on the '
              'response groups this one inherited')
     p_view.add_argument(
         '--branch-status', type=_branch_status_filter, metavar='STATUSES',
@@ -1746,7 +1746,7 @@ def main():
                         choices=tuple(sorted(
                             {'default', 'age', 'size', 'workers', 'priority',
                              'nodes', 'slowest', *OPENER_SORT_FIELDS,
-                             *ROOT_PROGRESS_SORT_FIELDS})))
+                             *WORD_PROGRESS_SORT_FIELDS})))
     p_view.add_argument('--limit', type=int, metavar='N')
     p_view.add_argument(
         '--by', choices=(
@@ -1965,7 +1965,7 @@ def main():
             'work_distribution' if args.work_distribution else
             'leaderboard' if args.leaderboard else
             'openers' if args.openers else
-            'root_progress' if args.root_progress else 'auto'
+            'word_progress' if args.word_progress else 'auto'
         )
         if args.by is not None and not args.hotspots:
             parser.error('--by requires --hotspots')
@@ -1975,9 +1975,9 @@ def main():
                 args.hotspots or args.work_distribution):
             parser.error('--since-seconds requires --hotspots or '
                          '--work-distribution')
-        if args.epoch is not None and not (args.hotspots or args.root_progress
+        if args.epoch is not None and not (args.hotspots or args.word_progress
                                            or args.work_distribution):
-            parser.error('--epoch requires --hotspots, --root-progress, or '
+            parser.error('--epoch requires --hotspots, --word-progress, or '
                          '--work-distribution')
         if args.since_seconds is not None and args.since_seconds < 1:
             parser.error('--since-seconds must be at least 1')

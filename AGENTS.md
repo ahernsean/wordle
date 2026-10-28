@@ -14,10 +14,10 @@ A Wordle solver with six layers:
 
 All read-only swarm inspection uses `erd_search.py view`. It provides text,
 JSON, JSON Lines, optional watch, semantic word/branch selection, queue,
-worker, cache, tree, hotspot, and root-progress reports. Check `view --help`
+worker, cache, tree, hotspot, and word-progress reports. Check `view --help`
 and use `SWARM.md` for examples.
 
-`view --root-progress WORD` answers "how far along is this root, and what is
+`view --word-progress WORD` answers "how far along is this word, and what is
 holding it up": per-response-group branch/node/time totals, which groups are
 untouched, request time versus work-start time, and a completion estimate
 drawn from observed claim throughput. It deliberately does not estimate
