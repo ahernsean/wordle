@@ -2116,6 +2116,18 @@ class ERDQueue:
     def close(self):
         self._conn.close()
 
+    def begin_read_snapshot(self):
+        """Read every later statement from one queue until close().
+
+        A report that reads the queue more than once would otherwise see the
+        swarm move between its reads, so a word read as unfinished could be
+        finished by the time its branches are counted.  The snapshot is taken
+        at the first statement after this; in WAL mode it blocks no writer.
+        Methods that open their own snapshot read within this one.
+        """
+        if not self._conn.in_transaction:
+            self._conn.execute("BEGIN DEFERRED")
+
     def checkpoint(self, mode: str = "TRUNCATE"):
         """Fold the WAL into the main database file (PRAGMA wal_checkpoint).
 
@@ -6556,14 +6568,8 @@ class ERDQueue:
     def opener_rows(self):
         """Return one row per opener word, merging that word's requests.
 
-        Opener work is keyed by (word, priority), so one word can hold several
-        requests, and two of them can own the same branch.  Branches are
-        therefore counted distinctly rather than summed across requests, which
-        would report a shared branch once per owning request.
-
-        direct_branch_count counts the branches the requests asked for
-        directly; a branch acquired later by promotion carries a
-        parent_branch_id and is counted only in branch_count.
+        Read from `opener_work` alone, so its cost follows the number of
+        words and not the memberships they hold.
 
         requested_priority is the priority of the word's outstanding
         requests, not the highest priority it was ever requested at: an
@@ -6572,17 +6578,12 @@ class ERDQueue:
         back to the priority of the completed requests only once none are
         outstanding.
 
-        open_branch_count counts the word's live branches that are not done;
-        a finished word owns none.
-
-        last_branch_finished_at is when the latest branch of an unfinished
-        word's unfinished requests resolved, NULL until one has: a word queued
-        again after finishing is not dated by its earlier run.
-
-        A word whose every request is complete reads the totals recorded when
-        its last request completed; only words with an unfinished request are
-        counted from their memberships, so the cost follows the queue's
-        outstanding work rather than everything it has ever finished.
+        A word whose every request is complete carries the branch totals
+        recorded when its last request completed, and opens no branch.  A
+        word with an unfinished request carries NULL in branch_count,
+        direct_branch_count, direct_done_branch_count, open_branch_count and
+        last_branch_finished_at: those are counted from its memberships, by
+        opener_branch_counts(), for the words a caller needs them for.
         """
         return self._conn.execute("""
             SELECT s.opener,
@@ -6612,11 +6613,48 @@ class ERDQueue:
                                 THEN s.requested_priority END),
                        MAX(s.requested_priority)) AS requested_priority,
                    NULL AS completed_at,
+                   NULL AS last_branch_finished_at,
+                   COUNT(*) AS request_count,
+                   MAX(s.state = 'active') AS has_active_request,
+                   1 AS has_incomplete_request,
+                   NULL AS branch_count,
+                   NULL AS direct_branch_count,
+                   NULL AS direct_done_branch_count,
+                   NULL AS open_branch_count
+            FROM opener_work s
+            GROUP BY s.opener
+            HAVING MAX(s.state != 'complete') = 1
+            ORDER BY requested_priority DESC, opener
+        """).fetchall()
+
+    def opener_branch_counts(self, openers):
+        """{opener: branch counts} for words with an unfinished request.
+
+        Opener work is keyed by (word, priority), so one word can hold several
+        requests, and two of them can own the same branch.  Branches are
+        therefore counted distinctly rather than summed across requests, which
+        would report a shared branch once per owning request.
+
+        direct_branch_count counts the branches the requests asked for
+        directly; a branch acquired later by promotion carries a
+        parent_branch_id and is counted only in branch_count.
+
+        open_branch_count counts the word's live branches that are not done.
+
+        last_branch_finished_at is when the latest branch of the word's
+        unfinished requests resolved, NULL until one has: a word queued again
+        after finishing is not dated by its earlier run.
+
+        A word with no unfinished request is left out; opener_rows() already
+        carries its recorded totals.
+        """
+        words = sorted({opener for opener in openers if opener is not None})
+        if not words:
+            return {}
+        rows = self._conn.execute("""
+            SELECT s.opener,
                    MAX(CASE WHEN s.state != 'complete' THEN m.resolved_at END)
                        AS last_branch_finished_at,
-                   COUNT(DISTINCT s.opener_work_id) AS request_count,
-                   MAX(s.state = 'active') AS has_active_request,
-                   MAX(s.state != 'complete') AS has_incomplete_request,
                    COUNT(DISTINCT m.branch_id) AS branch_count,
                    COUNT(DISTINCT CASE WHEN m.parent_branch_id IS NULL
                                        THEN m.branch_id END)
@@ -6633,11 +6671,11 @@ class ERDQueue:
             LEFT JOIN branch_opener_work m
               ON m.opener_work_id = s.opener_work_id
             LEFT JOIN pending_branches p ON p.branch_id = m.branch_id
-            WHERE s.opener IN (
-                SELECT opener FROM opener_work WHERE state != 'complete')
+            WHERE s.opener IN (SELECT value FROM json_each(?))
             GROUP BY s.opener
-            ORDER BY requested_priority DESC, opener
-        """).fetchall()
+            HAVING MAX(s.state != 'complete') = 1
+        """, (json.dumps(words),)).fetchall()
+        return {row["opener"]: row for row in rows}
 
     def opener_direct_branch_keys(self, openers):
         """{opener: branch keys of the response groups its requests took}.
@@ -6671,38 +6709,107 @@ class ERDQueue:
         words can own the same branch, so summing per-word counts would
         double-count exactly the shared ownership the opener report exists to
         show.  all spans every membership, resolved or not, to match
-        branch_count in opener_rows(); open counts live memberships whose
-        branch is not done.  One query serves every group and the whole.
+        branch_count in opener_branch_counts(); open counts branches with a
+        live membership that are not done.
         """
         if not groups:
             return {None: (0, 0)}
-        # Reduced to one row per (group, branch) and per branch before
-        # counting, so the totals are plain counts: a COUNT(DISTINCT) per
-        # group builds a set of every branch for each one.
-        totals = {None: (0, 0)}
-        for label, every, open_count in self._conn.execute("""
-            WITH word_group(opener, label) AS (
-                SELECT key, value FROM json_each(?)
-            ), owned AS (
-                SELECT w.label, m.branch_id,
-                       m.resolved_at IS NULL
-                       AND COALESCE(p.status, '') != 'done' AS is_open
-                FROM word_group AS w
-                JOIN opener_work AS s ON s.opener = w.opener
-                JOIN branch_opener_work AS m
-                  ON m.opener_work_id = s.opener_work_id
-                LEFT JOIN pending_branches AS p ON p.branch_id = m.branch_id
-            )
-            SELECT label, COUNT(*), SUM(is_open) FROM (
-                SELECT label, branch_id, MAX(is_open) AS is_open
-                FROM owned GROUP BY label, branch_id)
-            GROUP BY label
-            UNION ALL
-            SELECT NULL, COUNT(*), SUM(is_open) FROM (
-                SELECT branch_id, MAX(is_open) AS is_open
-                FROM owned GROUP BY branch_id)
-        """, (json.dumps(groups),)):
-            totals[label] = (every, open_count or 0)
+        words_by_label = collections.defaultdict(list)
+        for word, label in groups.items():
+            words_by_label[label].append(word)
+        labels = sorted(words_by_label, key=lambda label: (
+            -len(words_by_label[label]), str(label)))
+        largest = labels[0]
+        label_index = {label: index for index, label in enumerate(labels)}
+        # Every group but the largest is counted from the branches its own
+        # words hold; the largest is the whole less the branches only the
+        # other groups hold.  The subtraction needs both reads to see one
+        # queue, so they share a deferred transaction's snapshot, which in
+        # WAL mode blocks no writer.
+        opened_snapshot = not self._conn.in_transaction
+        if opened_snapshot:
+            self._conn.execute("BEGIN DEFERRED")
+        try:
+            # Whether a branch is done is a fact about the branch, so it is
+            # looked up once per branch, not per membership.
+            every, open_count = self._conn.execute("""
+                WITH owned AS (
+                    SELECT m.branch_id, MAX(m.resolved_at IS NULL) AS live
+                    FROM json_each(?) AS w
+                    JOIN opener_work AS s ON s.opener = w.value
+                    JOIN branch_opener_work AS m
+                      ON m.opener_work_id = s.opener_work_id
+                    GROUP BY m.branch_id
+                )
+                SELECT COUNT(*), COALESCE(SUM(live AND NOT EXISTS (
+                    SELECT 1 FROM pending_branches AS p
+                    WHERE p.branch_id = owned.branch_id
+                      AND p.status = 'done')), 0)
+                FROM owned
+            """, (json.dumps(sorted(groups)),)).fetchone()
+            # Reduced to one row per (branch, group), then one per branch,
+            # before anything leaves SQLite: a branch held by a smaller group
+            # can have owners by the hundred, most of them outside the report.
+            # Each branch becomes two bitmasks over the group indexes, the
+            # groups that hold it and those it is open in, and what comes back
+            # is a count per distinct pair; the groups are the few buckets of
+            # one grouping strategy, so the masks fit an integer.  CROSS JOIN
+            # fixes the order: from the smaller groups' branches out to their
+            # owners, never from every word's memberships in.
+            mask_counts = []
+            if len(labels) > 1:
+                mask_counts = self._conn.execute("""
+                    WITH words AS (
+                        SELECT DISTINCT key AS opener, value AS label
+                        FROM json_each(?)
+                    ), held AS (
+                        SELECT DISTINCT m.branch_id
+                        FROM json_each(?) AS w
+                        JOIN opener_work AS s ON s.opener = w.value
+                        JOIN branch_opener_work AS m
+                          ON m.opener_work_id = s.opener_work_id
+                    ), owned AS (
+                        SELECT held.branch_id, words.label,
+                               MAX(m.resolved_at IS NULL) AS live
+                        FROM held
+                        CROSS JOIN branch_opener_work AS m
+                          ON m.branch_id = held.branch_id
+                        CROSS JOIN opener_work AS s
+                          ON s.opener_work_id = m.opener_work_id
+                        JOIN words ON words.opener = s.opener
+                        GROUP BY held.branch_id, words.label
+                    ), masks AS (
+                        SELECT SUM(1 << label) AS held_mask,
+                               SUM((live AND NOT EXISTS (
+                                   SELECT 1 FROM pending_branches AS p
+                                   WHERE p.branch_id = owned.branch_id
+                                     AND p.status = 'done')) << label)
+                                   AS open_mask
+                        FROM owned GROUP BY branch_id
+                    )
+                    SELECT held_mask, open_mask, COUNT(*)
+                    FROM masks GROUP BY held_mask, open_mask
+                """, (json.dumps({word: label_index[label]
+                                  for word, label in groups.items()}),
+                      json.dumps(sorted(word for word, label in groups.items()
+                                        if label != largest)))).fetchall()
+        finally:
+            if opened_snapshot:
+                self._conn.execute("COMMIT")
+        totals = {None: (every, open_count)}
+        counts = {label: [0, 0] for label in labels}
+        only_smaller = only_smaller_open = 0
+        for held_mask, open_mask, branch_count in mask_counts:
+            for index, label in enumerate(labels[1:], start=1):
+                if held_mask >> index & 1:
+                    counts[label][0] += branch_count
+                    counts[label][1] += branch_count * (open_mask >> index & 1)
+            if not held_mask & 1:
+                only_smaller += branch_count
+            if open_mask and not open_mask & 1:
+                only_smaller_open += branch_count
+        totals.update((label, tuple(pair)) for label, pair in counts.items())
+        totals[largest] = (every - only_smaller, open_count - only_smaller_open)
         return totals
 
     def opener_worker_counts(self):

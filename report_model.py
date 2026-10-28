@@ -3946,8 +3946,6 @@ def _opener_summary_payload(row, rollup, timing, generated_at, answer_set):
     starts.
     """
     opener = _row_value(row, "opener")
-    branch_count = row["branch_count"] or 0
-    open_branch_count = rollup["open_branch_count"]
     state = _merged_opener_state(row)
     completed_at = None
     elapsed_time_millis = worker_time_millis = None
@@ -3961,25 +3959,68 @@ def _opener_summary_payload(row, rollup, timing, generated_at, answer_set):
         started_at = _row_value(row, "started_at")
         if started_at is not None:
             elapsed_time_millis = max(0, generated_at - started_at) * 1000
-    return {
+    payload = {
         "opener": opener.lower() if opener else None,
         "opener_is_answer": _is_answer(opener, answer_set),
         "requested_priority": row["requested_priority"],
         "requested_at": _row_value(row, "requested_at"),
         "started_at": _row_value(row, "started_at"),
         "completed_at": completed_at,
-        "last_branch_finished_at": _row_value(row, "last_branch_finished_at"),
+        "last_branch_finished_at": None,
         "request_count": row["request_count"] or 0,
         "state": state,
-        "direct_branch_count": row["direct_branch_count"] or 0,
-        "direct_done_branch_count": row["direct_done_branch_count"] or 0,
-        "branch_count": branch_count,
-        "open_branch_count": open_branch_count,
-        "done_branch_count": max(0, branch_count - open_branch_count),
+        "direct_branch_count": None,
+        "direct_done_branch_count": None,
+        "branch_count": None,
+        "open_branch_count": None,
+        "done_branch_count": None,
         "worker_count": rollup["worker_count"],
         "elapsed_time_millis": elapsed_time_millis,
         "worker_time_millis": worker_time_millis,
     }
+    if row["branch_count"] is not None or state == "complete":
+        _set_opener_branch_counts(payload, row, rollup["open_branch_count"])
+    return payload
+
+
+def _set_opener_branch_counts(payload, counts, open_branch_count):
+    """Copy a word's branch counts into its payload.
+
+    An unfinished word's counts come from its memberships and are taken only
+    for the words that need them, so a payload left without them carries
+    None in each rather than a zero that reads as a real count.
+    """
+    branch_count = counts["branch_count"] or 0
+    open_branch_count = open_branch_count or 0
+    payload.update({
+        "last_branch_finished_at": _row_value(
+            counts, "last_branch_finished_at"),
+        "direct_branch_count": counts["direct_branch_count"] or 0,
+        "direct_done_branch_count": counts["direct_done_branch_count"] or 0,
+        "branch_count": branch_count,
+        "open_branch_count": open_branch_count,
+        "done_branch_count": max(0, branch_count - open_branch_count),
+    })
+
+
+def _count_opener_branches(queue, payloads):
+    """Count the branches of the unfinished words among payloads lacking them.
+
+    Each is counted from every membership it holds, so the cost follows the
+    words asked about: a page of them, not the whole queue.
+    """
+    uncounted = [payload for payload in payloads
+                 if payload["branch_count"] is None
+                 and payload["state"] != "complete"]
+    if not uncounted:
+        return
+    counts = {(opener or "").lower(): row for opener, row in
+              queue.opener_branch_counts(
+                  payload["opener"] for payload in uncounted).items()}
+    for payload in uncounted:
+        row = counts.get(payload["opener"])
+        if row is not None:
+            _set_opener_branch_counts(payload, row, row["open_branch_count"])
 
 
 def _merged_opener_state(row):
@@ -4044,6 +4085,11 @@ _OPENER_SORT_KEYS = {
                                 if row["worker_time_millis"] is not None else float("inf"),
                                 row["opener"] or ""),
 }
+
+
+# Orders that read an unfinished word's branch counts, the ERD summary's
+# progress among them, so every word in the order is counted first.
+_OPENER_SORTS_BY_BRANCH_COUNTS = frozenset(("branches", "open", "done", "erd"))
 
 
 def _sorted_openers(rows, sort):
@@ -4454,11 +4500,16 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
     timing_cache = None
     try:
         queue = _open_report_queue(sources)
+        # The words are read before their branches are counted, so a word
+        # the swarm finishes in between would have no counts at all.
+        queue.begin_read_snapshot()
         opener = (
             request.branch_target.trailing_word
             if request.branch_target.kind == "word" else None
         )
-        summary_rows = queue.opener_rows()
+        # As dicts, since each is read field by field for every word, and a
+        # row's keys() builds a fresh list on every lookup.
+        summary_rows = [dict(row) for row in queue.opener_rows()]
         # Over every opener, whatever the view, so the projection is the
         # same wherever it is read.
         data["unfinished_opener_count"] = sum(
@@ -4505,6 +4556,15 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
         if opener_states:
             collapsed = [row for row in collapsed
                          if row["state"] in opener_states]
+        # An unfinished word's branches are counted for the page, after the
+        # order is settled, unless the order reads them: every word for an
+        # order by its counts or its ERD summary, and the active words, which
+        # the default order places by their latest finished branch.
+        if opener_sort in _OPENER_SORTS_BY_BRANCH_COUNTS:
+            _count_opener_branches(queue, collapsed)
+        else:
+            _count_opener_branches(
+                queue, [row for row in collapsed if row["state"] == "active"])
         def attach_erd_summaries(rows):
             erd_summaries = (
                 _opener_erd_summaries(
@@ -4528,7 +4588,7 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
         # shared ownership this report exists to show.  Only words with
         # unfinished work are counted: a finished word's branches are history,
         # and counting every branch ever owned would grow with the whole sweep.
-        # One query counts the whole and every group, since each needs its own
+        # One read counts the whole and every group, since each needs its own
         # distinct count.
         branch_totals = queue.branch_counts_by_group({
             row["opener"]: (_opener_group_key(row, group_by, generated_at)[1]
@@ -4571,6 +4631,7 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
                 collapsed[offset:offset + limit] if limit is not None
                 else collapsed[offset:]
             )
+        _count_opener_branches(queue, data["summary"])
         if opener_sort != "erd":
             attach_erd_summaries(data["summary"])
         # Branch rows belong to one named word.  Emitting them for every word
