@@ -655,7 +655,8 @@ class ReportClientContract:
         facts = self.page.locator("ul.tree li:not(.word-group) > .clickable .inline-facts").first
         self.assertEqual(
             [" ".join(text.split()) for text in facts.locator("> span").all_inner_texts()],
-            ["d1", "evaluating / active", "8 answers", "2 workers", "20/50", "@22222222"],
+            ["d1", "evaluating / active", "8 answers", "2 workers", "20/50",
+             "not split into sub-branches", "@22222222"],
         )
         self.assertTrue(all(
             style == "nowrap" for style in facts.locator("> span").evaluate_all(
@@ -693,6 +694,53 @@ class ReportClientContract:
         for fact in ("1 answer", "1 worker", "1 child branch",
                      "1 worker in subtree"):
             self.assertIn(fact, texts)
+
+    def _show_tree_rows(self, *rows):
+        self.page.evaluate("""async rows => {
+          const report=await (await fetch('/api/view/queue?tree=1')).json();
+          const template=report.data.nodes[0];
+          report.data.nodes=rows.map((row,index)=>({...template,
+            node_id:'salet:'+row.pattern,spine:'SALET '+row.pattern,
+            step:{...template.step,word:'salet',pattern:row.pattern},
+            branch_reference:String(index+1).repeat(12),...row}));
+          report.data.paging={parent_spine:'',cursor:null,page_size:10,
+            returned_group_count:1,total_group_count:1,next_cursor:null};
+          applyReport(report,null,parsePageState({search:'?kind=queue&tree=1'}));
+        }""", list(rows))
+        group = self.page.locator("ul.tree > li.word-group").first
+        group.locator("> details > summary").click()
+        return group.locator("ul.patterns > li")
+
+    def test_tree_row_tiles_open_the_branch_and_leave_the_row_folded(self):
+        rows = self._show_tree_rows(
+            {"pattern": "-----", "has_children": True, "child_count": 2})
+        self.assertEqual(
+            self.page.locator("ul.tree button", has_text="Open").count(), 0)
+        row = rows.first
+        self.assertFalse(row.locator("> details").evaluate("d => d.open"))
+        row.locator(".tile-button").click()
+        self.page.wait_for_selector("text=branch report")
+        self.assertEqual(
+            self.page.locator("#branch-target-input").input_value(),
+            "SALET -----")
+
+    def test_tree_leaves_say_why_they_do_not_expand(self):
+        rows = self._show_tree_rows(
+            {"pattern": "-----", "has_children": False,
+             "branch_status": "evaluating"},
+            {"pattern": "----y", "has_children": False,
+             "branch_status": "done"},
+            {"pattern": "---y-", "has_children": False,
+             "branch_status": "queued"},
+            {"pattern": "--y--", "has_children": True, "child_count": 1,
+             "branch_status": "evaluating"})
+        notes = [" ".join(row.locator(".inline-facts").first.inner_text().split())
+                 for row in rows.all()]
+        self.assertIn("not split into sub-branches", notes[0])
+        self.assertIn("solved", notes[1])
+        for note in notes[2:]:
+            self.assertNotIn("not split", note)
+            self.assertNotIn("solved", note)
 
     def test_word_group_click_builds_full_branch_spine(self):
         self.apply_branch_target("CACHE")
@@ -4121,8 +4169,13 @@ class ReportClientContract:
         self.page.locator("#layout-tree").click()
         self.page.locator("ul.tree > li.word-group > details > summary").first.click()
         self.page.wait_for_selector(".tree button")
-        self.page.locator(".tree button").first.click()
+        tiles = self.page.locator(".tree .tile-button").first
+        branch_target = (tiles.get_attribute("aria-label")
+                         .removeprefix("Open ").removesuffix(" branch report"))
+        tiles.click()
         self.page.wait_for_selector("text=branch report")
+        self.assertEqual(
+            self.page.locator("#branch-target-input").input_value(), branch_target)
 
     def test_overview_renders_branch_status_and_workers(self):
         text = self.page.locator("#report").inner_text()
