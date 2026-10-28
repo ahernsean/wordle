@@ -16,8 +16,8 @@ import time
 
 from report_model import (
     decode_candidate_bitmap,
-    ROOT_PROGRESS_DISPLAY_STATES,
-    ROOT_PROGRESS_GROUP_STATES,
+    WORD_PROGRESS_DISPLAY_STATES,
+    WORD_PROGRESS_GROUP_STATES,
     ReportRequest,
     ReportOpeners,
     WORKER_STALE_SECONDS,
@@ -2025,11 +2025,11 @@ def _state_counts(totals):
     already says the state is empty.
     """
     counts = totals.get("display_state_counts") or totals.get("state_counts") or {}
-    return {state: counts[state] for state in ROOT_PROGRESS_DISPLAY_STATES
+    return {state: counts[state] for state in WORD_PROGRESS_DISPLAY_STATES
             if counts.get(state)}
 
 
-def _render_root_progress_sections(report, width, display_order):
+def _render_word_progress_sections(report, width, display_order):
     data = report["data"]
     totals = data["totals"]
     word = data["word"].upper() + ("*" if data["word_is_answer"] else "")
@@ -2048,7 +2048,7 @@ def _render_root_progress_sections(report, width, display_order):
     )
     header = _semantic_header(
         report,
-        f"Root progress {subject}  active-epoch={data['epoch']}  {telemetry_scope}",
+        f"Word progress {subject}  active-epoch={data['epoch']}  {telemetry_scope}",
         width,
     )
     requested_at = totals["requested_at"]
@@ -2190,7 +2190,7 @@ def _render_root_progress_sections(report, width, display_order):
             width,
         ))
     return [("header", header), ("summary", summary),
-            ("root_progress", rows)]
+            ("word_progress", rows)]
 
 
 def _report_sections(report, previous_report, color, width, display_order):
@@ -2224,8 +2224,8 @@ def _report_sections(report, previous_report, color, width, display_order):
         return _render_leaderboard_sections(report, width)
     if report["report_kind"] == "openers":
         return _render_opener_sections(report, width, display_order)
-    if report["report_kind"] == "root_progress":
-        return _render_root_progress_sections(report, width, display_order)
+    if report["report_kind"] == "word_progress":
+        return _render_word_progress_sections(report, width, display_order)
     raise ValueError(f"unsupported report kind: {report['report_kind']}")
 
 

@@ -295,17 +295,17 @@ class ReportClientStaticTest(unittest.TestCase):
         self.assertEqual(
             set(report_model.OPENER_GROUP_BY_STRATEGIES) - reachable, set())
 
-    def test_root_progress_sort_options_name_server_sorts(self):
+    def test_word_progress_sort_options_name_server_sorts(self):
         # The panel reorders rows it already holds rather than refetching, so
         # the comparators live in both languages.  Nothing at runtime compares
         # them, which makes the option values the one place the two halves can
         # be held to the same vocabulary.
-        values = self._menu_values("ROOT_PROGRESS_SORT_OPTIONS")
-        self.assertEqual(values, list(report_model.ROOT_PROGRESS_SORT_FIELDS))
-        self.assertEqual(values[0], report_model.ROOT_PROGRESS_DEFAULT_SORT)
-        keys = re.search(r"const ROOT_PROGRESS_SORT_KEYS=\{(.*?)\};",
+        values = self._menu_values("WORD_PROGRESS_SORT_OPTIONS")
+        self.assertEqual(values, list(report_model.WORD_PROGRESS_SORT_FIELDS))
+        self.assertEqual(values[0], report_model.WORD_PROGRESS_DEFAULT_SORT)
+        keys = re.search(r"const WORD_PROGRESS_SORT_KEYS=\{(.*?)\};",
                          self.html, re.DOTALL).group(1)
-        for field in report_model.ROOT_PROGRESS_SORT_FIELDS:
+        for field in report_model.WORD_PROGRESS_SORT_FIELDS:
             self.assertIn(field + ":", keys)
 
     def test_inline_javascript_parses(self):
@@ -677,7 +677,7 @@ class ReportClientContract:
         self.assertNotIn("3.564102564102564", text)
         self.assertIn("max remaining depth", text)
 
-    def test_root_progress_panel_loads_after_the_word_report_renders(self):
+    def test_word_progress_panel_loads_after_the_word_report_renders(self):
         # The rollup behind the panel is a seconds-scale scan, so the word
         # report must render without waiting on it: hold the panel's response
         # open and assert the groups are already on screen behind a
@@ -688,9 +688,9 @@ class ReportClientContract:
         # already landed and the panel has rendered.
         self.page.evaluate("""() => {
           const original = window.fetch;
-          window.__heldRootProgress = [];
-          window.fetch = (input, init) => String(input).includes("/api/view/root-progress")
-            ? new Promise(resolve => window.__heldRootProgress.push(
+          window.__heldWordProgress = [];
+          window.fetch = (input, init) => String(input).includes("/api/view/word-progress")
+            ? new Promise(resolve => window.__heldWordProgress.push(
                 () => resolve(original(input, init))))
             : original(input, init);
         }""")
@@ -699,19 +699,19 @@ class ReportClientContract:
             self.page.wait_for_selector("text=word report")
             self.page.wait_for_selector("article.card.clickable")
             self.page.wait_for_function(
-                "() => window.__heldRootProgress.length > 0")
-            self.assertIn("Computing root progress",
+                "() => window.__heldWordProgress.length > 0")
+            self.assertIn("Computing word progress",
                           self.page.locator("#report").inner_text())
         finally:
             self.page.evaluate(
-                "() => window.__heldRootProgress.splice(0).forEach(r => r())")
-        self.page.wait_for_selector("table.root-progress")
+                "() => window.__heldWordProgress.splice(0).forEach(r => r())")
+        self.page.wait_for_selector("table.word-progress")
 
-    def test_root_progress_panel_separates_elapsed_from_worker_time(self):
+    def test_word_progress_panel_separates_elapsed_from_worker_time(self):
         self.apply_branch_target("SALET")
-        self.page.wait_for_selector("table.root-progress")
+        self.page.wait_for_selector("table.word-progress")
         headers = self.page.eval_on_selector_all(
-            "table.root-progress th", "cells => cells.map(c => c.textContent)")
+            "table.word-progress th", "cells => cells.map(c => c.textContent)")
         # The branch columns are named for the lifecycle phases the report
         # already shows elsewhere: queued -> evaluating -> finalizing -> done.
         self.assertEqual(
@@ -719,7 +719,7 @@ class ReportClientContract:
             ["Response", "State", "Answers", "Done", "Eval.", "Nodes",
              "Share", "Elapsed", "Workers", "Paid by"])
 
-    def test_root_progress_table_keeps_its_scroll_position_across_polls(self):
+    def test_word_progress_table_keeps_its_scroll_position_across_polls(self):
         # Every poll rebuilds the word report, so the scroller is a fresh
         # element each cycle.  Without carrying its offsets the table snaps
         # back to the top-left every couple of seconds while being read.
@@ -727,9 +727,9 @@ class ReportClientContract:
         # exercises only the vertical one.
         self.page.set_viewport_size({"width": 390, "height": 800})
         self.apply_branch_target("SALET")
-        self.page.wait_for_selector("table.root-progress")
+        self.page.wait_for_selector("table.word-progress")
         scrolled = self.page.evaluate("""() => {
-          const box = document.querySelector('.root-progress-scroll');
+          const box = document.querySelector('.word-progress-scroll');
           box.scrollLeft = box.scrollWidth - box.clientWidth;
           box.scrollTop = box.scrollHeight - box.clientHeight;
           box.dispatchEvent(new Event('scroll'));
@@ -739,18 +739,18 @@ class ReportClientContract:
         self.assertGreater(scrolled[1], 0, "table must overflow vertically")
         self.page.wait_for_timeout(2 * CLIENT_POLL_INTERVAL_MILLIS)
         after = self.page.evaluate("""() => {
-          const box = document.querySelector('.root-progress-scroll');
+          const box = document.querySelector('.word-progress-scroll');
           return [box.scrollLeft, box.scrollTop];
         }""")
         self.assertEqual(after, scrolled)
 
-    def test_root_progress_table_header_stays_visible_while_scrolling(self):
+    def test_word_progress_table_header_stays_visible_while_scrolling(self):
         # The table is longer than a phone screen; a header that scrolls away
         # leaves the columns unidentifiable exactly where the reading happens.
         self.apply_branch_target("SALET")
-        self.page.wait_for_selector("table.root-progress")
+        self.page.wait_for_selector("table.word-progress")
         overlap = self.page.evaluate("""() => {
-          const box = document.querySelector('.root-progress-scroll');
+          const box = document.querySelector('.word-progress-scroll');
           box.scrollTop = box.scrollHeight - box.clientHeight;
           const header = box.querySelector('thead th').getBoundingClientRect();
           const frame = box.getBoundingClientRect();
@@ -763,37 +763,37 @@ class ReportClientContract:
         self.assertAlmostEqual(overlap["headerTop"], overlap["frameTop"],
                                delta=2)
 
-    def test_root_progress_headline_shows_with_the_panel_collapsed(self):
+    def test_word_progress_headline_shows_with_the_panel_collapsed(self):
         # The remaining-time estimate is the number worth a glance; burying it
         # behind a disclosure puts it out of reach on a phone.
         self.apply_branch_target("SALET")
-        self.page.wait_for_selector("table.root-progress")
+        self.page.wait_for_selector("table.word-progress")
         self.page.evaluate(
-            "() => document.querySelector('details.root-progress-panel')"
+            "() => document.querySelector('details.word-progress-panel')"
             ".open = false")
-        headline = self.page.locator(".root-progress-headline").inner_text()
+        headline = self.page.locator(".word-progress-headline").inner_text()
         self.assertIn("remaining", headline)
         self.assertIn("groups working", headline)
         self.assertIn("began", headline)
         self.assertEqual(
-            self.page.locator("table.root-progress").count(), 1)
+            self.page.locator("table.word-progress").count(), 1)
 
-    def test_root_progress_headline_marks_a_warm_up_estimate_provisional(self):
-        headline = self.page.evaluate("""() => renderRootProgressHeadline({
+    def test_word_progress_headline_marks_a_warm_up_estimate_provisional(self):
+        headline = self.page.evaluate("""() => renderWordProgressHeadline({
           totals:{state_counts:{}}, work_started_at:1785575213,
           estimate:{estimated_seconds:3600, provisional:true},
         }, null).innerText""")
 
         self.assertIn("~1.0h remaining (provisional)", headline)
 
-    def test_root_progress_rate_is_shown_per_the_shortest_span_holding_ten(self):
+    def test_word_progress_rate_is_shown_per_the_shortest_span_holding_ten(self):
         rates = self.page.evaluate("""() => [5010554/86400, 10, 9.9, 0.2, 0.1,
           100/86400, 3/86400, 0].map(rateText)""")
 
         self.assertEqual(rates, ["~58/s", "~10/s", "~594/min", "~12/min",
                                  "~360/h", "~100/day", "~3/day", "~0/day"])
 
-    def test_root_progress_estimate_counts_agree_with_their_nouns(self):
+    def test_word_progress_estimate_counts_agree_with_their_nouns(self):
         def one_of_each(route):
             response = route.fetch()
             progress = response.json()
@@ -805,19 +805,19 @@ class ReportClientContract:
                 "stalled_branch_count": 1})
             route.fulfill(response=response, json=progress)
 
-        self.page.route("**/api/view/root-progress**", one_of_each)
+        self.page.route("**/api/view/word-progress**", one_of_each)
         try:
             self.apply_branch_target("SALET")
-            self.page.wait_for_selector("table.root-progress")
-            text = self.page.locator(".root-progress-panel").inner_text()
+            self.page.wait_for_selector("table.word-progress")
+            text = self.page.locator(".word-progress-panel").inner_text()
         finally:
-            self.page.unroute("**/api/view/root-progress**")
+            self.page.unroute("**/api/view/word-progress**")
 
         self.assertIn("43,249 candidates at ~58/s", text)
         self.assertIn(
             "excludes 1\u00a0waiting group and 1\u00a0stalled branch", text)
 
-    def test_completed_root_progress_replaces_an_inapplicable_estimate(self):
+    def test_completed_word_progress_replaces_an_inapplicable_estimate(self):
         def completed_progress(route):
             response = route.fetch()
             progress = response.json()
@@ -825,30 +825,30 @@ class ReportClientContract:
             progress["data"]["completed_at"] = 1785575213
             route.fulfill(response=response, json=progress)
 
-        self.page.route("**/api/view/root-progress**", completed_progress)
+        self.page.route("**/api/view/word-progress**", completed_progress)
         try:
             self.apply_branch_target("SALET")
-            self.page.wait_for_selector("table.root-progress")
-            text = self.page.locator(".root-progress-panel").inner_text()
+            self.page.wait_for_selector("table.word-progress")
+            text = self.page.locator(".word-progress-panel").inner_text()
         finally:
-            self.page.unroute("**/api/view/root-progress**")
+            self.page.unroute("**/api/view/word-progress**")
 
         self.assertIn("Completed", text)
         self.assertNotIn("No completion estimate", text)
 
-    def test_root_progress_headline_states_no_coverage_percentage(self):
+    def test_word_progress_headline_states_no_coverage_percentage(self):
         # Cost concentrates so hard that breadth of coverage reads as
         # percent-complete: 98.8% of answers reached beside ~12d remaining
         # after 11 days of work invites exactly the wrong conclusion.
         self.apply_branch_target("SALET")
-        self.page.wait_for_selector("table.root-progress")
-        headline = self.page.locator(".root-progress-headline").inner_text()
+        self.page.wait_for_selector("table.word-progress")
+        headline = self.page.locator(".word-progress-headline").inner_text()
         self.assertNotIn("%", headline)
 
-    def test_root_progress_headline_counts_groups_by_state(self):
+    def test_word_progress_headline_counts_groups_by_state(self):
         # The State column says where each pattern sits; the headline says how
         # many are in each live state, and nothing the ERD line already shows.
-        text = self.page.evaluate("""() => renderRootProgressHeadline({
+        text = self.page.evaluate("""() => renderWordProgressHeadline({
           totals:{state_counts:{waiting:34, working:45, solved:38}},
           work_started_at:1785575213, estimate:null,
         }, null).innerText""")
@@ -856,33 +856,33 @@ class ReportClientContract:
         self.assertIn("34 waiting", text)
         self.assertNotIn("38", text)
 
-    def test_root_progress_headline_omits_states_with_no_groups(self):
+    def test_word_progress_headline_omits_states_with_no_groups(self):
         # A zero is noise on a phone, and its absence already says the state is
         # empty.  SCOPE currently has nothing waiting.
-        text = self.page.evaluate("""() => renderRootProgressHeadline({
+        text = self.page.evaluate("""() => renderWordProgressHeadline({
           totals:{state_counts:{working:79, solved:38}},
           work_started_at:1785575213, estimate:null,
         }, null).innerText""")
         self.assertIn("79 groups working", text)
         self.assertNotIn("waiting", text)
 
-    def test_root_progress_table_states_which_patterns_are_finished(self):
+    def test_word_progress_table_states_which_patterns_are_finished(self):
         self.apply_branch_target("SALET")
-        self.page.wait_for_selector("table.root-progress")
+        self.page.wait_for_selector("table.word-progress")
         states = self.page.eval_on_selector_all(
-            "table.root-progress tbody tr td:nth-child(2)",
+            "table.word-progress tbody tr td:nth-child(2)",
             "cells => cells.map(c => c.textContent)")
         # Anchored to the server's vocabulary rather than a transcribed
         # literal, so a state added there cannot pass unnoticed here.
         self.assertLessEqual(
-            set(states), set(report_model.ROOT_PROGRESS_DISPLAY_STATES))
+            set(states), set(report_model.WORD_PROGRESS_DISPLAY_STATES))
         self.assertLessEqual({"waiting", "working", "loss"}, set(states))
 
-    def test_root_progress_table_renders_each_response_as_letter_tiles(self):
+    def test_word_progress_table_renders_each_response_as_letter_tiles(self):
         self.apply_branch_target("SALET")
-        self.page.wait_for_selector("table.root-progress")
-        self.page.wait_for_selector("table.root-progress tbody tr")
-        table = self.page.locator("table.root-progress")
+        self.page.wait_for_selector("table.word-progress")
+        self.page.wait_for_selector("table.word-progress tbody tr")
+        table = self.page.locator("table.word-progress")
         self.assertEqual(
             table.locator("thead th").first.inner_text(), "Response")
         responses = table.locator("tbody tr > td:nth-child(1) .word")
@@ -895,17 +895,17 @@ class ReportClientContract:
             response.locator(".letter").count() == 5
             for response in responses.all()))
 
-    def test_root_progress_response_tiles_open_the_branch_report(self):
+    def test_word_progress_response_tiles_open_the_branch_report(self):
         self.apply_branch_target("SALET")
-        self.page.wait_for_selector("table.root-progress tbody tr")
-        tile = self.page.locator("table.root-progress .tile-button").first
+        self.page.wait_for_selector("table.word-progress tbody tr")
+        tile = self.page.locator("table.word-progress .tile-button").first
         branch_target = tile.get_attribute("aria-label").removeprefix("Open ").removesuffix(" branch report")
         tile.click()
         self.page.wait_for_selector("text=branch report")
         self.assertEqual(
             self.page.locator("#branch-target-input").input_value(), branch_target)
 
-    def test_root_progress_response_tiles_preserve_a_deeper_spine(self):
+    def test_word_progress_response_tiles_preserve_a_deeper_spine(self):
         def deeper_progress(route):
             response = route.fetch()
             progress = response.json()
@@ -913,11 +913,11 @@ class ReportClientContract:
             progress["data"]["word"] = "crane"
             route.fulfill(response=response, json=progress)
 
-        self.page.route("**/api/view/root-progress**", deeper_progress)
+        self.page.route("**/api/view/word-progress**", deeper_progress)
         try:
             self.apply_branch_target("SALET ----- CRANE")
-            self.page.wait_for_selector("table.root-progress tbody tr")
-            tile = self.page.locator("table.root-progress .tile-button").first
+            self.page.wait_for_selector("table.word-progress tbody tr")
+            tile = self.page.locator("table.word-progress .tile-button").first
             branch_target = (
                 tile.get_attribute("aria-label")
                 .removeprefix("Open ").removesuffix(" branch report"))
@@ -928,7 +928,7 @@ class ReportClientContract:
                 self.page.locator("#branch-target-input").input_value(),
                 branch_target)
         finally:
-            self.page.unroute("**/api/view/root-progress**")
+            self.page.unroute("**/api/view/word-progress**")
 
     def test_a_request_that_never_answers_is_abandoned_and_replaced(self):
         # Nothing else would ever ask again: every poll finds the URL in
@@ -940,7 +940,7 @@ class ReportClientContract:
                                  __clockAhead: 0});
           Date.now = () => realNow() + window.__clockAhead;
           window.fetch = (input, init) => {
-            if (!String(input).includes("/api/view/root-progress"))
+            if (!String(input).includes("/api/view/word-progress"))
               return original(input, init);
             window.__progressCalls++;
             // The replacement takes a while, so an error shown for the
@@ -957,7 +957,7 @@ class ReportClientContract:
           };
         }""")
         self.apply_branch_target("SALET")
-        self.page.wait_for_selector("text=Computing root progress")
+        self.page.wait_for_selector("text=Computing word progress")
         self.page.wait_for_timeout(2 * CLIENT_POLL_INTERVAL_MILLIS)
         # Within the limit, polls wait on the request already out.
         self.assertEqual(self.page.evaluate("window.__progressCalls"), 1)
@@ -969,8 +969,8 @@ class ReportClientContract:
         # them, since the replacement owns the panel.
         self.page.wait_for_timeout(int(1.5 * CLIENT_POLL_INTERVAL_MILLIS))
         self.assertEqual(
-            self.page.locator(".root-progress-host p.error").count(), 0)
-        self.page.wait_for_selector("table.root-progress")
+            self.page.locator(".word-progress-host p.error").count(), 0)
+        self.page.wait_for_selector("table.word-progress")
 
     def test_a_failure_stays_steady_while_polls_retry_and_clears_on_success(self):
         # Retrying is cheap, but the computing notice and the error wrap to
@@ -982,7 +982,7 @@ class ReportClientContract:
           const original = window.fetch;
           Object.assign(window, {__progressFailing: true, __progressCalls: 0});
           window.fetch = async (input, init) => {
-            if (!String(input).includes("/api/view/root-progress"))
+            if (!String(input).includes("/api/view/word-progress"))
               return original(input, init);
             window.__progressCalls++;
             if (!window.__progressFailing) return original(input, init);
@@ -993,49 +993,49 @@ class ReportClientContract:
           };
         }""", CLIENT_POLL_INTERVAL_MILLIS * 2 // 3)
         self.apply_branch_target("SALET")
-        self.page.wait_for_selector(".root-progress-host p.error")
+        self.page.wait_for_selector(".word-progress-host p.error")
         seen = set()
         for _ in range(12):
-            seen.add(self.page.locator(".root-progress-host").inner_text())
+            seen.add(self.page.locator(".word-progress-host").inner_text())
             self.page.wait_for_timeout(CLIENT_POLL_INTERVAL_MILLIS // 4)
         self.assertGreater(self.page.evaluate("window.__progressCalls"), 1)
         self.assertFalse(any("Computing" in text for text in seen), seen)
         self.page.evaluate("window.__progressFailing = false")
-        self.page.wait_for_selector("table.root-progress")
+        self.page.wait_for_selector("table.word-progress")
         self.assertEqual(
-            self.page.locator(".root-progress-host p.error").count(), 0)
+            self.page.locator(".word-progress-host p.error").count(), 0)
 
-    def test_root_progress_dates_are_day_month_year(self):
+    def test_word_progress_dates_are_day_month_year(self):
         self.apply_branch_target("SALET")
-        self.page.wait_for_selector("table.root-progress")
-        headline = self.page.locator(".root-progress-headline").inner_text()
+        self.page.wait_for_selector("table.word-progress")
+        headline = self.page.locator(".word-progress-headline").inner_text()
         self.assertRegex(headline, r"began \d{1,2} [A-Z][a-z]{2} \d{4}")
         self.assertNotRegex(headline, r"[A-Z][a-z]{2} \d{1,2}, \d{4}")
 
-    def test_root_progress_omits_the_cumulative_branch_total(self):
+    def test_word_progress_omits_the_cumulative_branch_total(self):
         # Carving work into a sub-branch raises the count without any answer
         # being closer to solved, so the absolute total tracks scheduling as
         # much as progress.  Per-pattern values stay, where the comparison
         # between patterns is the point.
         self.apply_branch_target("SALET")
-        self.page.wait_for_selector("table.root-progress")
+        self.page.wait_for_selector("table.word-progress")
         metrics = "\n".join(self.page.locator(
-            "details.root-progress-panel .metrics").all_inner_texts())
+            "details.word-progress-panel .metrics").all_inner_texts())
         self.assertNotIn("564,186", metrics)
         cells = self.page.eval_on_selector_all(
-            "table.root-progress tbody tr td:nth-child(4)",
+            "table.word-progress tbody tr td:nth-child(4)",
             "cells => cells.map(c => c.textContent)")
         self.assertIn("538,391", cells)
 
-    def test_root_progress_counts_carry_thousands_separators(self):
+    def test_word_progress_counts_carry_thousands_separators(self):
         self.apply_branch_target("SALET")
-        self.page.wait_for_selector("table.root-progress")
-        text = self.page.locator("details.root-progress-panel").inner_text()
+        self.page.wait_for_selector("table.word-progress")
+        text = self.page.locator("details.word-progress-panel").inner_text()
         self.assertIn("538,391", text)
         self.assertNotIn("538391", text)
         self.assertIn("8,671", text)
 
-    def test_root_progress_response_column_stays_put_while_the_rest_scrolls(self):
+    def test_word_progress_response_column_stays_put_while_the_rest_scrolls(self):
         """The tiles name the row, so they must not scroll away from it.
 
         The table is wider than the panel by design — eleven columns of
@@ -1046,14 +1046,14 @@ class ReportClientContract:
         # the table is wider than the panel holding it.
         self.page.set_viewport_size({"width": 480, "height": 800})
         self.apply_branch_target("SALET")
-        self.page.wait_for_selector("table.root-progress")
+        self.page.wait_for_selector("table.word-progress")
         overflow = self.page.eval_on_selector(
-            ".root-progress-scroll",
+            ".word-progress-scroll",
             "node => [node.scrollWidth, node.clientWidth]")
         self.assertGreater(overflow[0], overflow[1],
                            "table does not overflow, so nothing is pinned")
         sticky = self.page.eval_on_selector(
-            "table.root-progress tbody tr td:first-child",
+            "table.word-progress tbody tr td:first-child",
             "cell => {const s = getComputedStyle(cell);"
             " return {position: s.position, left: s.left,"
             "         opaque: s.backgroundColor};}")
@@ -1063,25 +1063,25 @@ class ReportClientContract:
         self.assertNotIn(sticky["opaque"], ("transparent", "rgba(0, 0, 0, 0)"))
         # It has to actually hold position: scroll the container and check the
         # cell has not moved relative to the viewport.
-        scroller = self.page.locator(".root-progress-scroll")
+        scroller = self.page.locator(".word-progress-scroll")
         before = self.page.eval_on_selector(
-            "table.root-progress tbody tr td:first-child",
+            "table.word-progress tbody tr td:first-child",
             "cell => cell.getBoundingClientRect().left")
         scroller.evaluate("node => node.scrollLeft = node.scrollWidth")
         self.page.wait_for_function(
-            "() => document.querySelector('.root-progress-scroll').scrollLeft > 0")
+            "() => document.querySelector('.word-progress-scroll').scrollLeft > 0")
         after = self.page.eval_on_selector(
-            "table.root-progress tbody tr td:first-child",
+            "table.word-progress tbody tr td:first-child",
             "cell => cell.getBoundingClientRect().left")
         self.assertAlmostEqual(before, after, delta=1)
 
-    def test_root_progress_state_column_names_inherited_and_trivial_groups(self):
+    def test_word_progress_state_column_names_inherited_and_trivial_groups(self):
         # "solved" says least about the two cases a reader most wants to pick
         # out, so the column carries the folded state rather than the cache's.
         self.apply_branch_target("SALET")
-        self.page.wait_for_selector("table.root-progress")
+        self.page.wait_for_selector("table.word-progress")
         states = self.page.eval_on_selector_all(
-            "table.root-progress tbody tr td:nth-child(2)",
+            "table.word-progress tbody tr td:nth-child(2)",
             "cells => cells.map(c => c.textContent)")
         self.assertIn("inherited", states)
         self.assertLessEqual(
@@ -1089,7 +1089,7 @@ class ReportClientContract:
             {"waiting", "working", "solved", "inherited", "trivial", "loss"})
         # The summary above the table uses the same vocabulary.
         metrics = "\n".join(self.page.locator(
-            "details.root-progress-panel .metrics").all_inner_texts())
+            "details.word-progress-panel .metrics").all_inner_texts())
         self.assertIn("inherited", metrics)
         self.assertNotIn("worked", metrics)
 
@@ -1102,33 +1102,33 @@ class ReportClientContract:
         opposite edges of the cell.
         """
         self.apply_branch_target("SALET")
-        self.page.wait_for_selector("table.root-progress")
+        self.page.wait_for_selector("table.word-progress")
         alignments = self.page.eval_on_selector_all(
-            "table.root-progress tr > *:last-child",
+            "table.word-progress tr > *:last-child",
             "cells => [...new Set(cells.map(c => getComputedStyle(c).textAlign))]")
         self.assertEqual(alignments, ["center"])
         # The measurements beside it keep the numeric alignment.
         self.assertEqual(
             self.page.eval_on_selector(
-                "table.root-progress tbody tr td:nth-child(6)",
+                "table.word-progress tbody tr td:nth-child(6)",
                 "cell => getComputedStyle(cell).textAlign"),
             "right")
 
-    def test_root_progress_legend_defines_the_columns_it_shows(self):
+    def test_word_progress_legend_defines_the_columns_it_shows(self):
         # Four different units live in this table — branches, search nodes,
         # wall-clock and worker-time — and no header says which is which.
         self.apply_branch_target("SALET")
-        self.page.wait_for_selector("table.root-progress")
+        self.page.wait_for_selector("table.word-progress")
         terms = self.page.eval_on_selector_all(
-            "dl.root-progress-legend dt", "nodes => nodes.map(n => n.textContent)")
+            "dl.word-progress-legend dt", "nodes => nodes.map(n => n.textContent)")
         headers = self.page.eval_on_selector_all(
-            "table.root-progress th", "cells => cells.map(c => c.textContent)")
+            "table.word-progress th", "cells => cells.map(c => c.textContent)")
         # Every column a reader can see is defined, Response aside: its tiles
         # are the row's name rather than a measurement.
         self.assertEqual(set(headers) - set(terms), {"Response"})
-        self.page.locator("details.root-progress-legend-panel").evaluate(
+        self.page.locator("details.word-progress-legend-panel").evaluate(
             "node => node.open = true")
-        legend = self.page.locator("dl.root-progress-legend").inner_text()
+        legend = self.page.locator("dl.word-progress-legend").inner_text()
         self.assertIn("Branches finalized beneath the group", legend)
         # An inherited row's costs are the payer's, which only Paid by says.
         self.assertIn("its costs fill the row", legend)
@@ -1149,20 +1149,20 @@ class ReportClientContract:
         ones, so the payer's in-flight state is not something we know.
         """
         self.apply_branch_target("SALET")
-        self.page.wait_for_selector("table.root-progress")
+        self.page.wait_for_selector("table.word-progress")
         self.page.wait_for_function(
-            "() => document.querySelector('details.root-progress-panel')"
+            "() => document.querySelector('details.word-progress-panel')"
             "        .innerText.includes('tree total nodes')")
         with open(os.path.join(FIXTURE_DIRECTORY,
-                               "root_progress-inherited.json")) as fixture_file:
+                               "word_progress-inherited.json")) as fixture_file:
             rows = {row["pattern"]: row for row
                     in json.load(fixture_file)["data"]["response_groups"]}
         cells = self.page.eval_on_selector_all(
-            "table.root-progress tbody tr",
+            "table.word-progress tbody tr",
             "rows => rows.map(r => [...r.querySelectorAll('td')]"
             "                        .map(c => c.textContent))")
         patterns = self.page.eval_on_selector_all(
-            "table.root-progress tbody tr td:first-child .tile-button",
+            "table.word-progress tbody tr td:first-child .tile-button",
             "buttons => buttons.map(b => b.getAttribute('aria-label').split(' ')[2])")
         by_pattern = dict(zip(patterns, cells))
         inherited = [p for p in patterns if rows[p]["provenance"] == "inherited"]
@@ -1186,18 +1186,18 @@ class ReportClientContract:
 
     def _paid_by_rows(self):
         with open(os.path.join(FIXTURE_DIRECTORY,
-                               "root_progress-inherited.json")) as fixture_file:
+                               "word_progress-inherited.json")) as fixture_file:
             rows = [row for row in
                     json.load(fixture_file)["data"]["response_groups"]
                     if row["provenance"] == "inherited"]
         drawn = self.page.eval_on_selector_all(
-            "table.root-progress td.paid-by-inherited .word",
+            "table.word-progress td.paid-by-inherited .word",
             "nodes => nodes.map(n => n.dataset.spine)")
         return rows, drawn
 
     def _payer_button(self, spine_text):
         return self.page.locator(
-            f"table.root-progress td.paid-by-inherited"
+            f"table.word-progress td.paid-by-inherited"
             f" .word[data-spine='{spine_text}']").first.locator(
                 "xpath=ancestor::button")
 
@@ -1206,9 +1206,9 @@ class ReportClientContract:
         # opener searched itself makes "I paid for this" and "nobody has paid
         # for this yet" the same cell.
         self.apply_branch_target("SALET")
-        self.page.wait_for_selector("table.root-progress")
+        self.page.wait_for_selector("table.word-progress")
         cells = self.page.eval_on_selector_all(
-            "table.root-progress tbody tr",
+            "table.word-progress tbody tr",
             "rows => rows.map(r => [r.querySelectorAll('td')[1].textContent,"
             "                       r.querySelectorAll('td')[9].textContent])")
         by_state = collections.defaultdict(set)
@@ -1225,12 +1225,12 @@ class ReportClientContract:
         opener's response group and the response colours the tiles.
         """
         self.apply_branch_target("SALET")
-        self.page.wait_for_selector("table.root-progress")
+        self.page.wait_for_selector("table.word-progress")
         rows, _ = self._paid_by_rows()
         row = next(r for r in rows if r["paid_by_guess_depth"] == 1)
         expected = f"{row['paid_by']} {row['paid_by_pattern']}"
         coloured = self.page.eval_on_selector(
-            f"table.root-progress td.paid-by-inherited"
+            f"table.word-progress td.paid-by-inherited"
             f" .word[data-spine='{expected}']",
             "node => node.querySelectorAll('.letter.g, .letter.y').length")
         self.assertGreater(coloured, 0)
@@ -1253,7 +1253,7 @@ class ReportClientContract:
         what the cell opens.
         """
         self.apply_branch_target("SALET")
-        self.page.wait_for_selector("table.root-progress")
+        self.page.wait_for_selector("table.word-progress")
         rows, _ = self._paid_by_rows()
         row = next(r for r in rows if r["paid_by_guess_depth"] > 1)
         opener = row["paid_by"]
@@ -1273,41 +1273,41 @@ class ReportClientContract:
             "target => __reportClient.getState().branch_target === target",
             arg=spine)
 
-    def test_root_progress_names_who_paid_for_an_inherited_group(self):
+    def test_word_progress_names_who_paid_for_an_inherited_group(self):
         # A branch is its answer set, so the opener that reaches it first pays
         # and every later one reads the certificate.  Those groups are solved
         # with no work of their own recorded, which the table showed as an
         # empty row indistinguishable from one nobody has touched.
         self.apply_branch_target("SALET")
-        self.page.wait_for_selector("table.root-progress")
+        self.page.wait_for_selector("table.word-progress")
         payers = self.page.eval_on_selector_all(
-            "table.root-progress tbody tr td:nth-child(10)",
+            "table.word-progress tbody tr td:nth-child(10)",
             "cells => cells.map(c => c.textContent)")
         self.assertIn("TARSE", payers)
-        text = self.page.locator("details.root-progress-panel").inner_text()
+        text = self.page.locator("details.word-progress-panel").inner_text()
         self.assertIn("inherited", text)
         # An inherited row is not dimmed: it is finished work, not absent work.
         self.assertEqual(
-            self.page.locator("table.root-progress tbody tr.dim td.paid-by-inherited").count(),
+            self.page.locator("table.word-progress tbody tr.dim td.paid-by-inherited").count(),
             0)
 
-    def test_root_progress_asks_for_inherited_cost_in_its_one_request(self):
+    def test_word_progress_asks_for_inherited_cost_in_its_one_request(self):
         # What other openers spent on the groups this one inherited costs
         # milliseconds, so it comes with the rest: never a cheap first answer
         # waiting on a second request.
         requested = []
-        self.page.route("**/api/view/root-progress**", lambda route: (
+        self.page.route("**/api/view/word-progress**", lambda route: (
             requested.append(route.request.url), route.continue_())[-1])
         try:
             self.apply_branch_target("SALET")
-            self.page.wait_for_selector("table.root-progress")
-            text = self.page.locator("details.root-progress-panel").inner_text()
+            self.page.wait_for_selector("table.word-progress")
+            text = self.page.locator("details.word-progress-panel").inner_text()
             self.assertIn("tree total nodes", text)
             self.assertNotIn("Measuring what other openers spent", text)
             self.assertTrue(requested)
             self.assertTrue(all("inherited_cost=1" in url for url in requested))
         finally:
-            self.page.unroute("**/api/view/root-progress**")
+            self.page.unroute("**/api/view/word-progress**")
 
     def test_the_panel_follows_each_poll_without_being_asked(self):
         # A panel held from an earlier poll went on calling a group working
@@ -1317,7 +1317,7 @@ class ReportClientContract:
           const original = window.fetch;
           window.__progressCalls = 0;
           window.fetch = async (input, init) => {
-            if (!String(input).includes("/api/view/root-progress"))
+            if (!String(input).includes("/api/view/word-progress"))
               return original(input, init);
             window.__progressCalls++;
             const response = await original(input, init);
@@ -1330,17 +1330,17 @@ class ReportClientContract:
         }""")
         self.apply_branch_target("SALET")
         self.page.wait_for_function(
-            "() => document.querySelector('details.root-progress-panel')"
+            "() => document.querySelector('details.word-progress-panel')"
             "        ?.innerText.includes('987.7M')")
         self.page.wait_for_function(
             "() => window.__progressCalls > 1 && !document.querySelector("
-            "'details.root-progress-panel').innerText.includes('987.7M')")
+            "'details.word-progress-panel').innerText.includes('987.7M')")
         self.assertIn("5.0M", self.page.locator(
-            "details.root-progress-panel").inner_text())
+            "details.word-progress-panel").inner_text())
         self.assertEqual(self.page.locator(
-            "details.root-progress-panel button.refresh").count(), 0)
+            "details.word-progress-panel button.refresh").count(), 0)
 
-    def _root_progress_patterns(self):
+    def _word_progress_patterns(self):
         """Row order, read as response patterns.
 
         The Response cell renders word tiles rather than text, so the pattern
@@ -1348,10 +1348,10 @@ class ReportClientContract:
         navigates to.
         """
         return self.page.eval_on_selector_all(
-            "table.root-progress tbody tr td:first-child .tile-button",
+            "table.word-progress tbody tr td:first-child .tile-button",
             "buttons => buttons.map(b => b.getAttribute('aria-label').split(' ')[2])")
 
-    def test_root_progress_sorts_by_tree_cost_or_by_this_opener_alone(self):
+    def test_word_progress_sorts_by_tree_cost_or_by_this_opener_alone(self):
         """Both orders are needed and they are not the same question.
 
         Ranking on the tree's cost surfaces the groups worth the most work,
@@ -1360,25 +1360,25 @@ class ReportClientContract:
         cannot be the only order offered.
         """
         self.apply_branch_target("SALET")
-        self.page.wait_for_selector("table.root-progress")
+        self.page.wait_for_selector("table.word-progress")
         self.page.wait_for_function(
-            "() => document.querySelector('details.root-progress-panel')"
+            "() => document.querySelector('details.word-progress-panel')"
             "        .innerText.includes('tree total nodes')")
         self.assertEqual(
             self.page.eval_on_selector_all(
-                "#root-progress-sort option", "options => options.map(o => o.value)"),
+                "#word-progress-sort option", "options => options.map(o => o.value)"),
             ["tree_nodes", "own_nodes"])
 
-        by_tree = self._root_progress_patterns()
-        self.page.select_option("#root-progress-sort", "own_nodes")
+        by_tree = self._word_progress_patterns()
+        self.page.select_option("#word-progress-sort", "own_nodes")
         self.page.wait_for_function(
-            "() => document.querySelector('#root-progress-sort').value === 'own_nodes'")
-        by_own = self._root_progress_patterns()
+            "() => document.querySelector('#word-progress-sort').value === 'own_nodes'")
+        by_own = self._word_progress_patterns()
 
         self.assertNotEqual(by_tree, by_own)
         self.assertEqual(sorted(by_tree), sorted(by_own))
         with open(os.path.join(FIXTURE_DIRECTORY,
-                               "root_progress-inherited.json")) as fixture_file:
+                               "word_progress-inherited.json")) as fixture_file:
             fixture = json.load(fixture_file)
         rows = {row["pattern"]: row
                 for row in fixture["data"]["response_groups"]}
@@ -1406,43 +1406,43 @@ class ReportClientContract:
         self.assertLess(max(by_own.index(p) for p in worked_with_nodes),
                         min(by_own.index(p) for p in inherited))
 
-    def test_root_progress_sort_does_not_refetch_the_expensive_rollup(self):
+    def test_word_progress_sort_does_not_refetch_the_expensive_rollup(self):
         # The rollup is a scan of the finalize log.  Reordering rows already
         # rendered must not pay for it again.
         self.apply_branch_target("SALET")
-        self.page.wait_for_selector("table.root-progress")
+        self.page.wait_for_selector("table.word-progress")
         self.page.wait_for_function(
-            "() => document.querySelector('details.root-progress-panel')"
+            "() => document.querySelector('details.word-progress-panel')"
             "        .innerText.includes('tree total nodes')")
         requests = []
         self.page.on("request", lambda request: (
             requests.append(request.url)
-            if "/api/view/root-progress" in request.url else None))
-        self.page.select_option("#root-progress-sort", "own_nodes")
+            if "/api/view/word-progress" in request.url else None))
+        self.page.select_option("#word-progress-sort", "own_nodes")
         self.page.wait_for_function(
-            "() => document.querySelector('#root-progress-sort').value === 'own_nodes'")
+            "() => document.querySelector('#word-progress-sort').value === 'own_nodes'")
         self.page.wait_for_timeout(300)
         self.assertEqual(requests, [])
 
-    def test_root_progress_omits_a_request_time_the_queue_cannot_vouch_for(self):
+    def test_word_progress_omits_a_request_time_the_queue_cannot_vouch_for(self):
         # The fixture carries no request time: the queue rebuild that restamped
         # opener_work destroyed it.  Rendering a placeholder would read as a
         # measurement.
         self.apply_branch_target("SALET")
-        self.page.wait_for_selector("table.root-progress")
-        text = self.page.locator("details.root-progress-panel").inner_text()
+        self.page.wait_for_selector("table.word-progress")
+        text = self.page.locator("details.word-progress-panel").inner_text()
         self.assertNotIn("requested", text)
         self.assertIn("work began", text)
         self.assertIn("active epoch", text)
         self.assertIn("no recorded telemetry", text)
 
-    def test_root_progress_url_carries_only_parameters_the_report_accepts(self):
+    def test_word_progress_url_carries_only_parameters_the_report_accepts(self):
         # The word view's own display state — group_by, sort, limit, branch
-        # filters — is rejected outright by the root-progress report, not
+        # filters — is rejected outright by the word-progress report, not
         # ignored, so copying the whole state query 400s the panel. The
         # fixture server ignores query parameters, so this asserts on the URL
         # the client builds; test_report_server pins the server side.
-        url = self.page.evaluate("""() => rootProgressURL({
+        url = self.page.evaluate("""() => wordProgressURL({
           branch_target:'SCOPE', kind:'auto', tree:false,
           group_by:'worker_presence', sort:'size', limit:25,
           branch_status:['evaluating'], branch_worker_status:['active'],
@@ -1452,15 +1452,15 @@ class ReportClientContract:
           answers:true, claims:true, epoch:null,
         })""")
         self.assertEqual(
-            url, "/api/view/root-progress?branch_target=SCOPE&inherited_cost=1")
+            url, "/api/view/word-progress?branch_target=SCOPE&inherited_cost=1")
 
-    def test_root_progress_panel_shows_open_groups_as_started(self):
+    def test_word_progress_panel_shows_open_groups_as_started(self):
         # A group whose first branch is still open is being worked right now.
         # Dimming it as unstarted would hide the live state.
         self.apply_branch_target("SALET")
-        self.page.wait_for_selector("table.root-progress")
+        self.page.wait_for_selector("table.word-progress")
         started_without_finalizations = self.page.eval_on_selector_all(
-            "table.root-progress tbody tr:not(.dim)",
+            "table.word-progress tbody tr:not(.dim)",
             """rows => rows
                  .map(r => [...r.cells].map(c => c.textContent))
                  .filter(cells => cells[3] === '0')""")
@@ -1469,18 +1469,18 @@ class ReportClientContract:
         self.assertNotEqual(cells[4], "—")   # open count is known
         self.assertEqual(cells[8], "—")      # worker-time only exists at finalize
 
-    def test_root_progress_panel_marks_unstarted_groups_without_zero_costs(self):
+    def test_word_progress_panel_marks_unstarted_groups_without_zero_costs(self):
         # An unstarted group has no cost to report; showing 0 would read as
         # "measured zero" rather than "not begun".
         self.apply_branch_target("SALET")
-        self.page.wait_for_selector("table.root-progress")
+        self.page.wait_for_selector("table.word-progress")
         dimmed = self.page.eval_on_selector_all(
-            "table.root-progress tbody tr.dim td",
+            "table.word-progress tbody tr.dim td",
             "cells => cells.map(c => c.textContent)")
         self.assertIn("—", dimmed)
         self.assertNotIn("0.0%", dimmed)
 
-    def test_root_progress_is_fetched_with_every_poll_one_at_a_time(self):
+    def test_word_progress_is_fetched_with_every_poll_one_at_a_time(self):
         # It costs milliseconds, so it keeps pace with the report around it;
         # but a poll never starts a second request while one is in flight.
         # Each answer takes longer than a poll, so polls do arrive while one
@@ -1490,7 +1490,7 @@ class ReportClientContract:
           Object.assign(window, {__progressCalls: 0, __progressInFlight: 0,
                                  __progressMostInFlight: 0});
           window.fetch = async (input, init) => {
-            if (!String(input).includes("/api/view/root-progress"))
+            if (!String(input).includes("/api/view/word-progress"))
               return original(input, init);
             window.__progressCalls++;
             window.__progressInFlight++;
@@ -1503,7 +1503,7 @@ class ReportClientContract:
           };
         }""", CLIENT_POLL_INTERVAL_MILLIS * 3 // 2)
         self.apply_branch_target("SALET")
-        self.page.wait_for_selector("table.root-progress")
+        self.page.wait_for_selector("table.word-progress")
         first = self.page.evaluate("window.__progressCalls")
         self.page.wait_for_timeout(5 * CLIENT_POLL_INTERVAL_MILLIS)
         self.assertGreater(self.page.evaluate("window.__progressCalls"), first)
@@ -1588,10 +1588,10 @@ class ReportClientContract:
                   for index in range(4)]
         self.assertAlmostEqual(widths[0] / widths[1], 8 / 5, delta=0.02)
         self.assertAlmostEqual(widths[3] / widths[0], 1 / 8, delta=0.02)
-        # High up: above the root-progress panel and the per-group cards.
+        # High up: above the word-progress panel and the per-group cards.
         top = breakdown.bounding_box()["y"]
         self.assertLess(
-            top, self.page.locator(".root-progress-panel").bounding_box()["y"])
+            top, self.page.locator(".word-progress-panel").bounding_box()["y"])
         self.assertLess(
             top,
             self.page.locator(".grid > [data-identity]").first.bounding_box()["y"])
@@ -5884,9 +5884,10 @@ class ReportClientContract:
         self.assertEqual(meta.locator(".word").nth(0).locator(".letter.g").count(), 1)
         self.assertEqual(meta.locator(".word").nth(2).locator(".letter.blank").count(), 5)
 
-    def test_header_keeps_a_reference_and_the_root_as_text(self):
-        """A target that names no word has no tiles to draw: a queue reference
-        is a digest, and the root names the whole answer list."""
+    def test_header_keeps_a_reference_as_text_and_names_no_empty_target(self):
+        """A queue reference names no word, so it has no tiles to draw and
+        stays as text.  A report with no target covers everything and its
+        header names no scope at all."""
         result = self.page.evaluate("""async () => {
           const report=await (await fetch('/api/view?branch_target=QUEUE')).json();
           report.branch_target={kind:'branch_reference',steps:[],trailing_word:null,
@@ -5898,12 +5899,13 @@ class ReportClientContract:
           const reference=read();
           const overview=await (await fetch('/api/view')).json();
           applyReport(overview,null,{...__reportClient.getState(),branch_target:''});
-          return {reference,root:read()};
+          return {reference,untargeted:read()};
         }""")
         self.assertIn("@abcd1234", result["reference"]["text"])
         self.assertEqual(result["reference"]["tiles"], 0)
-        self.assertIn("root", result["root"]["text"])
-        self.assertEqual(result["root"]["tiles"], 0)
+        self.assertIn("overview report", result["untargeted"]["text"])
+        self.assertNotIn("root", result["untargeted"]["text"])
+        self.assertEqual(result["untargeted"]["tiles"], 0)
 
     def test_word_report_climbs_to_the_branch_it_was_guessed_in(self):
         """One level up from a word report is the branch that word was guessed
@@ -7060,14 +7062,14 @@ class ReportClientContract:
             "?kind=leaderboard", "?kind=openers", "?kind=queue&tree=1",
             "?branch_target=RAISE+.....",
             "?branch_target=RAISE+.....&tree=1",
-            # The word view carries the root-progress table, which is wider
+            # The word view carries the word-progress table, which is wider
             # than a phone and must scroll inside its own box.
             "?branch_target=SALET",
         ):
             self.page.goto(self.base_url + path)
             self.page.wait_for_selector("h1")
             if "branch_target=SALET" in path:
-                self.page.wait_for_selector("table.root-progress")
+                self.page.wait_for_selector("table.word-progress")
             for width in (375, 390, 480, 800, 1200):
                 with self.subTest(path=path or "overview", width=width):
                     self.page.set_viewport_size({"width": width, "height": 800})
@@ -7924,7 +7926,7 @@ class ReportClientContract:
 
     def test_sources_card_opens_the_word_report_where_its_erd_lives(self):
         # The card leads to the word report: that is where a word's ERD,
-        # response groups and root progress are, and it is what an operator
+        # response groups and word progress are, and it is what an operator
         # reaches for after seeing a word listed.
         self.open_sources()
         self.page.locator(".card.source-word").first.click()

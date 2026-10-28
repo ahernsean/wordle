@@ -455,7 +455,7 @@ class QueueOperatorCommandTest(unittest.TestCase):
             (["view", "--sample-size", "30"],
              "--sample-size requires --hotspots"),
             (["view", "--epoch", "3"],
-             "--epoch requires --hotspots, --root-progress, or "
+             "--epoch requires --hotspots, --word-progress, or "
              "--work-distribution"),
             (["view", "--accuracy"], "unrecognized arguments: --accuracy"),
             (["view", "--hotspots", "--since-seconds", "0"],
