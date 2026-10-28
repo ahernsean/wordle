@@ -176,7 +176,8 @@ def reference_tree_layout(rows, request, prefix, answer_set):
             parent_node_id = current_node["parent_node_id"]
             current_node = nodes.get(parent_node_id)
     parent_spine = request.tree_parent or prefix
-    parent_id = _tree_node_id(_spine_steps(parent_spine)) if parent_spine else None
+    parent_steps = _spine_steps(parent_spine) if parent_spine else ()
+    parent_id = _tree_node_id(parent_steps) if parent_steps else None
     direct_nodes = [
         node for node in nodes.values() if node["parent_node_id"] == parent_id
     ]
