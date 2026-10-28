@@ -4837,10 +4837,13 @@ class ERDQueue:
             return filters.get(name, default)
         return getattr(filters, name, default)
 
-    def report_queue_rows(
-        self, filters=None, sort=None, limit=None, generated_at=None,
-    ) -> dict:
-        """Return normalized, filtered queue rows with pre-limit summaries."""
+    def _report_queue_selection(self, filters, generated_at=None):
+        """The matched-row query every queue report reads, unexecuted.
+
+        Returns (base_query, where_clause, liveness_parameters,
+        where_parameters, include_cold): base_query defines the hot_rows and
+        cold_rows CTEs, and where_clause filters either of them.
+        """
         branch_statuses = tuple(self._report_filter_value(
             filters, "branch_statuses", ()
         ))
@@ -5027,12 +5030,22 @@ class ERDQueue:
         if scope_conditions:
             conditions.append("(" + " OR ".join(scope_conditions) + ")")
             parameters.extend(scope_parameters)
+        branch_keys = self._report_filter_value(filters, "branch_keys")
+        if branch_keys is not None:
+            branch_keys = [bytes(key) for key in branch_keys]
+            placeholders = ",".join("?" for _ in branch_keys) or "NULL"
+            conditions.append(
+                "branch_id IN (SELECT branch_id FROM branches "
+                f"WHERE branch_key IN ({placeholders}))")
+            parameters.extend(branch_keys)
         where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
+        return (base_query, where_clause, parameters[:1], parameters[1:],
+                include_cold)
+
+    def _report_queue_order(self, filters, sort=None):
+        """The ORDER BY a queue report's rows take, ties broken on branch_id."""
         sort_name = sort or self._report_filter_value(filters, "sort") or "default"
-        # Ties break on branch_id, the registry's integer for each branch, so
-        # a page is chosen from integers alone; only its own rows then join
-        # the registry for their key and count their completed candidates.
-        order_by = {
+        return {
             "age": "COALESCE(created_at, claimed_at, 0), branch_id",
             "size": "answer_count DESC, branch_id",
             "workers": "worker_count DESC, answer_count DESC, branch_id",
@@ -5044,12 +5057,55 @@ class ERDQueue:
                 "priority DESC, answer_count DESC, branch_id"
             ),
         }[sort_name]
+
+    @staticmethod
+    def _report_queue_row(row):
+        """One joined queue row as the reports carry it."""
+        opener_pattern = row["opener_pattern"]
+        return {
+            "branch_key": bytes(row["branch_key"]),
+            "branch_key_hex": bytes(row["branch_key"]).hex(),
+            "branch_status": row["branch_status"],
+            "branch_worker_status": row["branch_worker_status"],
+            "raw_status": row["pending_status"] or row["active_status"],
+            "is_cooperative": row["pending_status"] is None,
+            "answer_count": row["answer_count"],
+            "priority": row["priority"],
+            "budget": row["budget"],
+            "candidate_count": row["candidate_count"],
+            "completed_candidate_count": row["completed_candidate_count"],
+            "bulk_completed_candidate_count": row["bulk_done_candidates"] or 0,
+            "one_level_erd_pruned_candidate_count":
+                row["one_level_erd_pruned_candidates"] or 0,
+            "two_level_erd_pruned_candidate_count":
+                row["two_level_erd_pruned_candidates"] or 0,
+            "worker_count": row["worker_count"],
+            "search_node_count": row["nodes_spent"] or 0,
+            "ceiling": row["ceiling"],
+            "best_guess": row["best_guess"],
+            "best_erd": row["best_erd"],
+            "best_max_remaining_depth": row["best_max_depth"],
+            "opener": row["opener"],
+            "opener_pattern": (
+                fmt_pattern(opener_pattern) if opener_pattern is not None else None
+            ),
+            "spine": row["spine"],
+            "created_at": row["created_at"],
+            "updated_at": row["completed_at"] or row["claimed_at"] or row["created_at"],
+            "is_context": False,
+        }
+
+    def report_queue_rows(
+        self, filters=None, sort=None, limit=None, generated_at=None,
+    ) -> dict:
+        """Return normalized, filtered queue rows with pre-limit summaries."""
+        (base_query, where_clause, liveness_parameters, where_parameters,
+         include_cold) = self._report_queue_selection(filters, generated_at)
+        order_by = self._report_queue_order(filters, sort)
         effective_limit = (
             limit if limit is not None
             else self._report_filter_value(filters, "limit")
         )
-        liveness_parameters = parameters[:1]
-        where_parameters = parameters[1:]
         summary_query = base_query + f"""
             SELECT branch_status, branch_worker_status,
                    SUM(branch_count) AS branch_count
@@ -5135,41 +5191,7 @@ class ERDQueue:
                 by_worker_status.get(row["branch_worker_status"], 0) + row["branch_count"]
             )
         matched_rows = sum(by_status.values())
-        returned_rows = []
-        for row in joined_rows:
-            opener_pattern = row["opener_pattern"]
-            returned_rows.append({
-                "branch_key": bytes(row["branch_key"]),
-                "branch_key_hex": bytes(row["branch_key"]).hex(),
-                "branch_status": row["branch_status"],
-                "branch_worker_status": row["branch_worker_status"],
-                "raw_status": row["pending_status"] or row["active_status"],
-                "is_cooperative": row["pending_status"] is None,
-                "answer_count": row["answer_count"],
-                "priority": row["priority"],
-                "budget": row["budget"],
-                "candidate_count": row["candidate_count"],
-                "completed_candidate_count": row["completed_candidate_count"],
-                "bulk_completed_candidate_count": row["bulk_done_candidates"] or 0,
-                "one_level_erd_pruned_candidate_count":
-                    row["one_level_erd_pruned_candidates"] or 0,
-                "two_level_erd_pruned_candidate_count":
-                    row["two_level_erd_pruned_candidates"] or 0,
-                "worker_count": row["worker_count"],
-                "search_node_count": row["nodes_spent"] or 0,
-                "ceiling": row["ceiling"],
-                "best_guess": row["best_guess"],
-                "best_erd": row["best_erd"],
-                "best_max_remaining_depth": row["best_max_depth"],
-                "opener": row["opener"],
-                "opener_pattern": (
-                    fmt_pattern(opener_pattern) if opener_pattern is not None else None
-                ),
-                "spine": row["spine"],
-                "created_at": row["created_at"],
-                "updated_at": row["completed_at"] or row["claimed_at"] or row["created_at"],
-                "is_context": False,
-            })
+        returned_rows = [self._report_queue_row(row) for row in joined_rows]
         return {
             "summary": {
                 "branch_count": matched_rows,
@@ -5179,6 +5201,202 @@ class ERDQueue:
             "matched_rows": matched_rows,
             "rows": returned_rows,
         }
+
+    # A matched row's path: its spine's steps as lowercase "word pattern"
+    # pairs joined by single spaces, 12 characters to a step less the last
+    # space.  A row with no spine is one step, its opener and the opener's
+    # response pattern, the pattern code spelled most significant digit
+    # first as fmt_pattern spells it.  A trailing unpaired token records no
+    # guess, so a spine is cut to its whole steps; a row with no step at all
+    # has no path.
+    _TREE_PATH_SQL = """CASE
+        WHEN spine IS NOT NULL AND spine != '' THEN
+            CASE WHEN length(spine) >= 11 THEN
+                substr(LOWER(spine), 1, 12 * ((length(spine) + 1) / 12) - 1)
+            END
+        WHEN opener IS NOT NULL AND opener_pattern IS NOT NULL THEN
+            LOWER(opener) || ' '
+            || substr('-yg', opener_pattern / 81 % 3 + 1, 1)
+            || substr('-yg', opener_pattern / 27 % 3 + 1, 1)
+            || substr('-yg', opener_pattern / 9 % 3 + 1, 1)
+            || substr('-yg', opener_pattern / 3 % 3 + 1, 1)
+            || substr('-yg', opener_pattern % 3 + 1, 1)
+        END"""
+
+    def _report_tree_query(self, filters, generated_at):
+        """The matched rows with their paths, as CTEs `hot_pathed` and
+        `cold_pathed`; its parameters; whether the cold half can match at
+        all; and the base query alone, whose only parameter is the first.
+
+        A cold row is one step, its opener and pattern, so it can stand only
+        directly under the root, and a query reaches it through its opener
+        column rather than through a path computed for every one of them.
+        """
+        (base_query, where_clause, liveness_parameters, where_parameters,
+         include_cold) = self._report_queue_selection(filters, generated_at)
+        query = base_query + f""",
+            hot_pathed AS (
+                SELECT {self._TREE_PATH_SQL} AS path, * FROM hot_rows{where_clause}
+            ),
+            cold_pathed AS (
+                SELECT {self._TREE_PATH_SQL} AS path, * FROM cold_rows{where_clause}
+            )
+        """
+        parameters = liveness_parameters + where_parameters + where_parameters
+        return query, parameters, include_cold, base_query
+
+    @staticmethod
+    def _report_tree_parent_condition(parent_path):
+        """SQL selecting the paths below parent_path, with its parameters."""
+        if not parent_path:
+            return "path IS NOT NULL", []
+        return "path LIKE ?", [parent_path + " %"]
+
+    # A cold row's own word and whether it has a path, read from its columns.
+    _COLD_WORD_SQL = "LOWER(opener)"
+    _COLD_HAS_PATH_SQL = "(opener IS NOT NULL AND opener_pattern IS NOT NULL)"
+
+    def report_tree_child_words(self, filters=None, parent_path="",
+                                generated_at=None):
+        """The words guessed one step below a tree node, for paging it.
+
+        parent_path is the node's path ("" for the root).  Returns
+        (has_rows, words, pathless_rows): whether any row matched at all,
+        the distinct words of the node's children in order, and -- below the
+        root only -- the matched rows with no path, as report_queue_rows
+        carries them.  The words are at most the vocabulary however many
+        branches sit beneath them, so the page can be chosen from them
+        without reading the branches.
+        """
+        query, parameters, include_cold, _base = self._report_tree_query(
+            filters, generated_at)
+        condition, condition_parameters = self._report_tree_parent_condition(
+            parent_path)
+        word_start = len(parent_path) + 2 if parent_path else 1
+        if parent_path:
+            has_rows = bool(self._conn.execute(query + """
+                SELECT EXISTS (SELECT 1 FROM hot_pathed)
+                    OR EXISTS (SELECT 1 FROM cold_pathed)
+            """ if include_cold else query + """
+                SELECT EXISTS (SELECT 1 FROM hot_pathed)
+            """, parameters).fetchone()[0])
+            words = [row[0] for row in self._conn.execute(query + f"""
+                SELECT DISTINCT substr(path, {word_start}, 5) AS word
+                FROM hot_pathed WHERE {condition} ORDER BY word
+            """, parameters + condition_parameters)]
+            return has_rows, words, []
+        # Below the root every matched row is a child or stands on a chain of
+        # them, so one pass gives the words, and a NULL among them says some
+        # row has no path to place it by.
+        words_query = query + """
+            SELECT DISTINCT substr(path, 1, 5) AS word FROM hot_pathed
+        """
+        if include_cold:
+            words_query += f"""
+                UNION
+                SELECT CASE WHEN {self._COLD_HAS_PATH_SQL}
+                            THEN {self._COLD_WORD_SQL} END
+                FROM cold_pathed
+            """
+        words = [row[0] for row in self._conn.execute(
+            words_query + " ORDER BY word", parameters)]
+        has_rows = bool(words)
+        pathless_rows = []
+        if words and words[0] is None:
+            words.pop(0)
+            pathless = "SELECT * FROM hot_pathed WHERE path IS NULL"
+            if include_cold:
+                pathless += f"""
+                    UNION ALL SELECT * FROM cold_pathed
+                    WHERE NOT {self._COLD_HAS_PATH_SQL}
+                """
+            pathless_rows = [self._report_queue_row(row) for row in
+                             self._conn.execute(query + f"""
+                SELECT pathless.*,
+                       (SELECT branch_key FROM branches AS registry
+                        WHERE registry.branch_id = pathless.branch_id)
+                           AS branch_key,
+                       (SELECT COUNT(*) FROM candidate_claims AS claims
+                        WHERE claims.branch_id = pathless.branch_id
+                          AND claims.done = 1) AS completed_candidate_count
+                FROM ({pathless}) AS pathless
+                ORDER BY {self._report_queue_order(filters)}
+            """, parameters)]
+        return has_rows, words, pathless_rows
+
+    def report_tree_child_nodes(self, filters=None, parent_path="", words=(),
+                                generated_at=None):
+        """The children of a tree node whose guess word is in `words`.
+
+        Returns {child path: {"row", "subtree_worker_count",
+        "child_count"}}: the child's own queue row as report_queue_rows
+        carries it (None for a node on the way to deeper branches), the
+        workers on it and everything below it, and how many distinct nodes
+        sit one step further down.  Everything is reduced in SQL to a row per
+        child before it is read.  A path names one answer set, so no two
+        branches share one, and a child has at most one row.
+        """
+        words = sorted(set(words))
+        if not words:
+            return {}
+        query, parameters, include_cold, base_query = self._report_tree_query(
+            filters, generated_at)
+        condition, condition_parameters = self._report_tree_parent_condition(
+            parent_path)
+        word_start = len(parent_path) + 2 if parent_path else 1
+        child_length = word_start + 10
+        selected = f"""
+            SELECT * FROM hot_pathed WHERE {condition}
+              AND substr(path, {word_start}, 5)
+                  IN (SELECT value FROM json_each(?))
+        """
+        selected_parameters = condition_parameters + [json.dumps(words)]
+        if include_cold and not parent_path:
+            selected += f"""
+                UNION ALL
+                SELECT * FROM cold_pathed WHERE {self._COLD_HAS_PATH_SQL}
+                  AND {self._COLD_WORD_SQL} IN (SELECT value FROM json_each(?))
+            """
+            selected_parameters.append(json.dumps(words))
+        reduced = query + f""", selected AS ({selected})
+            SELECT substr(path, 1, {child_length}),
+                   SUM(worker_count),
+                   COUNT(DISTINCT CASE WHEN length(path) > {child_length}
+                         THEN substr(path, 1, {child_length + 12}) END),
+                   MAX(CASE WHEN length(path) = {child_length}
+                       THEN branch_id END)
+            FROM selected
+            GROUP BY substr(path, 1, {child_length})
+        """
+        children = {}
+        child_by_branch = {}
+        for child_path, subtree_worker_count, child_count, branch_id in (
+                self._conn.execute(reduced, parameters + selected_parameters)):
+            children[child_path] = {
+                "row": None,
+                "subtree_worker_count": subtree_worker_count,
+                "child_count": child_count,
+            }
+            if branch_id is not None:
+                child_by_branch[branch_id] = child_path
+        if child_by_branch:
+            own = "SELECT * FROM hot_rows WHERE branch_id IN owned"
+            if include_cold:
+                own += " UNION ALL SELECT * FROM cold_rows WHERE branch_id IN owned"
+            for row in self._conn.execute(base_query + f""",
+                    owned AS (SELECT value FROM json_each(?))
+                    SELECT own.*,
+                           (SELECT branch_key FROM branches AS registry
+                            WHERE registry.branch_id = own.branch_id)
+                               AS branch_key,
+                           (SELECT COUNT(*) FROM candidate_claims AS claims
+                            WHERE claims.branch_id = own.branch_id
+                              AND claims.done = 1) AS completed_candidate_count
+                    FROM ({own}) AS own
+                    """, parameters[:1] + [json.dumps(sorted(child_by_branch))]):
+                children[child_by_branch[row["branch_id"]]]["row"] = (
+                    self._report_queue_row(row))
+        return children
 
     def report_tree_rows(self, spine_prefix, filters=None, sort=None, limit=None) -> dict:
         """Return report queue rows at or below a recorded spine prefix."""

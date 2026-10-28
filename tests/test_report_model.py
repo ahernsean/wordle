@@ -9,6 +9,11 @@ from types import SimpleNamespace
 import unittest
 
 from tests.queue_invariants import add_second_request
+from tests.tree_queue import (
+    reference_layout_of_queue,
+    tree_layout,
+    write_tree_rows,
+)
 from contextlib import nullcontext
 from dataclasses import replace
 from unittest.mock import Mock, patch
@@ -263,8 +268,7 @@ class ReportModelTest(unittest.TestCase):
             report_kind="queue", tree=True,
             filters=ReportFilters(limit=1),
         )
-        self.assertFalse(report_model._tree_layout(
-            [], request, "", [], set())["tree_available"])
+        self.assertFalse(tree_layout([], request)["tree_available"])
         legacy_key = ScoreCache.encode_subset(["salet"])
         rows = [
             {
@@ -283,13 +287,13 @@ class ReportModelTest(unittest.TestCase):
                 "completed_candidate_count": 0, "candidate_count": 3,
             },
         ]
-        layout = report_model._tree_layout(rows, request, "", rows, set(ANSWERS))
+        layout = tree_layout(rows, request, ANSWERS)
         self.assertTrue(layout["tree_available"])
         self.assertEqual(layout["paging"]["next_cursor"], "unknown:1:" + legacy_key.hex())
         self.assertEqual(layout["nodes"][0]["guess_depth"], 1)
-        second_page = report_model._tree_layout(
+        second_page = tree_layout(
             rows, replace(request, tree_cursor=layout["paging"]["next_cursor"]),
-            "", rows, set(ANSWERS))
+            ANSWERS)
         self.assertEqual(second_page["paging"]["returned_group_count"], 1)
 
     def _tree_row(self, spine, words):
@@ -307,28 +311,44 @@ class ReportModelTest(unittest.TestCase):
             self._tree_row("RAISE ----- SLATE -y---", ["salet"]),
             self._tree_row("RAISE -g---", ["nurdy"]),
         ]
-        layout = report_model._tree_layout(
-            rows, ReportRequest(report_kind="queue", tree=True), "", rows,
-            set(ANSWERS))
+        layout = tree_layout(
+            rows, ReportRequest(report_kind="queue", tree=True), ANSWERS)
         counts = {node["spine"]: (node["child_count"], node["has_children"])
                   for node in layout["nodes"]}
         self.assertEqual(counts, {"RAISE -----": (2, True),
                                   "RAISE -g---": (0, False)})
 
-    def test_tree_layout_is_linear_in_its_nodes(self):
+    def test_a_tree_page_reads_only_its_own_words_branches(self):
         # The whole queue's tree runs to hundreds of thousands of nodes; a
-        # count taken per node over every node never finishes there, and at
-        # this size takes seconds where a linear layout takes milliseconds.
+        # page is chosen from the words beneath its node, and only the
+        # page's words have their branches reduced.
         letters = "abcdefghijklmnopqrstuvwxyz"
         words = [a + b + c + "ed" for a in letters for b in letters
-                 for c in letters[:6]][:4000]
-        rows = [self._tree_row(f"{word.upper()} ----- CRANE y----", ["crane"])
-                for word in words]
-        started = time.perf_counter()
-        report_model._tree_layout(
-            rows, ReportRequest(report_kind="queue", tree=True), "", rows,
-            set(ANSWERS))
-        self.assertLess(time.perf_counter() - started, 2.0)
+                 for c in letters[:6]][:400]
+        rows = [self._tree_row(f"{word.upper()} ----- CRANE y----",
+                               [word, "crane"]) for word in words]
+        reduced = []
+        original = ERDQueue.report_tree_child_nodes
+
+        def recording(queue, filters=None, parent_path="", words=(),
+                      generated_at=None):
+            reduced.append(sorted(words))
+            return original(queue, filters, parent_path, words, generated_at)
+
+        def unread(*_args, **_kwargs):
+            raise AssertionError("a tree page read every queue row")
+
+        with (
+            patch.object(ERDQueue, "report_tree_child_nodes", recording),
+            patch.object(ERDQueue, "report_queue_rows", unread),
+        ):
+            layout = tree_layout(
+                rows, ReportRequest(report_kind="queue", tree=True,
+                                    filters=ReportFilters(limit=3)), ANSWERS)
+        self.assertEqual(reduced, [sorted(words)[:3]])
+        self.assertEqual(layout["paging"]["total_group_count"], 400)
+        self.assertEqual([node["step"]["word"] for node in layout["nodes"]],
+                         sorted(words)[:3])
 
     def test_historical_hotspot_reports_normalize_branch_keys(self):
         branch_key = ScoreCache.encode_subset(["salet"])
@@ -640,25 +660,22 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(len(hotspots["data"]["rows"]), 1)
 
     def test_tree_report_limits_rows_to_the_selected_worker(self):
-        selected_key = ScoreCache.encode_subset(["salet"])
-        other_key = ScoreCache.encode_subset(["crane"])
-        queue = Mock()
-        queue.report_queue_rows.return_value = {"rows": [
-            {"branch_key_hex": selected_key.hex()},
-            {"branch_key_hex": other_key.hex()},
-        ]}
-        queue.heartbeats_with_branch.return_value = [{
-            "worker_id": "worker-2", "current_branch_key": selected_key,
-        }]
-        layout = {"tree_available": True, "nodes": ["selected"]}
+        rows = [self._tree_row("SALET -----", ["salet"]),
+                self._tree_row("CRANE -----", ["crane"])]
+        queue = self._open_queue()
+        write_tree_rows(queue, rows)
+        queue.heartbeat("worker-2", 2, rows[0]["branch_key"], 1,
+                        int(time.time()), 0)
+        queue.heartbeat("worker-3", 3, rows[1]["branch_key"], 1,
+                        int(time.time()), 0)
+        queue.close()
         request = ReportRequest(report_kind="queue", tree=True, worker_id="2")
-        with (
-            patch("report_model._open_report_queue", return_value=queue),
-            patch("report_model._tree_layout", return_value=layout) as tree_layout,
-        ):
+        with patch("report_model._decorative_answer_set",
+                   return_value=set(ANSWERS)):
             report = report_model.collect_tree_report(self.sources, request)
-        self.assertEqual(report["data"]["nodes"], ["selected"])
-        self.assertEqual(len(tree_layout.call_args.args[0]), 1)
+        self.assertEqual([node["spine"] for node in report["data"]["nodes"]],
+                         ["SALET -----"])
+        self.assertEqual(report["data"]["nodes"][0]["worker_count"], 1)
 
     def test_branch_target_queue_scopes_and_row_matching_cover_each_target_kind(self):
         branch_key = ScoreCache.encode_subset(["salet"])
@@ -5333,6 +5350,198 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class TreePageMatchesTheReferenceTest(unittest.TestCase):
+    """Every tree page the report builds equals the page built from every row.
+
+    The queue holds each shape a page meets: queued and finished response
+    groups with no spine, deeper branches with spines and live workers, two
+    openers sharing a guess word below them, and a branch from before spines
+    were recorded.
+    """
+
+    def setUp(self):
+        self._directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._directory.cleanup)
+        self.queue = ERDQueue(os.path.join(self._directory.name, "q.sqlite3"))
+        self.addCleanup(self.queue.close)
+        keys = (f"b{index:04d}".encode() for index in range(1000))
+        pending = []
+        for priority, opener in enumerate(("salet", "crane", "nurdy")):
+            for pattern in (0, 1, 27, 80, 242):
+                pending.append((next(keys), 3 + pattern % 7, 10 * priority,
+                                opener, pattern))
+        self.queue.add_pending_many(pending)
+        for branch_key, *_rest in pending[::4]:
+            self.queue.mark_done(branch_key)
+        rows = []
+        for spine, answer_count, worker_count in (
+                ("SALET ----y CRANE y----", 4, 1),
+                ("SALET ----y CRANE -y---", 3, 0),
+                ("SALET ----y KHAKI -----", 2, 2),
+                ("SALET ----y CRANE y---- NURDY g----", 2, 1),
+                ("SALET --gg- CRANE ggggg", 1, 0),
+                ("CRANE ----- SALET -y---", 5, 0),
+                ("CRANE ----- SALET -y--- KHAKI", 5, 0),
+                ("NURDY yyyyy", 2, 3)):
+            rows.append({"branch_key": next(keys), "spine": spine,
+                         "answer_count": answer_count,
+                         "worker_count": worker_count, "priority": 5})
+        rows.append({"branch_key": next(keys), "budget": 4,
+                     "answer_count": 2, "worker_count": 1})
+        rows.append({"branch_key": next(keys), "budget": 5,
+                     "answer_count": 3})
+        write_tree_rows(self.queue, rows)
+        self.queue.heartbeat("worker-9", 9, pending[1][0], 3,
+                             int(time.time()), 0)
+
+    def _assert_pages_match(self, request):
+        """Walk every page of the request's node, comparing each one."""
+        cursor, pages = None, 0
+        while True:
+            paged = replace(request, tree_cursor=cursor)
+            filters, prefix = report_model._tree_filters(self.queue, paged)
+            built = report_model._tree_layout(
+                self.queue, filters, paged, prefix, set(ANSWERS))
+            self.assertEqual(
+                built, reference_layout_of_queue(self.queue, paged, ANSWERS),
+                paged)
+            pages += 1
+            cursor = (built.get("paging") or {}).get("next_cursor")
+            if cursor is None:
+                return built, pages
+
+    def _expandable_spines(self, layout):
+        return [node["spine"] for node in layout["nodes"]
+                if node["has_children"] and node["spine"]]
+
+    def test_every_page_of_every_node_matches(self):
+        visited = []
+        for limit in (1, 2, 10):
+            parents = [None]
+            while parents:
+                request = ReportRequest(
+                    report_kind="queue", tree=True, tree_parent=parents.pop(),
+                    filters=ReportFilters(limit=limit))
+                self._assert_pages_match(request)
+                parents.extend(self._expandable_spines(
+                    {"nodes": self._all_nodes(request)}))
+                visited.append(request.tree_parent)
+        # The root and every node with children beneath it, at each limit.
+        self.assertEqual(len(visited), 3 * 5, visited)
+
+    def _all_nodes(self, request):
+        nodes, cursor = [], None
+        while True:
+            paged = replace(request, tree_cursor=cursor)
+            filters, prefix = report_model._tree_filters(self.queue, paged)
+            built = report_model._tree_layout(
+                self.queue, filters, paged, prefix, set(ANSWERS))
+            nodes.extend(built["nodes"])
+            cursor = (built.get("paging") or {}).get("next_cursor")
+            if cursor is None:
+                return nodes
+
+    def test_the_root_holds_every_shape(self):
+        nodes = self._all_nodes(ReportRequest(report_kind="queue", tree=True))
+        self.assertEqual(
+            sum(node["step"] is None for node in nodes), 2)
+        self.assertTrue(any(node["branch_key_hex"] is None
+                            and node["step"] for node in nodes))
+        self.assertTrue(any(node["subtree_worker_count"] > node["worker_count"]
+                            for node in nodes))
+        self.assertTrue(any(node["branch_status"] == "done" for node in nodes))
+        self.assertTrue(any(node["child_count"] > 1 for node in nodes))
+
+    def test_filtered_pages_match(self):
+        for filters in (
+                ReportFilters(branch_statuses=("done",)),
+                ReportFilters(branch_statuses=("queued", "evaluating")),
+                ReportFilters(branch_worker_statuses=("active",)),
+                ReportFilters(minimum_answer_count=4, limit=2),
+                ReportFilters(maximum_answer_count=2),
+                ReportFilters(priority=5),
+                ReportFilters(sort="size", limit=3)):
+            with self.subTest(filters=filters):
+                self._assert_pages_match(ReportRequest(
+                    report_kind="queue", tree=True, filters=filters))
+                self._assert_pages_match(ReportRequest(
+                    report_kind="queue", tree=True, filters=filters,
+                    tree_parent="SALET ----y"))
+
+    def test_worker_and_branch_target_pages_match(self):
+        for request in (
+                ReportRequest(report_kind="queue", tree=True, worker_id="9"),
+                ReportRequest(report_kind="queue", tree=True, worker_id="1"),
+                ReportRequest(report_kind="queue", tree=True,
+                              worker_id="worker-404"),
+                ReportRequest(tree=True, branch_target=parse_report_branch_target(
+                    "SALET")),
+                ReportRequest(tree=True, branch_target=parse_report_branch_target(
+                    "SALET ----y CRANE")),
+                ReportRequest(tree=True, branch_target=parse_report_branch_target(
+                    "SALET ----y"))):
+            with self.subTest(request=request):
+                self._assert_pages_match(request)
+
+    def test_a_node_with_only_cold_rows_beneath_it_has_rows(self):
+        has_rows, words, pathless_rows = self.queue.report_tree_child_words(
+            {"branch_statuses": ("done",)}, "salet -----")
+        self.assertTrue(has_rows)
+        self.assertEqual((words, pathless_rows), ([], []))
+
+    def test_a_page_reads_one_queue_while_branches_finish(self):
+        # The page's words are read before their branches, so a word whose
+        # only matching branch finishes in between would keep its group on
+        # the page with no node in it.
+        request = ReportRequest(
+            report_kind="queue", tree=True,
+            filters=ReportFilters(branch_statuses=("queued",), limit=1))
+        queued_crane = [
+            bytes(row["branch_key"]) for row in self.queue._conn.execute(
+                "SELECT b.branch_key FROM pending_branches AS p "
+                "JOIN branches AS b USING (branch_id) "
+                "WHERE p.opener = 'crane' AND p.status = 'pending'")]
+        writer = ERDQueue(self.queue.db_path)
+        self.addCleanup(writer.close)
+        original = ERDQueue.report_tree_child_nodes
+        finished = []
+
+        def finish_first(queue, *arguments, **keywords):
+            if not finished:
+                for branch_key in queued_crane:
+                    writer.mark_done(branch_key)
+                finished.append(True)
+            return original(queue, *arguments, **keywords)
+
+        sources = replace(ReportOpeners.defaults(),
+                          queue_path=self.queue.db_path, telemetry_path=None)
+        with (
+            patch.object(ERDQueue, "report_tree_child_nodes", finish_first),
+            patch("report_model._decorative_answer_set",
+                  return_value=set(ANSWERS)),
+        ):
+            data = report_model.collect_tree_report(sources, request)["data"]
+
+        self.assertEqual(finished, [True])
+        self.assertEqual(data["paging"]["returned_group_count"], 1)
+        self.assertEqual({node["step"]["word"] for node in data["nodes"]},
+                         {"crane"})
+        self.assertEqual(len(data["nodes"]), len(queued_crane))
+
+    def test_a_cursor_between_groups_matches(self):
+        for cursor in ("aaaaa", "khaki", "zzzzz", "unknown:1:00",
+                       "unknown:1:ff"):
+            request = ReportRequest(report_kind="queue", tree=True,
+                                    tree_cursor=cursor,
+                                    filters=ReportFilters(limit=2))
+            filters, prefix = report_model._tree_filters(self.queue, request)
+            self.assertEqual(
+                report_model._tree_layout(
+                    self.queue, filters, request, prefix, set(ANSWERS)),
+                reference_layout_of_queue(self.queue, request, ANSWERS),
+                cursor)
+
+
 class TreePageCursorTest(unittest.TestCase):
     """Paging a tree page whose groups are not all named by a guess word.
 
@@ -5373,7 +5582,7 @@ class TreePageCursorTest(unittest.TestCase):
             filters=ReportFilters(limit=limit),
             tree_cursor=cursor,
         )
-        return report_model._tree_layout(rows, request, "", rows, set(ANSWERS))
+        return tree_layout(rows, request, ANSWERS)
 
     def _words(self, page):
         return [(node["step"] or {}).get("word") for node in page["nodes"]]

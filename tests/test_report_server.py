@@ -19,11 +19,11 @@ from urllib.request import Request, urlopen
 
 from erd_queue import ERDQueue, encode_subset
 import report_server
+from tests.tree_queue import tree_layout
 from report_model import (
     ReportFilters,
     ReportRequest,
     ReportOpeners,
-    _tree_layout,
     collect_report,
 )
 from report_server import (
@@ -249,7 +249,7 @@ class ReportServerTest(unittest.TestCase):
         request = ReportRequest(
             report_kind="queue", tree=True, filters=ReportFilters(limit=1),
         )
-        layout = _tree_layout(rows, request, "", rows, {"khaki", "crane"})
+        layout = tree_layout(rows, request, {"khaki", "crane"})
         cursor = layout["paging"]["next_cursor"]
         self.assertEqual(cursor, "unknown:1:" + spineless_key.hex())
         parsed = parse_report_request(
