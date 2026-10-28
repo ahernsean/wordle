@@ -706,6 +706,23 @@ class ReportModelTest(unittest.TestCase):
                 self.sources, ReportRequest(report_kind="workers", tree=True))
         self.assertEqual(report["data"]["nodes"], [])
 
+    def test_a_word_tree_is_headed_by_the_word_and_nests_below_it(self):
+        rows = [self._tree_row("SALET -----", ["salet"]),
+                self._tree_row("SALET ----y", ["nurdy", "khaki"]),
+                self._tree_row("SALET ----y CRANE -----", ["khaki"]),
+                self._tree_row("CRANE -----", ["crane"])]
+        request = ReportRequest(
+            tree=True, branch_target=parse_report_branch_target("SALET"))
+        layout = tree_layout(rows, request, ANSWERS)
+        self.assertEqual(
+            [(node["spine"], node["has_children"]) for node in layout["nodes"]],
+            [("SALET -----", False), ("SALET ----y", True)])
+        self.assertEqual(layout["paging"]["total_group_count"], 1)
+        below = tree_layout(
+            rows, replace(request, tree_parent="SALET ----y"), ANSWERS)
+        self.assertEqual([node["spine"] for node in below["nodes"]],
+                         ["SALET ----y CRANE -----"])
+
     def test_branch_target_queue_scopes_and_row_matching_cover_each_target_kind(self):
         branch_key = ScoreCache.encode_subset(["salet"])
         queue = Mock()

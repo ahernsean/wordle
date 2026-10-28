@@ -3121,9 +3121,11 @@ def _tree_layout(queue, filters, request, prefix, answer_set):
     node, which are bounded by the vocabulary, and then reduces the
     branches under the page's words to a row per child.
     """
+    # A word alone is no whole step: its page is the root's, narrowed to the
+    # word by the filters, so the word heads its own response patterns.
     parent_spine = request.tree_parent or prefix
     parent_steps = _spine_steps(parent_spine) if parent_spine else ()
-    parent_id = _tree_node_id(parent_steps) if parent_spine else None
+    parent_id = _tree_node_id(parent_steps) if parent_steps else None
     parent_path = " ".join(
         f"{step.word} {step.pattern}" for step in parent_steps)
     has_rows, words, pathless_rows = queue.report_tree_child_words(
@@ -3136,9 +3138,6 @@ def _tree_layout(queue, filters, request, prefix, answer_set):
             "unavailable_reason": "no extant queue topology",
             "nodes": [],
         }
-    if parent_spine and not parent_steps:
-        # A spine of no whole step names no node, so nothing is its child.
-        words, pathless_rows = [], []
     pathless_nodes = _pathless_tree_nodes(pathless_rows)
     # A node with no word sorts ahead of every worded one, and each is a
     # group of its own.
