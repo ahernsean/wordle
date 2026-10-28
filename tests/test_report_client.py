@@ -568,6 +568,20 @@ class ReportClientContract:
         self.page.wait_for_selector("text=word report")
         self.assertEqual(self.current_tabs(), ["word"])
 
+    def test_a_tab_prompt_returns_after_a_failed_request(self):
+        self.page.goto(self.base_url + "?kind=word")
+        self.page.wait_for_selector(".target-prompt")
+        self.page.route(
+            "**/api/view**",
+            lambda route: route.fulfill(
+                status=400, content_type="application/json",
+                body='{"error":{"kind":"invalid","message":"not a word"}}'))
+        self.apply_branch_target("ZZZZZ")
+        self.page.wait_for_selector("#report p.error")
+        self.page.go_back()
+        self.page.wait_for_selector(".target-prompt")
+        self.assertEqual(self.page.locator("#report p.error").count(), 0)
+
     def test_word_and_branch_tabs_read_their_target_from_the_box(self):
         result = self.page.evaluate("""() => {
           const resolve=(kind,target)=>{

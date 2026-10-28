@@ -3596,8 +3596,10 @@
     }
     function connection(ok,message,disconnected=!ok){const chip=byId("connection");chip.classList.toggle("disconnected",disconnected);chip.textContent=ok?"●":"● "+message;const status=ok?"connected":message;chip.title=status;chip.setAttribute("aria-label",status+"; opens refresh interval");}
     function renderTargetPrompt(state){
+      // A poll repaints nothing while the prompt is on screen, but a failed
+      // request can have replaced it without moving the context.
       const context="prompt:"+state.kind+":"+state.branch_target;
-      if(context===lastContext)return;
+      if(context===lastContext&&byId("report").querySelector(".target-prompt"))return;
       lastContext=context;lastReport=null;displayedState=state;setReportStatus(null);
       document.querySelector("details.filters").hidden=true;
       const meta=element("section","report-meta");
