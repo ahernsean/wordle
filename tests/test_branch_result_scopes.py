@@ -502,6 +502,84 @@ class ResultTotalsTest(_CacheTest):
                 self.assertNotRegex(plan, r"SCAN (TABLE )?(counted|branch_)")
 
 
+class ExactResultDistributionTest(_CacheTest):
+    """The exact-result distribution counted on agrees with counting afresh."""
+
+    def setUp(self):
+        super().setUp()
+        self.keys = [ScoreCache.encode_subset(list(pair))
+                     for pair in itertools.combinations(WORDS, 2)]
+
+    def test_counting_on_agrees_with_counting_from_nothing(self):
+        score_cache = self.cache()
+        score_cache.write(self.keys[0], ERD_ALL, "crane", 2.0, max_depth=4)
+        score_cache.write(self.keys[1], ERD_ALL, "slate", 2.5, max_depth=3,
+                          solve_budget=3)
+        earlier = score_cache.exact_result_distribution(ERD_ALL)
+        self.assertTrue(earlier["counted_from_nothing"])
+
+        # One more at axes already counted, and others at axes new to it.
+        score_cache.write(self.keys[2], ERD_ALL, "trace", 2.0, max_depth=4)
+        score_cache.write(self.keys[3], ERD_ALL, "stale", 2.0, max_depth=5)
+        score_cache.write(self.keys[1], ERD_ALL, "tales", 2.2, max_depth=2,
+                          solve_budget=2)
+        score_cache.write(self.keys[4], ERD_ALL, "least", 2.5, max_depth=3,
+                          solve_budget=3)
+        score_cache.write_loss(self.keys[5], ERD_ALL, 2)
+
+        counted_on = score_cache.exact_result_distribution(ERD_ALL, earlier)
+        self.assertFalse(counted_on["counted_from_nothing"])
+        self.assertEqual(
+            counted_on["counts"],
+            score_cache.exact_result_distribution(ERD_ALL)["counts"])
+        self.assertEqual(counted_on["counts"], {
+            (4, None): 2, (5, None): 1, (3, 3): 2, (2, 2): 1})
+        self.assertEqual(
+            score_cache.report_cache_distributions(ERD_ALL, counted_on),
+            score_cache.report_cache_distributions(ERD_ALL))
+
+    def test_rows_gone_from_the_top_are_recounted(self):
+        score_cache = self.cache()
+        for key in self.keys[:3]:
+            score_cache.write(key, ERD_ALL, "crane", 2.0, max_depth=4)
+        earlier = score_cache.exact_result_distribution(ERD_ALL)
+        score_cache._conn.execute(
+            f"DELETE FROM {CANONICAL} WHERE rowid = "
+            f"(SELECT MAX(rowid) FROM {CANONICAL})")
+        counted_on = score_cache.exact_result_distribution(ERD_ALL, earlier)
+        self.assertTrue(counted_on["counted_from_nothing"])
+        self.assertEqual(counted_on["counts"], {(4, None): 2})
+
+    def test_another_policy_or_answer_list_is_recounted(self):
+        score_cache = self.cache()
+        score_cache.write(self.keys[0], ERD_ALL, "crane", 2.0, max_depth=4)
+        earlier = score_cache.exact_result_distribution(ERD_ALL)
+        for changed in ({"policy": "other"}, {"answer_list_id": -1}):
+            self.assertTrue(score_cache.exact_result_distribution(
+                ERD_ALL, {**earlier, **changed})["counted_from_nothing"])
+
+    def test_counting_on_reads_only_the_rows_above_the_mark(self):
+        score_cache = self.cache()
+        score_cache.write(self.keys[0], ERD_ALL, "crane", 2.0, max_depth=4)
+        earlier = score_cache.exact_result_distribution(ERD_ALL)
+        statements = []
+        score_cache._conn.set_trace_callback(statements.append)
+        try:
+            score_cache.exact_result_distribution(ERD_ALL, earlier)
+        finally:
+            score_cache._conn.set_trace_callback(None)
+        counts = [statement for statement in statements
+                  if "COUNT(" in statement]
+        self.assertEqual(len(counts), 2)
+        for statement in counts:
+            plan = " ".join(row[3] for row in score_cache._conn.execute(
+                "EXPLAIN QUERY PLAN " + statement))
+            self.assertRegex(plan, r"\bbranch_\w+ USING INTEGER "
+                                   r"PRIMARY KEY \(rowid>\?\)")
+            self.assertNotRegex(
+                plan, r"INDEX idx_branch_best_by_policy(_and_budget)? ")
+
+
 class ReportingTest(_CacheTest):
     """Counts and states say which kind of fact they mean."""
 
