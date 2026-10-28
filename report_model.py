@@ -4585,7 +4585,7 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
         # shared ownership this report exists to show.  Only words with
         # unfinished work are counted: a finished word's branches are history,
         # and counting every branch ever owned would grow with the whole sweep.
-        # One query counts the whole and every group, since each needs its own
+        # One read counts the whole and every group, since each needs its own
         # distinct count.
         branch_totals = queue.branch_counts_by_group({
             row["opener"]: (_opener_group_key(row, group_by, generated_at)[1]

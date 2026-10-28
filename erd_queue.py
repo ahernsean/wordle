@@ -6705,70 +6705,99 @@ class ERDQueue:
         words_by_label = collections.defaultdict(list)
         for word, label in groups.items():
             words_by_label[label].append(word)
-        # The whole is one pass over the memberships, reduced to one row per
-        # branch before counting.  Whether a branch is done is a fact about
-        # the branch, so it is looked up once per branch, not per membership.
-        every, open_count = self._conn.execute("""
-            WITH owned AS (
-                SELECT m.branch_id, MAX(m.resolved_at IS NULL) AS live
-                FROM json_each(?) AS w
-                JOIN opener_work AS s ON s.opener = w.value
-                JOIN branch_opener_work AS m
-                  ON m.opener_work_id = s.opener_work_id
-                GROUP BY m.branch_id
-            )
-            SELECT COUNT(*), COALESCE(SUM(live AND NOT EXISTS (
-                SELECT 1 FROM pending_branches AS p
-                WHERE p.branch_id = owned.branch_id AND p.status = 'done')), 0)
-            FROM owned
-        """, (json.dumps(sorted(groups)),)).fetchone()
-        totals = {None: (every, open_count)}
+        labels = sorted(words_by_label, key=lambda label: (
+            -len(words_by_label[label]), str(label)))
+        largest = labels[0]
+        label_index = {label: index for index, label in enumerate(labels)}
         # Every group but the largest is counted from the branches its own
-        # words hold, which is a small part of the memberships; the largest
-        # is the whole less the branches only the other groups hold.  A
-        # second pass over every membership per group is what this avoids.
-        largest = max(words_by_label,
-                      key=lambda label: len(words_by_label[label]))
-        smaller_words = sorted(word for word, label in groups.items()
-                               if label != largest)
-        counts = {label: [0, 0] for label in words_by_label}
-        only_smaller = only_smaller_open = 0
-        if smaller_words:
-            owners = collections.defaultdict(dict)
-            for branch_id, opener, live, done in self._conn.execute("""
-                WITH held AS (
-                    SELECT DISTINCT m.branch_id
+        # words hold; the largest is the whole less the branches only the
+        # other groups hold.  The subtraction needs both reads to see one
+        # queue, so they share a deferred transaction's snapshot, which in
+        # WAL mode blocks no writer.
+        opened_snapshot = not self._conn.in_transaction
+        if opened_snapshot:
+            self._conn.execute("BEGIN DEFERRED")
+        try:
+            # Whether a branch is done is a fact about the branch, so it is
+            # looked up once per branch, not per membership.
+            every, open_count = self._conn.execute("""
+                WITH owned AS (
+                    SELECT m.branch_id, MAX(m.resolved_at IS NULL) AS live
                     FROM json_each(?) AS w
                     JOIN opener_work AS s ON s.opener = w.value
                     JOIN branch_opener_work AS m
                       ON m.opener_work_id = s.opener_work_id
+                    GROUP BY m.branch_id
                 )
-                SELECT held.branch_id, s.opener, m.resolved_at IS NULL,
-                       COALESCE(p.status, '') = 'done'
-                FROM held
-                JOIN branch_opener_work AS m ON m.branch_id = held.branch_id
-                JOIN opener_work AS s ON s.opener_work_id = m.opener_work_id
-                LEFT JOIN pending_branches AS p ON p.branch_id = held.branch_id
-            """, (json.dumps(smaller_words),)):
-                label_of = owners[branch_id]
-                if opener not in groups:
-                    continue
-                label = groups[opener]
-                label_of[label] = (label_of.get(label, False)
-                                   or (bool(live) and not done))
-            for open_by_label in owners.values():
-                for label, is_open in open_by_label.items():
-                    if label != largest:
-                        counts[label][0] += 1
-                        counts[label][1] += is_open
-                if largest not in open_by_label:
-                    only_smaller += 1
-                    only_smaller_open += any(open_by_label.values())
-                elif (not open_by_label[largest]
-                      and any(open_by_label.values())):
-                    only_smaller_open += 1
-        counts[largest] = [every - only_smaller, open_count - only_smaller_open]
+                SELECT COUNT(*), COALESCE(SUM(live AND NOT EXISTS (
+                    SELECT 1 FROM pending_branches AS p
+                    WHERE p.branch_id = owned.branch_id
+                      AND p.status = 'done')), 0)
+                FROM owned
+            """, (json.dumps(sorted(groups)),)).fetchone()
+            # Reduced to one row per (branch, group), then one per branch,
+            # before anything leaves SQLite: a branch held by a smaller group
+            # can have owners by the hundred, most of them outside the report.
+            # Each branch becomes two bitmasks over the group indexes, the
+            # groups that hold it and those it is open in, and what comes back
+            # is a count per distinct pair; the groups are the few buckets of
+            # one grouping strategy, so the masks fit an integer.  CROSS JOIN
+            # fixes the order: from the smaller groups' branches out to their
+            # owners, never from every word's memberships in.
+            mask_counts = []
+            if len(labels) > 1:
+                mask_counts = self._conn.execute("""
+                    WITH words AS (
+                        SELECT DISTINCT key AS opener, value AS label
+                        FROM json_each(?)
+                    ), held AS (
+                        SELECT DISTINCT m.branch_id
+                        FROM json_each(?) AS w
+                        JOIN opener_work AS s ON s.opener = w.value
+                        JOIN branch_opener_work AS m
+                          ON m.opener_work_id = s.opener_work_id
+                    ), owned AS (
+                        SELECT held.branch_id, words.label,
+                               MAX(m.resolved_at IS NULL) AS live
+                        FROM held
+                        CROSS JOIN branch_opener_work AS m
+                          ON m.branch_id = held.branch_id
+                        CROSS JOIN opener_work AS s
+                          ON s.opener_work_id = m.opener_work_id
+                        JOIN words ON words.opener = s.opener
+                        GROUP BY held.branch_id, words.label
+                    ), masks AS (
+                        SELECT SUM(1 << label) AS held_mask,
+                               SUM((live AND NOT EXISTS (
+                                   SELECT 1 FROM pending_branches AS p
+                                   WHERE p.branch_id = owned.branch_id
+                                     AND p.status = 'done')) << label)
+                                   AS open_mask
+                        FROM owned GROUP BY branch_id
+                    )
+                    SELECT held_mask, open_mask, COUNT(*)
+                    FROM masks GROUP BY held_mask, open_mask
+                """, (json.dumps({word: label_index[label]
+                                  for word, label in groups.items()}),
+                      json.dumps(sorted(word for word, label in groups.items()
+                                        if label != largest)))).fetchall()
+        finally:
+            if opened_snapshot:
+                self._conn.execute("COMMIT")
+        totals = {None: (every, open_count)}
+        counts = {label: [0, 0] for label in labels}
+        only_smaller = only_smaller_open = 0
+        for held_mask, open_mask, branch_count in mask_counts:
+            for index, label in enumerate(labels[1:], start=1):
+                if held_mask >> index & 1:
+                    counts[label][0] += branch_count
+                    counts[label][1] += branch_count * (open_mask >> index & 1)
+            if not held_mask & 1:
+                only_smaller += branch_count
+            if open_mask and not open_mask & 1:
+                only_smaller_open += branch_count
         totals.update((label, tuple(pair)) for label, pair in counts.items())
+        totals[largest] = (every - only_smaller, open_count - only_smaller_open)
         return totals
 
     def opener_worker_counts(self):

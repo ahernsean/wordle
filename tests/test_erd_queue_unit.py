@@ -1903,6 +1903,7 @@ class TestOpenerBranchCountsAreExact(_TmpQueue):
             "ab": WORDS[:2], "cd": WORDS[2:4], "bc": WORDS[1:3],
             "de": WORDS[3:5], "abc": WORDS[:3], "cde": WORDS[2:5],
             "ae": [WORDS[0], WORDS[4]]}.items()}
+        self.keys = k
         self.q.add_pending_many([(k["ab"], 2, 50, "crane", 0),
                                  (k["cd"], 2, 50, "crane", 1),
                                  (k["bc"], 2, 50, "crane", 2)])
@@ -2039,6 +2040,39 @@ class TestOpenerBranchCountsAreExact(_TmpQueue):
         # up to three groups.
         self.assertEqual(checked, 4 * 3 + 6 * 9 + 4 * 27 + 81)
         self.assertEqual(self.q.branch_counts_by_group({}), {None: (0, 0)})
+
+    def test_group_totals_read_one_queue_while_workers_finish_branches(self):
+        # The largest group is the whole less what only the others hold, so
+        # a branch finished between those two reads would be subtracted from
+        # a whole that still counted it open.
+        groups = {"crane": "x", "slate": "x", "trace": "y"}
+        before = self.q.branch_counts_by_group(groups)
+        worker = ERDQueue(self.queue_path)
+        self.addCleanup(worker.close)
+        connection = self.q._conn
+
+        class FinishBetweenReads:
+            def __init__(self, finish):
+                self.finish = finish
+
+            def execute(self, sql, *parameters):
+                if "held_mask" in sql:
+                    self.finish()
+                return connection.execute(sql, *parameters)
+
+            def __getattr__(self, name):
+                return getattr(connection, name)
+
+        self.q._conn = FinishBetweenReads(
+            lambda: worker.mark_done(self.keys["abc"]))
+        try:
+            during = self.q.branch_counts_by_group(groups)
+        finally:
+            self.q._conn = connection
+        after = self.q.branch_counts_by_group(groups)
+
+        self.assertEqual(during, before)
+        self.assertNotEqual(after, before)
 
 
 class TestOpenerWorkConcurrency(_TmpQueue):
