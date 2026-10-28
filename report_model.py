@@ -1187,24 +1187,42 @@ def _queue_overview(sources, generated_at, answer_set, report):
 #: long a repair or migration that deletes results can leave a total high.
 RESULT_TOTALS_RECOUNT_SECONDS = 120
 
-# The last result totals per cache file, and when each was counted from
-# nothing.  A server process polls the same cache every two seconds, and a
-# full count walks every stored result; counting on reads only the new ones.
+# The last result totals and exact-result distribution per cache file, and
+# when each was counted from nothing.  A server process polls the same cache
+# every two seconds, and a full count walks every stored result; counting on
+# reads only the new ones.
 _result_totals_by_cache_path = {}
+_exact_distribution_by_cache_path = {}
 
 
-def _erd_result_totals(cache, sources, generated_at):
-    """The cache's ERD result totals, counted on from the last ones taken."""
-    carried = _result_totals_by_cache_path.get(sources.cache_path)
+def _counted_on(carried_by_cache_path, count, sources, generated_at):
+    """count(previous), carried per cache file and recounted on schedule."""
+    carried = carried_by_cache_path.get(sources.cache_path)
     previous = None
     if (carried is not None
             and generated_at - carried[1] <= RESULT_TOTALS_RECOUNT_SECONDS):
         previous = carried[0]
-    totals = cache.erd_result_totals(ERD_ALL, previous)
+    counted = count(previous)
     counted_at = (
-        generated_at if totals["counted_from_nothing"] else carried[1])
-    _result_totals_by_cache_path[sources.cache_path] = (totals, counted_at)
-    return totals
+        generated_at if counted["counted_from_nothing"] else carried[1])
+    carried_by_cache_path[sources.cache_path] = (counted, counted_at)
+    return counted
+
+
+def _erd_result_totals(cache, sources, generated_at):
+    """The cache's ERD result totals, counted on from the last ones taken."""
+    return _counted_on(
+        _result_totals_by_cache_path,
+        lambda previous: cache.erd_result_totals(ERD_ALL, previous),
+        sources, generated_at)
+
+
+def _exact_result_distribution(cache, sources, generated_at):
+    """The cache's exact results by reuse axes, counted on like the totals."""
+    return _counted_on(
+        _exact_distribution_by_cache_path,
+        lambda previous: cache.exact_result_distribution(ERD_ALL, previous),
+        sources, generated_at)
 
 
 def _cache_overview(sources, generated_at, answer_words, report):
@@ -3624,27 +3642,32 @@ def collect_cache_report(sources: ReportOpeners, request: ReportRequest) -> dict
         branch_target = request.branch_target
         if branch_target.kind == "root":
             limit = request.filters.limit or 50
-            recent_rows = cache.report_recent_rows(
-                ERD_ALL, generated_at - 300, limit
-            )
-            data.update({
-                "summary": cache.erd_report_summary(
-                    ERD_ALL, generated_at - 300,
-                    _erd_result_totals(cache, sources, generated_at),
-                ),
-                "distributions": cache.report_cache_distributions(ERD_ALL),
-                "recent_rows": [
-                    {
-                        **_with_best_guess_is_answer(
-                            {key: value for key, value in row.items() if key != "branch_key"},
-                            answer_set,
-                        ),
-                        "branch_key_hex": row["branch_key"].hex(),
-                        "branch_reference": branch_reference(row["branch_key"]),
-                    }
-                    for row in recent_rows
-                ],
-            })
+            # The summary and the distributions count the same results, so
+            # they read one cache or could disagree by what landed between.
+            with cache.read_snapshot():
+                recent_rows = cache.report_recent_rows(
+                    ERD_ALL, generated_at - 300, limit
+                )
+                data.update({
+                    "summary": cache.erd_report_summary(
+                        ERD_ALL, generated_at - 300,
+                        _erd_result_totals(cache, sources, generated_at),
+                    ),
+                    "distributions": cache.report_cache_distributions(
+                        ERD_ALL, _exact_result_distribution(
+                            cache, sources, generated_at)),
+                    "recent_rows": [
+                        {
+                            **_with_best_guess_is_answer(
+                                {key: value for key, value in row.items() if key != "branch_key"},
+                                answer_set,
+                            ),
+                            "branch_key_hex": row["branch_key"].hex(),
+                            "branch_reference": branch_reference(row["branch_key"]),
+                        }
+                        for row in recent_rows
+                    ],
+                })
         elif branch_target.kind == "word":
             resolved = resolve_branch_target(branch_target, all_answers)
             groups = ResponseCache(all_answers, score_cache=None).group_words(

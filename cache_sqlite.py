@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
 import sqlite3
@@ -883,6 +884,23 @@ class ScoreCache:
             self.checkpoint()
         self._conn.close()
 
+    @contextlib.contextmanager
+    def read_snapshot(self):
+        """Read every statement inside the block from one cache.
+
+        A report that reads the cache more than once would otherwise see the
+        swarm's writes land between its reads, and two counts of the same
+        results could disagree.  In WAL mode the snapshot blocks no writer.
+        """
+        opened_snapshot = not self._conn.in_transaction
+        if opened_snapshot:
+            self._conn.execute("BEGIN DEFERRED")
+        try:
+            yield
+        finally:
+            if opened_snapshot:
+                self._conn.execute("COMMIT")
+
     def checkpoint(self):
         """Fold the WAL into the main database file (PRAGMA wal_checkpoint(TRUNCATE)).
 
@@ -1675,6 +1693,26 @@ class ScoreCache:
         """, (self.answer_list_id, self.answer_list_id)).fetchone()
         return row["m"] if row else None
 
+    def _counting_floor(self, tables, policy, previous):
+        """(highest rowid per table, previous or None if it cannot be counted on).
+
+        A count can be carried forward only for the same answer list and
+        policy, and only while no table's highest rowid has fallen below the
+        one it saw.
+        """
+        highest = {
+            table: self._conn.execute(
+                f"SELECT COALESCE(MAX(rowid), 0) FROM {table}").fetchone()[0]
+            for table in tables
+        }
+        if (previous is None
+                or previous["answer_list_id"] != self.answer_list_id
+                or previous["policy"] != policy
+                or any(highest[table] < previous["highest_rowid"][table]
+                       for table in highest)):
+            previous = None
+        return highest, previous
+
     def erd_result_totals(self, policy: str, previous=None) -> dict:
         """Count a policy's stored results, counting on from `previous`.
 
@@ -1691,19 +1729,9 @@ class ScoreCache:
         if opened_snapshot:
             self._conn.execute("BEGIN DEFERRED")
         try:
-            highest = {
-                table: self._conn.execute(
-                    f"SELECT COALESCE(MAX(rowid), 0) FROM {table}").fetchone()[0]
-                for table in ("branch_best_by_policy",
-                              "branch_best_by_policy_and_budget",
-                              "branch_loss_by_policy")
-            }
-            if (previous is None
-                    or previous["answer_list_id"] != self.answer_list_id
-                    or previous["policy"] != policy
-                    or any(highest[table] < previous["highest_rowid"][table]
-                           for table in highest)):
-                previous = None
+            highest, previous = self._counting_floor(
+                ("branch_best_by_policy", "branch_best_by_policy_and_budget",
+                 "branch_loss_by_policy"), policy, previous)
             parameters = (policy, self.answer_list_id)
             if previous is None:
                 def count(table, counted="COUNT(*)"):
@@ -1794,6 +1822,51 @@ class ScoreCache:
             "budgeted_branch_count": totals["budgeted_branch_count"],
             "recent_budgeted_result_count": recent_budgeted,
             "loss_branch_count": totals["loss_branch_count"],
+        }
+
+    def exact_result_distribution(self, policy: str, previous=None) -> dict:
+        """Stored exact results per (max_depth, solve_budget), counted on.
+
+        Counts on from `previous` by rowid exactly as erd_result_totals does,
+        and for the same reason: results are only inserted on the normal
+        path.  A repair that deletes a result or corrects its max_depth in
+        place goes unseen until the caller recounts from nothing.
+        """
+        tables = ("branch_best_by_policy", "branch_best_by_policy_and_budget")
+        opened_snapshot = not self._conn.in_transaction
+        if opened_snapshot:
+            self._conn.execute("BEGIN DEFERRED")
+        try:
+            highest, previous = self._counting_floor(tables, policy, previous)
+            counts = dict(previous["counts"]) if previous is not None else {}
+            for table in tables:
+                if previous is None:
+                    rows = self._conn.execute(f"""
+                        SELECT max_depth, solve_budget, COUNT(*) FROM {table}
+                        WHERE policy = ? AND answer_list_id = ?
+                        GROUP BY max_depth, solve_budget
+                    """, (policy, self.answer_list_id))
+                else:
+                    # NOT INDEXED for the reason erd_result_totals gives.
+                    rows = self._conn.execute(f"""
+                        SELECT max_depth, solve_budget, COUNT(*)
+                        FROM {table} NOT INDEXED
+                        WHERE rowid > ? AND policy = ? AND answer_list_id = ?
+                        GROUP BY max_depth, solve_budget
+                    """, (previous["highest_rowid"][table], policy,
+                          self.answer_list_id))
+                for max_depth, solve_budget, count in rows:
+                    axes = (max_depth, solve_budget)
+                    counts[axes] = counts.get(axes, 0) + count
+        finally:
+            if opened_snapshot:
+                self._conn.execute("COMMIT")
+        return {
+            "policy": policy,
+            "answer_list_id": self.answer_list_id,
+            "highest_rowid": highest,
+            "counted_from_nothing": previous is None,
+            "counts": counts,
         }
 
     @staticmethod
@@ -1958,22 +2031,27 @@ class ScoreCache:
             for row in rows
         ]
 
-    def report_cache_distributions(self, policy) -> dict:
-        """Return exact/loss counts grouped by their cache reuse axes."""
+    def report_cache_distributions(self, policy, exact_distribution=None) -> dict:
+        """Return exact/loss counts grouped by their cache reuse axes.
+
+        `exact_distribution` is what exact_result_distribution returned for
+        this policy; without it the results are counted here.  The loss rows
+        are always read afresh: a loss is raised in place, which no rowid
+        mark can see, and the table is a tenth the size of the results.
+        """
+        if exact_distribution is None:
+            exact_distribution = self.exact_result_distribution(policy)
         # Rows, not branches: a branch with results at three budgets
         # contributes one unrestricted row and three budget-specific ones, and
         # the by_solve_budget axis is what tells them apart.
-        exact_rows = self._conn.execute("""
-            SELECT max_depth, solve_budget, COUNT(*) AS branch_count
-            FROM branch_best_by_policy
-            WHERE policy = ? AND answer_list_id = ?
-            GROUP BY max_depth, solve_budget
-            UNION ALL
-            SELECT max_depth, solve_budget, COUNT(*) AS branch_count
-            FROM branch_best_by_policy_and_budget
-            WHERE policy = ? AND answer_list_id = ?
-            GROUP BY max_depth, solve_budget
-        """, (policy, self.answer_list_id, policy, self.answer_list_id)).fetchall()
+        exact_rows = [
+            {"max_depth": max_depth, "solve_budget": solve_budget,
+             "branch_count": count}
+            for (max_depth, solve_budget), count in sorted(
+                exact_distribution["counts"].items(),
+                key=lambda item: tuple((value is not None, value or 0)
+                                       for value in item[0]))
+        ]
         loss_rows = self._conn.execute("""
             SELECT loss_budget, COUNT(*) AS branch_count
             FROM branch_loss_by_policy
