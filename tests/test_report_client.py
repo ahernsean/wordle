@@ -6576,8 +6576,9 @@ class ReportClientContract:
         self.assertEqual(states["all"]["branch_worker_status"], [])
         self.assertEqual(states["historical"]["branch_status"], [])
         self.assertEqual(states["historical"]["branch_worker_status"], [])
-        self.assertFalse(states["tree"]["claims"])
-        self.assertFalse(states["tree"]["answers"])
+        # Tree is a layout of the branch report, so the report's own options stand.
+        self.assertTrue(states["tree"]["claims"])
+        self.assertTrue(states["tree"]["answers"])
         self.assertEqual(states["word"]["sort"], "size")
 
     def test_unqueued_branch_status_is_kept_only_for_word_reports(self):
