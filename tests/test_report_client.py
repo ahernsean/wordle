@@ -502,6 +502,34 @@ class ReportClientContract:
         self.page.wait_for_selector("text=overview report")
         self.assertEqual(overview_button.get_attribute("aria-current"), "page")
 
+    def test_a_word_or_branch_report_has_its_own_current_tab(self):
+        target_tab = self.page.locator("#target-tab")
+        self.assertTrue(target_tab.is_hidden())
+        self.apply_branch_target("CRANE")
+        self.page.wait_for_selector("text=word report")
+        self.assertTrue(target_tab.is_visible())
+        self.assertEqual(target_tab.inner_text(), "Word")
+        self.assertEqual(target_tab.get_attribute("aria-current"), "page")
+        self.assertEqual(
+            self.page.locator('[data-kind][aria-current="page"]').count(), 0)
+        self.page.locator("#layout-tree").click()
+        self.page.wait_for_selector("ul.tree > li")
+        self.assertEqual(target_tab.get_attribute("aria-current"), "page")
+        self.page.locator("#layout-flat").click()
+        self.apply_branch_target("CRANE .y..g")
+        self.page.wait_for_selector("text=branch report")
+        self.assertEqual(target_tab.inner_text(), "Branch")
+        self.assertEqual(target_tab.get_attribute("aria-current"), "page")
+        self.page.locator('[data-kind="openers"]').click()
+        self.page.wait_for_selector("text=openers report")
+        self.assertTrue(target_tab.is_hidden())
+        self.assertEqual(
+            self.page.locator('[data-kind="openers"]').get_attribute("aria-current"),
+            "page")
+        self.page.locator("[data-overview]").click()
+        self.page.wait_for_selector("text=overview report")
+        self.assertTrue(target_tab.is_hidden())
+
     def test_positional_cache_queue_and_explicit_navigation_urls(self):
         result = self.page.evaluate("""() => ({
           inferredCache: buildAPIURL(parsePageState({search:'?branch_target=CACHE'})),
