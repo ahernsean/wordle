@@ -756,7 +756,8 @@ class ReportClientContract:
         # lone answer is solved and has nothing below it.
         solved = rows.filter(has=self.page.locator("> details"))
         self.assertEqual(solved.count(), 1)
-        self.assertIn("solved", " ".join(rows.nth(3).inner_text().split()))
+        self.assertEqual(
+            rows.nth(3).locator(".inline-facts > span").last.inner_text(), "solved")
         solved.locator("> details > summary").click()
         solved.locator(".tree-children ul.response-tree > li").first.wait_for()
         self.assertTrue(any(
@@ -767,9 +768,11 @@ class ReportClientContract:
         def live_best(route):
             report = route.fetch().json()
             for row in report["data"]["response_groups"]:
-                if row["pattern"] == "y----":
+                if row["pattern"] == "-y---":
                     row.update(live_best_guess="abbey", live_best_erd=1.5,
-                               live_best_guess_is_answer=True)
+                               live_best_guess_is_answer=True,
+                               branch_status="evaluating",
+                               branch_worker_status="active", worker_count=1)
             route.fulfill(json=report)
 
         self.page.route("**/api/view?*branch_target=*", live_best)
@@ -779,12 +782,14 @@ class ReportClientContract:
         rows.first.wait_for()
         live = rows.filter(has_text="best so far")
         self.assertEqual(live.count(), 1)
-        self.assertIn("provisional", live.inner_text())
         self.assertEqual(live.locator("> details").count(), 1)
-        # Without a best of either kind, the row says why it cannot open.
-        missing = rows.nth(2)
-        self.assertEqual(missing.locator("details").count(), 0)
-        self.assertIn("not solved yet", " ".join(missing.inner_text().split()))
+        # Each row ends with one word saying whether its line is finished.
+        self.assertEqual(
+            [" ".join(row.locator(".inline-facts > span").last.inner_text().split())
+             for row in rows.all()],
+            ["solved", "no solution within budget", "in progress", "solved"])
+        # A group with no best of either kind has nothing to open.
+        self.assertEqual(rows.nth(1).locator("details").count(), 0)
 
     def test_branch_best_guess_is_exact_from_the_cache_or_provisional_from_the_swarm(self):
         self.apply_branch_target("RAISE .....")

@@ -1819,9 +1819,15 @@
       if(row.live_best_guess)return {guess:row.live_best_guess.toUpperCase(),provisional:true};
       return null;
     }
-    function responseGroupLeafNote(row){
-      if(row.answer_count===1)return "solved";
-      if(row.branch_status==="evaluating"||row.branch_status==="finalizing")return "no candidate fully evaluated yet";
+    // Whether a group's line is finished.  An exact result is stored only once
+    // every response group under its best guess is solved, so "solved" speaks
+    // for everything below the row.
+    function responseGroupState(row){
+      if(row.cache_state==="exact"||row.answer_count===1)return "solved";
+      if(row.cache_state==="loss")return "no solution within budget";
+      if(row.branch_status==="evaluating"||row.branch_status==="finalizing")return "in progress";
+      if(row.branch_status==="queued")return "queued";
+      if(row.branch_status==="unqueued")return "not started";
       return "not solved yet";
     }
     function responseTreeItem(row,wordSpine,word,wordIsAnswer,state){
@@ -1836,11 +1842,9 @@
       fact(countNoun(row.answer_count,"answer","answers"));
       if(row.best_guess)fact(bestGuessCell(row,"best "));
       else if(row.live_best_guess)fact(wordErdCell(wordTiles(row.live_best_guess,null,row.live_best_guess_is_answer),{best_erd:row.live_best_erd},"best_erd","best so far "));
-      if(expansion?.provisional)fact("provisional");
       if(row.max_remaining_depth!==null&&row.max_remaining_depth!==undefined)fact("max remaining depth "+row.max_remaining_depth);
       if(row.worker_count)fact(countNoun(row.worker_count,"worker","workers"));
-      fact(valueOrDash(row.branch_status)+(row.branch_worker_status?" / "+row.branch_worker_status:""));
-      if(!expansion)fact(responseGroupLeafNote(row));
+      fact(responseGroupState(row));
       head.append(facts);
       if(!expands){item.append(head);return item;}
       const childSpine=rowSpine+" "+expansion.guess,nodeId="response:"+childSpine;
