@@ -340,9 +340,11 @@ a few hundred openers stopped reports there, and must not come back:
   total and still dedupe every matched membership, but in one pass: the
   smaller groups are counted from the branches their own words hold, and the
   largest is the whole less what only the others hold.  Those counts reach
-  Python as one row per pair of group bitmasks, never as memberships, and
-  both reads share one snapshot: a difference taken across two moments can
-  report more open branches than branches.  Counting every word
+  Python as one row per pair of group bitmasks, never as memberships.  The
+  whole report reads one snapshot (`ERDQueue.begin_read_snapshot`): read
+  separately, a word finished between listing and counting has no counts,
+  and a difference taken across two moments can report more open branches
+  than branches.  Counting every word
   and every group from every membership was 4.0-4.9 s per poll at 9,400
   unfinished openers; this is about 0.8-1.2 s, most of it that one pass.
 

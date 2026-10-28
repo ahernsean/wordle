@@ -2116,6 +2116,18 @@ class ERDQueue:
     def close(self):
         self._conn.close()
 
+    def begin_read_snapshot(self):
+        """Read every later statement from one queue until close().
+
+        A report that reads the queue more than once would otherwise see the
+        swarm move between its reads, so a word read as unfinished could be
+        finished by the time its branches are counted.  The snapshot is taken
+        at the first statement after this; in WAL mode it blocks no writer.
+        Methods that open their own snapshot read within this one.
+        """
+        if not self._conn.in_transaction:
+            self._conn.execute("BEGIN DEFERRED")
+
     def checkpoint(self, mode: str = "TRUNCATE"):
         """Fold the WAL into the main database file (PRAGMA wal_checkpoint).
 

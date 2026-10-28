@@ -4500,6 +4500,9 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
     timing_cache = None
     try:
         queue = _open_report_queue(sources)
+        # The words are read before their branches are counted, so a word
+        # the swarm finishes in between would have no counts at all.
+        queue.begin_read_snapshot()
         opener = (
             request.branch_target.trailing_word
             if request.branch_target.kind == "word" else None

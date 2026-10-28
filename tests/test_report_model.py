@@ -4149,6 +4149,29 @@ class OpenerReportTest(unittest.TestCase):
         self.assertEqual([row["opener"] for row in data["summary"]],
                          ["crane"])
 
+    def test_a_word_finished_while_the_report_reads_keeps_its_counts(self):
+        self._queue_words(("salet", 5, 1), ("crane", 4, 3), ("nurdy", 3, 2))
+        original = ERDQueue.opener_branch_counts
+        finished = []
+
+        def finish_first(queue, openers):
+            if not finished:
+                finished.append("crane")
+                self._finish("crane")
+            return original(queue, openers)
+
+        with patch.object(ERDQueue, "opener_branch_counts", finish_first):
+            data = self._openers(group_by="none", sort="branches")
+
+        rows = {row["opener"]: row for row in data["summary"]}
+        self.assertEqual(rows["crane"]["state"], "queued")
+        self.assertEqual(rows["crane"]["branch_count"], 3)
+        self.assertEqual(rows["crane"]["open_branch_count"], 3)
+        self.assertEqual(data["matched_branch_count"], 6)
+        self.assertEqual(
+            {row["opener"]: row["state"]
+             for row in self._openers()["summary"]}["crane"], "complete")
+
     def test_a_finished_word_reads_the_totals_recorded_when_it_finished(self):
         self._queue_words(("crane", 1, 2))
         self._finish("crane")
