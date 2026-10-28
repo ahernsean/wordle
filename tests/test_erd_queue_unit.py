@@ -12,6 +12,7 @@ claims_for_branch, heartbeats_with_branch, worker_counts_by_branch,
 set_meta/get_meta, and total_branches.  claim_next/mark_done are also tested
 here for completeness.
 """
+import collections
 import itertools
 import os
 import sqlite3
@@ -1885,6 +1886,159 @@ class TestOpenerRowsRequestedPriority(_TmpQueue):
         row = {r["opener"]: r for r in self.q.opener_rows()}["crane"]
         self.assertEqual(row["requested_priority"], 50)
         self.assertFalse(row["has_incomplete_request"])
+
+
+class TestOpenerBranchCountsAreExact(_TmpQueue):
+    """opener_branch_counts() and branch_counts_by_group() against counts
+    taken directly from the memberships.
+
+    The fixture holds every shape that makes a naive count wrong: branches
+    shared across words, a done branch, a membership re-opened onto a branch
+    that reads done, a promoted child, a word with two unfinished requests,
+    and a finished word."""
+
+    def setUp(self):
+        super().setUp()
+        k = {name: ScoreCache.encode_subset(words) for name, words in {
+            "ab": WORDS[:2], "cd": WORDS[2:4], "bc": WORDS[1:3],
+            "de": WORDS[3:5], "abc": WORDS[:3], "cde": WORDS[2:5],
+            "ae": [WORDS[0], WORDS[4]]}.items()}
+        self.q.add_pending_many([(k["ab"], 2, 50, "crane", 0),
+                                 (k["cd"], 2, 50, "crane", 1),
+                                 (k["bc"], 2, 50, "crane", 2)])
+        self.q.add_pending_many([(k["bc"], 2, 40, "slate", 0),
+                                 (k["de"], 2, 40, "slate", 1)])
+        self.q.add_pending_many([(k["ab"], 2, 30, "trace", 0),
+                                 (k["abc"], 3, 30, "trace", 1)])
+        self.q.add_pending_many([(k["cde"], 3, 20, "stale", 0)])
+        self.q.mark_done(k["cde"])
+        self.q.mark_openers_complete(["stale"])
+        self.q.mark_done(k["ab"])
+        self.q.mark_done(k["cd"])
+        # A finished branch re-promoted for another request: its membership
+        # is live and its active row open while its pending row reads done.
+        self.q.add_pending_many([(k["ae"], 2, 10, "tales", 1)])
+        tales_request, = self.q._conn.execute(
+            "SELECT opener_work_id FROM opener_work WHERE opener = 'tales'"
+        ).fetchone()
+        self.assertTrue(self.q.create_branch(
+            k["ab"], 2, N_CANDIDATES, budget=4, opener="tales",
+            opener_pattern=1, opener_work_id=tales_request,
+            parent_branch_key=k["ae"]))
+        add_second_request(self.q, [(k["ae"], 2, 45, "slate", 2)])
+        # A branch promoted under crane's ownership below one of its groups.
+        conn = self.q._conn
+        child_id = self.q._intern_branch(k["de"])
+        crane_request, = conn.execute(
+            "SELECT opener_work_id FROM opener_work WHERE opener = 'crane'"
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO branch_opener_work (branch_id, opener_work_id, "
+            "parent_branch_id, opener_pattern) VALUES (?, ?, ?, 2)",
+            (child_id, crane_request, self.q._intern_branch(k["bc"])))
+        # One owner's membership resolved while another's stays live, so the
+        # branch is open for one word and not the other.
+        conn.execute(
+            "UPDATE branch_opener_work SET resolved_at = 1 "
+            "WHERE opener_work_id = ? AND branch_id = ?",
+            (crane_request, self.q._intern_branch(k["bc"])))
+        conn.commit()
+        self.unfinished = ["crane", "slate", "tales", "trace"]
+
+    def _memberships(self):
+        return self.q._conn.execute("""
+            SELECT s.opener, s.state, m.branch_id, m.parent_branch_id,
+                   m.resolved_at, COALESCE(p.status, '') = 'done' AS done
+            FROM branch_opener_work AS m
+            JOIN opener_work AS s ON s.opener_work_id = m.opener_work_id
+            LEFT JOIN pending_branches AS p ON p.branch_id = m.branch_id
+        """).fetchall()
+
+    def test_the_fixture_holds_every_shape(self):
+        rows = self._memberships()
+        self.assertTrue(any(row["resolved_at"] is None and row["done"]
+                            for row in rows))
+        self.assertTrue(any(row["parent_branch_id"] is not None
+                            for row in rows))
+        resolved_open = {row["branch_id"] for row in rows
+                         if row["resolved_at"] is not None and not row["done"]}
+        self.assertTrue(any(row["branch_id"] in resolved_open
+                            and row["resolved_at"] is None for row in rows))
+        owners = collections.defaultdict(set)
+        for row in rows:
+            owners[row["branch_id"]].add(row["opener"])
+        self.assertTrue(any(len(words) > 1 for words in owners.values()))
+        self.assertEqual(self.q._conn.execute(
+            "SELECT COUNT(*) FROM opener_work "
+            "WHERE opener = 'slate' AND state != 'complete'").fetchone()[0], 2)
+
+    def test_opener_rows_leave_unfinished_counts_to_be_counted(self):
+        rows = {row["opener"]: row for row in self.q.opener_rows()}
+        for word in self.unfinished:
+            self.assertIsNone(rows[word]["branch_count"])
+            self.assertIsNone(rows[word]["open_branch_count"])
+            self.assertIsNone(rows[word]["last_branch_finished_at"])
+        self.assertEqual(rows["stale"]["branch_count"], 1)
+        self.assertEqual(rows["slate"]["request_count"], 2)
+
+    def test_each_word_is_counted_from_its_memberships(self):
+        expected = {}
+        for word in self.unfinished:
+            rows = [row for row in self._memberships()
+                    if row["opener"] == word]
+            resolved = [row["resolved_at"] for row in rows
+                        if row["state"] != "complete"
+                        and row["resolved_at"] is not None]
+            expected[word] = {
+                "branch_count": len({row["branch_id"] for row in rows}),
+                "direct_branch_count": len({
+                    row["branch_id"] for row in rows
+                    if row["parent_branch_id"] is None}),
+                "direct_done_branch_count": len({
+                    row["branch_id"] for row in rows
+                    if row["parent_branch_id"] is None and row["done"]}),
+                "open_branch_count": len({
+                    row["branch_id"] for row in rows
+                    if row["resolved_at"] is None and not row["done"]}),
+                "last_branch_finished_at": max(resolved, default=None),
+            }
+
+        counts = self.q.opener_branch_counts(self.unfinished + ["stale", None])
+
+        self.assertEqual(
+            {word: {key: row[key] for key in expected[word]}
+             for word, row in counts.items()}, expected)
+        self.assertEqual(self.q.opener_branch_counts([]), {})
+
+    def test_group_totals_count_each_branch_once_however_words_are_grouped(self):
+        rows = self._memberships()
+
+        def reference(words):
+            branches = {row["branch_id"] for row in rows
+                        if row["opener"] in words}
+            live = {row["branch_id"] for row in rows
+                    if row["opener"] in words and row["resolved_at"] is None
+                    and not row["done"]}
+            return (len(branches), len(live))
+
+        checked = 0
+        for size in range(1, len(self.unfinished) + 1):
+            for words in itertools.combinations(self.unfinished, size):
+                for labels in itertools.product("xyz", repeat=size):
+                    groups = dict(zip(words, labels))
+                    expected = {None: reference(set(words))}
+                    for label in set(labels):
+                        expected[label] = reference(
+                            {word for word in words
+                             if groups[word] == label})
+                    self.assertEqual(
+                        self.q.branch_counts_by_group(groups), expected,
+                        groups)
+                    checked += 1
+        # Every non-empty set of the four words, each split every way into
+        # up to three groups.
+        self.assertEqual(checked, 4 * 3 + 6 * 9 + 4 * 27 + 81)
+        self.assertEqual(self.q.branch_counts_by_group({}), {None: (0, 0)})
 
 
 class TestOpenerWorkConcurrency(_TmpQueue):

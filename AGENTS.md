@@ -297,7 +297,7 @@ a few hundred openers stopped reports there, and must not come back:
   counted each node's children that way; at 155,510 rows the overview tree did
   not finish in ten minutes.  Count once per parent.
 - **A report counts in SQL, never by shipping memberships to Python.** The
-  Openers report's per-word open branches come from `opener_rows`, its worker
+  Openers report's per-word open branches come from `opener_branch_counts`, its worker
   counts from the live heartbeats (`opener_worker_counts`, a handful of rows),
   and its cross-word branch totals from one pass that reduces to one row per
   (group, branch) before counting (`branch_counts_by_group`): a
@@ -330,6 +330,18 @@ a few hundred openers stopped reports there, and must not come back:
   The report server carries the last totals per cache file and recounts
   from nothing every `RESULT_TOTALS_RECOUNT_SECONDS`, which is how a
   repair or migration that deletes results reaches the totals.
+
+- **The Openers report counts a word's memberships only for its page.**
+  `opener_rows` reads `opener_work` alone, and the order, the state filter
+  and every grouping need nothing more.  `opener_branch_counts` then counts
+  memberships for the words shown, for the active words (the default order
+  places them by their latest finished branch), and for every word only when
+  the order is by branch counts or ERD.  The cross-word totals are a real
+  total and still dedupe every matched membership, but in one pass: the
+  smaller groups are counted from the branches their own words hold, and the
+  largest is the whole less what only the others hold.  Counting every word
+  and every group from every membership was 4.0-4.9 s per poll at 9,400
+  unfinished openers; this is about 0.8-1.2 s, most of it that one pass.
 
 The tree views still read every queue row, about 8 s today and 32 s at full
 depth; computing a tree page in SQL is the remaining step.

@@ -4100,6 +4100,55 @@ class OpenerReportTest(unittest.TestCase):
         queue.mark_openers_complete(queue.openers_ready_to_complete())
         queue.close()
 
+    def _openers_counting(self, **filters):
+        """The report's data, and every word whose branches it counted."""
+        counted = []
+        original = ERDQueue.opener_branch_counts
+
+        def recording(queue, openers):
+            openers = list(openers)
+            counted.extend(openers)
+            return original(queue, openers)
+
+        with patch.object(ERDQueue, "opener_branch_counts", recording):
+            data = self._openers(**filters)
+        return data, counted
+
+    def test_branches_are_counted_for_the_words_shown_and_the_active_ones(self):
+        self._queue_words(*[(word, 50 - index, 2) for index, word in
+                            enumerate(("salet", "crane", "nurdy", "khaki",
+                                       "scope", "abbey"))])
+        queue = self._open_queue()
+        self.assertEqual(queue.claim_next("worker-0")["opener"], "salet")
+        queue.close()
+
+        data, counted = self._openers_counting(
+            group_by="none", sort="word", limit=2, opener_offset=2)
+
+        shown = [row["opener"] for row in data["summary"]]
+        self.assertEqual(shown, ["khaki", "nurdy"])
+        # SALET is active, and the default order would place it by its
+        # latest finished branch, so it is counted whatever the order.
+        self.assertEqual(sorted(counted), ["khaki", "nurdy", "salet"])
+        for row in data["summary"]:
+            self.assertEqual((row["branch_count"], row["open_branch_count"],
+                              row["done_branch_count"]), (2, 2, 0))
+        # The totals are over every matched word, not the page.
+        self.assertEqual(data["matched_branch_count"], 12)
+
+    def test_an_order_by_branch_counts_counts_every_word_first(self):
+        self._queue_words(("salet", 5, 1), ("crane", 4, 3), ("nurdy", 3, 2))
+
+        for sort in ("branches", "open", "done", "erd"):
+            data, counted = self._openers_counting(
+                group_by="none", sort=sort, limit=1)
+            self.assertEqual(sorted(counted), ["crane", "nurdy", "salet"],
+                             sort)
+        data, _ = self._openers_counting(group_by="none", sort="branches",
+                                         limit=1)
+        self.assertEqual([row["opener"] for row in data["summary"]],
+                         ["crane"])
+
     def test_a_finished_word_reads_the_totals_recorded_when_it_finished(self):
         self._queue_words(("crane", 1, 2))
         self._finish("crane")
