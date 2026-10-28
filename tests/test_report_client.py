@@ -5160,6 +5160,35 @@ class ReportClientContract:
         self.page.go_back()
         self.assertIn("kind=queue", self.page.url)
 
+    def test_tree_open_rows_survive_a_reload(self):
+        def with_children(route):
+            report = route.fetch().json()
+            if report["data"].get("nodes"):
+                report["data"]["nodes"][0].update(has_children=True, child_count=1)
+            route.fulfill(json=report)
+
+        self.page.route("**/api/view/queue?*tree=1*", with_children)
+        self.page.locator("[data-kind=queue]").click()
+        self.page.locator("#layout-tree").click()
+        group = self.page.locator(".tree > li.word-group > details").first
+        group.locator("> summary").click()
+        branch = group.locator("details.tree-branch").first
+        branch.locator("> summary").click()
+        self.page.wait_for_timeout(100)
+        self.page.reload()
+        group = self.page.locator(".tree > li.word-group > details").first
+        group.wait_for()
+        self.assertIsNotNone(group.get_attribute("open"))
+        branch = group.locator("details.tree-branch").first
+        self.assertIsNotNone(branch.get_attribute("open"))
+        # Folding a row is remembered as well: it must not reopen.
+        group.locator("> summary").click()
+        self.page.wait_for_timeout(100)
+        self.page.reload()
+        group = self.page.locator(".tree > li.word-group > details").first
+        group.wait_for(state="attached")
+        self.assertIsNone(group.get_attribute("open"))
+
     def test_disconnect_preserves_data_and_recovers(self):
         original = self.page.locator("#report").inner_text()
         self.page.route("**/api/view**", lambda route: route.abort())
