@@ -14,6 +14,7 @@ from tests.tree_queue import (
     tree_layout,
     write_tree_rows,
 )
+from contextlib import nullcontext
 from dataclasses import replace
 from unittest.mock import Mock, patch
 
@@ -390,6 +391,9 @@ class ReportModelTest(unittest.TestCase):
             "branch_key": branch_key, "best_guess": "salet",
         }]
         cache.erd_result_totals.return_value = {"counted_from_nothing": True}
+        cache.exact_result_distribution.return_value = {
+            "counted_from_nothing": True}
+        cache.read_snapshot.return_value = nullcontext()
         cache.erd_report_summary.return_value = {"exact_branch_count": 1}
         cache.report_cache_distributions.return_value = {"answer_count": []}
         with (
@@ -3439,6 +3443,68 @@ class ReportModelTest(unittest.TestCase):
         recount_at = started_at + report_model.RESULT_TOTALS_RECOUNT_SECONDS
         self.assertEqual(exact_count(recount_at), 3)
         self.assertEqual(exact_count(recount_at + 1), 2)
+
+    def test_exact_distribution_is_carried_and_recounted_on_schedule(self):
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        self.addCleanup(cache.close)
+        sources = SimpleNamespace(cache_path=self.cache_path)
+
+        def insert(branch_key):
+            cache._conn.execute(
+                "INSERT INTO branch_best_by_policy (branch_key, policy, "
+                "answer_list_id, best_guess, best_score, max_depth, updated_at) "
+                "VALUES (?, ?, ?, 'salet', 2.0, 3, 1)",
+                (branch_key, ERD_ALL, cache.answer_list_id))
+
+        def at_depth_three(generated_at):
+            return report_model._exact_result_distribution(
+                cache, sources, generated_at)["counts"][(3, None)]
+
+        for branch_key in (b"first", b"second"):
+            insert(branch_key)
+        started_at = 1_000_000
+        self.assertEqual(at_depth_three(started_at), 2)
+        insert(b"third")
+        self.assertEqual(at_depth_three(started_at + 2), 3)
+        cache._conn.execute(
+            "DELETE FROM branch_best_by_policy WHERE branch_key = ?", (b"first",))
+        recount_at = started_at + report_model.RESULT_TOTALS_RECOUNT_SECONDS
+        self.assertEqual(at_depth_three(recount_at), 3)
+        self.assertEqual(at_depth_three(recount_at + 1), 2)
+
+    def test_cache_report_counts_one_cache_while_results_land(self):
+        cache = ScoreCache(self.cache_path, ANSWERS, checkpoint_on_close=False)
+        cache.write(ScoreCache.encode_subset(ANSWERS[:3]), ERD_ALL, "cigar",
+                    2.0, max_depth=3)
+        cache.close()
+        original = ScoreCache.exact_result_distribution
+        landed = []
+
+        def land_one_first(score_cache, policy, previous=None):
+            if not landed:
+                landed.append(True)
+                writer = ScoreCache(self.cache_path, ANSWERS,
+                                    checkpoint_on_close=False)
+                writer.write(ScoreCache.encode_subset(ANSWERS[3:6]), ERD_ALL,
+                             "awake", 2.2, max_depth=4)
+                writer.close()
+            return original(score_cache, policy, previous)
+
+        with patch.object(ScoreCache, "exact_result_distribution",
+                          land_one_first):
+            data = report_model.collect_cache_report(
+                self.sources, ReportRequest(report_kind="cache"))["data"]
+
+        self.assertEqual(landed, [True])
+        self.assertEqual(data["summary"]["exact_branch_count"], 1)
+        self.assertEqual(
+            data["distributions"]["state_branch_counts"]["exact_branch_count"],
+            1)
+        later = report_model.collect_cache_report(
+            self.sources, ReportRequest(report_kind="cache"))["data"]
+        self.assertEqual(
+            later["distributions"]["state_branch_counts"]["exact_branch_count"],
+            2)
 
     def test_cache_reference_resolves_finalized_branch_without_a_spine(self):
         branch_key = b"finalized branch"

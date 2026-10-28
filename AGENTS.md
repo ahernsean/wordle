@@ -330,6 +330,12 @@ a few hundred openers stopped reports there, and must not come back:
   The report server carries the last totals per cache file and recounts
   from nothing every `RESULT_TOTALS_RECOUNT_SECONDS`, which is how a
   repair or migration that deletes results reaches the totals.
+  The Cache report's distribution of results by `max_depth` and
+  `solve_budget` is counted on the same way
+  (`ScoreCache.exact_result_distribution`), since a `GROUP BY` over every
+  result was 2.4 s per poll; its loss rows are read afresh, because a loss
+  is raised in place where no rowid mark can see it.  The report reads its
+  summary and distributions from one cache snapshot so the two agree.
 
 - **The Openers report counts a word's memberships only for its page.**
   `opener_rows` reads `opener_work` alone, and the order, the state filter
