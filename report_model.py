@@ -3025,8 +3025,92 @@ def _tree_group_sort_key(group_key):
     return (1, group_key)
 
 
-def _tree_layout(rows, request, prefix, unfiltered_rows, answer_set):
-    if not rows:
+def _tree_node(node_id, parent_node_id, step, guess_depth, spine):
+    return {
+        "node_id": node_id,
+        "parent_node_id": parent_node_id,
+        "step": step,
+        "branch_key_hex": None,
+        "branch_reference": None,
+        "branch_status": None,
+        "branch_worker_status": None,
+        "answer_count": None,
+        "guess_depth": guess_depth,
+        "worker_count": 0,
+        "subtree_worker_count": 0,
+        "child_count": 0,
+        "priority": None,
+        "completed_candidate_count": None,
+        "candidate_count": None,
+        "is_context": False,
+        "spine": spine,
+    }
+
+
+def _tree_node_row(node, row):
+    """Give a node the queue row of the branch it is."""
+    node.update({
+        "branch_key_hex": row["branch_key_hex"],
+        "branch_reference": branch_reference(bytes(row["branch_key"])),
+        "branch_status": row["branch_status"],
+        "branch_worker_status": row["branch_worker_status"],
+        "answer_count": row["answer_count"],
+        "worker_count": row["worker_count"],
+        "priority": row["priority"],
+        "completed_candidate_count": row["completed_candidate_count"],
+        "candidate_count": row["candidate_count"],
+        "is_context": bool(row.get("is_context")),
+    })
+
+
+def _pathless_tree_nodes(rows):
+    """The nodes of rows with no spine and no opener, keyed by id.
+
+    Such a row has no word to place it by, so it stands under the root on a
+    chain of synthetic nodes as long as its budget says its spine is.
+    """
+    nodes = {}
+    for row in rows:
+        guess_depth = (
+            GAME_GUESSES - row["budget"] if row.get("budget") is not None else 1
+        )
+        parent_id = None
+        for guess_depth_value in range(1, max(guess_depth, 1) + 1):
+            node_id = _spineless_tree_node_id(
+                guess_depth_value, row["branch_key_hex"])
+            nodes.setdefault(node_id, _tree_node(
+                node_id, parent_id, None, guess_depth_value, None))
+            parent_id = node_id
+        _tree_node_row(nodes[parent_id], row)
+    child_counts = collections.Counter(
+        node["parent_node_id"] for node in nodes.values()
+        if node["parent_node_id"] is not None)
+    for node in nodes.values():
+        node["child_count"] = child_counts[node["node_id"]]
+        node["has_children"] = node["child_count"] > 0
+    for node in nodes.values():
+        current_node = node
+        while current_node is not None:
+            current_node["subtree_worker_count"] += node["worker_count"]
+            current_node = nodes.get(current_node["parent_node_id"])
+    return nodes
+
+
+def _tree_layout(queue, filters, request, prefix, answer_set):
+    """One page of a tree node's children, grouped by their guess word.
+
+    Only the page is built: the queue gives the distinct words below the
+    node, which are bounded by the vocabulary, and then reduces the
+    branches under the page's words to a row per child.
+    """
+    parent_spine = request.tree_parent or prefix
+    parent_steps = _spine_steps(parent_spine) if parent_spine else ()
+    parent_id = _tree_node_id(parent_steps) if parent_spine else None
+    parent_path = " ".join(
+        f"{step.word} {step.pattern}" for step in parent_steps)
+    has_rows, words, pathless_rows = queue.report_tree_child_words(
+        filters, parent_path)
+    if not has_rows:
         return {
             "root": _branch_target_payload(request.branch_target),
             "topology_source": "queue",
@@ -3034,115 +3118,18 @@ def _tree_layout(rows, request, prefix, unfiltered_rows, answer_set):
             "unavailable_reason": "no extant queue topology",
             "nodes": [],
         }
-
-    # A node is a played guess.  The response includes one page of immediate
-    # children; their descendants are fetched only when a node is expanded.
-    nodes = {}
-    for row in rows:
-        steps = _steps_from_queue_row(row)
-        if steps:
-            parent_id = None
-            for guess_depth_value in range(1, len(steps) + 1):
-                step = steps[guess_depth_value - 1]
-                node_id = _tree_node_id(steps[:guess_depth_value])
-                nodes.setdefault(node_id, {
-                    "node_id": node_id,
-                    "parent_node_id": parent_id,
-                    "step": _step_payload(step, answer_set),
-                    "branch_key_hex": None,
-                    "branch_reference": None,
-                    "branch_status": None,
-                    "branch_worker_status": None,
-                    "answer_count": None,
-                    "guess_depth": guess_depth_value,
-                    "worker_count": 0,
-                    "subtree_worker_count": 0,
-                    "child_count": 0,
-                    "priority": None,
-                    "completed_candidate_count": None,
-                    "candidate_count": None,
-                    "is_context": False,
-                    "spine": " ".join(
-                        value for spine_step in steps[:guess_depth_value]
-                        for value in (spine_step.word.upper(), spine_step.pattern)
-                    ),
-                })
-                parent_id = node_id
-            final_node = nodes[parent_id]
-        else:
-            guess_depth = (
-                GAME_GUESSES - row["budget"] if row.get("budget") is not None else 1
-            )
-            parent_id = None
-            for guess_depth_value in range(1, max(guess_depth, 1) + 1):
-                node_id = _spineless_tree_node_id(
-                    guess_depth_value, row["branch_key_hex"]
-                )
-                nodes.setdefault(node_id, {
-                    "node_id": node_id,
-                    "parent_node_id": parent_id,
-                    "step": None,
-                    "branch_key_hex": None,
-                    "branch_reference": None,
-                    "branch_status": None,
-                    "branch_worker_status": None,
-                    "answer_count": None,
-                    "guess_depth": guess_depth_value,
-                    "worker_count": 0,
-                    "subtree_worker_count": 0,
-                    "child_count": 0,
-                    "priority": None,
-                    "completed_candidate_count": None,
-                    "candidate_count": None,
-                    "is_context": False,
-                    "spine": None,
-                })
-                parent_id = node_id
-            final_node = nodes[parent_id]
-        final_node.update({
-            "branch_key_hex": row["branch_key_hex"],
-            "branch_reference": branch_reference(bytes(row["branch_key"])),
-            "branch_status": row["branch_status"],
-            "branch_worker_status": row["branch_worker_status"],
-            "answer_count": row["answer_count"],
-            "worker_count": row["worker_count"],
-            "priority": row["priority"],
-            "completed_candidate_count": row["completed_candidate_count"],
-            "candidate_count": row["candidate_count"],
-            "is_context": bool(row.get("is_context")),
-        })
-    # Counted once per parent: a count taken per node by scanning every node
-    # is quadratic, and the whole queue's tree has hundreds of thousands.
-    child_counts = collections.Counter(
-        candidate["parent_node_id"] for candidate in nodes.values()
-        if candidate["parent_node_id"] is not None)
-    for node in nodes.values():
-        node["child_count"] = child_counts[node["node_id"]]
-        node["has_children"] = node["child_count"] > 0
-    for node in nodes.values():
-        worker_count = node["worker_count"]
-        current_node = node
-        while current_node is not None:
-            current_node["subtree_worker_count"] += worker_count
-            parent_node_id = current_node["parent_node_id"]
-            current_node = nodes.get(parent_node_id)
-    parent_spine = request.tree_parent or prefix
-    parent_id = _tree_node_id(_spine_steps(parent_spine)) if parent_spine else None
-    direct_nodes = [
-        node for node in nodes.values() if node["parent_node_id"] == parent_id
-    ]
-    grouped_nodes = {}
-    for node in sorted(
-        direct_nodes,
-        key=lambda node: (
-            (node["step"] or {}).get("word", ""),
-            (node["step"] or {}).get("pattern", ""),
-            node["branch_key_hex"] or "",
-        ),
-    ):
-        group_key = (node["step"] or {}).get("word") or node["node_id"]
-        grouped_nodes.setdefault(group_key, []).append(node)
-    group_keys = list(grouped_nodes)
+    if parent_spine and not parent_steps:
+        # A spine of no whole step names no node, so nothing is its child.
+        words, pathless_rows = [], []
+    pathless_nodes = _pathless_tree_nodes(pathless_rows)
+    # A node with no word sorts ahead of every worded one, and each is a
+    # group of its own.
+    group_keys = [node["node_id"] for node in sorted(
+        (node for node in pathless_nodes.values()
+         if node["parent_node_id"] is None),
+        key=lambda node: node["branch_key_hex"] or "")]
+    group_keys.extend(words)
+    total_group_count = len(group_keys)
     if request.tree_cursor is not None:
         cursor_sort_key = _tree_group_sort_key(request.tree_cursor)
         group_keys = [
@@ -3151,8 +3138,33 @@ def _tree_layout(rows, request, prefix, unfiltered_rows, answer_set):
         ]
     page_size = request.filters.limit or DEFAULT_TREE_PAGE_SIZE
     page_keys = group_keys[:page_size]
-    page_nodes = [node for key in page_keys for node in grouped_nodes[key]]
     next_cursor = page_keys[-1] if len(group_keys) > page_size else None
+    children = queue.report_tree_child_nodes(
+        filters, parent_path,
+        [key for key in page_keys if key not in pathless_nodes])
+    nodes_by_word = collections.defaultdict(list)
+    for child_path, child in children.items():
+        steps = _spine_steps(child_path)
+        node = _tree_node(
+            _tree_node_id(steps), parent_id,
+            _step_payload(steps[-1], answer_set), len(steps),
+            " ".join(value for step in steps
+                     for value in (step.word.upper(), step.pattern)))
+        if child["row"] is not None:
+            _tree_node_row(node, child["row"])
+        node["subtree_worker_count"] = child["subtree_worker_count"]
+        node["child_count"] = child["child_count"]
+        node["has_children"] = child["child_count"] > 0
+        nodes_by_word[steps[-1].word].append(node)
+    page_nodes = []
+    for key in page_keys:
+        if key in pathless_nodes:
+            page_nodes.append(pathless_nodes[key])
+        else:
+            page_nodes.extend(sorted(
+                nodes_by_word[key],
+                key=lambda node: (node["step"]["pattern"],
+                                  node["branch_key_hex"] or "")))
     return {
         "root": _branch_target_payload(request.branch_target),
         "topology_source": "queue",
@@ -3164,10 +3176,30 @@ def _tree_layout(rows, request, prefix, unfiltered_rows, answer_set):
             "cursor": request.tree_cursor,
             "page_size": page_size,
             "returned_group_count": len(page_keys),
-            "total_group_count": len(grouped_nodes),
+            "total_group_count": total_group_count,
             "next_cursor": next_cursor,
         },
     }
+
+
+def _tree_filters(queue, request):
+    """The queue filters a tree request selects its rows by, and its prefix."""
+    scope, prefix = _branch_target_queue_scope(request.branch_target, queue)
+    filters = _filters_payload(replace(request.filters, limit=None))
+    filters.update(scope)
+    if request.tree_parent:
+        filters["spine_prefix"] = request.tree_parent
+    if request.worker_id is not None:
+        filters["branch_keys"] = [
+            bytes(row["current_branch_key"])
+            for row in queue.heartbeats_with_branch()
+            if row["current_branch_key"] is not None
+            and (
+                row["worker_id"] == request.worker_id
+                or _worker_number(row["worker_id"]) == request.worker_id
+            )
+        ]
+    return filters, prefix
 
 
 def collect_tree_report(sources: ReportOpeners, request: ReportRequest) -> dict:
@@ -3191,31 +3223,11 @@ def collect_tree_report(sources: ReportOpeners, request: ReportRequest) -> dict:
     queue = None
     try:
         queue = _open_report_queue(sources)
-        filtered_rows, prefix = _scoped_queue_rows(queue, request, True)
-        unfiltered_rows = filtered_rows
-        if request.branch_target.kind in ("branch", "branch_reference"):
-            unfiltered_rows, _ = _scoped_queue_rows(queue, request, False)
-        if request.worker_id is not None:
-            selected_branch_keys = {
-                bytes(row["current_branch_key"]).hex()
-                for row in queue.heartbeats_with_branch()
-                if row["current_branch_key"] is not None
-                and (
-                    row["worker_id"] == request.worker_id
-                    or _worker_number(row["worker_id"]) == request.worker_id
-                )
-            }
-            filtered_rows = [
-                row for row in filtered_rows
-                if row["branch_key_hex"] in selected_branch_keys
-            ]
-            unfiltered_rows = [
-                row for row in unfiltered_rows
-                if row["branch_key_hex"] in selected_branch_keys
-            ]
-        data.update(_tree_layout(
-            list(filtered_rows), request, prefix, unfiltered_rows, answer_set
-        ))
+        # The words are read before the branches beneath them, so the two
+        # reads must see one queue.
+        queue.begin_read_snapshot()
+        filters, prefix = _tree_filters(queue, request)
+        data.update(_tree_layout(queue, filters, request, prefix, answer_set))
         _mark_queue_opener_ok(report)
     except (sqlite3.Error, OSError) as error:
         _mark_queue_opener_error(report, error)

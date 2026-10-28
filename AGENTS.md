@@ -348,8 +348,17 @@ a few hundred openers stopped reports there, and must not come back:
   and every group from every membership was 4.0-4.9 s per poll at 9,400
   unfinished openers; this is about 0.8-1.2 s, most of it that one pass.
 
-The tree views still read every queue row, about 8 s today and 32 s at full
-depth; computing a tree page in SQL is the remaining step.
+- **A tree page reads only its own words' branches.**  A page groups a
+  node's children by guess word, so it is chosen from the distinct words
+  beneath the node -- at most the vocabulary, however many branches sit
+  under them -- and only the page's words have their branches reduced in
+  SQL, to a row per child (`report_tree_child_words`,
+  `report_tree_child_nodes`).  A cold row is one step, its opener and
+  pattern, so it can stand only directly under the root and is reached
+  through its opener column, never through a path computed for each of
+  them.  Building every node from every matched row to keep one page was
+  30-35 s per request for the root at 600,000 branches; this is about 1 s.
+  The two reads share one queue snapshot.
 
 ### The coordination window feeds the publish threshold
 
