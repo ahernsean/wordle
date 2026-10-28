@@ -3207,13 +3207,15 @@ def _tree_filters(queue, request):
     filters.update(scope)
     if request.tree_parent:
         filters["spine_prefix"] = request.tree_parent
-    if request.worker_id is not None:
+    # The Workers tree is the tree of the branches its workers are on.
+    if request.worker_id is not None or request.report_kind == "workers":
         filters["branch_keys"] = [
             bytes(row["current_branch_key"])
             for row in queue.heartbeats_with_branch()
             if row["current_branch_key"] is not None
             and (
-                row["worker_id"] == request.worker_id
+                request.worker_id is None
+                or row["worker_id"] == request.worker_id
                 or _worker_number(row["worker_id"]) == request.worker_id
             )
         ]

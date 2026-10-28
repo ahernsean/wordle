@@ -676,6 +676,24 @@ class ReportClientContract:
             " document.documentElement.clientWidth]"
         ))
 
+    def test_tree_row_facts_agree_with_a_count_of_one(self):
+        self.page.evaluate("""async () => {
+          const report=await (await fetch('/api/view/queue?tree=1')).json();
+          report.data.nodes=[{...report.data.nodes[0],answer_count:1,worker_count:1,
+            has_children:true,child_count:1,subtree_worker_count:1}];
+          report.data.paging={parent_spine:'',cursor:null,page_size:10,
+            returned_group_count:1,total_group_count:1,next_cursor:null};
+          applyReport(report,null,parsePageState({search:'?kind=queue&tree=1'}));
+        }""")
+        group = self.page.locator("ul.tree > li.word-group").first
+        group.locator("> details > summary").click()
+        facts = group.locator("ul.patterns > li .inline-facts").first
+        texts = [" ".join(text.split())
+                 for text in facts.locator("> span").all_inner_texts()]
+        for fact in ("1 answer", "1 worker", "1 child branch",
+                     "1 worker in subtree"):
+            self.assertIn(fact, texts)
+
     def test_word_group_click_builds_full_branch_spine(self):
         self.apply_branch_target("CACHE")
         self.page.wait_for_selector("text=word report")
@@ -6312,16 +6330,10 @@ class ReportClientContract:
         self.assertEqual(self.page.evaluate(
             "() => __reportClient.getState().branch_status"), ["done"])
         # Flat and Tree are one view: the toggle keeps its filters.
-        self.page.locator("[data-kind=auto][data-overview]").click()
-        self.page.wait_for_function(
-            "() => __reportClient.getState().branch_target === ''")
-        before = self.page.evaluate(
-            "() => __reportClient.getState().branch_status")
-        self.assertEqual(before, ["evaluating", "finalizing"])
-        self.page.evaluate("""() => __reportClient.setState(
-          {...__reportClient.getState(), tree: true})""")
+        self.page.locator("#layout-tree").click()
+        self.page.wait_for_function("() => __reportClient.getState().tree")
         self.assertEqual(self.page.evaluate(
-            "() => __reportClient.getState().branch_status"), before)
+            "() => __reportClient.getState().branch_status"), ["done"])
 
     def test_an_overview_filter_chosen_on_the_overview_is_kept(self):
         self.page.evaluate("""() => __reportClient.setState(
@@ -7542,6 +7554,17 @@ class ReportClientContract:
                 "() => __reportClient.getState().finalization_cursor"),
             "")
 
+    def test_a_tree_asked_of_the_overview_opens_the_overview(self):
+        self.page.goto(self.base_url + "?tree=1")
+        self.page.wait_for_selector("text=overview report")
+        state = self.page.evaluate("() => __reportClient.getState()")
+        self.assertFalse(state["tree"])
+        self.assertEqual(state["branch_status"], ["evaluating", "finalizing"])
+        self.assertEqual(
+            self.page.locator("[data-overview]").get_attribute("aria-current"),
+            "page")
+        self.assertTrue(self.page.locator("#layout-toggle").is_hidden())
+
     def test_work_distribution_offers_no_tree_layout(self):
         self.open_work_distribution()
         self.assertTrue(self.page.locator("#layout-toggle").is_hidden())
@@ -8305,9 +8328,10 @@ class ReportClientContract:
         toggle = self.page.locator("#layout-toggle")
         flat = self.page.locator("#layout-flat")
         tree = self.page.locator("#layout-tree")
-        self.assertTrue(toggle.is_visible())
-        # Cache, hotspots, leaderboard, and sources have no branch topology, so
-        # the layout switch is hidden entirely rather than shown-but-inert.
+        # The overview, cache, hotspots, leaderboard, and sources have no branch
+        # topology, so the layout switch is hidden entirely rather than
+        # shown-but-inert.
+        self.assertFalse(toggle.is_visible())
         for treeless in ("cache", "hotspots", "leaderboard", "openers"):
             self.page.locator(f"[data-kind={treeless}]").click()
             self.page.wait_for_selector(f"text={treeless} report")

@@ -677,6 +677,35 @@ class ReportModelTest(unittest.TestCase):
                          ["SALET -----"])
         self.assertEqual(report["data"]["nodes"][0]["worker_count"], 1)
 
+    def test_workers_tree_holds_only_the_branches_workers_are_on(self):
+        rows = [self._tree_row("SALET -----", ["salet"]),
+                self._tree_row("CRANE -----", ["crane"]),
+                self._tree_row("RAISE -----", ["raise"])]
+        queue = self._open_queue()
+        write_tree_rows(queue, rows)
+        queue.heartbeat("worker-2", 2, rows[0]["branch_key"], 1,
+                        int(time.time()), 0)
+        queue.heartbeat("worker-3", 3, rows[2]["branch_key"], 1,
+                        int(time.time()), 0)
+        queue.close()
+        request = ReportRequest(report_kind="workers", tree=True)
+        with patch("report_model._decorative_answer_set",
+                   return_value=set(ANSWERS)):
+            report = report_model.collect_tree_report(self.sources, request)
+        self.assertEqual(
+            sorted(node["spine"] for node in report["data"]["nodes"]),
+            ["RAISE -----", "SALET -----"])
+
+    def test_workers_tree_with_no_workers_is_empty(self):
+        queue = self._open_queue()
+        write_tree_rows(queue, [self._tree_row("SALET -----", ["salet"])])
+        queue.close()
+        with patch("report_model._decorative_answer_set",
+                   return_value=set(ANSWERS)):
+            report = report_model.collect_tree_report(
+                self.sources, ReportRequest(report_kind="workers", tree=True))
+        self.assertEqual(report["data"]["nodes"], [])
+
     def test_branch_target_queue_scopes_and_row_matching_cover_each_target_kind(self):
         branch_key = ScoreCache.encode_subset(["salet"])
         queue = Mock()
@@ -5474,6 +5503,7 @@ class TreePageMatchesTheReferenceTest(unittest.TestCase):
                 ReportRequest(report_kind="queue", tree=True, worker_id="1"),
                 ReportRequest(report_kind="queue", tree=True,
                               worker_id="worker-404"),
+                ReportRequest(report_kind="workers", tree=True),
                 ReportRequest(tree=True, branch_target=parse_report_branch_target(
                     "SALET")),
                 ReportRequest(tree=True, branch_target=parse_report_branch_target(
