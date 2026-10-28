@@ -1075,7 +1075,7 @@ class OverviewRendererTest(unittest.TestCase):
         self.assertIn("epoch=17", output)
         self.assertIn("window=whole epoch", output)
         self.assertIn("scanned in 10.4s", output)
-        for label in ("<=2s", "2-30s", "30-300s", "300-3,600s", ">3,600s"):
+        for label in ("<=2s", "2-30s", "30s-5m", "5m-1h", ">1h"):
             with self.subTest(label=label):
                 self.assertIn(label, output)
         self.assertIn("39,332", output)
@@ -3503,15 +3503,15 @@ class WorkDistributionCommandEndToEndTest(unittest.TestCase):
         self.assertIn("Population: epoch_finalized_branches", text)
         band_rows = {
             line.split()[0]: line.split()
-            for line in text.splitlines() if line.startswith(("<=", "2-", "30-",
-                                                              "300-", ">3"))
+            for line in text.splitlines() if line.startswith(("<=", "2-", "30s",
+                                                              "5m", ">1"))
         }
         # 20 claims of 20 ms is 400 ms of worker time; 2 claims of 350 s is
         # 700 s.  Claim count and band are independent.  Coord/work sits in the
         # second column so an 80-column terminal cannot drop it, and the branch
         # count follows it.
         self.assertEqual(band_rows["<=2s"][2], "1")
-        self.assertEqual(band_rows["300-3,600s"][2], "1")
+        self.assertEqual(band_rows["5m-1h"][2], "1")
         self.assertEqual(band_rows["2-30s"][2], "0")
 
     def test_json_output_round_trips_the_bands_and_their_shares(self):

@@ -7355,7 +7355,7 @@ class ReportClientContract:
             "table.work-distribution tbody tr td:first-child"
         ).all_inner_texts()
         self.assertEqual(
-            labels, ["<=2s", "2-30s", "30-300s", "300-3,600s", ">3,600s"])
+            labels, ["<=2s", "2-30s", "30s-5m", "5m-1h", ">1h"])
         text = self.page.locator("#report").inner_text()
         self.assertIn("finalized branches", text)
         self.assertNotIn("epoch_finalized_branches", text)
