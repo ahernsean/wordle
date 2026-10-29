@@ -1240,7 +1240,8 @@
       meta.append(element("h1","",report.report_kind+" report"));
       // A report with no target covers everything, so its header names none.
       if((report.report_kind!=="branch"||report.tree)&&state.branch_target)meta.append(branchTargetLabel(report,state));
-      meta.append(element("span","dim","sorted by "+activeSortLabel(state)));
+      // A branch report lists nothing in the order the sort control sets.
+      if(report.report_kind!=="branch")meta.append(element("span","dim","sorted by "+activeSortLabel(state)));
       // A report served from revalidation is not refreshed by the poll: its
       // data is as old as the last time its signal moved.  Saying so is the
       // difference between a reader trusting a two-second cadence the screen
@@ -1858,10 +1859,10 @@
     }
     function renderResponseTreeLevel(report,wordSpine,state){
       const data=report.data||{},rows=data.response_groups||[],fragment=document.createDocumentFragment();
-      const list=element("ul","tree response-tree"),showAll=expandedResponseTreeLevels.has(wordSpine);
-      for(const row of showAll?rows:rows.slice(0,RESPONSE_TREE_PAGE_SIZE))list.append(responseTreeItem(row,wordSpine,data.word,data.word_is_answer,state));
+      const list=element("ul","tree response-tree"),showAll=expandedResponseTreeLevels.has(wordSpine),pageSize=state.limit||RESPONSE_TREE_PAGE_SIZE;
+      for(const row of showAll?rows:rows.slice(0,pageSize))list.append(responseTreeItem(row,wordSpine,data.word,data.word_is_answer,state));
       fragment.append(list);
-      if(!showAll&&rows.length>RESPONSE_TREE_PAGE_SIZE){
+      if(!showAll&&rows.length>pageSize){
         const more=element("button","","Show all "+countNoun(rows.length,"response group","response groups"));
         more.addEventListener("click",()=>{expandedResponseTreeLevels.add(wordSpine);const host=more.closest(".tree-children,.response-tree-host");if(host)fillResponseTree(host,wordSpine,state);});
         fragment.append(more);
@@ -1993,15 +1994,21 @@
       }
       fragment.append(spineSection?sectionPair(spineSection,identitySection):identitySection);
       const bundleSummary=data.bundle_summary||{};
-      const queueFacts=data.queue?[["status",data.queue.branch_status],["worker",data.queue.branch_worker_status],["priority",data.queue.priority],["budget",data.queue.budget],["best",bestGuessCell(data.queue)||"none yet"],["ERD ceiling",erdText(data.queue,"ceiling")],["nodes",data.queue.search_node_count],...(bundleSummary.wall_time_millis?[['wall time',formatDuration(bundleSummary.wall_time_millis/1000)]]:[])]:null;
+      // The best, ceiling and node count live on the branch's active row, which a
+      // finalized branch no longer has; its result is the cache's to report.
+      const liveQueueRow=!!data.queue?.active_status;
+      const queueFacts=data.queue?[["status",data.queue.branch_status],["worker",data.queue.branch_worker_status],["priority",data.queue.priority],["budget",data.queue.budget],...(liveQueueRow?[["best",bestGuessCell(data.queue)||"none yet"],["ERD ceiling",erdText(data.queue,"ceiling")],["nodes",data.queue.search_node_count]]:[]),...(bundleSummary.wall_time_millis?[['wall time',formatDuration(bundleSummary.wall_time_millis/1000)]]:[])]:null;
       fragment.append(section("Queue",queueFacts?labeledFacts(queueFacts):element("p","empty","No current queue state")));
       const claimSummary=data.claim_summary||{};
       // The guess this branch is played with, and the response groups it
       // splits the branch into: the cache's exact result once there is one,
-      // and the swarm's best so far until then.
-      {const cache=data.cache||{},queueState=data.queue||{},exactGuess=cache.cache_state==="exact"?cache.best_guess:null,liveGuess=exactGuess?null:queueState.best_guess,branchSpine=spineText(data.branch?.spine||[]),bestSection=element("div","best-guess");
-       if((exactGuess||liveGuess)&&branchSpine){const guess=(exactGuess||liveGuess).toUpperCase(),line=element("p","");line.append(exactGuess?bestGuessCell(cache):wordErdCell(wordTiles(liveGuess,null,queueState.best_guess_is_answer),queueState,"best_erd"));if(liveGuess)line.append(" ",element("span","chip","provisional"));const host=element("div","response-tree-host");fillResponseTree(host,branchSpine+" "+guess,state);bestSection.append(line,host);}
-       else bestSection.append(element("p","dim",queueState.status==="open"?"No candidate fully evaluated yet":"Not solved yet"));
+      // and the swarm's best so far until then.  Its state is the one the
+      // branch's own row shows in a response-group tree.
+      {const cache=data.cache||{},queueState=data.queue||{},branch=data.branch||{},spine=branch.spine||[],lastStep=spine[spine.length-1],exactGuess=cache.cache_state==="exact"?cache.best_guess:null,liveGuess=exactGuess?null:queueState.best_guess,branchSpine=spineText(spine),bestSection=element("div","best-guess");
+       const lineState=responseGroupState({cache_state:cache.cache_state,answer_count:branch.answer_count,branch_status:branch.branch_status});
+       if(branch.answer_count===1){bestSection.append(element("p","",lastStep?.pattern==="ggggg"?"solved · nothing left to guess":"solved · one answer left, guessed next"));}
+       else if((exactGuess||liveGuess)&&branchSpine){const guess=(exactGuess||liveGuess).toUpperCase(),line=element("p",""),depth=exactGuess?cache.max_remaining_depth:queueState.best_max_remaining_depth;line.append(exactGuess?bestGuessCell(cache):wordErdCell(wordTiles(liveGuess,null,queueState.best_guess_is_answer),queueState,"best_erd"));if(depth!==null&&depth!==undefined)line.append(" · max remaining depth "+depth);line.append(" · "+lineState);if(liveGuess)line.append(" ",element("span","chip","provisional"));const host=element("div","response-tree-host");fillResponseTree(host,branchSpine+" "+guess,state);bestSection.append(line,host);}
+       else bestSection.append(element("p","dim",lineState==="in progress"?"in progress · no candidate fully evaluated yet":lineState));
        fragment.append(section("Best guess",bestSection));}
       if(data.queue&&data.queue.candidate_count){const liveWorkers=(data.workers||[]).filter(worker=>worker.is_live);const candidateFacts=[["candidates",formatInteger(data.queue.completed_candidate_count)+"/"+formatInteger(data.queue.candidate_count)+" ="],["evaluated",claimSummary.evaluated_count||0],["+ one-level ERD prunes",data.queue.one_level_erd_pruned_candidate_count??data.queue.bulk_completed_candidate_count],["+ two-level ERD prunes",data.queue.two_level_erd_pruned_candidate_count??0],...(claimSummary.provenance_unknown_count?[["+ unattributed",claimSummary.provenance_unknown_count]]:[])];const candidateStatusFacts=[...(claimSummary.in_flight_count?[["in flight",claimSummary.in_flight_count]]:[])],candidateETAFacts=[];const candidateETA=data.candidate_eta;if(candidateETA?.state==="ready"||candidateETA?.state==="rough"){const etaDataMinutes=Math.round(candidateETA.sample_duration_seconds/60),etaWorkers=candidateETA.worker_count_changed?"; scaling "+candidateETA.sample_worker_count+"→"+candidateETA.current_worker_count+" workers":"";candidateETAFacts.push([(candidateETA.state==="rough"?"Rough ETA":"ETA")+" ("+etaDataMinutes+" min data"+etaWorkers+")","~"+formatDuration(candidateETA.estimated_seconds)]);candidateETAFacts.push(["ETA work remaining","checks "+numText(candidateETA.remaining_inspection_count)+" · full evals ~"+numText(candidateETA.expected_full_evaluation_count)]);}else if(candidateETA?.state==="learning")candidateETAFacts.push(["ETA","learning: first 3 min of current work sample"]);const republishedList=data.republished_candidates||[];if(republishedList.length)candidateStatusFacts.push(["candidates re-queued",numText(republishedList.length)+" (up to "+Math.max(...republishedList.map(row=>row.republish_count))+"× each)"]);if(claimSummary.worker_contributions?.length)candidateStatusFacts.push(["worker evals",claimSummary.worker_contributions.map(row=>workerName({worker_id:row.worker_id})+":"+numText(row.done_count)).join(" ")]);const candidates=element("div");candidates.append(sweepStrip(data.queue.candidate_count,data.completed_candidate_bitmap,liveWorkers,previousBy(previous,"workers","worker_id")),labeledFacts(candidateFacts));if(candidateStatusFacts.length)candidates.append(labeledFacts(candidateStatusFacts));for(const fact of candidateETAFacts)candidates.append(labeledFacts([fact]));fragment.append(section("Candidates",candidates));}
       // Live workers sits directly under Candidates: they are the two panels
@@ -2054,7 +2061,7 @@
           const scheduleFacts=[];
           if(row.winner_best_first_rank!==null&&row.winner_best_first_rank!==undefined){
             scheduleFacts.push("winner ranked "+numText(row.winner_best_first_rank));
-            if(row.candidates_completed_before_winner!==null&&row.candidates_completed_before_winner!==undefined)scheduleFacts.push(numText(row.candidates_completed_before_winner)+" candidates completed first");
+            if(row.candidates_completed_before_winner!==null&&row.candidates_completed_before_winner!==undefined)scheduleFacts.push(countNoun(row.candidates_completed_before_winner,"candidate","candidates")+" completed first");
             if(row.weakest_best_first_rank_before_winner!==null&&row.weakest_best_first_rank_before_winner!==undefined)scheduleFacts.push("weakest of them ranked "+numText(row.weakest_best_first_rank_before_winner));
           }
           if(row.winner_republish_count)scheduleFacts.push("winner republished "+numText(row.winner_republish_count)+"\u00d7");

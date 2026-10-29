@@ -818,6 +818,79 @@ class ReportClientContract:
         self.page.wait_for_timeout(200)
         self.assertTrue(any("RAISE" in url and "SLATE" in url for url in requested))
 
+    def _show_branch_report(self, edit):
+        def edited(route):
+            report = route.fetch().json()
+            edit(report["data"])
+            route.fulfill(json=report)
+
+        self.page.route("**/api/view?*branch_target=RAISE*.....*", edited)
+        self.apply_branch_target("RAISE .....")
+        self.page.wait_for_selector("section:has-text('Identity')")
+        return self.page.locator(
+            "section", has=self.page.locator("h2", has_text="Best guess"))
+
+    def test_a_one_answer_branch_is_solved_by_the_answer(self):
+        def one_answer(pattern):
+            def edit(data):
+                data["branch"].update(answer_count=1, spine=[
+                    {"word": "raise", "pattern": "-----", "word_is_answer": False},
+                    {"word": "vowed", "pattern": pattern, "word_is_answer": True}])
+                data["cache"].update(cache_state="not_applicable", best_guess=None,
+                                     best_erd=None, max_remaining_depth=None)
+                data["queue"] = None
+            return edit
+
+        section = self._show_branch_report(one_answer("ggggg"))
+        self.assertEqual(" ".join(section.locator("p").inner_text().split()),
+                         "solved · nothing left to guess")
+        self.page.unroute("**/api/view?*branch_target=RAISE*.....*")
+        section = self._show_branch_report(one_answer("-gggg"))
+        self.page.evaluate("__reportClient.fetchReport()")
+        section.locator("p", has_text="one answer left").wait_for()
+
+    def test_branch_best_guess_names_its_state_and_depth(self):
+        section = self._show_branch_report(lambda data: None)
+        line = " ".join(section.locator("p").first.inner_text().split())
+        self.assertTrue(line.startswith("CRANE"))
+        self.assertTrue(line.endswith("· solved"))
+
+    def test_a_finalized_branch_reports_no_live_best_in_its_queue_facts(self):
+        queue = self.page.locator(
+            "section", has=self.page.locator("h2", has_text="Queue"))
+        self._show_branch_report(lambda data: data["queue"].update(active_status=None))
+        text = " ".join(queue.inner_text().split())
+        self.assertIn("status done", text)
+        self.assertNotIn("best", text)
+        self.assertNotIn("nodes", text)
+        self.page.unroute("**/api/view?*branch_target=RAISE*.....*")
+        self._show_branch_report(lambda data: data["queue"].update(active_status="open"))
+        self.page.evaluate("__reportClient.fetchReport()")
+        queue.locator("text=nodes").wait_for()
+        self.assertIn("12,000", queue.inner_text())
+
+    def test_branch_report_header_names_no_sort(self):
+        self._show_branch_report(lambda data: None)
+        self.assertNotIn("sorted by", self.page.locator(".report-meta").inner_text())
+
+    def test_finalization_counts_agree_with_their_noun(self):
+        def one_first(data):
+            for row in data["recent_finalizations"]:
+                row.update(winner_best_first_rank=2,
+                           candidates_completed_before_winner=1)
+        self._show_branch_report(one_first)
+        text = " ".join(self.page.locator("#report").inner_text().split())
+        self.assertIn("1 candidate completed first", text)
+        self.assertNotIn("1 candidates", text)
+
+    def test_best_guess_list_pages_by_the_report_limit(self):
+        self.page.goto(self.base_url + "?branch_target=RAISE%20-----&limit=2")
+        section = self.page.locator(
+            "section", has=self.page.locator("h2", has_text="Best guess"))
+        section.locator("ul.response-tree > li").first.wait_for()
+        self.assertEqual(section.locator("ul.response-tree > li").count(), 2)
+        self.assertEqual(section.locator("button", has_text="Show all").count(), 1)
+
     def test_word_group_click_builds_full_branch_spine(self):
         self.apply_branch_target("CACHE")
         self.page.wait_for_selector("text=word report")
@@ -4746,7 +4819,7 @@ class ReportClientContract:
           return document.querySelector('#report').innerText;
         }""")
         self.assertIn("winner ranked 46", text)
-        self.assertIn("4,900 candidates completed first", text)
+        self.assertIn("4,900\u00a0candidates completed first", text)
         self.assertIn("weakest of them ranked 7,795", text)
         self.assertIn("winner republished 1\u00d7", text)
         self.assertIn("5,305 (up to 3\u00d7 each)", text)
