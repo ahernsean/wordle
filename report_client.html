@@ -2021,7 +2021,7 @@
       // branch's own row shows in a response-group tree.
       {const cache=data.cache||{},queueState=data.queue||{},branch=data.branch||{},spine=branch.spine||[],lastStep=spine[spine.length-1],exactGuess=cache.cache_state==="exact"?cache.best_guess:null,liveGuess=exactGuess?null:queueState.best_guess,branchSpine=spineText(spine),bestSection=element("div","best-guess");
        const lineState=responseGroupState({cache_state:cache.cache_state,answer_count:branch.answer_count,branch_status:branch.branch_status});
-       if(branch.answer_count===1){bestSection.append(element("p","",lastStep?.pattern==="ggggg"?"solved · nothing left to guess":"solved · one answer left, guessed next"));}
+       if(branch.answer_count===1){bestSection.append(element("p","",lastStep?.pattern==="ggggg"?"solved · won on guess "+numText(spine.length):"solved · one answer left, guessed next"));}
        else if((exactGuess||liveGuess)&&branchSpine){const guess=(exactGuess||liveGuess).toUpperCase(),line=element("p",""),depth=exactGuess?cache.max_remaining_depth:queueState.best_max_remaining_depth;line.append(exactGuess?bestGuessCell(cache):wordErdCell(wordTiles(liveGuess,null,queueState.best_guess_is_answer),queueState,"best_erd"));if(depth!==null&&depth!==undefined)line.append(" · max remaining depth "+depth);line.append(" · "+lineState);if(liveGuess)line.append(" ",element("span","chip","provisional"));const host=element("div","response-tree-host");fillResponseTree(host,branchSpine+" "+guess,state);bestSection.append(line,host);}
        else bestSection.append(element("p","dim",lineState==="in progress"?"in progress · no candidate fully evaluated yet":lineState));
        fragment.append(section("Best guess",bestSection));}

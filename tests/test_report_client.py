@@ -926,7 +926,7 @@ class ReportClientContract:
 
         section = self._show_branch_report(one_answer("ggggg"))
         self.assertEqual(" ".join(section.locator("p").inner_text().split()),
-                         "solved · nothing left to guess")
+                         "solved · won on guess 2")
         self.page.unroute("**/api/view?*branch_target=RAISE*.....*")
         section = self._show_branch_report(one_answer("-gggg"))
         self.page.evaluate("__reportClient.fetchReport()")
