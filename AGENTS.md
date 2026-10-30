@@ -384,6 +384,18 @@ a few hundred openers stopped reports there, and must not come back:
   30-35 s per request for the root at 600,000 branches; this is about 1 s.
   The two reads share one queue snapshot.
 
+- **A filter's counts come from the aggregate the report already runs.**
+  Each status checkbox shows how many items checking it would list: its
+  facet counted under every filter but its own.  The queue's status
+  summary is one `GROUP BY (branch_status, branch_worker_status)`, so it
+  runs with both status conditions lifted, and the summary and every
+  facet are reduced in Python from its seven rows at most.  Lifting the
+  status filter makes an in-flight view count the cold branches, about
+  0.3 s at full depth; the Overview offers only the in-flight statuses
+  (`facet_statuses`), so it never does.  A report that lists rows
+  already in memory -- a word's response groups, the openers -- counts
+  them before its status filter.
+
 ### The coordination window feeds the publish threshold
 
 `_BranchWorker._last_claim_complete` is the origin of the **coordination
