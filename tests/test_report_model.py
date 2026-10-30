@@ -2043,6 +2043,35 @@ class ReportModelTest(unittest.TestCase):
         self.assertEqual(groups()[first["pattern"]],
                          ("evaluating", 1, "working"))
 
+    def test_word_report_carries_the_live_best_of_a_group_still_open(self):
+        target = parse_report_branch_target("bebop")
+        first, second = collect_report(
+            self.sources, ReportRequest(branch_target=target)
+        )["data"]["response_groups"]
+        first_key = bytes.fromhex(first["branch_key_hex"])
+        second_key = bytes.fromhex(second["branch_key_hex"])
+
+        def live_bests():
+            return {
+                row["pattern"]: (row["live_best_guess"], row["live_best_erd"])
+                for row in collect_report(
+                    self.sources, ReportRequest(branch_target=target)
+                )["data"]["response_groups"]
+            }
+
+        self.assertEqual(live_bests(), {first["pattern"]: (None, None),
+                                        second["pattern"]: (None, None)})
+        queue = self._open_queue()
+        queue.create_branch(first_key, 2, 5, budget=5)
+        queue.create_branch(second_key, 2, 5, budget=5)
+        queue.update_branch_best(first_key, "CIGAR", 1.5, 2, budget=5)
+        queue.update_branch_best(second_key, "REBUT", 1.5, 2, budget=5)
+        self.assertTrue(queue.try_finalize_branch(second_key))
+        queue.close()
+        # A finalizing branch's best is the cache's to report, not the queue's.
+        self.assertEqual(live_bests(), {first["pattern"]: ("cigar", 1.5),
+                                        second["pattern"]: (None, None)})
+
     def test_word_report_ignores_a_queued_opener_group_at_another_budget(self):
         # TRACE's top-level group y-g-g (slate, plate, stale) is queued at the
         # budget one below the root.  The report at CRANE --g-g TRACE reaches
