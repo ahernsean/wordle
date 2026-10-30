@@ -84,9 +84,18 @@ first-call JIT compile would land inside the measurement.
 
 `worker_time.wait_dependency_time_millis` totals the time workers spend in
 `cooperative_solve` waiting on a dependency, less what they evaluate, scan and
-claim while there, without saying which dependency or why — and waiting on dependencies is the
-swarm's largest single cost (61.5% of all worker time on epoch 21, against 3.4%
-for the scan and 2.3% for lock waits).
+claim while there, without saying which dependency or why.
+
+**It is a small cost, not the largest one.** Over epoch 25 (whole sweep
+queued, 2,710 worker-hours) `worker_time` charges 71.6% of worker time to
+evaluation, 13.4% to scheduling, 7.0% to claiming, 3.3% to finalizing, 3.6% to
+other, and
+1.17% to `wait_dependency`; every other wait together is under 0.1%.  Epochs
+23 and 24 agree (1.25%, 1.07%).  The 61.5% once quoted for epoch 21 was
+`idle_millis`, a residual of everything the per-claim phases did not measure,
+which grew through a run and reset on restart; it was never an attribution
+to dependency waiting, and the partition that replaced it puts waiting at
+about 1%.
 
 `telemetry.dependency_wait` carries one row per `cooperative_solve` episode that
 reached the wait loop: the dependency's spine, size and budget, how the episode
@@ -113,6 +122,15 @@ sleep count.** That is what `blocks_other` is for — a claim transaction can
 decline for reasons with no column of their own, and dropping those would leave
 `blocked_time_millis` holding time no counter accounts for. A counter that is a
 partition can be audited; a counter that is a selection cannot.
+
+**A counter counts sleeps, not time, and the sleeps are not one length.** A
+help-capped sleep is a single 50 ms poll, so a worker parked for a minute adds
+about 1,200 to `blocks_help_capped`, while one awaiting-finalize sleep covers a
+whole wait on a rival.  Compare the counters as reasons, never as shares of
+time; the time per reason is `worker_time`'s `wait_<reason>_time_millis`.  On
+epoch 25, 147,279 help-capped sleeps were 0.08% of worker time, and
+`blocks_worker_cap` was 1 sleep of 149,810: the cap is not what holds a
+waiting worker.
 
 **Every reason is reported by the code that decided it, never sampled
 afterwards.** The two claim outcomes come from `ERDQueue.last_claim_decline()`,
