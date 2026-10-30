@@ -489,7 +489,7 @@ class ReportClientContract:
         self.page.wait_for_selector("text=word report")
         self.apply_branch_target("CRANE .y..g")
         self.page.wait_for_selector("text=branch report")
-        self.assertEqual(self.page.locator("[data-kind]").count(), 8)
+        self.assertEqual(self.page.locator("[data-kind]").count(), 10)
         self.assertEqual(self.page.locator("text=Choose word or branch").count(), 0)
 
     def test_overview_nav_highlight_tracks_root_not_auto_kind(self):
@@ -502,33 +502,116 @@ class ReportClientContract:
         self.page.wait_for_selector("text=overview report")
         self.assertEqual(overview_button.get_attribute("aria-current"), "page")
 
-    def test_a_word_or_branch_report_has_its_own_current_tab(self):
-        target_tab = self.page.locator("#target-tab")
-        self.assertTrue(target_tab.is_hidden())
+    def current_tabs(self):
+        return [button.get_attribute("data-kind")
+                for button in self.page.locator('[data-kind][aria-current="page"]').all()]
+
+    def test_word_and_branch_tabs_are_always_present_and_track_the_report(self):
+        word_tab = self.page.locator('[data-kind="word"]')
+        branch_tab = self.page.locator('[data-kind="branch"]')
+        self.assertTrue(word_tab.is_visible())
+        self.assertTrue(branch_tab.is_visible())
+        self.assertEqual(self.current_tabs(), ["auto"])
         self.apply_branch_target("CRANE")
         self.page.wait_for_selector("text=word report")
-        self.assertTrue(target_tab.is_visible())
-        self.assertEqual(target_tab.inner_text(), "Word")
-        self.assertEqual(target_tab.get_attribute("aria-current"), "page")
-        self.assertEqual(
-            self.page.locator('[data-kind][aria-current="page"]').count(), 0)
+        self.assertEqual(self.current_tabs(), ["word"])
         self.page.locator("#layout-tree").click()
         self.page.wait_for_selector("ul.tree > li")
-        self.assertEqual(target_tab.get_attribute("aria-current"), "page")
+        self.assertEqual(self.current_tabs(), ["word"])
         self.page.locator("#layout-flat").click()
         self.apply_branch_target("CRANE .y..g")
         self.page.wait_for_selector("text=branch report")
-        self.assertEqual(target_tab.inner_text(), "Branch")
-        self.assertEqual(target_tab.get_attribute("aria-current"), "page")
+        self.assertEqual(self.current_tabs(), ["branch"])
+        # The Word tab reads the box: a branch's word is the guess that
+        # reached it.
+        word_tab.click()
+        self.page.wait_for_selector("text=word report")
+        self.assertEqual(
+            self.page.evaluate("() => __reportClient.getState()"),
+            {**self.page.evaluate("() => __reportClient.getState()"),
+             "kind": "auto", "branch_target": "CRANE"})
+        self.assertEqual(self.current_tabs(), ["word"])
+        branch_tab.click()
+        self.page.wait_for_selector(".target-prompt")
+        self.assertIn("CRANE ends in a word, not a response",
+                      self.page.locator(".target-prompt").inner_text())
+        self.assertEqual(self.current_tabs(), ["branch"])
         self.page.locator('[data-kind="openers"]').click()
         self.page.wait_for_selector("text=openers report")
-        self.assertTrue(target_tab.is_hidden())
-        self.assertEqual(
-            self.page.locator('[data-kind="openers"]').get_attribute("aria-current"),
-            "page")
+        self.assertEqual(self.current_tabs(), ["openers"])
+        self.assertTrue(word_tab.is_visible())
+        self.assertTrue(branch_tab.is_visible())
         self.page.locator("[data-overview]").click()
         self.page.wait_for_selector("text=overview report")
-        self.assertTrue(target_tab.is_hidden())
+        word_tab.click()
+        self.page.wait_for_selector(".target-prompt")
+        self.assertIn("Enter a word", self.page.locator(".target-prompt").inner_text())
+        self.assertEqual(self.current_tabs(), ["word"])
+        self.assertIn("kind=word", self.page.url)
+        branch_tab.click()
+        self.page.wait_for_selector("text=Enter a spine ending in a response")
+        self.assertEqual(self.current_tabs(), ["branch"])
+        self.apply_branch_target("CRANE .y..g")
+        self.page.wait_for_selector(".target-prompt", state="detached")
+        self.page.wait_for_selector("text=branch report")
+        self.assertEqual(self.current_tabs(), ["branch"])
+
+    def test_word_and_branch_tabs_take_a_target_typed_but_not_applied(self):
+        self.page.locator("#branch-target-input").fill("CRANE .y..g")
+        self.page.locator('[data-kind="branch"]').click()
+        self.page.wait_for_selector("text=branch report")
+        self.assertEqual(self.current_tabs(), ["branch"])
+        self.page.locator("#branch-target-input").fill("RAISE")
+        self.page.locator('[data-kind="word"]').click()
+        self.page.wait_for_function(
+            "() => __reportClient.getState().branch_target === 'RAISE'")
+        self.page.wait_for_selector("text=word report")
+        self.assertEqual(self.current_tabs(), ["word"])
+
+    def test_a_tab_prompt_returns_after_a_failed_request(self):
+        self.page.goto(self.base_url + "?kind=word")
+        self.page.wait_for_selector(".target-prompt")
+        self.page.route(
+            "**/api/view**",
+            lambda route: route.fulfill(
+                status=400, content_type="application/json",
+                body='{"error":{"kind":"invalid","message":"not a word"}}'))
+        self.apply_branch_target("ZZZZZ")
+        self.page.wait_for_selector("#report p.error")
+        self.page.go_back()
+        self.page.wait_for_selector(".target-prompt")
+        self.assertEqual(self.page.locator("#report p.error").count(), 0)
+
+    def test_word_and_branch_tabs_read_their_target_from_the_box(self):
+        result = self.page.evaluate("""() => {
+          const resolve=(kind,target)=>{
+            const state=parsePageState({search:'?'+new URLSearchParams({kind,branch_target:target})});
+            return [state.kind,state.branch_target];};
+          return {
+            wordOfWord: resolve('word','CRANE'),
+            wordOfBranch: resolve('word','CRANE .y..g'),
+            wordOfDeeperBranch: resolve('word','CRANE .y..g RAISE .....'),
+            wordOfDeeperWord: resolve('word','CRANE .y..g RAISE'),
+            wordOfReference: resolve('word','@abcd1234'),
+            wordOfNothing: resolve('word',''),
+            branchOfBranch: resolve('branch','CRANE .y..g'),
+            branchOfReference: resolve('branch','@abcd1234'),
+            branchOfWord: resolve('branch','CRANE'),
+            branchOfNothing: resolve('branch',''),
+          };
+        }""")
+        self.assertEqual(result, {
+            "wordOfWord": ["auto", "CRANE"],
+            "wordOfBranch": ["auto", "CRANE"],
+            "wordOfDeeperBranch": ["auto", "CRANE .y..g RAISE"],
+            "wordOfDeeperWord": ["auto", "CRANE .y..g RAISE"],
+            "wordOfReference": ["word", "@abcd1234"],
+            "wordOfNothing": ["word", ""],
+            "branchOfBranch": ["auto", "CRANE .y..g"],
+            "branchOfReference": ["auto", "@abcd1234"],
+            "branchOfWord": ["branch", "CRANE"],
+            "branchOfNothing": ["branch", ""],
+        })
 
     def test_positional_cache_queue_and_explicit_navigation_urls(self):
         result = self.page.evaluate("""() => ({
@@ -7326,6 +7409,7 @@ class ReportClientContract:
             "", "?kind=queue", "?kind=workers", "?kind=cache", "?kind=hotspots",
             "?kind=work_distribution",
             "?kind=leaderboard", "?kind=openers", "?kind=queue&tree=1",
+            "?kind=word", "?kind=branch&branch_target=CRANE",
             "?branch_target=RAISE+.....",
             "?branch_target=RAISE+.....&tree=1",
             # The word view carries the word-progress table, which is wider
