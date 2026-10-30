@@ -2867,29 +2867,128 @@ class TestQueueReportBuildsOnlyHotBranches(_TmpQueue):
                                       r"( AS \w+)? USING (COVERING )?INDEX \S+ \(\)")
 
 
+def _one_branch_per_report_status(queue):
+    """One branch in every state a report can name: queued, done, an
+    in-progress pending row, an open and a finalized active row, and a
+    cooperative branch with no pending row at all.  Returns their keys in
+    that order."""
+    keys = [ScoreCache.encode_subset(list(pair))
+            for pair in itertools.combinations(WORDS, 2)][:6]
+    assert len(set(keys)) == 6
+    queue.add_pending_many(
+        [(key, 3, 5, "crane", index) for index, key in enumerate(keys[:5])])
+    queued, done, in_progress, opened, finalized = keys[:5]
+    cooperative = keys[5]
+    ids = {key: queue._intern_branch(key) for key in keys}
+    ProductionERDQueue.mark_done(queue, done)
+    queue._conn.execute("UPDATE pending_branches SET status = 'in_progress' "
+                        "WHERE branch_id = ?", (ids[in_progress],))
+    for key in (opened, finalized, cooperative):
+        queue.create_branch(key, 3, N_CANDIDATES)
+    queue._conn.execute("UPDATE active_branches SET status = 'finalized' "
+                        "WHERE branch_id = ?", (ids[finalized],))
+    queue._conn.commit()
+    return keys
+
+
+class TestQueueReportFacetCounts(_TmpQueue):
+    """Each status filter's values are counted under every other filter."""
+
+    def setUp(self):
+        super().setUp()
+        (self.queued, self.done, self.in_progress, self.opened,
+         self.finalized, self.cooperative) = _one_branch_per_report_status(
+            self.q)
+        # A worker on the open branch makes it the one active branch; the
+        # in-progress, cooperative and finalized branches have none.
+        self.q.heartbeat("worker-0", pid=1, current_branch_key=self.opened,
+                         n_words=2, started_at=int(time.time()), claims_done=0)
+
+    def _facets(self, **filters):
+        return self.q.report_queue_rows(
+            ReportFilters(**filters), limit=1)["facet_counts"]
+
+    def test_no_filter_counts_every_branch_by_each_status(self):
+        self.assertEqual(self._facets(), {
+            "branch_status": {"queued": 1, "evaluating": 3,
+                              "finalizing": 1, "done": 1},
+            "branch_worker_status": {"active": 1, "waiting": 3},
+        })
+
+    def test_a_status_filter_does_not_narrow_its_own_counts(self):
+        # Checking "queued" must still say how many done branches checking
+        # "done" as well would add; it narrows only the worker counts.
+        facets = self._facets(branch_statuses=("queued",))
+        self.assertEqual(facets["branch_status"], {
+            "queued": 1, "evaluating": 3, "finalizing": 1, "done": 1})
+        self.assertEqual(facets["branch_worker_status"],
+                         {"active": 0, "waiting": 0})
+        facets = self._facets(branch_statuses=("finalizing",))
+        self.assertEqual(facets["branch_worker_status"],
+                         {"active": 0, "waiting": 1})
+
+    def test_a_worker_filter_narrows_the_status_counts(self):
+        facets = self._facets(branch_worker_statuses=("active",))
+        self.assertEqual(facets["branch_status"], {
+            "queued": 0, "evaluating": 1, "finalizing": 0, "done": 0})
+        self.assertEqual(facets["branch_worker_status"],
+                         {"active": 1, "waiting": 3})
+
+    def test_other_filters_narrow_every_count(self):
+        # Only the cooperative branch has no pending row to name the opener
+        # that queued it.
+        facets = self.q.report_queue_rows({"opener": "crane"}, limit=1)[
+            "facet_counts"]
+        self.assertEqual(facets, {
+            "branch_status": {"queued": 1, "evaluating": 2,
+                              "finalizing": 1, "done": 1},
+            "branch_worker_status": {"active": 1, "waiting": 2},
+        })
+
+    def test_the_summary_is_the_counts_both_filters_select(self):
+        result = self.q.report_queue_rows(ReportFilters(
+            branch_statuses=("evaluating", "done"),
+            branch_worker_statuses=("waiting",)))
+        self.assertEqual(result["summary"], {
+            "branch_count": 2,
+            "branch_count_by_status": {"evaluating": 2},
+            "branch_count_by_worker_status": {"waiting": 2},
+        })
+        self.assertEqual(result["matched_rows"], len(result["rows"]))
+
+    def test_a_facet_domain_offers_only_its_statuses(self):
+        result = self.q.report_queue_rows(
+            ReportFilters(branch_statuses=("evaluating", "finalizing")),
+            facet_statuses=("evaluating", "finalizing"))
+        self.assertEqual(result["facet_counts"]["branch_status"],
+                         {"evaluating": 3, "finalizing": 1})
+
+    def test_counts_needing_the_cold_branches_read_them(self):
+        # Without a facet domain, an in-flight filter still offers queued and
+        # done boxes, and their counts live only in the cold rows.
+        statements = []
+        self.q._conn.set_trace_callback(statements.append)
+        try:
+            self.q.report_queue_rows(
+                ReportFilters(branch_statuses=("evaluating", "finalizing")))
+        finally:
+            self.q._conn.set_trace_callback(None)
+        self.assertTrue(any("FROM cold_rows" in statement
+                            for statement in statements))
+
+    def test_facet_counts_alone_match_the_rows_report(self):
+        filters = ReportFilters(branch_statuses=("evaluating",),
+                                minimum_answer_count=2)
+        self.assertEqual(
+            self.q.report_queue_facet_counts(filters),
+            self.q.report_queue_rows(filters)["facet_counts"])
+
+
 class TestInProgressReportsReadOnlyInProgressBranches(_TmpQueue):
 
     def setUp(self):
         super().setUp()
-        # One branch in every state a report can name: queued, done, an
-        # in-progress pending row, an open and a finalized active row, and a
-        # cooperative branch with no pending row at all.
-        keys = [ScoreCache.encode_subset(list(pair))
-                for pair in itertools.combinations(WORDS, 2)][:6]
-        self.assertEqual(len(set(keys)), 6)
-        self.q.add_pending_many(
-            [(key, 3, 5, "crane", index) for index, key in enumerate(keys[:5])])
-        queued, done, in_progress, opened, finalized = keys[:5]
-        cooperative = keys[5]
-        ids = {key: self.q._intern_branch(key) for key in keys}
-        ProductionERDQueue.mark_done(self.q, done)
-        self.q._conn.execute("UPDATE pending_branches SET status = 'in_progress' "
-                             "WHERE branch_id = ?", (ids[in_progress],))
-        for key in (opened, finalized, cooperative):
-            self.q.create_branch(key, 3, N_CANDIDATES)
-        self.q._conn.execute("UPDATE active_branches SET status = 'finalized' "
-                             "WHERE branch_id = ?", (ids[finalized],))
-        self.q._conn.commit()
+        _one_branch_per_report_status(self.q)
 
     def _rows(self, statuses):
         result = self.q.report_queue_rows(
@@ -2916,12 +3015,14 @@ class TestInProgressReportsReadOnlyInProgressBranches(_TmpQueue):
     def test_an_in_progress_filter_starts_from_in_progress_rows(self):
         # The whole sweep's queue holds hundreds of thousands of pending rows
         # and a few dozen in progress; building every one to filter it away
-        # cost seconds per overview poll.
+        # cost seconds per overview poll.  The overview offers only the
+        # in-flight statuses as facets, so counting them reads no cold row.
         statements = []
         self.q._conn.set_trace_callback(statements.append)
         try:
             self.q.report_queue_rows(
-                ReportFilters(branch_statuses=("evaluating", "finalizing")))
+                ReportFilters(branch_statuses=("evaluating", "finalizing")),
+                facet_statuses=("evaluating", "finalizing"))
             self.q.overview_phase_counts()
         finally:
             self.q._conn.set_trace_callback(None)

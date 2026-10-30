@@ -124,6 +124,8 @@
     .statuses label { display:inline-flex; gap:.25rem; align-items:center; white-space:nowrap; }
     .statuses label[hidden] { display:none; }
     .statuses label.inert { opacity:.45; }
+    .statuses .facet-count { color:var(--dim); font-variant-numeric:tabular-nums; }
+    .statuses .facet-count:empty { display:none; }
     .conn-wrap { position:relative; margin-left:auto; }
     #connection { color:var(--green); padding:.1rem .3rem; white-space:nowrap; cursor:pointer; border-radius:4px; user-select:none; }
     #connection.disconnected { color:#ffffff; background:var(--red); border-radius:4px; }
@@ -3676,9 +3678,17 @@
       if(reportHasFocusedControl()||reportHasActiveSelection())return;
       applyReport(lastReport,lastReport,state);displayedState=state;renderOwed=false;
     }
+    // Each filter value shows how many items checking it would list, as the
+    // report counted them under every other filter.  A report that counts
+    // none leaves its boxes bare rather than showing another view's counts.
+    function showFacetCounts(report){
+      const facets=report.data.facet_counts||{};
+      document.querySelectorAll(".facet-count").forEach(span=>{const count=(facets[span.dataset.facet]||{})[span.dataset.value];span.textContent=Number.isInteger(count)?" ("+numText(count)+")":"";});
+    }
     function applyReport(report,previousReport,state){
       if(!report||report.schema_version!==SCHEMA_VERSION||!report.data||!report.sources)throw new Error("Unsupported or malformed report");
       report=overviewWithRecentCompletions(report,previousReport,state);
+      showFacetCounts(report);
       // A refresh landing mid-choreography ends it first, so the grid is
       // measured at rest rather than part-way through somebody else's animation.
       endGridTransitions();
@@ -3850,8 +3860,8 @@
          ||(lastReport&&lastContext===contextKey(currentState)));
     function schedulePoll(){clearTimeout(pollTimer);pollTimer=setTimeout(async()=>{if(!skipAutomaticScan())await fetchReport();schedulePoll();},currentState.poll);}
     function initialize(){
-      const addFilterControls=(containerId,names,dataName)=>{const container=byId(containerId);for(const name of names){const filterLabel=element("label"),input=element("input");input.type="checkbox";input.value=name;input.dataset[dataName]="1";filterLabel.append(input," "+name);container.append(filterLabel);}};
-      addFilterControls("branch-statuses",branchStatusNames,"branchStatus");addFilterControls("branch-worker-statuses",branchWorkerStatusNames,"branchWorkerStatus");addFilterControls("source-states",sourceStateNames,"sourceState");
+      const addFilterControls=(containerId,names,dataName,facet)=>{const container=byId(containerId);for(const name of names){const filterLabel=element("label"),input=element("input"),count=element("span","facet-count");input.type="checkbox";input.value=name;input.dataset[dataName]="1";count.dataset.facet=facet;count.dataset.value=name;filterLabel.append(input," "+name,count);container.append(filterLabel);}};
+      addFilterControls("branch-statuses",branchStatusNames,"branchStatus","branch_status");addFilterControls("branch-worker-statuses",branchWorkerStatusNames,"branchWorkerStatus","branch_worker_status");addFilterControls("source-states",sourceStateNames,"sourceState","opener_state");
       currentState=parsePageState(location);syncControls();
       byId("apply").addEventListener("click",()=>applyBranchTarget(readControls().branch_target));byId("branch-target-input").addEventListener("keydown",event=>{if(event.key==="Enter")byId("apply").click();});const targetInput=byId("branch-target-input");targetInput.addEventListener("input",syncTargetClear);byId("clear-target").addEventListener("click",()=>{targetInput.value="";syncTargetClear();targetInput.focus();applyBranchTarget("");});
       byId("layout-flat").addEventListener("click",()=>setState({...readControls(),tree:false}));

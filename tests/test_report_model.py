@@ -625,6 +625,11 @@ class ReportModelTest(unittest.TestCase):
                 "branch_count_by_status": {"evaluating": 1},
                 "branch_count_by_worker_status": {"active": 1},
             },
+            "facet_counts": {
+                "branch_status": {"queued": 0, "evaluating": 1,
+                                  "finalizing": 0, "done": 0},
+                "branch_worker_status": {"active": 1, "waiting": 0},
+            },
             "matched_rows": 1,
             "rows": [{
                 "branch_key": branch_key, "branch_status": "evaluating",
@@ -645,6 +650,11 @@ class ReportModelTest(unittest.TestCase):
                 "branch_count": 1,
                 "branch_count_by_status": {"evaluating": 1},
                 "branch_count_by_worker_status": {"active": 1},
+            },
+            "facet_counts": {
+                "branch_status": {"queued": 0, "evaluating": 1,
+                                  "finalizing": 0, "done": 0},
+                "branch_worker_status": {"active": 1, "waiting": 0},
             },
             "matched_rows": 1,
             "rows": [{
@@ -1768,6 +1778,93 @@ class ReportModelTest(unittest.TestCase):
                           side_effect=sqlite3.OperationalError("queue locked")):
             report = collect_report(self.sources, request)
         self.assertFalse(report["sources"]["queue"]["ok"])
+
+    def test_queue_backed_reports_carry_the_queue_facet_counts(self):
+        queue = self._open_queue()
+        queued_key = ScoreCache.encode_subset(["nurdy", "khaki"])
+        done_key = ScoreCache.encode_subset(["salet", "khaki"])
+        queue.add_pending_many([(queued_key, 2, 1, "crane", 0),
+                                (done_key, 2, 1, "crane", 1)])
+        queue.mark_done(done_key)
+        queue.close()
+        filters = ReportFilters(branch_statuses=("queued",))
+
+        def facets(**request_values):
+            return collect_report(self.sources, ReportRequest(
+                filters=filters, **request_values))["data"]["facet_counts"]
+
+        queue_facets = facets(report_kind="queue")
+        # Checking "queued" leaves every other status's count in place.
+        self.assertGreater(queue_facets["branch_status"]["queued"], 0)
+        self.assertGreater(queue_facets["branch_status"]["done"], 0)
+        self.assertEqual(facets(report_kind="queue", tree=True), queue_facets)
+        self.assertEqual(facets(report_kind="hotspots"), queue_facets)
+        overview = collect_report(self.sources, ReportRequest())["data"]
+        self.assertEqual(set(overview["facet_counts"]["branch_status"]),
+                         set(report_model.OVERVIEW_BRANCH_STATUSES))
+
+    def test_status_facets_count_each_value_under_the_other_filter(self):
+        pairs = [("unqueued", None), ("queued", None), ("evaluating", "active"),
+                 ("evaluating", "waiting"), ("evaluating", "waiting"),
+                 ("finalizing", "waiting"), ("done", None)]
+        rows = [{"branch_status": status, "branch_worker_status": worker_status}
+                for status, worker_status in pairs]
+
+        def selected(statuses, worker_statuses):
+            return sum(
+                1 for row in rows
+                if (not statuses or row["branch_status"] in statuses)
+                and (not worker_statuses
+                     or row["branch_worker_status"] in worker_statuses))
+
+        for statuses, worker_statuses in (
+                ((), ()), (("evaluating",), ()), ((), ("waiting",)),
+                (("queued", "finalizing"), ("waiting",))):
+            with self.subTest(statuses=statuses, worker_statuses=worker_statuses):
+                facets = report_model._status_facet_counts(
+                    rows, ReportFilters(
+                        branch_statuses=statuses,
+                        branch_worker_statuses=worker_statuses),
+                    report_model.BRANCH_STATUSES)
+                self.assertEqual(facets["branch_status"], {
+                    status: selected((status,), worker_statuses)
+                    for status in report_model.BRANCH_STATUSES})
+                self.assertEqual(facets["branch_worker_status"], {
+                    worker_status: selected(statuses, (worker_status,))
+                    for worker_status in report_model.BRANCH_WORKER_STATUSES})
+
+    def test_word_report_facets_count_what_checking_each_box_selects(self):
+        target = parse_report_branch_target("salet")
+
+        def data(**filter_values):
+            return collect_report(self.sources, ReportRequest(
+                branch_target=target, filters=ReportFilters(**filter_values),
+            ))["data"]
+
+        everything = data()["response_groups"]
+        # The answer-count filter must narrow the counts it is applied to.
+        self.assertLess(
+            sum(data(minimum_answer_count=2)["facet_counts"][
+                "branch_status"].values()),
+            len(everything))
+        for filter_values in ({}, {"branch_worker_statuses": ("waiting",)},
+                              {"branch_statuses": ("evaluating",)},
+                              {"maximum_answer_count": 1}):
+            with self.subTest(filters=filter_values):
+                facets = data(**filter_values)["facet_counts"]
+                for status, count in facets["branch_status"].items():
+                    self.assertEqual(count, len(data(**{
+                        **filter_values, "branch_statuses": (status,),
+                    })["response_groups"]), status)
+                for worker_status, count in facets[
+                        "branch_worker_status"].items():
+                    self.assertEqual(count, len(data(**{
+                        **filter_values,
+                        "branch_worker_statuses": (worker_status,),
+                    })["response_groups"]), worker_status)
+        self.assertEqual(
+            sum(data()["facet_counts"]["branch_status"].values()),
+            len(everything))
 
     def test_word_report_filters_and_sorts_its_response_groups(self):
         target = parse_report_branch_target("salet")
@@ -3826,6 +3923,11 @@ class OpenerReportTest(unittest.TestCase):
         self.assertEqual(complete["total_opener_count"], 2)
         self.assertEqual(
             complete["matched_opener_count"], len(complete["summary"]))
+        # Each state's count is what checking it alone would list, whatever
+        # is checked now.
+        self.assertEqual(complete["facet_counts"], {
+            "opener_state": {"queued": 1, "active": 0, "complete": 1}})
+        self.assertEqual(every["facet_counts"], complete["facet_counts"])
 
     def test_opener_report_marks_openers_that_are_themselves_answers(self):
         # SALET is in ANSWERS; RAISE is only in the candidate list (set up in

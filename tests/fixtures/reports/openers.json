@@ -10,6 +10,13 @@
   "branch_row_offset": 0,
   "eta_seconds": 86400,
   "eta_window_days": 3,
+  "facet_counts": {
+   "opener_state": {
+    "active": 0,
+    "complete": 1,
+    "queued": 2
+   }
+  },
   "finished_in_eta_window_count": 2,
   "matched_branch_count": 1376,
   "matched_open_branch_count": 1211,

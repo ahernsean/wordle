@@ -16,6 +16,7 @@ version violation — check the target version by hand, or on the box itself.
 from __future__ import annotations
 
 import collections
+import dataclasses
 import json
 import logging
 import hashlib
@@ -36,6 +37,11 @@ logger = logging.getLogger(__name__)
 # reclamation and report liveness, so a worker inside it is never reclaimed or
 # excluded from live-worker totals.
 WORKER_LIVENESS_SECONDS = 30
+# The statuses a queue report gives a branch.  Every branch the queue holds is
+# queued for, so none reads as unqueued, and only a branch being evaluated or
+# finalized has a worker status.
+QUEUE_REPORT_BRANCH_STATUSES = ("queued", "evaluating", "finalizing", "done")
+QUEUE_REPORT_BRANCH_WORKER_STATUSES = ("active", "waiting")
 
 # Why a claim transaction handed out no bundle.  These are decided inside the
 # transaction, which is the only place that can decide them: the cap counts
@@ -5095,18 +5101,36 @@ class ERDQueue:
             "is_context": False,
         }
 
-    def report_queue_rows(
-        self, filters=None, sort=None, limit=None, generated_at=None,
-    ) -> dict:
-        """Return normalized, filtered queue rows with pre-limit summaries."""
+    def _report_queue_status_pairs(self, filters, generated_at, facet_statuses):
+        """The matched branches counted by (status, worker status), with
+        both status filters lifted, unexecuted.
+
+        Each status filter is a facet, and a facet's own counts are taken
+        under every filter but itself, so the counts read what checking a box
+        would select.  The rows are the cross product of the two -- seven at
+        most -- so every facet and the summary are reduced from them without
+        a second pass over the branches.
+
+        facet_statuses names the statuses the caller offers as facet values,
+        or None for all of them.  Statuses outside it are counted only when
+        the status filter itself needs them -- which keeps a report offering
+        only the in-flight statuses from counting the cold branches, which
+        are the bulk of the queue and nearly all of the count's cost.
+        """
+        branch_statuses = tuple(self._report_filter_value(
+            filters, "branch_statuses", ()
+        ))
+        counted_statuses = ()
+        if branch_statuses and facet_statuses is not None:
+            counted_statuses = tuple(sorted(
+                set(branch_statuses) | set(facet_statuses)))
+        lifted = (dataclasses.asdict(filters) if dataclasses.is_dataclass(filters)
+                  else dict(filters or {}))
+        lifted["branch_statuses"] = counted_statuses
+        lifted["branch_worker_statuses"] = ()
         (base_query, where_clause, liveness_parameters, where_parameters,
-         include_cold) = self._report_queue_selection(filters, generated_at)
-        order_by = self._report_queue_order(filters, sort)
-        effective_limit = (
-            limit if limit is not None
-            else self._report_filter_value(filters, "limit")
-        )
-        summary_query = base_query + f"""
+         include_cold) = self._report_queue_selection(lifted, generated_at)
+        query = base_query + f"""
             SELECT branch_status, branch_worker_status,
                    SUM(branch_count) AS branch_count
             FROM (
@@ -5115,23 +5139,100 @@ class ERDQueue:
                 FROM hot_rows{where_clause}
                 GROUP BY branch_status, branch_worker_status
         """
-        summary_parameters = liveness_parameters + where_parameters
+        parameters = liveness_parameters + where_parameters
         if include_cold:
             # A cold branch's statuses follow from its pending status alone,
             # so grouping on that column walks the status index in order
             # instead of sorting every cold row by the derived pair.
-            summary_query += f"""
+            query += f"""
                 UNION ALL
                 SELECT MIN(branch_status), MIN(branch_worker_status),
                        COUNT(*) AS branch_count
                 FROM cold_rows{where_clause}
                 GROUP BY pending_status
             """
-            summary_parameters += where_parameters
-        summary_query += """
+            parameters += where_parameters
+        query += """
             )
             GROUP BY branch_status, branch_worker_status
         """
+        return query, parameters
+
+    def _report_queue_counts(self, filters, status_pair_rows, facet_statuses):
+        """The summary and facet counts reduced from the status-pair counts.
+
+        A branch is matched when it passes both status filters; it counts
+        toward a status facet when it passes the worker filter, and toward
+        a worker facet when it passes the status filter.
+        """
+        branch_statuses = set(self._report_filter_value(
+            filters, "branch_statuses", ()
+        ))
+        branch_worker_statuses = set(self._report_filter_value(
+            filters, "branch_worker_statuses", ()
+        ))
+        offered_statuses = (
+            QUEUE_REPORT_BRANCH_STATUSES if facet_statuses is None
+            else tuple(facet_statuses)
+        )
+        by_status = {}
+        by_worker_status = {}
+        status_facet = dict.fromkeys(offered_statuses, 0)
+        worker_status_facet = dict.fromkeys(QUEUE_REPORT_BRANCH_WORKER_STATUSES, 0)
+        for row in status_pair_rows:
+            status = row["branch_status"]
+            worker_status = row["branch_worker_status"]
+            count = row["branch_count"]
+            passes_status = not branch_statuses or status in branch_statuses
+            passes_worker_status = (
+                not branch_worker_statuses
+                or worker_status in branch_worker_statuses
+            )
+            if passes_worker_status and status in status_facet:
+                status_facet[status] += count
+            if passes_status and worker_status in worker_status_facet:
+                worker_status_facet[worker_status] += count
+            if passes_status and passes_worker_status:
+                by_status[status] = by_status.get(status, 0) + count
+                by_worker_status[worker_status] = (
+                    by_worker_status.get(worker_status, 0) + count
+                )
+        summary = {
+            "branch_count": sum(by_status.values()),
+            "branch_count_by_status": by_status,
+            "branch_count_by_worker_status": by_worker_status,
+        }
+        facet_counts = {
+            "branch_status": status_facet,
+            "branch_worker_status": worker_status_facet,
+        }
+        return summary, facet_counts
+
+    def report_queue_facet_counts(self, filters=None, generated_at=None,
+                                  facet_statuses=None):
+        """Every status facet's counts under this request's other filters,
+        for a report that reads its rows some other way."""
+        query, parameters = self._report_queue_status_pairs(
+            filters, generated_at, facet_statuses)
+        rows = self._conn.execute(query, parameters).fetchall()
+        return self._report_queue_counts(filters, rows, facet_statuses)[1]
+
+    def report_queue_rows(
+        self, filters=None, sort=None, limit=None, generated_at=None,
+        facet_statuses=None,
+    ) -> dict:
+        """Return normalized, filtered queue rows with pre-limit summaries
+        and the status facets' counts; facet_statuses is as
+        _report_queue_status_pairs takes it."""
+        (base_query, where_clause, liveness_parameters, where_parameters,
+         include_cold) = self._report_queue_selection(filters, generated_at)
+        order_by = self._report_queue_order(filters, sort)
+        effective_limit = (
+            limit if limit is not None
+            else self._report_filter_value(filters, "limit")
+        )
+        summary_query, summary_parameters = self._report_queue_status_pairs(
+            filters, generated_at, facet_statuses)
         limit_clause = "" if effective_limit is None else " LIMIT ?"
         limit_parameters = [] if effective_limit is None else [effective_limit]
         # The cold half is paged on its own before it meets the hot rows, so
@@ -5181,24 +5282,13 @@ class ERDQueue:
         finally:
             if opened_snapshot:
                 self._conn.execute("COMMIT")
-        by_status = {}
-        by_worker_status = {}
-        for row in summary_rows:
-            by_status[row["branch_status"]] = (
-                by_status.get(row["branch_status"], 0) + row["branch_count"]
-            )
-            by_worker_status[row["branch_worker_status"]] = (
-                by_worker_status.get(row["branch_worker_status"], 0) + row["branch_count"]
-            )
-        matched_rows = sum(by_status.values())
+        summary, facet_counts = self._report_queue_counts(
+            filters, summary_rows, facet_statuses)
         returned_rows = [self._report_queue_row(row) for row in joined_rows]
         return {
-            "summary": {
-                "branch_count": matched_rows,
-                "branch_count_by_status": by_status,
-                "branch_count_by_worker_status": by_worker_status,
-            },
-            "matched_rows": matched_rows,
+            "summary": summary,
+            "facet_counts": facet_counts,
+            "matched_rows": summary["branch_count"],
             "rows": returned_rows,
         }
 

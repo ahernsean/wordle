@@ -6813,6 +6813,36 @@ class ReportClientContract:
         for selector in (active, waiting):
             self.assertFalse(self.page.locator(selector).is_disabled())
 
+    def test_filter_checkboxes_show_the_counts_their_report_sent(self):
+        labels = self.page.evaluate("""async () => {
+          const read=selector=>[...document.querySelectorAll(selector)].map(input=>input.parentElement.textContent.trim());
+          const queue=await (await fetch('/api/view/queue')).json();
+          queue.data.facet_counts={branch_status:{queued:312121,evaluating:14,finalizing:0,done:295622},branch_worker_status:{active:5,waiting:9}};
+          applyReport(queue,null,{...__reportClient.getState(),kind:'queue'});
+          const counted={statuses:read('[data-branch-status]'),workers:read('[data-branch-worker-status]')};
+          const cache=await (await fetch('/api/view/cache')).json();
+          delete cache.data.facet_counts;
+          applyReport(cache,null,{...__reportClient.getState(),kind:'cache'});
+          return {...counted,bare:read('[data-branch-status]')};
+        }""")
+        self.assertEqual(labels["statuses"], [
+            "unqueued", "queued (312,121)", "evaluating (14)",
+            "finalizing (0)", "done (295,622)"])
+        self.assertEqual(labels["workers"], ["active (5)", "waiting (9)"])
+        # A report that counts nothing leaves no other view's counts behind.
+        self.assertEqual(labels["bare"], [
+            "unqueued", "queued", "evaluating", "finalizing", "done"])
+
+    def test_opener_state_checkboxes_show_their_counts(self):
+        labels = self.page.evaluate("""async () => {
+          const openers=await (await fetch('/api/view/openers')).json();
+          openers.data.facet_counts={opener_state:{active:6,queued:9148,complete:5707}};
+          applyReport(openers,null,{...__reportClient.getState(),kind:'openers'});
+          return [...document.querySelectorAll('[data-source-state]')].map(input=>input.parentElement.textContent.trim());
+        }""")
+        self.assertEqual(labels, [
+            "active (6)", "queued (9,148)", "complete (5,707)"])
+
     def test_word_summary_keeps_unfiltered_totals(self):
         text = self.page.evaluate("""async () => {
           const report=await (await fetch('/api/view?branch_target=QUEUE')).json();

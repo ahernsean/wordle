@@ -1050,6 +1050,7 @@ def _queue_overview(sources, generated_at, answer_set, report):
             filters=filters,
             limit=filters.get("limit") or DEFAULT_OVERVIEW_BRANCH_LIMIT,
             generated_at=generated_at,
+            facet_statuses=OVERVIEW_BRANCH_STATUSES,
         )
         active_branch_keys = [
             bytes(row["branch_key"])
@@ -1155,6 +1156,7 @@ def _queue_overview(sources, generated_at, answer_set, report):
         report["data"]["worker_totals"] = worker_totals
         report["data"]["branches"] = normalized_rows
         report["data"]["matched_branch_count"] = queue_result["matched_rows"]
+        report["data"]["facet_counts"] = queue_result["facet_counts"]
         # Completions explain a departure from the view, so they are sent to
         # any overview still showing the branches a worker is on.
         worker_statuses = filters.get("branch_worker_statuses") or ()
@@ -1573,6 +1575,42 @@ def _maximum_response_group_count(sources, all_answers, branch_words,
     return maximum
 
 
+def _passes_answer_budget_priority_filters(row, filters, budget):
+    """Whether a row at this budget passes every branch filter but status."""
+    return (
+        (filters.minimum_answer_count is None
+         or row["answer_count"] >= filters.minimum_answer_count)
+        and (filters.maximum_answer_count is None
+             or row["answer_count"] <= filters.maximum_answer_count)
+        and (filters.budget is None or filters.budget == budget)
+        and (filters.priority is None or row["priority"] == filters.priority)
+    )
+
+
+def _status_facet_counts(rows, filters, offered_statuses):
+    """Count rows for each status filter's values, each under the other.
+
+    A facet's counts read what checking its box would select, so each is
+    taken with every filter applied but its own: a status's count honors the
+    worker filter, and a worker status's count honors the status filter.
+    """
+    status_facet = dict.fromkeys(offered_statuses, 0)
+    worker_status_facet = dict.fromkeys(BRANCH_WORKER_STATUSES, 0)
+    for row in rows:
+        status = row["branch_status"]
+        worker_status = row["branch_worker_status"]
+        if (status in status_facet and (
+                not filters.branch_worker_statuses
+                or worker_status in filters.branch_worker_statuses)):
+            status_facet[status] += 1
+        if (worker_status in worker_status_facet and (
+                not filters.branch_statuses
+                or status in filters.branch_statuses)):
+            worker_status_facet[worker_status] += 1
+    return {"branch_status": status_facet,
+            "branch_worker_status": worker_status_facet}
+
+
 def collect_word_report(sources: ReportOpeners, request: ReportRequest) -> dict:
     generated_at = int(time.time())
     all_answers = load_word_list(sources.answer_list_path)
@@ -1737,6 +1775,12 @@ def collect_word_report(sources: ReportOpeners, request: ReportRequest) -> dict:
     response_groups = data["response_groups"]
     all_response_groups = list(response_groups)
     filters = request.filters
+    response_groups = [
+        row for row in response_groups
+        if _passes_answer_budget_priority_filters(row, filters, group_budget)
+    ]
+    data["facet_counts"] = _status_facet_counts(
+        response_groups, filters, BRANCH_STATUSES)
     if filters.branch_statuses:
         response_groups = [
             row for row in response_groups
@@ -1746,22 +1790,6 @@ def collect_word_report(sources: ReportOpeners, request: ReportRequest) -> dict:
         response_groups = [
             row for row in response_groups
             if row["branch_worker_status"] in filters.branch_worker_statuses
-        ]
-    if filters.minimum_answer_count is not None:
-        response_groups = [
-            row for row in response_groups
-            if row["answer_count"] >= filters.minimum_answer_count
-        ]
-    if filters.maximum_answer_count is not None:
-        response_groups = [
-            row for row in response_groups
-            if row["answer_count"] <= filters.maximum_answer_count
-        ]
-    if filters.budget is not None and filters.budget != group_budget:
-        response_groups = []
-    if filters.priority is not None:
-        response_groups = [
-            row for row in response_groups if row["priority"] == filters.priority
         ]
     if filters.sort == "size":
         response_groups.sort(key=lambda row: (-row["answer_count"], row["pattern"]))
@@ -3026,6 +3054,7 @@ def collect_queue_report(sources: ReportOpeners, request: ReportRequest) -> dict
         limit = request.filters.limit or DEFAULT_QUEUE_ROW_LIMIT
         result, _prefix = _scoped_queue_result(queue, request, limit=limit)
         data["summary"] = _bucketed_collection_summary(result["summary"])
+        data["facet_counts"] = result["facet_counts"]
         data["matched_rows"] = result["matched_rows"]
         data["rows"] = result["rows"]
         for row in data["rows"]:
@@ -3261,6 +3290,8 @@ def collect_tree_report(sources: ReportOpeners, request: ReportRequest) -> dict:
         queue.begin_read_snapshot()
         filters, prefix = _tree_filters(queue, request)
         data.update(_tree_layout(queue, filters, request, prefix, answer_set))
+        data["facet_counts"] = queue.report_queue_facet_counts(
+            filters, generated_at)
         _mark_queue_opener_ok(report)
     except (sqlite3.Error, OSError) as error:
         _mark_queue_opener_error(report, error)
@@ -3799,6 +3830,7 @@ def collect_hotspot_report(sources: ReportOpeners, request: ReportRequest) -> di
                 "sample_truncated": matched_rows > limit,
                 "rows": scoped["rows"],
             }
+            data["facet_counts"] = scoped["facet_counts"]
         else:
             scope, prefix = _branch_target_queue_scope(request.branch_target, queue)
             branch_key = scope.get("branch_key")
@@ -4623,6 +4655,10 @@ def collect_opener_report(sources: ReportOpeners, request: ReportRequest) -> dic
         opener_sort = request.filters.sort or "default"
         _assign_queue_positions(collapsed)
         data["total_opener_count"] = len(collapsed)
+        state_facet = dict.fromkeys(OPENER_STATES, 0)
+        for row in collapsed:
+            state_facet[row["state"]] += 1
+        data["facet_counts"] = {"opener_state": state_facet}
         opener_states = request.filters.opener_states
         if opener_states:
             collapsed = [row for row in collapsed
