@@ -395,6 +395,9 @@ a few hundred openers stopped reports there, and must not come back:
   (`facet_statuses`), so it never does.  A report that lists rows
   already in memory -- a word's response groups, the openers -- counts
   them before its status filter.
+  The Workers report counts workers, not branches, and reads only the
+  branches its workers are on (`branch_keys`), so checking `done` costs
+  what checking nothing does rather than a pass over every done branch.
 
 ### The coordination window feeds the publish threshold
 
