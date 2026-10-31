@@ -366,12 +366,13 @@ class ReportModelTest(unittest.TestCase):
     def test_workers_report_filters_normalized_worker_rows(self):
         queue = Mock()
         queue.report_queue_rows.return_value = {"rows": [{
-            "branch_key_hex": "a", "branch_status": "evaluating",
+            "branch_key_hex": "0a", "branch_status": "evaluating",
+            "branch_worker_status": "active",
         }]}
         queue.heartbeats_with_branch.return_value = [{"worker_id": "worker-2"}]
         worker = {
             "worker_id": "worker-2", "worker_number": "2",
-            "branch_key_hex": "a", "is_live": True, "updated_at": 1,
+            "branch_key_hex": "0a", "is_live": True, "updated_at": 1,
         }
         request = ReportRequest(report_kind="workers", worker_id="2")
         with (
@@ -1802,6 +1803,60 @@ class ReportModelTest(unittest.TestCase):
         overview = collect_report(self.sources, ReportRequest())["data"]
         self.assertEqual(set(overview["facet_counts"]["branch_status"]),
                          set(report_model.OVERVIEW_BRANCH_STATUSES))
+
+    def test_workers_facets_count_the_workers_each_checkbox_lists(self):
+        now = int(time.time())
+        two_workers_key = ScoreCache.encode_subset(["nurdy", "khaki"])
+        finalizing_key = ScoreCache.encode_subset(["salet", "khaki"])
+        abandoned_key = ScoreCache.encode_subset(["crane", "khaki"])
+        done_key = ScoreCache.encode_subset(["nurdy", "salet"])
+        queue = self._open_queue()
+        for key in (two_workers_key, finalizing_key, abandoned_key):
+            queue.create_branch(key, 2, 1)
+        queue.try_finalize_branch(finalizing_key)
+        queue.add_pending_many([(done_key, 2, 1, "crane", 0)])
+        queue.mark_done(done_key)
+        for worker_id, key in (
+                ("worker-1", two_workers_key), ("worker-2", two_workers_key),
+                ("worker-3", finalizing_key), ("worker-4", abandoned_key),
+                ("worker-5", done_key), ("worker-6", None)):
+            queue.heartbeat(worker_id, 10, key, 2, now, 0)
+        # A worker silent past liveness leaves its branch with no worker.
+        queue._conn.execute(
+            "UPDATE worker_heartbeat SET updated_at = ? "
+            "WHERE worker_id IN ('worker-4', 'worker-5')",
+            (now - WORKER_LIVENESS_SECONDS - 1,))
+        queue.close()
+
+        def workers_report(statuses=(), worker_statuses=()):
+            with patch("report_model.time.time", return_value=now):
+                return collect_report(self.sources, ReportRequest(
+                    report_kind="workers", filters=ReportFilters(
+                        branch_statuses=statuses,
+                        branch_worker_statuses=worker_statuses)))["data"]
+
+        self.assertEqual(workers_report()["matched_rows"], 6)
+        # Counted in workers, not branches: two workers share one branch.
+        self.assertEqual(workers_report()["facet_counts"], {
+            "branch_status": {"queued": 0, "evaluating": 3,
+                              "finalizing": 1, "done": 1},
+            "branch_worker_status": {"active": 3, "waiting": 1},
+        })
+        for statuses, worker_statuses in (
+                ((), ()), (("evaluating",), ()), ((), ("waiting",)),
+                (("evaluating", "finalizing"), ("active",))):
+            facets = workers_report(statuses, worker_statuses)["facet_counts"]
+            for status, count in facets["branch_status"].items():
+                with self.subTest(statuses=statuses,
+                                  worker_statuses=worker_statuses, box=status):
+                    self.assertEqual(count, workers_report(
+                        (status,), worker_statuses)["matched_rows"])
+            for worker_status, count in facets["branch_worker_status"].items():
+                with self.subTest(statuses=statuses,
+                                  worker_statuses=worker_statuses,
+                                  box=worker_status):
+                    self.assertEqual(count, workers_report(
+                        statuses, (worker_status,))["matched_rows"])
 
     def test_status_facets_count_each_value_under_the_other_filter(self):
         pairs = [("unqueued", None), ("queued", None), ("evaluating", "active"),

@@ -2404,8 +2404,7 @@ class ReportClientContract:
         caption = " ".join(self.page.locator(".report-meta").first.inner_text().split())
         self.assertNotIn("root", caption)
         self.assertIn(
-            "sorted by state: latest activity, next up, latest finished",
-            caption)
+            "sorted by state (default)", caption)
         self.page.evaluate(
             "__reportClient.setState({...__reportClient.getState(), sort: 'default'})")
         self.assertIn("sort=default", self.page.url)
@@ -5567,7 +5566,7 @@ class ReportClientContract:
         falsy sort, and `_sorted_openers` reads its dispatch table with `.get`
         and leaves the rows alone when the lookup misses.  A menu option the
         request never carries therefore renders a successful report in some
-        other order, which is what "ERD (lowest first)" did while spelled "".
+        other order, which is what the ERD option did while its value was "".
 
         Asserting the option values against the server's tables catches a
         renamed key but not a dropped one, so this drives each option through
@@ -7450,14 +7449,22 @@ class ReportClientContract:
             self.page.wait_for_selector("h1")
             if "branch_target=SALET" in path:
                 self.page.wait_for_selector("table.word-progress")
-            for width in (375, 390, 480, 800, 1200):
-                with self.subTest(path=path or "overview", width=width):
-                    self.page.set_viewport_size({"width": width, "height": 800})
-                    measured = self.page.evaluate(
-                        "() => ({scroll: document.documentElement.scrollWidth,"
-                        " client: document.documentElement.clientWidth})"
-                    )
-                    self.assertLessEqual(measured["scroll"], measured["client"])
+            # A select is as wide as its longest option, so the filter panel
+            # is measured open as well as closed.
+            for filters_open in (False, True):
+                self.page.locator("details.filters").evaluate(
+                    "(node, open) => { node.open = open; }", filters_open)
+                for width in (375, 390, 480, 800, 1200):
+                    with self.subTest(path=path or "overview", width=width,
+                                      filters_open=filters_open):
+                        self.page.set_viewport_size(
+                            {"width": width, "height": 800})
+                        measured = self.page.evaluate(
+                            "() => ({scroll: document.documentElement.scrollWidth,"
+                            " client: document.documentElement.clientWidth})"
+                        )
+                        self.assertLessEqual(
+                            measured["scroll"], measured["client"])
 
     def test_touch_layout_does_not_cover_controls_with_sticky_header(self):
         context = self.browser.new_context(
