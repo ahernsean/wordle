@@ -23,6 +23,7 @@ from erd_queue import (
     DISK_STOP_FRACTION,
     DISK_WARN_FRACTION,
     ERDQueue,
+    QUEUE_REPORT_BRANCH_STATUSES,
     WORKER_LIVENESS_SECONDS,
     best_first_rank,
     derive_telemetry_path,
@@ -1587,6 +1588,16 @@ def _passes_answer_budget_priority_filters(row, filters, budget):
     )
 
 
+def _passes_status_filters(row, filters):
+    """Whether a row passes both status filters."""
+    return (
+        (not filters.branch_statuses
+         or row["branch_status"] in filters.branch_statuses)
+        and (not filters.branch_worker_statuses
+             or row["branch_worker_status"] in filters.branch_worker_statuses)
+    )
+
+
 def _status_facet_counts(rows, filters, offered_statuses):
     """Count rows for each status filter's values, each under the other.
 
@@ -3013,7 +3024,8 @@ def _bucketed_collection_summary(summary):
     }
 
 
-def _scoped_queue_result(queue, request, apply_filters=True, limit=None):
+def _scoped_queue_result(queue, request, apply_filters=True, limit=None,
+                         branch_keys=None):
     """Return the queue's own result for this request's scope, and the prefix.
 
     The result carries a summary and a `matched_rows` count computed by SQL
@@ -3021,6 +3033,7 @@ def _scoped_queue_result(queue, request, apply_filters=True, limit=None):
     not have to materialize the rows to count them.  `limit` therefore bounds
     only what is returned, never what is counted -- which is what lets a
     row-bearing report ask for a page without the server building the rest.
+    `branch_keys`, when given, further restricts the match to those branches.
     """
     filters = request.filters if apply_filters else ReportFilters()
     unbounded_filters = replace(filters, limit=None)
@@ -3029,14 +3042,15 @@ def _scoped_queue_result(queue, request, apply_filters=True, limit=None):
     query_filters.update(scope)
     if request.tree_parent:
         query_filters["spine_prefix"] = request.tree_parent
+    if branch_keys is not None:
+        query_filters["branch_keys"] = list(branch_keys)
     result = queue.report_queue_rows(query_filters, limit=limit)
     return result, prefix
 
 
 def _scoped_queue_rows(queue, request, apply_filters=True):
-    """Return every matched queue row.  Callers that need the rows themselves
-    -- a tree's topology, a worker report's branch-key set -- rather than a
-    page of them."""
+    """Return every matched queue row, for a caller that needs the rows
+    themselves -- a tree's topology -- rather than a page of them."""
     result, prefix = _scoped_queue_result(queue, request, apply_filters)
     return result["rows"], prefix
 
@@ -3312,38 +3326,54 @@ def collect_workers_report(sources: ReportOpeners, request: ReportRequest) -> di
     queue = None
     try:
         queue = _open_report_queue(sources)
+        filters = request.filters
         filters_have_branch_scope = any((
-            request.filters.branch_statuses,
-            request.filters.branch_worker_statuses,
-            request.filters.minimum_answer_count is not None,
-            request.filters.maximum_answer_count is not None,
-            request.filters.budget is not None,
-            request.filters.priority is not None,
+            filters.branch_statuses,
+            filters.branch_worker_statuses,
+            filters.minimum_answer_count is not None,
+            filters.maximum_answer_count is not None,
+            filters.budget is not None,
+            filters.priority is not None,
         ))
-        if request.branch_target.kind == "root" and not filters_have_branch_scope:
-            scoped_rows = queue.report_queue_rows({
-                "branch_worker_statuses": ("active",),
-            })["rows"]
-        else:
-            scoped_rows, _prefix = _scoped_queue_rows(queue, request)
-        scoped_keys = {row["branch_key_hex"] for row in scoped_rows}
         workers = [
             _normalize_worker(row, generated_at, answer_set)
             for row in queue.heartbeats_with_branch()
         ]
-        if request.branch_target.kind != "root" or filters_have_branch_scope:
-            workers = [
-                worker for worker in workers
-                if worker["branch_key_hex"] in scoped_keys
-            ]
         if request.worker_id is not None:
             workers = [
                 worker for worker in workers
                 if worker["worker_id"] == request.worker_id
                 or worker["worker_number"] == request.worker_id
             ]
+        # Only the workers' own branches are read, with both status filters
+        # lifted: one row per branch says whether its workers are listed and
+        # what each status checkbox would list, counted in workers.
+        worker_branch_keys = sorted({
+            bytes.fromhex(worker["branch_key_hex"]) for worker in workers
+            if worker["branch_key_hex"] is not None
+        })
+        lifted_request = replace(request, filters=replace(
+            filters, branch_statuses=(), branch_worker_statuses=()))
+        branch_result, _prefix = _scoped_queue_result(
+            queue, lifted_request, branch_keys=worker_branch_keys)
+        branch_by_key = {
+            row["branch_key_hex"]: row for row in branch_result["rows"]
+        }
+        worker_branches = [
+            branch_by_key[worker["branch_key_hex"]] for worker in workers
+            if worker["branch_key_hex"] in branch_by_key
+        ]
+        data["facet_counts"] = _status_facet_counts(
+            worker_branches, filters, QUEUE_REPORT_BRANCH_STATUSES)
+        if request.branch_target.kind != "root" or filters_have_branch_scope:
+            workers = [
+                worker for worker in workers
+                if worker["branch_key_hex"] in branch_by_key
+                and _passes_status_filters(
+                    branch_by_key[worker["branch_key_hex"]], filters)
+            ]
         status_by_key = {
-            row["branch_key_hex"]: row["branch_status"] for row in scoped_rows
+            key: row["branch_status"] for key, row in branch_by_key.items()
         }
         by_state = {
             "working": 0,
