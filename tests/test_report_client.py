@@ -2296,6 +2296,40 @@ class ReportClientContract:
         self.assertNotEqual(colors["work-queued"], "rgba(0, 0, 0, 0)")
         self.assertNotEqual(colors["work-working"], colors["work-queued"])
 
+    def test_word_report_work_bar_states_contrast_with_each_other_and_the_page(self):
+        # 3:1 is the WCAG floor for graphical objects; a pair of fills that
+        # merely differ can still be indistinguishable on a four-pixel bar.
+        self._apply_word_breakdown([(40, "finished"), (30, "working"),
+                                    (20, "queued"), (10, "unqueued")])
+
+        def luminance(color):
+            channels = [int(value) / 255
+                        for value in re.findall(r"\d+", color)[:3]]
+            linear = [value / 12.92 if value <= 0.04045
+                      else ((value + 0.055) / 1.055) ** 2.4
+                      for value in channels]
+            return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+        def contrast(first, second):
+            lighter, darker = sorted((luminance(first), luminance(second)),
+                                     reverse=True)
+            return (lighter + 0.05) / (darker + 0.05)
+
+        try:
+            for scheme in ("light", "dark"):
+                with self.subTest(scheme=scheme):
+                    self.page.emulate_media(color_scheme=scheme)
+                    colors = {part["state"]: part["color"]
+                              for part in self._work_bar_against_strip()}
+                    page = self.page.evaluate(
+                        "() => getComputedStyle(document.body).backgroundColor")
+                    working, queued = colors["work-working"], colors["work-queued"]
+                    self.assertGreaterEqual(contrast(working, queued), 3)
+                    self.assertGreaterEqual(contrast(working, page), 3)
+                    self.assertGreaterEqual(contrast(queued, page), 3)
+        finally:
+            self.page.emulate_media(color_scheme="light")
+
     def test_word_report_work_bar_keeps_each_part_over_its_group_once_finished(self):
         # A finished group leaves its slot empty rather than closing it up, so
         # the parts still unfinished stay over their own segments.
