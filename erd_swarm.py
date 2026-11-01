@@ -26,7 +26,10 @@ import os
 import random
 import signal
 import sqlite3
+import sys
+import threading
 import time
+import traceback
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 
@@ -75,13 +78,18 @@ WORDS_FILE = DEFAULT_CANDIDATE_LIST_PATH
 BEST_REFRESH_SECONDS = 0.25   # how often a worker re-reads the shared bound
 HB_SECONDS = 2.0              # liveness heartbeat cadence during a long candidate evaluation
 # A worker that hasn't heartbeat within this many seconds is presumed dead, and
-# only then are its in-flight candidate claims reclaimed.  Live workers heartbeat
-# every HB_SECONDS regardless of how long a single candidate takes (the
-# heartbeat fires on every recursive sub-branch call, not just between
-# candidates), so a slow-but-alive worker is never reclaimed — only a crashed
-# or OOM-killed process whose heartbeat truly stops.  30s = 15 missed
-# heartbeats, which is conservative enough for any real process death.
+# only then are its in-flight candidate claims reclaimed.  A worker heartbeats
+# every HB_SECONDS from any code that reaches _liveness_tick, which evaluation
+# does on every recursive sub-branch call however long a candidate takes.  Code
+# that runs this long without reaching it loses the worker's claims exactly as
+# a crash would, so any loop whose length grows with the queue must either
+# tick or be bounded.  30s = 15 missed heartbeats.
 HB_TIMEOUT_SECONDS = 30
+# A worker silent this long logs the stack of the code keeping it silent, and
+# logs it again each time the silence grows by as much.  Below
+# HB_TIMEOUT_SECONDS, so the first report is written while the worker still
+# holds the claims a stale reclaim is about to free.
+STALL_REPORT_SECONDS = 20
 CHECKPOINT_SECONDS = 300      # WAL checkpoint interval (5 min)
 # Cadence for the per-table WAL traffic log.  Deliberately far shorter than the
 # checkpoint interval: at the runaway rates this diagnostic exists to catch, the
@@ -739,6 +747,7 @@ class _WorkerTimeAccount:
         self._total_nanoseconds = dict.fromkeys(self.ACTIVITIES, 0)
         now = clock()
         self._since = now
+        self._opened = now
         self._open_interval(now)
         self._last_tick = None
         self._last_tick_activity = None
@@ -809,6 +818,12 @@ class _WorkerTimeAccount:
         self._last_tick = now
         self._last_tick_activity = self.current
 
+    def seconds_since_tick(self):
+        """Seconds since the last liveness tick, or since the account opened
+        if the worker has not ticked yet."""
+        last_tick = self._opened if self._last_tick is None else self._last_tick
+        return (self._clock() - last_tick) / 1e9
+
     def note_heartbeat_written(self):
         now = self._clock()
         if self._last_heartbeat is not None:
@@ -848,6 +863,67 @@ class _WorkerTimeAccount:
         started_at = self.started_at
         self._open_interval(now)
         return started_at, interval_time_millis, figures
+
+
+class _StallWatchdog:
+    """Logs where a worker is when it stops ticking.
+
+    A worker that goes HB_TIMEOUT_SECONDS without a liveness tick has its
+    claims reclaimed as stale, live or not, and the telemetry says only which
+    activity it was in.  This runs on a thread of its own, so it can read the
+    worker thread's stack while that thread is still in the code that is
+    keeping it silent.  Code that holds the GIL throughout blocks this thread
+    as well, and is reported once it lets go.
+    """
+
+    def __init__(self, worker_name, account, thread_ident,
+                 report_seconds=STALL_REPORT_SECONDS, poll_seconds=1.0):
+        self._worker_name = worker_name
+        self._account = account
+        self._thread_ident = thread_ident
+        self._report_seconds = report_seconds
+        self._poll_seconds = poll_seconds
+        self._next_report_seconds = report_seconds
+        self._stopping = threading.Event()
+        self._thread = None
+
+    def check(self):
+        """Log the watched thread's stack if its silence has reached the next
+        report.  Returns whether it logged."""
+        silent_seconds = self._account.seconds_since_tick()
+        if silent_seconds < self._report_seconds:
+            self._next_report_seconds = self._report_seconds
+            return False
+        if silent_seconds < self._next_report_seconds:
+            return False
+        frame = sys._current_frames().get(self._thread_ident)
+        stack = ("".join(traceback.format_stack(frame)) if frame is not None
+                 else "  (thread not running)\n")
+        logger.warning('%s no liveness tick for %.0fs (activity %s); stack:\n%s',
+                       self._worker_name, silent_seconds,
+                       self._account.current, stack.rstrip("\n"))
+        self._next_report_seconds = (
+            (silent_seconds // self._report_seconds + 1) * self._report_seconds)
+        return True
+
+    def start(self):
+        self._thread = threading.Thread(
+            target=self._run, name=f"{self._worker_name}-stall-watchdog",
+            daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stopping.set()
+        if self._thread is not None:
+            self._thread.join()
+
+    def _run(self):
+        while not self._stopping.wait(self._poll_seconds):
+            try:
+                self.check()
+            except Exception:  # pragma: no cover
+                logger.exception('%s stall watchdog check failed',
+                                 self._worker_name)
 
 
 class _BranchWorker:
@@ -2466,8 +2542,10 @@ class _BranchWorker:
         for opener_work in self._opener_work_candidates():
             opener_work_id = opener_work['opener_work_id']
             priority = opener_work['requested_priority']
+            # Openers arrive in descending priority, so every one after this
+            # is below the gate too, and each would cost a query to read.
             if priority < fallback_priority:
-                continue
+                break
             if opener_work_id in joinable_opener_ids:
                 continue  # already has a joinable active branch below
             promoted = self._promote_opener_work(
@@ -3377,9 +3455,12 @@ def swarm_worker(worker_id, cache_path, queue_path, stop_event,  # pragma: no co
     signal.signal(signal.SIGTERM, _graceful_stop)
     signal.signal(signal.SIGINT, _graceful_stop)
 
+    watchdog = _StallWatchdog(w.name, w._time_account, threading.get_ident())
+    watchdog.start()
     try:
         w.run()
     finally:
+        watchdog.stop()
         w.close()
         logger.info('worker-%d exiting (%d claims done)',
                     worker_id, w.claims_done)

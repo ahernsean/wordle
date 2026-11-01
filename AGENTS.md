@@ -456,6 +456,16 @@ would be invisible at batch sizes of a few dozen and fatal at sweep scale.
 commands want every matching request and are not on the claim path. Do not
 call it that way from a worker.
 
+**A cursor walk must stop where its filter stops matching.** The cursor is
+one query per row, and each query scans the priority index from the top
+rather than seeking to the cursor, so walking every queued opener is
+quadratic: 34 s at 8,960 openers.  `_help_other_branch` once skipped openers
+below its priority gate with `continue`, and since nothing after the first
+such opener can pass, a blocked worker read the rest of the queue for
+nothing, ticking no heartbeat, and lost its claims to stale reclaim (#379).
+A worker silent for `STALL_REPORT_SECONDS` logs its own stack
+(`_StallWatchdog`), so the next such loop names itself in the worker log.
+
 ### One worker per branch
 
 **Two workers on one branch is a loss at production vocabulary, not a gain.**
