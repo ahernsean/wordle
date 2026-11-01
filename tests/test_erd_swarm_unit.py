@@ -2186,6 +2186,38 @@ class TestHelpOtherBranchPromotesHigherPriority(unittest.TestCase):
         self.assertIsNone(row)
         w.evaluate_bundle.assert_not_called()
 
+    def test_stops_reading_openers_at_the_first_one_below_the_branch_served(self):
+        """Openers arrive in descending priority, so none after the first
+        below the served branch can pass the gate.  Each is a query of its
+        own, and at sweep depth reading every one of them kept a blocked
+        worker from ticking past HB_TIMEOUT_SECONDS."""
+        from erd_queue import ERDQueue
+        ScoreCache(self.cache_path, BRANCH).close()
+        q = ERDQueue(self.queue_path)
+        for rank in range(5):
+            words = BRANCH[:rank + 2]
+            q.add_pending_many([(ScoreCache.encode_subset(words), len(words),
+                                 1 + rank, f"low{rank}", 20)])
+        q.close()
+
+        w = _BranchWorker(0, self.cache_path, self.queue_path, None)
+        w._work_context = _context(
+            branch_key=b"served-branch", opener_priority=9,
+            opener="served", opener_pattern=1)
+        w.evaluate_bundle = mock.MagicMock(return_value=False)
+        reads = mock.patch.object(
+            w.queue, "opener_work_candidates",
+            wraps=w.queue.opener_work_candidates)
+        try:
+            with reads as opener_work_candidates:
+                result = w._help_other_branch(b"served-branch")
+        finally:
+            w.close()
+
+        self.assertFalse(result)
+        w.evaluate_bundle.assert_not_called()
+        self.assertEqual(opener_work_candidates.call_count, 1)
+
     def test_widens_its_own_opener_when_only_active_branch_is_the_one_excluded(self):
         """The production shape from the issue: a worker blocked on AUDIO's
         only active branch, with AUDIO also holding a pending branch under

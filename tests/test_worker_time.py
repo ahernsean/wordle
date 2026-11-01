@@ -4,6 +4,7 @@ coordination total, and the reclaim and checkpoint-pause records."""
 import os
 import sqlite3
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -216,6 +217,106 @@ class TestWorkerTimeAccount(unittest.TestCase):
              "heartbeats_deferred": 2, "nodes": 987,
              "claim_lock_wait_time_millis": 5, "claim_transaction_time_millis": 6,
              "claim_commit_time_millis": 7, "claim_retries": 8})
+
+
+class _ParkedThread:
+    """A thread waiting inside a function whose name a stack can show."""
+
+    def __init__(self):
+        self._release = threading.Event()
+        self._parked = threading.Event()
+        self._thread = threading.Thread(
+            target=self.waiting_in_a_scheduling_scan, daemon=True)
+
+    def waiting_in_a_scheduling_scan(self):
+        self._parked.set()
+        self._release.wait()
+
+    def __enter__(self):
+        self._thread.start()
+        self._parked.wait()
+        return self._thread.ident
+
+    def __exit__(self, *exc_info):
+        self._release.set()
+        self._thread.join()
+
+
+class TestStallWatchdog(unittest.TestCase):
+
+    def test_silence_is_measured_from_the_last_tick(self):
+        clock = _SteppingClock()
+        account = _account(clock)
+        clock.advance(7_000)
+        self.assertEqual(account.seconds_since_tick(), 7.0)
+        account.note_tick()
+        clock.advance(1_500)
+        self.assertEqual(account.seconds_since_tick(), 1.5)
+
+    def test_a_silent_worker_logs_the_stack_it_is_silent_in(self):
+        clock = _SteppingClock()
+        account = _account(clock)
+        account.note_tick()
+        with _ParkedThread() as thread_ident:
+            watchdog = erd_swarm._StallWatchdog(
+                "worker-3", account, thread_ident, report_seconds=20)
+            clock.advance(19_999)
+            self.assertFalse(watchdog.check())
+            clock.advance(1)
+            with account.activity("scheduling"):
+                with self.assertLogs("wordle", "WARNING") as logged:
+                    self.assertTrue(watchdog.check())
+        message = logged.output[0]
+        self.assertIn("worker-3 no liveness tick for 20s", message)
+        self.assertIn("(activity scheduling)", message)
+        self.assertIn("waiting_in_a_scheduling_scan", message)
+
+    def test_a_continuing_silence_reports_each_time_it_grows_by_the_period(self):
+        clock = _SteppingClock()
+        account = _account(clock)
+        account.note_tick()
+        reported_at = []
+
+        def run_for(seconds):
+            for _second in range(seconds):
+                clock.advance(1_000)
+                if watchdog.check():
+                    reported_at.append(account.seconds_since_tick())
+
+        with _ParkedThread() as thread_ident:
+            watchdog = erd_swarm._StallWatchdog(
+                "worker-3", account, thread_ident, report_seconds=20)
+            with self.assertLogs("wordle", "WARNING") as logged:
+                run_for(70)
+                account.note_tick()
+                run_for(20)
+        self.assertEqual(reported_at, [20.0, 40.0, 60.0, 20.0])
+        self.assertEqual(len(logged.output), 4)
+
+    def test_a_ticking_worker_is_never_reported(self):
+        clock = _SteppingClock()
+        account = _account(clock)
+        watchdog = erd_swarm._StallWatchdog(
+            "worker-3", account, threading.get_ident(), report_seconds=20)
+        for _second in range(120):
+            clock.advance(1_000)
+            if _second % 2 == 0:
+                account.note_tick()
+            self.assertFalse(watchdog.check())
+
+    def test_its_thread_reports_without_being_asked(self):
+        account = _account(_SteppingClock(step_time_millis=30_000))
+        with _ParkedThread() as thread_ident:
+            watchdog = erd_swarm._StallWatchdog(
+                "worker-3", account, thread_ident, report_seconds=20,
+                poll_seconds=0.01)
+            with self.assertLogs("wordle", "WARNING") as logged:
+                watchdog.start()
+                deadline = time.monotonic() + 10
+                while not logged.output and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                watchdog.stop()
+        self.assertIn("waiting_in_a_scheduling_scan", logged.output[0])
 
 
 class TestWorkerChargesItsActivities(unittest.TestCase):
