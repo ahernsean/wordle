@@ -2296,6 +2296,57 @@ class ReportClientContract:
         self.assertNotEqual(colors["work-queued"], "rgba(0, 0, 0, 0)")
         self.assertNotEqual(colors["work-working"], colors["work-queued"])
 
+    def test_word_report_work_bar_states_hold_two_to_one_against_the_page(self):
+        self._apply_word_breakdown([(40, "finished"), (30, "working"),
+                                    (20, "queued"), (10, "unqueued")])
+
+        def luminance(color):
+            channels = [int(value) / 255
+                        for value in re.findall(r"\d+", color)[:3]]
+            linear = [value / 12.92 if value <= 0.04045
+                      else ((value + 0.055) / 1.055) ** 2.4
+                      for value in channels]
+            return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+        def contrast(first, second):
+            lighter, darker = sorted((luminance(first), luminance(second)),
+                                     reverse=True)
+            return (lighter + 0.05) / (darker + 0.05)
+
+        try:
+            for scheme in ("light", "dark"):
+                with self.subTest(scheme=scheme):
+                    self.page.emulate_media(color_scheme=scheme)
+                    colors = {part["state"]: part["color"]
+                              for part in self._work_bar_against_strip()}
+                    page = self.page.evaluate(
+                        "() => getComputedStyle(document.body).backgroundColor")
+                    self.assertGreaterEqual(
+                        contrast(colors["work-working"], page), 2)
+                    self.assertGreaterEqual(
+                        contrast(colors["work-queued"], page), 2)
+        finally:
+            self.page.emulate_media(color_scheme="light")
+
+    def test_word_report_work_bar_stands_working_taller_than_queued(self):
+        # Height tells a sliver's state where its fill is too thin to read,
+        # so every working part, even a two-pixel one, rises above every
+        # queued part while all of them stand on the strip.
+        self._apply_many_group_word_report()
+        parts = self.page.evaluate("""() => [...document.querySelectorAll(
+            '.response-group-breakdown .answer-work-bar > span')].map(part => {
+              const box = part.getBoundingClientRect();
+              return {state: part.className, height: box.height,
+                      bottom: box.bottom};
+            })""")
+        working = [part for part in parts if part["state"] == "work-working"]
+        queued = [part for part in parts if part["state"] == "work-queued"]
+        self.assertTrue(working and queued)
+        self.assertGreater(min(part["height"] for part in working),
+                           max(part["height"] for part in queued))
+        bottoms = {round(part["bottom"], 1) for part in working + queued}
+        self.assertEqual(len(bottoms), 1)
+
     def test_word_report_work_bar_keeps_each_part_over_its_group_once_finished(self):
         # A finished group leaves its slot empty rather than closing it up, so
         # the parts still unfinished stay over their own segments.
