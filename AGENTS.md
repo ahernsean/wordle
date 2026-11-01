@@ -1503,6 +1503,14 @@ say-so by itself. Committing/pushing unapproved work just to satisfy the hook
 is the wrong move — it's fine to leave changes uncommitted and explain the
 tension to the user instead.
 
+If you are in a Claude cloud session, a requested change from the user is
+complete only when it is in a pull request. The user has no access to the cloud
+container, so work that has yet to be pushed is invisible to them. Thus, in a
+cloud session, default to treating a request to change something as a request
+for its PR, unless the user has asked only for discussion, speculation,
+reasoning, or an answer. Ask yourself, how would the user be able to see what
+I'm contributing?
+
 ---
 
 ## Schema coordination (Linux + phone)
