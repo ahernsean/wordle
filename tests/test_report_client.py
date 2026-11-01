@@ -6711,10 +6711,13 @@ class ReportClientContract:
         self.apply_branch_target("SALET")
         self.page.wait_for_selector("text=word report")
         self.assertTrue(clear.is_visible())
+        target.focus()
         clear.click()
         self.assertEqual(target.input_value(), "")
         self.assertFalse(clear.is_visible())
-        self.assertTrue(self.page.evaluate(
+        # Clearing leaves the box unfocused, so a phone keyboard closes
+        # rather than opening over the overview the clear just applied.
+        self.assertFalse(self.page.evaluate(
             "() => document.activeElement.id === 'branch-target-input'"))
         # Clearing applies at once: an emptied target in the inferred report
         # is the overview.
