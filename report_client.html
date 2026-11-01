@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>ERD swarm reports</title>
   <style>
-    :root { color-scheme: light; --bg:#ffffff; --panel:#f8f9fa; --text:#1a1a1b; --dim:#787c7e; --green:#6aaa64; --green-complete:#9fc09f; --blue:#5f89c2; --completed-bg:#eaf2fc; --yellow:#c9b458; --gray:#787c7e; --border:#d3d6da; --sweep-empty:#d3d6da; --red:#d14b4b; --amber:#b59f3b; --hover-tint:#edf5ec; --popover-shadow:0 5px 16px rgba(0,0,0,.14); --header-bg:rgba(255,255,255,.97); --status-amber-bg:#fff9e8; --status-amber-text:#6f5a13; --status-red-bg:#fff1f1; --card-historical-bg:#f3f4f6; --tile-blank-outline:#878a8c; --chip-exact-text:#3e7c3a; --chip-cut-text:#7d6812; --chip-loss-text:#a32c2c; --flash-improved-bg:#e8f4e7; --flash-changed-bg:#fff0f0; --lookup-bg:#eef3f8; --work-working:#1a4c18; --work-queued:#8e9193; }
+    :root { color-scheme: light; --bg:#ffffff; --panel:#f8f9fa; --text:#1a1a1b; --dim:#787c7e; --green:#6aaa64; --green-complete:#9fc09f; --blue:#5f89c2; --completed-bg:#eaf2fc; --yellow:#c9b458; --gray:#787c7e; --border:#d3d6da; --sweep-empty:#d3d6da; --red:#d14b4b; --amber:#b59f3b; --hover-tint:#edf5ec; --popover-shadow:0 5px 16px rgba(0,0,0,.14); --header-bg:rgba(255,255,255,.97); --status-amber-bg:#fff9e8; --status-amber-text:#6f5a13; --status-red-bg:#fff1f1; --card-historical-bg:#f3f4f6; --tile-blank-outline:#878a8c; --chip-exact-text:#3e7c3a; --chip-cut-text:#7d6812; --chip-loss-text:#a32c2c; --flash-improved-bg:#e8f4e7; --flash-changed-bg:#fff0f0; --lookup-bg:#eef3f8; --work-working:#008a0b; --work-queued:#909eb2; }
     /* The OS/browser's own color-scheme preference drives the palette live --
        no toggle, no stored setting.  Every color elsewhere in this file reads
        one of these custom properties rather than a literal, so flipping the
@@ -21,7 +21,7 @@
         --status-red-bg:#3a1e1e; --card-historical-bg:#232326; --tile-blank-outline:#565758;
         --chip-exact-text:#7fc47a; --chip-cut-text:#d9c069; --chip-loss-text:#e07a7a;
         --flash-improved-bg:#22371f; --flash-changed-bg:#3a1e1e; --lookup-bg:#17202b;
-        --work-working:#8fdc86; --work-queued:#5f6367;
+        --work-working:#009e0d; --work-queued:#526075;
       }
     }
     * { box-sizing:border-box; }
@@ -323,12 +323,12 @@
     .answer-segment { display:flex; align-items:center; justify-content:center; min-width:0; overflow:hidden; color:#ffffff; font-size:.72rem; font-weight:700; text-shadow:0 1px 2px rgba(0,0,0,.65); box-shadow:inset -1px 0 rgba(255,255,255,.5); }
     .answer-segment-label, .response-count-segment-label { display:block; text-align:center; line-height:.9rem; white-space:nowrap; }
     .answer-segment:last-child { box-shadow:none; }
-    .answer-work-bar { display:flex; width:100%; height:4px; border:solid transparent; border-width:0 1px; }
-    .answer-work-bar > span { min-width:0; }
-    /* Working and queued each hold at least 3:1 against the other and
-       against the page, in both palettes, so a sliver of either reads at a
-       glance on a four-pixel bar. */
-    .answer-work-bar > .work-working { background:var(--work-working); }
+    /* A working group stands taller than a queued one, so a sliver of
+       either is told apart by its height where its color is too thin to
+       read.  Each fill holds at least 2:1 against the page in both palettes. */
+    .answer-work-bar { display:flex; align-items:flex-end; width:100%; height:7px; border:solid transparent; border-width:0 1px; }
+    .answer-work-bar > span { min-width:0; height:4px; }
+    .answer-work-bar > .work-working { height:100%; background:var(--work-working); }
     .answer-work-bar > .work-queued { background:var(--work-queued); }
     .answer-strip[data-selectable] .answer-segment { cursor:pointer; }
     .answer-strip[data-selectable] .answer-segment:hover { filter:brightness(1.2); }
