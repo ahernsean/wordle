@@ -2,6 +2,7 @@
 import os
 import fcntl
 import pty
+import re
 import select
 from pathlib import Path
 import shutil
@@ -241,15 +242,18 @@ class TestExportAndSend(unittest.TestCase):
         result = self._run(EXPORT_SIZE_BYTES="1234567890")
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        lines = result.stdout.splitlines()
+        # A step's duration is whole seconds of bash's SECONDS, so a step of a
+        # few milliseconds that crosses a second boundary reports 1s.
+        lines = [re.sub(r" in [0-9]+s$", " in Ns", line)
+                 for line in result.stdout.splitlines()]
         expected = [
             "Starting the Taildrop relay...",
-            "  connected in 0s",
+            "  connected in Ns",
             "Copying the export (1,235 MB) into the relay...",
-            "  done in 0s",
+            "  done in Ns",
             "Sending the export (1,235 MB) to ios-app. "
             "Keep Tailscale open there until this finishes...",
-            "  done in 0s",
+            "  done in Ns",
         ]
         self.assertEqual([line for line in lines if line in expected], expected)
 
