@@ -924,9 +924,7 @@ class ReportModelTest(unittest.TestCase):
                 "inspection_worker_time_millis": 0,
                 "evaluated_candidate_count": 10,
                 "evaluation_worker_time_millis": 24_000,
-                "evaluation_worker_count": 1,
-                "evaluation_worker_count_min": 1,
-                "evaluation_worker_count_max": 1,
+                "evaluation_worker_time_millis_by_worker_count": {1: 24_000},
             },
             live_worker_count=4,
             now=1_200,
@@ -935,6 +933,59 @@ class ReportModelTest(unittest.TestCase):
         self.assertAlmostEqual(eta["estimated_seconds"], 240 / 1.97)
         self.assertTrue(eta["worker_count_changed"])
         self.assertEqual(eta["sample_worker_count"], 1)
+
+    def test_candidate_eta_deflates_a_mixed_sample_at_each_worker_count(self):
+        # 70% of the evaluation time was measured alone and 30% beside a
+        # second worker, which a mean of 1.3 workers would misprice: speedup
+        # is 1.0 at one worker and 1.64 at two, so the paired time ran at
+        # 0.82 of one worker's efficiency.
+        eta = _candidate_eta(
+            {"candidate_count": 100, "completed_candidate_count": 0},
+            {
+                "best_updated_at": 1_000,
+                "window_started_at": 1_000,
+                "inspected_candidate_count": 10,
+                "pruned_candidate_count": 5,
+                "inspection_worker_time_millis": 10_000,
+                "inspection_worker_time_millis_by_worker_count": {1: 10_000},
+                "evaluated_candidate_count": 10,
+                "evaluation_worker_time_millis": 20_000,
+                "evaluation_worker_time_millis_by_worker_count": {
+                    1: 14_000, 2: 6_000},
+            },
+            live_worker_count=1,
+            now=1_200,
+        )
+        self.assertEqual(eta["state"], "rough")
+        self.assertTrue(eta["worker_count_changed"])
+        self.assertAlmostEqual(eta["sample_worker_count"], 36_000 / 30_000)
+        inspection_seconds = 100 * 10_000 / 10 / 1000
+        evaluation_seconds = 50 * 20_000 / 10 / 1000
+        self.assertAlmostEqual(
+            eta["estimated_seconds"],
+            inspection_seconds + evaluation_seconds * (0.7 + 0.3 * 1.64 / 2),
+        )
+
+    def test_candidate_eta_reports_a_steady_sample_count_exactly(self):
+        eta = _candidate_eta(
+            {"candidate_count": 100, "completed_candidate_count": 0},
+            {
+                "best_updated_at": 1_000,
+                "window_started_at": 1_000,
+                "inspected_candidate_count": 0,
+                "pruned_candidate_count": 0,
+                "inspection_worker_time_millis": 0,
+                "evaluated_candidate_count": 10,
+                "evaluation_worker_time_millis": 24_000,
+                "evaluation_worker_time_millis_by_worker_count": {2: 24_000},
+            },
+            live_worker_count=2,
+            now=1_700,
+        )
+        self.assertEqual(eta["state"], "ready")
+        self.assertFalse(eta["worker_count_changed"])
+        self.assertEqual(eta["sample_worker_count"], 2)
+        self.assertAlmostEqual(eta["estimated_seconds"], 240 / 2)
 
     def test_candidate_eta_does_not_scale_legacy_global_worker_counts(self):
         eta = _candidate_eta(

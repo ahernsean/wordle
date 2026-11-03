@@ -229,9 +229,47 @@ class QueueVisibilityTests(unittest.TestCase):
         self.assertEqual(row["branch_worker_count"], 2)
         sample = self.q.branch_candidate_eta_sample(
             self.user_key, window_seconds=60, now=now)
-        self.assertEqual(sample["evaluation_worker_count"], 2)
-        self.assertEqual(sample["evaluation_worker_count_min"], 2)
-        self.assertEqual(sample["evaluation_worker_count_max"], 2)
+        self.assertEqual(
+            sample["evaluation_worker_time_millis_by_worker_count"], {2: 1})
+
+    def test_candidate_eta_sample_breaks_worker_time_down_by_worker_count(self):
+        self.q.create_branch(self.user_key, 100, 10)
+        branch_id = self.q._intern_branch(self.user_key)
+        self.q._conn.execute("""
+            UPDATE active_branches SET created_at = 900 WHERE branch_id = ?
+        """, (branch_id,))
+        self.q._conn.execute("""
+            INSERT INTO telemetry.two_level_prune_telemetry
+                (branch_id, inspected_candidate_count, pruned_candidate_count,
+                 bound_erd, wall_time_millis, branch_worker_count, epoch,
+                 recorded_at)
+            VALUES (?, 4, 2, NULL, 400, 1, 0, 910),
+                   (?, 4, 2, NULL, 300, 2, 0, 920),
+                   (?, 4, 2, NULL, 200, 1, 0, 930),
+                   (?, 4, 2, NULL, 999, 2, 0, 850)
+        """, (branch_id, branch_id, branch_id, branch_id))
+        self.q._conn.execute("""
+            INSERT INTO candidate_claims
+                (branch_id, idx, claimed_by, done, done_at,
+                 evaluation_time_millis, evaluation_bound_erd,
+                 branch_worker_count)
+            VALUES (?, 0, 'worker-0', 1, 950, 7000, NULL, 1),
+                   (?, 1, 'worker-1', 1, 960, 3000, NULL, 2),
+                   (?, 2, 'worker-0', 1, 970, 4000, NULL, 1),
+                   (?, 3, 'one-level-erd-prune', 1, 980, NULL, NULL, NULL)
+        """, (branch_id, branch_id, branch_id, branch_id))
+
+        sample = self.q.branch_candidate_eta_sample(
+            self.user_key, window_seconds=600, now=1_000)
+
+        self.assertEqual(
+            sample["inspection_worker_time_millis_by_worker_count"],
+            {1: 600, 2: 300})
+        self.assertEqual(
+            sample["evaluation_worker_time_millis_by_worker_count"],
+            {1: 11000, 2: 3000})
+        self.assertEqual(sample["inspection_worker_time_millis"], 900)
+        self.assertEqual(sample["evaluation_worker_time_millis"], 14000)
 
     def test_eta_migration_starts_existing_incumbent_sample_once(self):
         self.q.create_branch(self.user_key, 100, 10)

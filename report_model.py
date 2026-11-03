@@ -2447,8 +2447,6 @@ def _candidate_eta(queue_payload, eta_sample, live_worker_count, now):
     evaluated = eta_sample["evaluated_candidate_count"]
     inspection_time_millis = eta_sample["inspection_worker_time_millis"]
     evaluation_time_millis = eta_sample["evaluation_worker_time_millis"]
-    inspection_workers = eta_sample.get("inspection_worker_count")
-    evaluation_workers = eta_sample.get("evaluation_worker_count")
     inspection_worker_count_known = not eta_sample.get(
         "inspection_unknown_worker_count", 0)
     evaluation_worker_count_known = not eta_sample.get(
@@ -2494,36 +2492,49 @@ def _candidate_eta(queue_payload, eta_sample, live_worker_count, now):
             remaining * evaluation_time_millis / evaluated / 1000
         )
     def speedup(worker_count):
-        worker_count = max(1, round(worker_count))
         return BRANCH_ETA_SPEEDUP.get(
-            worker_count, BRANCH_ETA_SPEEDUP[max(BRANCH_ETA_SPEEDUP)])
+            max(1, worker_count), BRANCH_ETA_SPEEDUP[max(BRANCH_ETA_SPEEDUP)])
 
-    inspection_sample_workers = (
-        inspection_workers if inspection_worker_count_known and inspection_workers
-        else live_worker_count)
-    evaluation_sample_workers = (
-        evaluation_workers if evaluation_worker_count_known and evaluation_workers
-        else live_worker_count)
-    current_speedup = speedup(live_worker_count)
+    # Worker time measured with n workers on the branch is n / speedup(n)
+    # times the one-worker cost of the same work, so each part of a sample is
+    # deflated at the worker count it was measured under, not at the sample's
+    # mean count: the speedup curve is not linear between those counts.
+    def one_worker_fraction(time_millis_by_worker_count, count_known):
+        total_time_millis = sum(time_millis_by_worker_count.values())
+        if not count_known or total_time_millis <= 0:
+            return speedup(live_worker_count) / live_worker_count
+        return sum(
+            time_millis * speedup(worker_count) / worker_count
+            for worker_count, time_millis in time_millis_by_worker_count.items()
+        ) / total_time_millis
+
+    inspection_time_by_worker_count = eta_sample.get(
+        "inspection_worker_time_millis_by_worker_count") or {}
+    evaluation_time_by_worker_count = eta_sample.get(
+        "evaluation_worker_time_millis_by_worker_count") or {}
     estimated_seconds = (
-        inspection_worker_seconds * speedup(inspection_sample_workers)
-        / inspection_sample_workers
-        + evaluation_worker_seconds * speedup(evaluation_sample_workers)
-        / evaluation_sample_workers
-    ) / current_speedup
-    sampled_worker_counts = [count for count in (
-        eta_sample.get("inspection_worker_count_min"),
-        eta_sample.get("inspection_worker_count_max"),
-        eta_sample.get("evaluation_worker_count_min"),
-        eta_sample.get("evaluation_worker_count_max"),
-    ) if count is not None]
+        inspection_worker_seconds * one_worker_fraction(
+            inspection_time_by_worker_count, inspection_worker_count_known)
+        + evaluation_worker_seconds * one_worker_fraction(
+            evaluation_time_by_worker_count, evaluation_worker_count_known)
+    ) / speedup(live_worker_count)
+    sampled_time_by_worker_count = {}
+    for time_by_worker_count in (
+            inspection_time_by_worker_count, evaluation_time_by_worker_count):
+        for worker_count, time_millis in time_by_worker_count.items():
+            sampled_time_by_worker_count[worker_count] = (
+                sampled_time_by_worker_count.get(worker_count, 0) + time_millis)
     worker_count_changed = worker_count_sample_complete and any(
-        round(count) != live_worker_count for count in sampled_worker_counts)
-    component_worker_counts = []
-    if inspection_worker_seconds:
-        component_worker_counts.append(inspection_sample_workers)
-    if evaluation_worker_seconds:
-        component_worker_counts.append(evaluation_sample_workers)
+        worker_count != live_worker_count
+        for worker_count in sampled_time_by_worker_count)
+    sampled_time_millis = sum(sampled_time_by_worker_count.values())
+    sample_worker_count = (
+        sum(worker_count * time_millis
+            for worker_count, time_millis in sampled_time_by_worker_count.items())
+        / sampled_time_millis
+        if worker_count_sample_complete and sampled_time_millis > 0
+        else live_worker_count
+    )
     result.update({
         "state": (
             "ready" if (sample_duration_seconds >= BRANCH_ETA_STABLE_SAMPLE_SECONDS
@@ -2534,9 +2545,7 @@ def _candidate_eta(queue_payload, eta_sample, live_worker_count, now):
         "estimated_seconds": estimated_seconds,
         "remaining_inspection_count": remaining_inspections,
         "expected_full_evaluation_count": round(expected_full_evaluations),
-        "sample_worker_count": round(
-            sum(component_worker_counts) / len(component_worker_counts)
-        ),
+        "sample_worker_count": sample_worker_count,
         "current_worker_count": live_worker_count,
         "worker_count_changed": worker_count_changed,
         "worker_count_sample_complete": worker_count_sample_complete,
