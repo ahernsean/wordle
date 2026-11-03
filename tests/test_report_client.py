@@ -1149,12 +1149,12 @@ class ReportClientContract:
         finally:
             self.page.unroute("**/api/view/word-progress**")
 
-        # One priced branch is named without being compared with anything.
+        # One timed branch is named without being compared with anything.
         self.assertIn(" (1\u00a0candidate left, 1\u00a0worker)", text)
         self.assertNotIn("the last of", text)
         self.assertNotIn("longest", text)
         self.assertIn(
-            "4\u00a0open branches: 1\u00a0priced, 1\u00a0still sampling"
+            "4\u00a0open branches: 1\u00a0timed, 1\u00a0still sampling"
             " (1\u00a0candidate), 2\u00a0with no worker"
             " (43,249\u00a0candidates)", text)
         self.assertIn("excludes 1\u00a0waiting group", text)
@@ -1286,7 +1286,7 @@ class ReportClientContract:
         }, null).innerText""")
         self.assertNotIn("branches", same)
 
-    def test_word_progress_panel_is_named_for_cost_once_the_word_is_complete(self):
+    def test_word_progress_panel_is_a_work_breakdown_once_the_word_is_complete(self):
         summary = "details.word-progress-panel > summary"
         self._word_progress_panel_with(lambda data: None)
         self.assertEqual(self.page.locator(summary).inner_text(),
@@ -1298,7 +1298,7 @@ class ReportClientContract:
 
         self._word_progress_panel_with(completed)
         self.page.wait_for_function(
-            f"() => document.querySelector({summary!r}).innerText === 'Word cost'")
+            f"() => document.querySelector({summary!r}).innerText === 'Work breakdown'")
 
     def test_completed_word_progress_replaces_an_inapplicable_estimate(self):
         def completed_progress(route):

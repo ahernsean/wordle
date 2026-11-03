@@ -342,7 +342,7 @@ def _format_required_sample(seconds):
 
 def word_progress_estimate_lines(estimate, waiting_group_count):
     """The word estimate as the lines a reader sees: the estimate, then how the
-    open branches divide when they are not all priced.
+    open branches divide when they are not all timed.
 
     The total comes before its parts, so the parts can be checked against it.
     """
@@ -355,10 +355,10 @@ def word_progress_estimate_lines(estimate, waiting_group_count):
         else:
             worker_text = (
                 f"no worker for {_format_elapsed(longest['unworked_seconds'])}")
-        priced = estimate["estimated_branch_count"]
+        timed = estimate["estimated_branch_count"]
         source_text = (
-            f"from {longest['spine']}" if priced == 1 else
-            f"from {longest['spine']}, the last of {priced:,} priced"
+            f"from {longest['spine']}" if timed == 1 else
+            f"from {longest['spine']}, the last of {timed:,} timed"
             " branches to finish")
         lines.append(
             f"~{_abbreviate_duration(estimate['estimated_seconds'])} remaining"
@@ -381,7 +381,7 @@ def word_progress_estimate_lines(estimate, waiting_group_count):
         lines.append("No estimate yet: no open branch with candidates left"
                      " has a worker")
     parts = [
-        (estimate["estimated_branch_count"], "priced", None),
+        (estimate["estimated_branch_count"], "timed", None),
         (estimate["learning_branch_count"], "still sampling",
          estimate["learning_remaining_candidate_count"]),
         (estimate["unworked_branch_count"], "with no worker",

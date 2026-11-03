@@ -2829,12 +2829,12 @@ class WordProgressRendererTest(unittest.TestCase):
         output = render_report(word_progress_report(
             estimate=self._branch_estimate()), width=160)
         self.assertIn(
-            "~12.4d remaining, from SCOPE -y---, the last of 3 priced branches"
+            "~12.4d remaining, from SCOPE -y---, the last of 3 timed branches"
             " to finish (7,171 candidates left, 1 worker)", output)
         self.assertNotIn("provisional", output)
         self.assertNotIn("longest", output)
 
-    def test_a_single_priced_branch_is_named_without_a_comparison(self):
+    def test_a_single_timed_branch_is_named_without_a_comparison(self):
         # "The last of 1" compares a branch with nothing.
         output = render_report(word_progress_report(
             estimate=self._branch_estimate(estimated_branch_count=1,
@@ -2868,13 +2868,13 @@ class WordProgressRendererTest(unittest.TestCase):
                 unworked_remaining_candidate_count=4256,
                 candidates_done_branch_count=1)), width=200)
         self.assertIn(
-            "14 open branches: 3 priced, 1 still sampling (1 candidate),"
+            "14 open branches: 3 timed, 1 still sampling (1 candidate),"
             " 9 with no worker (4,256 candidates), 1 with every candidate done",
             output)
         # Only groups still waiting hold work the estimate cannot see.
         self.assertIn("excludes 79 waiting groups", output)
 
-    def test_open_branches_all_priced_are_not_divided(self):
+    def test_open_branches_all_timed_are_not_divided(self):
         output = render_report(word_progress_report(
             estimate=self._branch_estimate()), width=160)
         self.assertNotIn("open branches:", output)
@@ -3309,7 +3309,7 @@ class TerminalUtilityTest(unittest.TestCase):
         output = report_terminal.render_report(report, width=120)
         self.assertIn("~2m remaining (provisional), from RAISE -y---", output)
         self.assertIn("RAISE -y--- (3 candidates left, 1 worker)", output)
-        self.assertIn("2 open branches: 1 priced, 1 with no worker"
+        self.assertIn("2 open branches: 1 timed, 1 with no worker"
                       " (2 candidates)", output)
         self.assertIn("excludes 1 waiting group", output)
 

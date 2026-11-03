@@ -1621,7 +1621,7 @@
       return Math.floor(seconds/60)+"m"+(rest?" "+rest+"s":"");
     };
     // The estimate, then how the open branches divide when they are not all
-    // priced.  The total comes before its parts, so the parts can be checked
+    // timed.  The total comes before its parts, so the parts can be checked
     // against it.  Only groups still waiting hold work the estimate cannot
     // see: a group the swarm never opened because it needed no search is not
     // missing work.
@@ -1642,9 +1642,9 @@
       const facts=[],longest=estimate.longest_branch;
       if(longest){
         const away=!longest.live_worker_count&&longest.unworked_seconds!==null&&longest.unworked_seconds!==undefined;
-        const priced=estimate.estimated_branch_count;
+        const timed=estimate.estimated_branch_count;
         facts.push(remainingTimeNode(estimate,", from ",inlineSpine(longest.spine_steps||[]),
-          (priced===1?"":", the last of "+countNoun(priced,"priced branch","priced branches")+" to finish")
+          (timed===1?"":", the last of "+countNoun(timed,"timed branch","timed branches")+" to finish")
           +" ("+countNoun(longest.remaining_candidate_count,"candidate")+" left, "
           +(away?"no worker for "+formatElapsed(longest.unworked_seconds):countNoun(longest.worker_count,"worker"))+")"));
       }else if(estimate.learning_branch_count){
@@ -1656,7 +1656,7 @@
         facts.push("No estimate yet: no open branch with candidates left has a worker");
       }
       const parts=[
-        [estimate.estimated_branch_count,"priced",null],
+        [estimate.estimated_branch_count,"timed",null],
         [estimate.learning_branch_count,"still sampling",estimate.learning_remaining_candidate_count],
         [estimate.unworked_branch_count,"with no worker",estimate.unworked_remaining_candidate_count],
         [estimate.candidates_done_branch_count,"with every candidate done",null],
@@ -1823,9 +1823,9 @@
       fragment.append(element("p","dim","Counts cover "+telemetryEpochText+"."));
       return fragment;
     }
-    // Once a word's work is complete the panel records what it cost; there is
+    // Once a word's work is complete the panel breaks down where it went; there is
     // no progress left to report.
-    function wordProgressHeading(complete){return complete?"Word cost":"Word progress";}
+    function wordProgressHeading(complete){return complete?"Work breakdown":"Word progress";}
     function renderWordProgressInto(headlineHost,host,url,data,solvedGroupCount,state){
       const summary=host.closest("details")?.querySelector(":scope > summary");
       if(summary)summary.textContent=wordProgressHeading(data.completed_at!==null&&data.completed_at!==undefined);
