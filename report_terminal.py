@@ -306,6 +306,13 @@ def _abbreviate_number(value):
     return f"{value:.1f}" if isinstance(value, float) else str(value)
 
 
+def _sample_worker_count_text(sample_worker_count):
+    """A steady sample's worker count, or a mixed sample's mean to 0.01."""
+    if sample_worker_count == int(sample_worker_count):
+        return f"{int(sample_worker_count):,}"
+    return f"{sample_worker_count:,.2f}"
+
+
 def _abbreviate_duration(seconds):
     if seconds is None or seconds < 0:
         return "—"
@@ -1252,7 +1259,8 @@ def _render_branch_sections(report, previous_report, color, width, display_order
         candidate_eta = data.get("candidate_eta")
         if candidate_eta and candidate_eta["state"] in ("ready", "rough"):
             eta_scaling = (
-                f"; scaling {candidate_eta['sample_worker_count']}→"
+                "; scaling "
+                f"{_sample_worker_count_text(candidate_eta['sample_worker_count'])}→"
                 f"{candidate_eta['current_worker_count']} workers"
                 if candidate_eta["worker_count_changed"] else ""
             )

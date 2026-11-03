@@ -858,6 +858,10 @@ class OverviewRendererTest(unittest.TestCase):
         self.assertIn("wall-time=2m", output)
         self.assertIn("+ unattributed 3", output)
         self.assertIn("scaling 1→2 workers", output)
+        report["data"]["candidate_eta"]["sample_worker_count"] = 1.3
+        report["data"]["candidate_eta"]["current_worker_count"] = 1
+        self.assertIn(
+            "scaling 1.30→1 workers", render_report(report, width=100))
         self.assertIn("1 re-queued (up to 2x each)", output)
         self.assertIn("worker evals w0:6,484 w2:6,335", output)
         self.assertIn("and 1 more reaching this same answer set", output)

@@ -4902,6 +4902,27 @@ class ReportClientContract:
         eta_work = next(line for line in text if line.startswith("ETA work remaining"))
         self.assertIn("checks 0 · full evals ~8,393", eta_work)
 
+    def test_candidate_eta_names_the_sample_worker_count_it_scaled_from(self):
+        lines = self.page.evaluate("""async () => {
+          const report=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();
+          const etaLine=sampleWorkerCount=>{
+            report.data.candidate_eta={state:'rough',sample_duration_seconds:300,
+              estimated_seconds:13,remaining_inspection_count:0,
+              expected_full_evaluation_count:8393,worker_count_changed:true,
+              sample_worker_count:sampleWorkerCount,current_worker_count:1};
+            applyReport(report,null,{...__reportClient.getState(),branch_target:'RAISE .....'});
+            const section=[...document.querySelectorAll('section')].find(
+              section=>section.querySelector('h2')?.textContent==='Candidates'
+            );
+            return [...section.querySelectorAll('.labeled-facts')].map(
+              facts=>facts.innerText
+            ).find(line=>line.startsWith('Rough ETA'));
+          };
+          return [etaLine(1.3), etaLine(2)];
+        }""")
+        self.assertIn("scaling 1.30→1 workers", lines[0])
+        self.assertIn("scaling 2→1 workers", lines[1])
+
     def test_ceiling_proven_loss_explains_its_proof(self):
         facts = self.page.evaluate("""async () => {
           const branch=await (await fetch('/api/view?branch_target=RAISE%20.....')).json();

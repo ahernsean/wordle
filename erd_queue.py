@@ -5844,8 +5844,9 @@ class ERDQueue:
         than the trailing report window.  Without a best ERD, the sample begins
         at branch creation.  Bound-tagged scans from an older concurrent worker
         are excluded only once a current best exists.  All durations are
-        aggregate worker time; the report converts them to wall time using live
-        worker count.
+        aggregate worker time, also broken down by how many workers were on
+        the branch when each was recorded, so the report can convert each
+        part to wall time at the parallel efficiency it was measured under.
         """
         now = int(time.time()) if now is None else now
         branch_id = self._intern_branch(branch_key)
@@ -5873,12 +5874,6 @@ class ERDQueue:
                        COALESCE(SUM(pruned_candidate_count), 0)
                            AS pruned_candidate_count,
                        COALESCE(SUM(wall_time_millis), 0) AS inspection_worker_time_millis,
-                       CASE WHEN SUM(wall_time_millis) > 0
-                            THEN SUM(branch_worker_count * wall_time_millis) * 1.0
-                                 / SUM(wall_time_millis) END
-                           AS inspection_worker_count,
-                       MIN(branch_worker_count) AS inspection_worker_count_min,
-                       MAX(branch_worker_count) AS inspection_worker_count_max,
                        SUM(CASE WHEN wall_time_millis > 0
                                      AND branch_worker_count IS NULL
                                 THEN 1 ELSE 0 END)
@@ -5893,12 +5888,6 @@ class ERDQueue:
             SELECT COUNT(evaluation_time_millis) AS evaluated_candidate_count,
                    COALESCE(SUM(evaluation_time_millis), 0)
                        AS evaluation_worker_time_millis,
-                   CASE WHEN SUM(evaluation_time_millis) > 0
-                        THEN SUM(branch_worker_count * evaluation_time_millis) * 1.0
-                             / SUM(evaluation_time_millis) END
-                       AS evaluation_worker_count,
-                   MIN(branch_worker_count) AS evaluation_worker_count_min,
-                   MAX(branch_worker_count) AS evaluation_worker_count_max,
                    SUM(CASE WHEN evaluation_time_millis IS NOT NULL
                                  AND branch_worker_count IS NULL
                             THEN 1 ELSE 0 END)
@@ -5909,6 +5898,27 @@ class ERDQueue:
                   AND done_at >= ? AND done_at <= ?
             """, (branch_id, branch_row["best_erd"], branch_row["best_erd"],
                   since, now)).fetchone()
+            inspection_by_worker_count = self._conn.execute("""
+                SELECT branch_worker_count,
+                       COALESCE(SUM(wall_time_millis), 0) AS worker_time_millis
+                FROM telemetry.two_level_prune_telemetry
+                WHERE branch_id = ? AND branch_worker_count IS NOT NULL
+                  AND (bound_erd = ? OR ? IS NULL)
+                  AND recorded_at >= ? AND recorded_at <= ?
+                GROUP BY branch_worker_count
+            """, (branch_id, branch_row["best_erd"], branch_row["best_erd"],
+                  since, now)).fetchall()
+            evaluation_by_worker_count = self._conn.execute("""
+                SELECT branch_worker_count,
+                       SUM(evaluation_time_millis) AS worker_time_millis
+                FROM candidate_claims
+                WHERE branch_id = ? AND evaluation_time_millis IS NOT NULL
+                  AND branch_worker_count IS NOT NULL
+                  AND (evaluation_bound_erd = ? OR ? IS NULL)
+                  AND done_at >= ? AND done_at <= ?
+                GROUP BY branch_worker_count
+            """, (branch_id, branch_row["best_erd"], branch_row["best_erd"],
+                  since, now)).fetchall()
         except sqlite3.OperationalError:
             return None
         return {
@@ -5916,6 +5926,14 @@ class ERDQueue:
             "window_started_at": since,
             **dict(prune_row),
             **dict(evaluation_row),
+            "inspection_worker_time_millis_by_worker_count": {
+                row["branch_worker_count"]: row["worker_time_millis"]
+                for row in inspection_by_worker_count
+            },
+            "evaluation_worker_time_millis_by_worker_count": {
+                row["branch_worker_count"]: row["worker_time_millis"]
+                for row in evaluation_by_worker_count
+            },
         }
 
     def report_word_progress(self, spine_prefix, epoch, recent_window_seconds,
