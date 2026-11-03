@@ -19,8 +19,8 @@ and use `SWARM.md` for examples.
 
 `view --word-progress WORD` answers "how far along is this word, and what is
 holding it up": per-response-group branch/node/time totals, which groups are
-untouched, request time versus work-start time, and a completion estimate
-drawn from observed claim throughput. It deliberately does not estimate
+untouched, request time versus work-start time, and a completion estimate:
+the longest open branch's own candidate ETA. It deliberately does not estimate
 unstarted groups — see SWARM.md for why the cost model cannot rank them.
 
 Use `erd_search.py epoch show` to inspect the active telemetry epoch. See

@@ -2619,7 +2619,6 @@ def word_progress_report(estimate=None, requested_at=1_798_000_000,
                 "open_branch_count": 8632,
                 "counted_branch_count": 10,
                 "requested_at": requested_at,
-                "recent_window_seconds": 86400,
             },
         },
     }
@@ -2803,50 +2802,65 @@ class WordProgressRendererTest(unittest.TestCase):
                    if line.startswith("-y---"))
         self.assertIn("8,584", hot)
 
+    @staticmethod
+    def _branch_estimate(**overrides):
+        return {
+            "estimated_seconds": 1_075_650.0,
+            "provisional": False,
+            "estimated_branch_count": 3,
+            "estimated_remaining_candidate_count": 9_001,
+            "longest_branch": {"spine": "SCOPE -y---", "answer_count": 502,
+                               "remaining_candidate_count": 7171,
+                               "live_worker_count": 1},
+            "learning_branch_count": 0,
+            "learning_remaining_candidate_count": 0,
+            "unworked_branch_count": 0,
+            "unworked_remaining_candidate_count": 0,
+            **overrides,
+        }
+
+    def test_estimate_names_the_branch_it_rests_on(self):
+        output = render_report(word_progress_report(
+            estimate=self._branch_estimate()), width=140)
+        self.assertIn(
+            "estimate ~12.4d, longest of 3 open branches: SCOPE -y---"
+            " (7,171 candidates left, 1 worker)", output)
+        self.assertNotIn("provisional", output)
+
+    def test_estimate_counts_one_candidate_left_in_the_singular(self):
+        estimate = self._branch_estimate()
+        estimate["longest_branch"]["remaining_candidate_count"] = 1
+        output = render_report(word_progress_report(estimate=estimate),
+                               width=140)
+        self.assertIn("SCOPE -y--- (1 candidate left, 1 worker)", output)
+
     def test_estimate_states_what_it_excludes(self):
-        output = render_report(word_progress_report(estimate={
-            "remaining_candidate_count": 7171,
-            "recent_candidate_count": 576,
-            "candidates_per_second": 576 / 86400,
-            "estimated_seconds": 1_075_650.0,
-            "stalled_branch_count": 9,
-            "stalled_remaining_candidate_count": 4256,
-        }), width=120)
-        self.assertIn("estimate ~12.4d", output)
+        output = render_report(word_progress_report(
+            estimate=self._branch_estimate(
+                learning_branch_count=1,
+                learning_remaining_candidate_count=1,
+                unworked_branch_count=9,
+                unworked_remaining_candidate_count=4256)), width=160)
         # Only groups still waiting hold work the estimate cannot see.
-        self.assertIn("for 7,171 candidates at ~24/h", output)
-        self.assertIn("79 waiting groups", output)
-        self.assertIn("9 stalled branches (4,256 candidates)", output)
+        self.assertIn(
+            "excludes 79 waiting groups and 1 branch still sampling"
+            " (1 candidate) and 9 branches with no worker (4,256 candidates)",
+            output)
 
-    def test_rate_is_shown_per_the_shortest_span_holding_ten_events(self):
-        cases = (
-            (5_010_554 / 86400, "~58/s"),
-            (10, "~10/s"),
-            (9.9, "~594/min"),
-            (0.2, "~12/min"),
-            (0.1, "~360/h"),
-            (100 / 86400, "~100/day"),
-            (3 / 86400, "~3/day"),
-            (0, "~0/day"),
-        )
-        for events_per_second, expected in cases:
-            with self.subTest(events_per_second=events_per_second):
-                self.assertEqual(
-                    report_terminal.format_rate(events_per_second), expected)
+    def test_provisional_estimate_is_marked(self):
+        output = render_report(word_progress_report(
+            estimate=self._branch_estimate(provisional=True)), width=140)
+        self.assertIn("estimate ~12.4d (provisional), longest of", output)
 
-    def test_provisional_estimate_states_its_sample_duration(self):
-        output = render_report(word_progress_report(estimate={
-            "remaining_candidate_count": 7171,
-            "recent_candidate_count": 576,
-            "candidates_per_second": 576 / 86400,
-            "estimated_seconds": 1_075_650.0,
-            "sample_duration_seconds": 600,
-            "provisional": True,
-            "stalled_branch_count": 0,
-            "stalled_remaining_candidate_count": 0,
-        }), width=120)
-
-        self.assertIn("provisional; 10m sample", output)
+    def test_estimate_without_a_sampled_branch_says_so(self):
+        output = render_report(word_progress_report(
+            estimate=self._branch_estimate(
+                estimated_seconds=None, estimated_branch_count=0,
+                longest_branch=None, learning_branch_count=2,
+                learning_remaining_candidate_count=30)), width=140)
+        self.assertIn("estimate unavailable: no open branch has a sample yet",
+                      output)
+        self.assertIn("2 branches still sampling (30 candidates)", output)
 
     def test_absent_estimate_is_stated_rather_than_guessed(self):
         output = render_report(word_progress_report(), width=120)
@@ -3208,10 +3222,17 @@ class TerminalUtilityTest(unittest.TestCase):
                        "open_branch_count": 1, "search_node_count": 1200,
                        "wall_time_millis": 90000,
                        "state_counts": {"waiting": 1, "evaluating": 2}},
-            "estimate": {"provisional": True, "sample_duration_seconds": 60,
-                         "estimated_seconds": 120, "remaining_candidate_count": 3,
-                         "candidates_per_second": 0.025, "stalled_branch_count": 1,
-                         "stalled_remaining_candidate_count": 2},
+            "estimate": {"provisional": True, "estimated_seconds": 120,
+                         "estimated_branch_count": 1,
+                         "estimated_remaining_candidate_count": 3,
+                         "longest_branch": {"spine": "RAISE -y---",
+                                            "answer_count": 2,
+                                            "remaining_candidate_count": 3,
+                                            "live_worker_count": 1},
+                         "learning_branch_count": 0,
+                         "learning_remaining_candidate_count": 0,
+                         "unworked_branch_count": 1,
+                         "unworked_remaining_candidate_count": 2},
             "response_groups": [{"pattern": "-----", "state": "waiting",
                                  "answer_count": 2, "started": False,
                                  "provenance": "none", "paid_by": None,
@@ -3233,11 +3254,11 @@ class TerminalUtilityTest(unittest.TestCase):
                                  "inherited_wall_time_millis": 0}],
         }
         output = report_terminal.render_report(report, width=120)
-        self.assertIn("estimate ~2m", output)
-        self.assertIn("at ~90/h", output)
+        self.assertIn("estimate ~2m (provisional)", output)
+        self.assertIn("RAISE -y--- (3 candidates left, 1 worker)", output)
         self.assertIn(
-            "excludes 1 waiting group and 1 stalled branch (2 candidates)",
-            output)
+            "excludes 1 waiting group and 1 branch with no worker"
+            " (2 candidates)", output)
 
 
 if __name__ == "__main__":

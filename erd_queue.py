@@ -5936,7 +5936,7 @@ class ERDQueue:
             },
         }
 
-    def report_word_progress(self, spine_prefix, epoch, recent_window_seconds,
+    def report_word_progress(self, spine_prefix, epoch,
                              active_branch_limit=10, now=None) -> dict:
         """Per-response-group work totals for one spine, plus live rates.
 
@@ -5981,16 +5981,15 @@ class ERDQueue:
         Their ratio is a coarse read on how much parallelism the group drew.
 
         Progress on still-running branches comes from candidate_claims: a
-        branch is `n_candidates` claims wide, and `recent_done_count` over
-        `recent_window_seconds` gives the rate that turns the remainder into an
-        estimate.  Claim rows carry no epoch, so the window is the only fence.
-        Counting claims costs a scan per branch and a word can hold thousands
-        of open branches at once, so only the `active_branch_limit` widest are
-        counted -- claims are handed out widest-branch-first, so those are the
-        ones carrying the work an estimate depends on.
+        branch is `n_candidates` claims wide, and its done claims are its
+        progress.  Each comes back with its key and spine, so a report can
+        price its remainder from that branch's own candidate sample.  Counting
+        claims costs a scan per branch and a word can hold thousands of open
+        branches at once, so only the `active_branch_limit` widest are counted
+        -- claims are handed out widest-branch-first, so those are the ones
+        carrying the work an estimate depends on.
         """
         now = int(time.time()) if now is None else now
-        since = now - recent_window_seconds
         # The response pattern follows one space past the prefix.
         pattern_start = len(spine_prefix) + 2
         low, high = self._spine_subtree_bounds(spine_prefix)
@@ -6073,25 +6072,27 @@ class ERDQueue:
                                                     first)
                 work_started_at = min(work_started_at or first, first)
         active_rows = self._conn.execute("""
-            SELECT branch_id, n_words, n_candidates, created_at
-            FROM active_branches
-            WHERE status = 'open' AND spine LIKE ?
-            ORDER BY n_words DESC LIMIT ?
+            SELECT ab.branch_id, bk.branch_key, ab.spine, ab.n_words,
+                   ab.n_candidates, ab.created_at
+            FROM active_branches ab
+            JOIN branches bk ON bk.branch_id = ab.branch_id
+            WHERE ab.status = 'open' AND ab.spine LIKE ?
+            ORDER BY ab.n_words DESC LIMIT ?
         """, (descendants, active_branch_limit)).fetchall()
         active = []
         for row in active_rows:
             branch_id = row["branch_id"]
-            claim_row = self._conn.execute("""
-                SELECT COUNT(*) AS done_count,
-                       COUNT(*) FILTER (WHERE done_at >= ?) AS recent_count
-                FROM candidate_claims WHERE branch_id = ? AND done = 1
-            """, (since, branch_id)).fetchone()
+            done_count = self._conn.execute("""
+                SELECT COUNT(*) FROM candidate_claims
+                WHERE branch_id = ? AND done = 1
+            """, (branch_id,)).fetchone()[0]
             active.append({
                 "branch_id": branch_id,
+                "branch_key": bytes(row["branch_key"]),
+                "spine": row["spine"],
                 "answer_count": row["n_words"],
                 "candidate_count": row["n_candidates"],
-                "done_candidate_count": claim_row["done_count"],
-                "recent_done_candidate_count": claim_row["recent_count"],
+                "done_candidate_count": done_count,
                 "created_at": row["created_at"],
             })
         return {
@@ -6101,7 +6102,6 @@ class ERDQueue:
             "counted_branch_count": len(active),
             "work_started_at": work_started_at,
             "work_latest_at": work_latest_at,
-            "recent_window_seconds": recent_window_seconds,
             "epoch": epoch,
             "telemetry_epochs": sorted(telemetry_epochs),
         }

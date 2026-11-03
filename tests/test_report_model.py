@@ -5505,40 +5505,101 @@ class WordProgressReportTest(unittest.TestCase):
         self.assertEqual(data["work_started_at"], requested_at - 86_400)
         self.assertIsNone(data["totals"]["requested_at"])
 
-    def test_estimate_excludes_stalled_branches_from_both_rate_and_remainder(self):
+    @staticmethod
+    def _estimated_branch(spine, remaining, state, estimated_seconds,
+                          live_worker_count=1):
+        return {
+            "spine": spine, "answer_count": 50,
+            "candidate_count": 1_000, "done_candidate_count": 1_000 - remaining,
+            "live_worker_count": live_worker_count,
+            "eta": {"state": state, "estimated_seconds": estimated_seconds},
+        }
+
+    def test_estimate_is_the_longest_open_branch(self):
+        # Open branches run concurrently on their own workers, so the work
+        # under the word is done when the slowest branch is -- however many
+        # candidates the quick ones still hold.
         estimate = _word_progress_estimate([
-            # Progressing: 400 of 1,000 candidates left, 100/day observed.
-            {"candidate_count": 1000, "done_candidate_count": 600,
-             "recent_done_candidate_count": 100, "created_at": 0},
-            # Stalled at 99%: waiting on published sub-branches, not on its
-            # own candidates.  Its remainder must not be charged to the
-            # rate above, which it is not producing.
-            {"candidate_count": 1000, "done_candidate_count": 990,
-             "recent_done_candidate_count": 0, "created_at": 0},
-        ], 86400, 86400)
+            self._estimated_branch("SALET -y---", 900, "ready", 100),
+            self._estimated_branch("SALET ----- CRONY -----", 50, "rough", 400,
+                                   live_worker_count=2),
+            # Workers on it, but its sample has not seen both kinds of work.
+            {**self._estimated_branch("SALET --y--", 30, "learning", None)},
+            # No live worker, so no wall time to scale its sample to.
+            {**self._estimated_branch("SALET ---y-", 20, None, None,
+                                      live_worker_count=0), "eta": None},
+            # Every candidate done: it waits on sub-branches, not on itself.
+            {**self._estimated_branch("SALET y----", 0, None, None),
+             "eta": None},
+        ])
 
-        self.assertEqual(estimate["remaining_candidate_count"], 400)
-        self.assertEqual(estimate["candidates_per_second"], 100 / 86400)
-        self.assertEqual(estimate["estimated_seconds"], 4 * 86400)
-        self.assertEqual(estimate["stalled_branch_count"], 1)
-        self.assertEqual(estimate["stalled_remaining_candidate_count"], 10)
-
-    def test_estimate_uses_the_available_sample_span_until_the_window_fills(self):
-        estimate = _word_progress_estimate([
-            {"candidate_count": 1000, "done_candidate_count": 100,
-             "recent_done_candidate_count": 100, "created_at": 1000},
-        ], 86400, 1600)
-
-        self.assertEqual(estimate["sample_duration_seconds"], 600)
+        self.assertEqual(estimate["estimated_seconds"], 400)
         self.assertTrue(estimate["provisional"])
-        self.assertEqual(estimate["candidates_per_second"], 100 / 600)
-        self.assertEqual(estimate["estimated_seconds"], 5400)
+        self.assertEqual(estimate["estimated_branch_count"], 2)
+        self.assertEqual(estimate["estimated_remaining_candidate_count"], 950)
+        self.assertEqual(estimate["longest_branch"], {
+            "spine": "SALET ----- CRONY -----", "answer_count": 50,
+            "remaining_candidate_count": 50, "live_worker_count": 2})
+        self.assertEqual(estimate["learning_branch_count"], 1)
+        self.assertEqual(estimate["learning_remaining_candidate_count"], 30)
+        self.assertEqual(estimate["unworked_branch_count"], 1)
+        self.assertEqual(estimate["unworked_remaining_candidate_count"], 20)
 
-    def test_estimate_is_absent_when_nothing_completed_in_the_window(self):
+    def test_estimate_is_provisional_only_when_a_branch_sample_is_rough(self):
+        estimate = _word_progress_estimate([
+            self._estimated_branch("SALET -y---", 900, "ready", 100),
+            self._estimated_branch("SALET --y--", 50, "ready", 40),
+        ])
+
+        self.assertFalse(estimate["provisional"])
+        self.assertEqual(estimate["estimated_seconds"], 100)
+
+    def test_estimate_names_no_time_until_a_branch_has_a_sample(self):
+        estimate = _word_progress_estimate([
+            self._estimated_branch("SALET -y---", 900, "learning", None),
+        ])
+
+        self.assertIsNone(estimate["estimated_seconds"])
+        self.assertIsNone(estimate["longest_branch"])
+        self.assertEqual(estimate["learning_branch_count"], 1)
+
+    def test_estimate_is_absent_when_no_open_branch_has_candidates_left(self):
         self.assertIsNone(_word_progress_estimate([
-            {"candidate_count": 1000, "done_candidate_count": 10,
-             "recent_done_candidate_count": 0, "created_at": 0},
-        ], 86400, 86400))
+            {**self._estimated_branch("SALET -y---", 0, None, None),
+             "eta": None},
+        ]))
+
+    def test_estimate_prices_each_open_branch_from_its_own_sample(self):
+        now = int(time.time())
+        worked_key = ScoreCache.encode_subset(ANSWERS[0:2])
+        queue = self._open_queue()
+        self._open_branch(queue, "SALET -y---", 2, now - 300, slice(0, 2))
+        self._open_branch(queue, "SALET ----y", 2, now - 300, slice(2, 4))
+        queue.heartbeat("worker-0", os.getpid(), worked_key, 2, now, 0)
+        for _ in range(2):
+            bundle_id, [idx], _forced = queue.claim_next_bundle(
+                worked_key, "worker-0", 5, list(range(5)), [0.0] * 5,
+                small_count=1, count_cap=1)
+            self.assertTrue(queue.apply_candidate_result(
+                worked_key, idx, claimed_by="worker-0", bundle_id=bundle_id,
+                evaluation_time_millis=3_000))
+        queue.close()
+
+        data = collect_report(self.sources, self._request())["data"]
+
+        estimate = data["estimate"]
+        # Two evaluations at 3 s each leave three more, on one worker.
+        self.assertAlmostEqual(estimate["estimated_seconds"], 9)
+        self.assertTrue(estimate["provisional"])
+        self.assertEqual(estimate["longest_branch"]["spine"], "SALET -y---")
+        self.assertEqual(estimate["longest_branch"]["live_worker_count"], 1)
+        self.assertEqual(estimate["unworked_branch_count"], 1)
+        self.assertEqual(estimate["unworked_remaining_candidate_count"], 5)
+        branches = {branch["spine"]: branch
+                    for branch in data["active_branches"]}
+        self.assertEqual(branches["SALET -y---"]["eta"]["state"], "rough")
+        self.assertIsNone(branches["SALET ----y"]["eta"])
+        json.dumps(data["active_branches"])
 
     def test_word_progress_requires_a_word_target(self):
         with self.assertRaises(ValueError):

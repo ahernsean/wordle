@@ -369,6 +369,9 @@
        with no text node between them are one unbreakable inline box. */
     .inline-facts { display:inline-flex; flex-wrap:wrap; margin-left:.35rem; }
     .stat-line > span, .inline-facts > span { white-space:nowrap; }
+    /* Facts written as sentences wrap between words on a phone; a spine
+       inside one is kept whole with no-break spaces. */
+    .stat-line.prose-facts > span { white-space:normal; min-width:0; }
     .stat-line > span:not(:last-child)::after, .inline-facts > span:not(:last-child)::after { content:"·"; color:var(--border); margin:0 .3em; }
     .sweep { display:flex; gap:1px; height:1.25rem; margin:.3rem 0; position:relative; }
     .progress-line .sweep { height:1rem; margin:0 0 .3rem; }
@@ -1614,18 +1617,9 @@
     function excludedText(totals,estimate){
       const waiting=(totals.display_state_counts||totals.state_counts||{}).waiting||0,parts=[];
       if(waiting)parts.push(countNoun(waiting,"waiting group"));
-      if(estimate.stalled_branch_count)parts.push(countNoun(estimate.stalled_branch_count,"stalled branch","stalled branches"));
+      if(estimate.learning_branch_count)parts.push(countNoun(estimate.learning_branch_count,"branch still sampling","branches still sampling")+" ("+countNoun(estimate.learning_remaining_candidate_count,"candidate")+")");
+      if(estimate.unworked_branch_count)parts.push(countNoun(estimate.unworked_branch_count,"branch with no worker","branches with no worker")+" ("+countNoun(estimate.unworked_remaining_candidate_count,"candidate")+")");
       return parts.length?"excludes "+parts.join(" and "):"";
-    }
-    // A rate is shown per the shortest span that holds at least ten events, so
-    // it keeps two significant figures at any speed; slower than ten a day
-    // reads per day.
-    const RATE_DISPLAY_UNITS=[[1,"s"],[60,"min"],[3600,"h"],[86400,"day"]];
-    function rateText(eventsPerSecond){
-      let index=0;
-      while(index<RATE_DISPLAY_UNITS.length-1&&eventsPerSecond*RATE_DISPLAY_UNITS[index][0]<10)index++;
-      const [spanSeconds,unit]=RATE_DISPLAY_UNITS[index];
-      return "~"+numText(Math.round(eventsPerSecond*spanSeconds))+"/"+unit;
     }
     // The headline sits outside the collapsible panel so the numbers worth a
     // glance are readable with the table closed.  It carries no coverage
@@ -1638,7 +1632,7 @@
     function renderWordProgressHeadline(data,solvedGroupCount){
       const totals=data.totals||{},estimate=data.estimate,parts=[];
       const counts=totals.display_state_counts||totals.state_counts||{};
-      if(estimate)parts.push("~"+formatDuration(estimate.estimated_seconds)+" remaining"+(estimate.provisional?" (provisional)":""));
+      if(estimate&&estimate.longest_branch)parts.push("~"+formatDuration(estimate.estimated_seconds)+" remaining"+(estimate.provisional?" (provisional)":""));
       if(counts.working)parts.push(numText(counts.working)+" groups working");
       if(counts.waiting)parts.push(numText(counts.waiting)+" waiting");
       parts.push("began "+absoluteTime(data.work_started_at));
@@ -1688,14 +1682,20 @@
       fragment.append(statLine(times));
       const estimate=data.estimate;
       if(estimate){
-        fragment.append(statLine([
-          "~"+formatDuration(estimate.estimated_seconds)+" remaining"+(estimate.provisional?" (provisional; "+formatDuration(estimate.sample_duration_seconds)+" sample)":""),
-          numText(estimate.remaining_candidate_count)+" candidates at "+rateText(estimate.candidates_per_second),
-          excludedText(totals,estimate)]));
+        const longest=estimate.longest_branch;
+        const estimateLine=statLine(longest?[
+          "~"+formatDuration(estimate.estimated_seconds)+" remaining"+(estimate.provisional?" (provisional)":""),
+          "longest of "+countNoun(estimate.estimated_branch_count,"open branch","open branches")+": "+longest.spine.replace(/ /g,"\u00a0")
+            +" ("+countNoun(longest.remaining_candidate_count,"candidate")+" left, "+countNoun(longest.live_worker_count,"worker")+")",
+          excludedText(totals,estimate)]:[
+          "No estimate yet: no open branch has a sample",
+          excludedText(totals,estimate)]);
+        estimateLine.classList.add("prose-facts");
+        fragment.append(estimateLine);
       }else if(data.completed_at!==null&&data.completed_at!==undefined){
         fragment.append(element("p","dim","Completed "+relativeAge(data.completed_at,Math.floor(Date.now()/1000))+"."));
       }else{
-        fragment.append(element("p","dim","No completion estimate: no candidates finished in the last "+formatDuration(totals.recent_window_seconds)+"."));
+        fragment.append(element("p","dim","No completion estimate: no open branch has candidates left."));
       }
       const sortField=element("label","field word-progress-sort");
       sortField.append(element("span","fieldlabel","Order by"));
@@ -3892,7 +3892,7 @@
       addEventListener("resize",()=>{measureStickyTop();const root=byId("report");layoutSpines(root);layoutSweepMarkerDigits(root);if(openGroupMenuNode)positionGroupMenu(openGroupMenuNode.node,openGroupMenuNode.opener);if(currentState?.kind==="leaderboard"&&lastReport&&root.clientWidth!==leaderboardReportWidth&&!reportHasFocusedControl()&&!reportHasActiveSelection())applyReport(lastReport,lastReport,currentState);});
       addEventListener("popstate",()=>{abortActiveRequest();currentState=parsePageState(location);syncControls();redrawLeaderboardZoom();fetchReport();schedulePoll();});document.addEventListener("visibilitychange",()=>{if(!document.hidden){if(!skipAutomaticScan())fetchReport();schedulePoll();}});fetchReport();schedulePoll();
     }
-    window.parsePageState=parsePageState;window.buildAPIURL=buildAPIURL;window.wordProgressURL=wordProgressURL;window.renderWordProgressHeadline=renderWordProgressHeadline;window.rateText=rateText;window.applyReport=applyReport;window.renderResponseGroupBreakdown=renderResponseGroupBreakdown;window.spineTextFromSelection=spineTextFromSelection;window.__skipAutomaticScanProbe=()=>skipAutomaticScan();window.__reportClient={setState:state=>setState(state),getState:()=>({...currentState}),fetchReport};
+    window.parsePageState=parsePageState;window.buildAPIURL=buildAPIURL;window.wordProgressURL=wordProgressURL;window.renderWordProgressHeadline=renderWordProgressHeadline;window.applyReport=applyReport;window.renderResponseGroupBreakdown=renderResponseGroupBreakdown;window.spineTextFromSelection=spineTextFromSelection;window.__skipAutomaticScanProbe=()=>skipAutomaticScan();window.__reportClient={setState:state=>setState(state),getState:()=>({...currentState}),fetchReport};
     document.addEventListener("DOMContentLoaded",initialize);
   })();
   </script>
