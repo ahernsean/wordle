@@ -373,6 +373,10 @@
     /* Facts written as sentences wrap between words on a phone; a spine
        inside one is kept whole with no-break spaces. */
     .stat-line.prose-facts > span { white-space:normal; min-width:0; }
+    .word-estimate-primary { margin-top:.35rem; }
+    /* The estimate's figure is a metric's size wherever it stands, the
+       headline's smaller line included. */
+    .estimate-figure { font-size:1rem; }
     .stat-line > span:not(:last-child)::after, .inline-facts > span:not(:last-child)::after { content:"·"; color:var(--border); margin:0 .3em; }
     .sweep { display:flex; gap:1px; height:1.25rem; margin:.3rem 0; position:relative; }
     .progress-line .sweep { height:1rem; margin:0 0 .3rem; }
@@ -1620,17 +1624,18 @@
       const rest=seconds%60;
       return Math.floor(seconds/60)+"m"+(rest?" "+rest+"s":"");
     };
-    // The estimate, then how the open branches divide when they are not all
-    // timed.  The total comes before its parts, so the parts can be checked
-    // against it.  Only groups still waiting hold work the estimate cannot
-    // see: a group the swarm never opened because it needed no search is not
-    // missing work.
-    // The time remaining is bold, like the other figures in the panel.
-    function remainingTimeNode(estimate,...rest){
+    // The estimate reads like a metric: its figure bold, what it describes
+    // dim beside it.  The absence of an estimate stands where its time would.
+    function estimateNode(figure,...rest){
       const node=element("span","");
-      node.append(element("strong","","~"+formatDuration(estimate.estimated_seconds)),
-        " remaining"+(estimate.provisional?" (provisional)":""),...rest);
+      const description=element("span","dim");
+      description.append(...rest);
+      node.append(element("strong","estimate-figure",figure),description);
       return node;
+    }
+    function remainingTimeNode(estimate,...rest){
+      return estimateNode("~"+formatDuration(estimate.estimated_seconds),
+        " remaining"+(estimate.provisional?" (provisional)":""),...rest);
     }
     // A spine inside a sentence: its words as the smallest tiles, in a line.
     function inlineSpine(steps){
@@ -1638,6 +1643,12 @@
       for(const step of steps)node.append(wordTiles(step.word,step.pattern,step.word_is_answer,"word-sm"));
       return node;
     }
+    // The estimate, then how the open branches divide when they are not all
+    // timed.  The total comes before its parts, so the parts can be checked
+    // against it.  Only groups still waiting hold work the estimate cannot
+    // see: a group the swarm never opened because it needed no search is not
+    // missing work.  The estimate is the panel's main figure and is shown as
+    // one; the facts after it are secondary.
     function wordEstimateFacts(totals,estimate){
       const facts=[],longest=estimate.longest_branch;
       if(longest){
@@ -1649,11 +1660,11 @@
           +(away?"no worker for "+formatElapsed(longest.unworked_seconds):countNoun(longest.worker_count,"worker"))+")"));
       }else if(estimate.learning_branch_count){
         const sampled=estimate.learning_sample_seconds,count=estimate.learning_branch_count,required=estimate.required_sample_seconds;
-        facts.push("No estimate yet"+(sampled===null||sampled===undefined?"":" after "+formatElapsed(sampled))+": "
+        facts.push(estimateNode("No estimate yet",(sampled===null||sampled===undefined?"":" after "+formatElapsed(sampled))+": "
           +countNoun(count,"open branch","open branches")+(count===1?" is":" are")+" still sampling to gather "
-          +(required%60===0?countNoun(required/60,"minute"):countNoun(required,"second"))+" of data");
+          +(required%60===0?countNoun(required/60,"minute"):countNoun(required,"second"))+" of data"));
       }else{
-        facts.push("No estimate yet: no open branch with candidates left has a worker");
+        facts.push(estimateNode("No estimate yet",": no open branch with candidates left has a worker"));
       }
       const parts=[
         [estimate.estimated_branch_count,"timed",null],
@@ -1679,15 +1690,19 @@
     function renderWordProgressHeadline(data,solvedGroupCount){
       const totals=data.totals||{},estimate=data.estimate,parts=[];
       const counts=totals.display_state_counts||totals.state_counts||{};
+      // Only the estimate is at full strength; every other fact is dim.
+      const dim=text=>element("span","dim",text);
       if(estimate&&estimate.longest_branch)parts.push(remainingTimeNode(estimate,""));
       // A group holds every branch open beneath it, so the two counts differ
       // whenever a group has published sub-branches.
       const openBranches=(data.active_branches||[]).length;
-      if(counts.working)parts.push(countNoun(counts.working,"group","groups")+" working"
-        +(openBranches&&openBranches!==counts.working?" ("+countNoun(openBranches,"branch","branches")+")":""));
-      if(counts.waiting)parts.push(numText(counts.waiting)+" waiting");
-      parts.push("began "+absoluteTime(data.work_started_at));
-      return statLine(parts);
+      if(counts.working)parts.push(dim(countNoun(counts.working,"group","groups")+" working"
+        +(openBranches&&openBranches!==counts.working?" ("+countNoun(openBranches,"branch","branches")+")":"")));
+      if(counts.waiting)parts.push(dim(numText(counts.waiting)+" waiting"));
+      parts.push(dim("began "+absoluteTime(data.work_started_at)));
+      const line=statLine(parts);
+      line.classList.remove("dim");
+      return line;
     }
     function renderWordProgressPanel(data,url,state,headlineHost,host,solvedGroupCount){
       const fragment=document.createDocumentFragment(),totals=data.totals||{};
@@ -1733,9 +1748,16 @@
       fragment.append(statLine(times));
       const estimate=data.estimate;
       if(estimate){
-        const estimateLine=statLine(wordEstimateFacts(totals,estimate));
-        estimateLine.classList.add("prose-facts");
-        fragment.append(estimateLine);
+        const [primary,...secondary]=wordEstimateFacts(totals,estimate);
+        const estimateBlock=element("div","word-estimate"),primaryLine=element("div","word-estimate-primary");
+        primaryLine.append(primary);
+        estimateBlock.append(primaryLine);
+        if(secondary.length){
+          const secondaryLine=statLine(secondary);
+          secondaryLine.classList.add("prose-facts");
+          estimateBlock.append(secondaryLine);
+        }
+        fragment.append(estimateBlock);
       }else if(data.completed_at!==null&&data.completed_at!==undefined){
         fragment.append(element("p","dim","Completed "+relativeAge(data.completed_at,Math.floor(Date.now()/1000))+"."));
       }else{

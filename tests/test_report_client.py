@@ -1185,7 +1185,7 @@ class ReportClientContract:
             self.apply_branch_target("SALET")
             self.page.wait_for_selector("table.word-progress")
             text = self.page.locator(
-                ".word-progress-panel .stat-line.prose-facts").text_content()
+                ".word-progress-panel .word-estimate").text_content()
         finally:
             self.page.unroute("**/api/view/word-progress**")
 
@@ -1235,13 +1235,63 @@ class ReportClientContract:
         finally:
             self.page.unroute("**/api/view/word-progress**")
 
+    def _strong_styles(self, host):
+        # The estimate's figure beside a metric's: colour, size and weight.
+        return self.page.evaluate("""host => {
+          const style=node=>{const computed=getComputedStyle(node);
+            return [computed.color,computed.fontSize,computed.fontWeight];};
+          return [style(document.querySelector(host+' strong')),
+                  style(document.querySelector('.word-progress-panel .metric strong'))];
+        }""", host)
+
     def test_word_progress_time_remaining_is_bold(self):
-        # It stands out the way the panel's other figures do.
+        # It stands out the way the panel's other figures do: bold, and at the
+        # same full strength, though it sits in a dim line.
         self._word_progress_panel_with(lambda data: None)
         for host in (".word-progress-headline",
-                     ".word-progress-panel .stat-line.prose-facts"):
+                     ".word-progress-panel .word-estimate"):
             strong = self.page.locator(host + " strong").first.inner_text()
             self.assertRegex(strong, r"^~\d", host)
+        for host in (".word-progress-headline",
+                     ".word-progress-panel .word-estimate-primary"):
+            estimate_style, metric_style = self._strong_styles(host)
+            self.assertEqual(estimate_style, metric_style, host)
+        # The rest of the headline stays secondary.
+        began = self.page.locator(".word-progress-headline span",
+                                  has_text="began").last
+        self.assertIn("dim", began.get_attribute("class"))
+
+    def test_word_progress_secondary_facts_stay_dim(self):
+        def mixed(data):
+            data["estimate"].update({"open_branch_count": 3,
+                                     "unworked_branch_count": 2,
+                                     "unworked_remaining_candidate_count": 9})
+
+        self._word_progress_panel_with(mixed)
+        secondary = self.page.locator(
+            ".word-progress-panel .word-estimate .stat-line")
+        self.assertIn("3\u00a0open branches:", secondary.inner_text())
+        self.assertIn("dim", secondary.get_attribute("class"))
+        self.assertEqual(self.page.locator(
+            ".word-progress-panel .word-estimate-primary").count(), 1)
+
+    def test_word_progress_absent_estimate_is_bold(self):
+        def unsampled(data):
+            data["estimate"].update({
+                "estimated_seconds": None, "estimated_branch_count": 0,
+                "longest_branch": None, "learning_branch_count": 2,
+                "learning_remaining_candidate_count": 30,
+                "learning_sample_seconds": 42})
+
+        self._word_progress_panel_with(unsampled)
+        host = ".word-progress-panel .word-estimate-primary"
+        self.assertEqual(self.page.locator(host + " strong").first.inner_text(),
+                         "No estimate yet")
+        estimate_style, metric_style = self._strong_styles(host)
+        self.assertEqual(estimate_style, metric_style)
+        # The time sampled so far is the data's, not a fixed phrase.
+        self.assertIn("No estimate yet after 42s:",
+                      self.page.locator(host).inner_text())
 
     def test_word_progress_estimate_draws_its_branch_as_tiles(self):
         steps = [{"word": "bayou", "pattern": "-y---", "word_is_answer": True},
@@ -1252,7 +1302,7 @@ class ReportClientContract:
                 "spine": "BAYOU -y--- CAROB -----", "spine_steps": steps})
 
         self._word_progress_panel_with(two_step_spine)
-        facts = self.page.locator(".word-progress-panel .stat-line.prose-facts")
+        facts = self.page.locator(".word-progress-panel .word-estimate")
         tiles = facts.locator(".inline-spine .word.word-sm")
         self.assertEqual(tiles.count(), 2)
         self.assertEqual(
