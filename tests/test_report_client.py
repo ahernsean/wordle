@@ -1279,7 +1279,12 @@ class ReportClientContract:
           totals:{state_counts:{working:5}}, work_started_at:1785575213,
           active_branches:[{},{},{},{},{},{}], estimate:null,
         }, null).innerText""")
-        self.assertIn("5 groups working (6\u00a0branches)", headline)
+        self.assertIn("5\u00a0groups working (6\u00a0branches)", headline)
+        one = self.page.evaluate("""() => renderWordProgressHeadline({
+          totals:{state_counts:{working:1}}, work_started_at:1785575213,
+          active_branches:[{}], estimate:null,
+        }, null).innerText""")
+        self.assertIn("1\u00a0group working", one)
         same = self.page.evaluate("""() => renderWordProgressHeadline({
           totals:{state_counts:{working:2}}, work_started_at:1785575213,
           active_branches:[{},{}], estimate:null,
@@ -1335,7 +1340,7 @@ class ReportClientContract:
           totals:{state_counts:{waiting:34, working:45, solved:38}},
           work_started_at:1785575213, estimate:null,
         }, null).innerText""")
-        self.assertIn("45 groups working", text)
+        self.assertIn("45\u00a0groups working", text)
         self.assertIn("34 waiting", text)
         self.assertNotIn("38", text)
 
@@ -1346,7 +1351,7 @@ class ReportClientContract:
           totals:{state_counts:{working:79, solved:38}},
           work_started_at:1785575213, estimate:null,
         }, null).innerText""")
-        self.assertIn("79 groups working", text)
+        self.assertIn("79\u00a0groups working", text)
         self.assertNotIn("waiting", text)
 
     def test_word_progress_table_states_which_patterns_are_finished(self):

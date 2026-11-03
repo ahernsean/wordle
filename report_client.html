@@ -1683,7 +1683,7 @@
       // A group holds every branch open beneath it, so the two counts differ
       // whenever a group has published sub-branches.
       const openBranches=(data.active_branches||[]).length;
-      if(counts.working)parts.push(numText(counts.working)+" groups working"
+      if(counts.working)parts.push(countNoun(counts.working,"group","groups")+" working"
         +(openBranches&&openBranches!==counts.working?" ("+countNoun(openBranches,"branch","branches")+")":""));
       if(counts.waiting)parts.push(numText(counts.waiting)+" waiting");
       parts.push("began "+absoluteTime(data.work_started_at));
