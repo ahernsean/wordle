@@ -1372,13 +1372,22 @@ class ReportClientContract:
         self.assertEqual(self.page.locator(summary).inner_text(),
                          "Word progress")
 
-        def completed(data):
-            data["estimate"] = None
-            data["completed_at"] = 1785575213
+        def completed(route):
+            response = route.fetch()
+            progress = response.json()
+            progress["data"]["estimate"] = None
+            progress["data"]["completed_at"] = 1785575213
+            route.fulfill(response=response, json=progress)
 
-        self._word_progress_panel_with(completed)
-        self.page.wait_for_function(
-            f"() => document.querySelector({summary!r}).innerText === 'Work breakdown'")
+        # The panel is already drawn, so the route stays until a poll has
+        # carried the completed data to it.
+        self.page.route("**/api/view/word-progress**", completed)
+        try:
+            self.page.wait_for_function(
+                f"() => document.querySelector({summary!r}).innerText"
+                " === 'Work breakdown'")
+        finally:
+            self.page.unroute("**/api/view/word-progress**")
 
     def test_completed_word_progress_replaces_an_inapplicable_estimate(self):
         def completed_progress(route):
