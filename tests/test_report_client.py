@@ -1147,7 +1147,7 @@ class ReportClientContract:
             self.page.unroute("**/api/view/word-progress**")
 
         self.assertIn(
-            "longest of 1\u00a0open branch: SCOPE ----y (1\u00a0candidate"
+            "longest of 1\u00a0open branch: SCOPE\u00a0----y (1\u00a0candidate"
             " left, 1\u00a0worker)", text)
         self.assertIn(
             "excludes 1\u00a0waiting group and 1\u00a0branch still sampling"

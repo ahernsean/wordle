@@ -2827,6 +2827,13 @@ class WordProgressRendererTest(unittest.TestCase):
             " (7,171 candidates left, 1 worker)", output)
         self.assertNotIn("provisional", output)
 
+    def test_estimate_counts_one_candidate_left_in_the_singular(self):
+        estimate = self._branch_estimate()
+        estimate["longest_branch"]["remaining_candidate_count"] = 1
+        output = render_report(word_progress_report(estimate=estimate),
+                               width=140)
+        self.assertIn("SCOPE -y--- (1 candidate left, 1 worker)", output)
+
     def test_estimate_states_what_it_excludes(self):
         output = render_report(word_progress_report(
             estimate=self._branch_estimate(

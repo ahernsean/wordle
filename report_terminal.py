@@ -2120,8 +2120,9 @@ def _render_word_progress_sections(report, width, display_order):
                 f"{provisional_text}, longest of "
                 + count_noun(estimate["estimated_branch_count"],
                              "open branch", "open branches")
-                + f": {longest['spine']}"
-                f" ({longest['remaining_candidate_count']:,} candidates left, "
+                + f": {longest['spine']} ("
+                + count_noun(longest["remaining_candidate_count"], "candidate")
+                + " left, "
                 + count_noun(longest["live_worker_count"], "worker") + ")",
                 width,
             ))

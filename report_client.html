@@ -369,6 +369,9 @@
        with no text node between them are one unbreakable inline box. */
     .inline-facts { display:inline-flex; flex-wrap:wrap; margin-left:.35rem; }
     .stat-line > span, .inline-facts > span { white-space:nowrap; }
+    /* Facts written as sentences wrap between words on a phone; a spine
+       inside one is kept whole with no-break spaces. */
+    .stat-line.prose-facts > span { white-space:normal; min-width:0; }
     .stat-line > span:not(:last-child)::after, .inline-facts > span:not(:last-child)::after { content:"·"; color:var(--border); margin:0 .3em; }
     .sweep { display:flex; gap:1px; height:1.25rem; margin:.3rem 0; position:relative; }
     .progress-line .sweep { height:1rem; margin:0 0 .3rem; }
@@ -1680,13 +1683,15 @@
       const estimate=data.estimate;
       if(estimate){
         const longest=estimate.longest_branch;
-        fragment.append(statLine(longest?[
+        const estimateLine=statLine(longest?[
           "~"+formatDuration(estimate.estimated_seconds)+" remaining"+(estimate.provisional?" (provisional)":""),
-          "longest of "+countNoun(estimate.estimated_branch_count,"open branch","open branches")+": "+longest.spine
+          "longest of "+countNoun(estimate.estimated_branch_count,"open branch","open branches")+": "+longest.spine.replace(/ /g,"\u00a0")
             +" ("+countNoun(longest.remaining_candidate_count,"candidate")+" left, "+countNoun(longest.live_worker_count,"worker")+")",
           excludedText(totals,estimate)]:[
           "No estimate yet: no open branch has a sample",
-          excludedText(totals,estimate)]));
+          excludedText(totals,estimate)]);
+        estimateLine.classList.add("prose-facts");
+        fragment.append(estimateLine);
       }else if(data.completed_at!==null&&data.completed_at!==undefined){
         fragment.append(element("p","dim","Completed "+relativeAge(data.completed_at,Math.floor(Date.now()/1000))+"."));
       }else{
