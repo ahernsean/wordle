@@ -10,29 +10,50 @@
   "active_branches": [
    {
     "answer_count": 502,
-    "branch_id": 1589207,
     "candidate_count": 14855,
     "created_at": 1785575213,
     "done_candidate_count": 7742,
-    "recent_done_candidate_count": 569
+    "eta": {
+     "current_worker_count": 1,
+     "estimated_seconds": 1080075.9226713532,
+     "expected_full_evaluation_count": 412,
+     "observed_work_units": 569,
+     "remaining_inspection_count": 7113,
+     "sample_duration_seconds": 600,
+     "sample_worker_count": 1,
+     "state": "ready",
+     "worker_count_changed": false,
+     "worker_count_sample_complete": true
+    },
+    "live_worker_count": 1,
+    "spine": "SCOPE ----y"
    },
    {
     "answer_count": 197,
-    "branch_id": 2799543,
     "candidate_count": 14855,
     "created_at": 1786341888,
     "done_candidate_count": 14763,
-    "recent_done_candidate_count": 0
+    "eta": null,
+    "live_worker_count": 0,
+    "spine": "SCOPE ----y AROID -----"
    }
   ],
   "epoch": 11,
   "estimate": {
-   "candidates_per_second": 0.006585648148148148,
+   "estimated_branch_count": 1,
+   "estimated_remaining_candidate_count": 7113,
    "estimated_seconds": 1080075.9226713532,
-   "recent_candidate_count": 569,
-   "remaining_candidate_count": 7113,
-   "stalled_branch_count": 9,
-   "stalled_remaining_candidate_count": 4256
+   "learning_branch_count": 0,
+   "learning_remaining_candidate_count": 0,
+   "longest_branch": {
+    "answer_count": 502,
+    "live_worker_count": 1,
+    "remaining_candidate_count": 7113,
+    "spine": "SCOPE ----y"
+   },
+   "provisional": false,
+   "unworked_branch_count": 1,
+   "unworked_remaining_candidate_count": 92
   },
   "response_groups": [
    {
@@ -1132,7 +1153,6 @@
     "none": 23,
     "worked": 4
    },
-   "recent_window_seconds": 86400,
    "requested_at": null,
    "response_group_count": 115,
    "search_node_count": 136199509648,

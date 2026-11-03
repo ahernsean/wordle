@@ -834,6 +834,13 @@ def decode_candidate_bitmap(bitmap, candidate_count):
     ]
 
 
+def _worker_is_live(row, generated_at):
+    """A fresh heartbeat proves liveness; a stale one does not disprove it,
+    so the process table is consulted before a worker is called dead."""
+    return (generated_at - row["updated_at"] <= WORKER_LIVENESS_SECONDS
+            or _worker_process_is_running(row["pid"]))
+
+
 def _normalize_worker(row, generated_at, answer_set):
     branch_key_value = _row_value(row, "current_branch_key")
     branch_key = bytes(branch_key_value) if branch_key_value is not None else None
@@ -846,12 +853,7 @@ def _normalize_worker(row, generated_at, answer_set):
         "pid": row["pid"],
         "answer_count": _row_value(row, "n_words"),
         "updated_at": row["updated_at"],
-        # A fresh heartbeat proves liveness; a stale one does not disprove it,
-        # so the process table is consulted before a worker is called dead.
-        "is_live": (
-            generated_at - row["updated_at"] <= WORKER_LIVENESS_SECONDS
-            or _worker_process_is_running(row["pid"])
-        ),
+        "is_live": _worker_is_live(row, generated_at),
         "heartbeat_age_seconds": max(0, generated_at - row["updated_at"]),
         "branch_reference": branch_reference(branch_key) if branch_key else None,
         "branch_key_hex": branch_key.hex() if branch_key else None,
@@ -1866,65 +1868,72 @@ def collect_word_report(sources: ReportOpeners, request: ReportRequest) -> dict:
     return report
 
 
-WORD_PROGRESS_RECENT_WINDOW_SECONDS = 86400
+def _word_progress_estimate(active_branches):
+    """When the branches open under a word will finish, at current staffing.
 
+    Each open branch is priced by its own candidate ETA (`_candidate_eta`),
+    which charges prune checks and full evaluations separately from that
+    branch's recent sample and scales them to the workers on it now.  A rate
+    pooled across branches cannot do that: a newly opened small branch
+    completes most of its candidates by pruning within moments, so it inflates
+    the pooled rate while the remainder sits on large branches evaluating one
+    candidate at a time.  Pooling also loses every branch that finalizes during
+    the sample, whose completions leave with it while its time stays.
 
-def _word_progress_estimate(active_branches, recent_window_seconds, now):
-    """A completion estimate for the branches currently carrying the work.
+    The open branches are worked concurrently, so they are finished when the
+    longest is, and that is the estimate.  It is provisional when any branch it
+    rests on has only a rough sample.  It is not a completion time for the
+    word: response groups still waiting, and branches not yet published beneath
+    the open ones, have no sample to price them by.
 
-    Only in-flight branches can be estimated: their candidate lists have a
-    known width and an observed completion rate.  Response groups the swarm
-    has not opened yet have neither, and the cost model cannot supply one --
-    it is keyed on (size, budget), and branches of near-identical size differ
-    in cost by orders of magnitude -- so they are excluded and counted
-    separately rather than guessed at.
-
-    Only branches that completed a candidate inside the window contribute.  A
-    branch sitting at 99% with no recent completions is not slow, it is
-    waiting on sub-branches it already published; counting its remainder
-    against a rate it is not producing inflates the estimate without bound.
-    Those branches are reported as stalled instead, so excluding them hides
-    nothing.
-
-    A newly opened word has less history than the window.  Its rate therefore
-    uses the observed span from its first sampled branch through `now`, rather
-    than treating the unseen part of the window as idle time.  Such an estimate
-    is explicitly provisional until the full window has elapsed.
-
-    Returns None when nothing has completed inside the window, which is the
-    honest answer for an idle or just-restarted word.
+    A branch with candidates left but no estimate either has no live worker on
+    it or has not yet sampled both kinds of work; each kind is counted so the
+    report can say what the estimate leaves out.  A branch with every candidate
+    done is waiting on its sub-branches or its finalize and adds no remaining
+    candidate work of its own.  Returns None when no open branch has
+    candidates left.
     """
-    remaining = 0
-    recent = 0
-    stalled_remaining = 0
-    stalled_count = 0
-    sample_started_at = None
+    estimated = []
+    learning_branch_count = learning_remaining = 0
+    unworked_branch_count = unworked_remaining = 0
     for branch in active_branches:
         branch_remaining = max(0, branch["candidate_count"]
                                   - branch["done_candidate_count"])
-        if branch["recent_done_candidate_count"]:
-            remaining += branch_remaining
-            recent += branch["recent_done_candidate_count"]
-            created_at = branch["created_at"]
-            sample_started_at = (created_at if sample_started_at is None else
-                                 min(sample_started_at, created_at))
-        elif branch_remaining:
-            stalled_remaining += branch_remaining
-            stalled_count += 1
-    if not recent or not remaining:
+        if not branch_remaining:
+            continue
+        eta = branch["eta"]
+        if eta is not None and eta["state"] in ("ready", "rough"):
+            estimated.append(branch)
+        elif branch["live_worker_count"]:
+            learning_branch_count += 1
+            learning_remaining += branch_remaining
+        else:
+            unworked_branch_count += 1
+            unworked_remaining += branch_remaining
+    if not (estimated or learning_branch_count or unworked_branch_count):
         return None
-    sample_duration_seconds = min(
-        recent_window_seconds, max(1, now - sample_started_at))
-    rate_per_second = recent / sample_duration_seconds
+    longest = max(estimated, key=lambda branch: branch["eta"]["estimated_seconds"],
+                  default=None)
     return {
-        "remaining_candidate_count": remaining,
-        "recent_candidate_count": recent,
-        "candidates_per_second": rate_per_second,
-        "estimated_seconds": remaining / rate_per_second,
-        "sample_duration_seconds": sample_duration_seconds,
-        "provisional": sample_duration_seconds < recent_window_seconds,
-        "stalled_branch_count": stalled_count,
-        "stalled_remaining_candidate_count": stalled_remaining,
+        "estimated_seconds": (
+            longest["eta"]["estimated_seconds"] if longest else None),
+        "provisional": any(
+            branch["eta"]["state"] == "rough" for branch in estimated),
+        "estimated_branch_count": len(estimated),
+        "estimated_remaining_candidate_count": sum(
+            branch["candidate_count"] - branch["done_candidate_count"]
+            for branch in estimated),
+        "longest_branch": None if longest is None else {
+            "spine": longest["spine"],
+            "answer_count": longest["answer_count"],
+            "remaining_candidate_count": (
+                longest["candidate_count"] - longest["done_candidate_count"]),
+            "live_worker_count": longest["live_worker_count"],
+        },
+        "learning_branch_count": learning_branch_count,
+        "learning_remaining_candidate_count": learning_remaining,
+        "unworked_branch_count": unworked_branch_count,
+        "unworked_remaining_candidate_count": unworked_remaining,
     }
 
 
@@ -2126,8 +2135,13 @@ def collect_word_progress_report(sources: ReportOpeners,
         queue = _open_report_queue(sources)
         active_epoch = queue.epoch
         progress = queue.report_word_progress(
-            spine_prefix, request.epoch, WORD_PROGRESS_RECENT_WINDOW_SECONDS,
-            now=generated_at)
+            spine_prefix, request.epoch, now=generated_at)
+        heartbeat_rows = queue.heartbeats_with_branch()
+        eta_samples = [
+            queue.branch_candidate_eta_sample(
+                branch["branch_key"], BRANCH_ETA_WINDOW_SECONDS, generated_at)
+            for branch in progress["active_branches"]
+        ]
         # Work under a deeper spine is still requested under its opener, so the
         # request time is the opener's however deep the target sits.
         requests = queue.opener_work_requests_for_word(
@@ -2306,10 +2320,27 @@ def collect_word_progress_report(sources: ReportOpeners,
              if entry["completed_at"] is not None),
             default=data["completed_at"],
         )
-    data["estimate"] = _word_progress_estimate(
-        progress["active_branches"],
-        progress["recent_window_seconds"], generated_at)
-    data["active_branches"] = progress["active_branches"]
+    live_worker_counts = collections.Counter(
+        bytes(row["current_branch_key"]) for row in heartbeat_rows
+        if row["current_branch_key"] is not None
+        and _worker_is_live(row, generated_at))
+    active_branches = []
+    for branch, eta_sample in zip(progress["active_branches"], eta_samples):
+        live_worker_count = live_worker_counts[branch["branch_key"]]
+        active_branches.append({
+            "spine": branch["spine"],
+            "answer_count": branch["answer_count"],
+            "candidate_count": branch["candidate_count"],
+            "done_candidate_count": branch["done_candidate_count"],
+            "created_at": branch["created_at"],
+            "live_worker_count": live_worker_count,
+            "eta": _candidate_eta(
+                {"candidate_count": branch["candidate_count"],
+                 "completed_candidate_count": branch["done_candidate_count"]},
+                eta_sample, live_worker_count, generated_at),
+        })
+    data["estimate"] = _word_progress_estimate(active_branches)
+    data["active_branches"] = active_branches
     # A request time later than the work it asked for is not a request time.
     # Rebuilding the queue's opener_work rows stamps every one of them with the
     # rebuild's own clock, discarding whatever the original request time was,
@@ -2333,7 +2364,6 @@ def collect_word_progress_report(sources: ReportOpeners,
         "open_branch_count": progress["open_branch_count"],
         "counted_branch_count": progress["counted_branch_count"],
         "requested_at": earliest_request,
-        "recent_window_seconds": progress["recent_window_seconds"],
         "provenance_counts": collections.Counter(
             row["provenance"] for row in rows),
         "display_state_counts": collections.Counter(

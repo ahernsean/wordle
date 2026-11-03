@@ -278,8 +278,14 @@ is wall-clock from the group's first branch to its last, which the swarm's
 other work shares; `WorkerTime` is summed across bundles, so six workers for
 an hour reads as six hours. Their ratio is a coarse read on parallelism drawn.
 
-The estimate covers only branches with observed throughput, and says how many
-waiting groups and stalled branches it excludes. Waiting groups are not
+The estimate is the longest of the open branches' own candidate ETAs -- the
+same per-branch figure the branch view shows, which prices prune checks and
+full evaluations separately and scales them to the workers on that branch
+now. Open branches run concurrently, so the work in flight is done when the
+slowest is, and the estimate names that branch. It is provisional while any
+branch it rests on has only a rough sample. It says how many waiting groups it
+excludes, and how many open branches it could not price yet: those still
+sampling, and those with no worker on them. Waiting groups are not
 estimated: the cost model is keyed on `(size, budget)` and branches of
 near-identical size differ in cost by orders of magnitude, so it cannot rank
 them. Groups the swarm has not opened show `—`, never `0`.

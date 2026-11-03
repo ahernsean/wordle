@@ -1107,17 +1107,20 @@ class ReportClientContract:
     def test_word_progress_headline_marks_a_warm_up_estimate_provisional(self):
         headline = self.page.evaluate("""() => renderWordProgressHeadline({
           totals:{state_counts:{}}, work_started_at:1785575213,
-          estimate:{estimated_seconds:3600, provisional:true},
+          estimate:{estimated_seconds:3600, provisional:true,
+                    longest_branch:{spine:"SALET -y---"}},
         }, null).innerText""")
 
         self.assertIn("~1.0h remaining (provisional)", headline)
 
-    def test_word_progress_rate_is_shown_per_the_shortest_span_holding_ten(self):
-        rates = self.page.evaluate("""() => [5010554/86400, 10, 9.9, 0.2, 0.1,
-          100/86400, 3/86400, 0].map(rateText)""")
+    def test_word_progress_headline_names_no_time_without_a_sampled_branch(self):
+        headline = self.page.evaluate("""() => renderWordProgressHeadline({
+          totals:{state_counts:{}}, work_started_at:1785575213,
+          estimate:{estimated_seconds:null, provisional:false,
+                    longest_branch:null, learning_branch_count:1},
+        }, null).innerText""")
 
-        self.assertEqual(rates, ["~58/s", "~10/s", "~594/min", "~12/min",
-                                 "~360/h", "~100/day", "~3/day", "~0/day"])
+        self.assertNotIn("remaining", headline)
 
     def test_word_progress_estimate_counts_agree_with_their_nouns(self):
         def one_of_each(route):
@@ -1126,9 +1129,13 @@ class ReportClientContract:
             data = progress["data"]
             data["totals"]["display_state_counts"] = {"waiting": 1}
             data["estimate"].update({
-                "remaining_candidate_count": 43249,
-                "candidates_per_second": 5010554 / 86400,
-                "stalled_branch_count": 1})
+                "estimated_branch_count": 1,
+                "learning_branch_count": 1,
+                "learning_remaining_candidate_count": 1,
+                "unworked_branch_count": 2,
+                "unworked_remaining_candidate_count": 43249})
+            data["estimate"]["longest_branch"].update({
+                "remaining_candidate_count": 1, "live_worker_count": 1})
             route.fulfill(response=response, json=progress)
 
         self.page.route("**/api/view/word-progress**", one_of_each)
@@ -1139,9 +1146,34 @@ class ReportClientContract:
         finally:
             self.page.unroute("**/api/view/word-progress**")
 
-        self.assertIn("43,249 candidates at ~58/s", text)
         self.assertIn(
-            "excludes 1\u00a0waiting group and 1\u00a0stalled branch", text)
+            "longest of 1\u00a0open branch: SCOPE ----y (1\u00a0candidate"
+            " left, 1\u00a0worker)", text)
+        self.assertIn(
+            "excludes 1\u00a0waiting group and 1\u00a0branch still sampling"
+            " (1\u00a0candidate) and 2\u00a0branches with no worker"
+            " (43,249\u00a0candidates)", text)
+
+    def test_word_progress_without_a_sampled_branch_says_so(self):
+        def unsampled(route):
+            response = route.fetch()
+            progress = response.json()
+            progress["data"]["estimate"].update({
+                "estimated_seconds": None, "estimated_branch_count": 0,
+                "longest_branch": None, "learning_branch_count": 1,
+                "learning_remaining_candidate_count": 5})
+            route.fulfill(response=response, json=progress)
+
+        self.page.route("**/api/view/word-progress**", unsampled)
+        try:
+            self.apply_branch_target("SALET")
+            self.page.wait_for_selector("table.word-progress")
+            text = self.page.locator(".word-progress-panel").inner_text()
+        finally:
+            self.page.unroute("**/api/view/word-progress**")
+
+        self.assertIn("No estimate yet: no open branch has a sample", text)
+        self.assertIn("1\u00a0branch still sampling (5\u00a0candidates)", text)
 
     def test_completed_word_progress_replaces_an_inapplicable_estimate(self):
         def completed_progress(route):

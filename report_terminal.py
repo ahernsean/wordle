@@ -325,20 +325,6 @@ def _abbreviate_duration(seconds):
     return f"{seconds / 86400:.1f}d"
 
 
-# A rate is shown per the shortest span that holds at least ten events, so
-# it keeps two significant figures at any speed; slower than ten a day reads
-# per day.
-RATE_DISPLAY_UNITS = ((1, "s"), (60, "min"), (3600, "h"), (86400, "day"))
-
-
-def format_rate(events_per_second):
-    for span_seconds, unit in RATE_DISPLAY_UNITS:
-        events = events_per_second * span_seconds
-        if events >= 10:
-            break
-    return f"~{events:,.0f}/{unit}"
-
-
 DISK_RATE_FLOOR_BYTES = 10_000
 
 
@@ -2117,21 +2103,28 @@ def _render_word_progress_sections(report, width, display_order):
     estimate = data["estimate"]
     if estimate is None:
         summary.append(_fit(
-            "  estimate unavailable: no candidates completed in the window",
+            "  estimate unavailable: no open branch has candidates left",
             width,
         ))
     else:
-        provisional_text = (
-            f" (provisional; {_abbreviate_duration(estimate['sample_duration_seconds'])} sample)"
-            if estimate.get("provisional") else ""
-        )
-        summary.append(_fit(
-            f"  estimate ~{_abbreviate_duration(estimate['estimated_seconds'])}"
-            f"{provisional_text}"
-            f" for {estimate['remaining_candidate_count']:,} candidates"
-            f" at {format_rate(estimate['candidates_per_second'])}",
-            width,
-        ))
+        longest = estimate["longest_branch"]
+        if longest is None:
+            summary.append(_fit(
+                "  estimate unavailable: no open branch has a sample yet",
+                width,
+            ))
+        else:
+            provisional_text = " (provisional)" if estimate["provisional"] else ""
+            summary.append(_fit(
+                f"  estimate ~{_abbreviate_duration(estimate['estimated_seconds'])}"
+                f"{provisional_text}, longest of "
+                + count_noun(estimate["estimated_branch_count"],
+                             "open branch", "open branches")
+                + f": {longest['spine']}"
+                f" ({longest['remaining_candidate_count']:,} candidates left, "
+                + count_noun(longest["live_worker_count"], "worker") + ")",
+                width,
+            ))
         # Only groups still waiting hold work the estimate cannot see.  A
         # group the swarm never opened because it needed no search is not
         # missing work, and counting it here would invent a backlog.
@@ -2139,13 +2132,17 @@ def _render_word_progress_sections(report, width, display_order):
         waiting = _state_counts(totals).get("waiting", 0)
         if waiting:
             excluded.append(count_noun(waiting, "waiting group"))
-        if estimate["stalled_branch_count"]:
-            excluded.append(
-                count_noun(estimate["stalled_branch_count"],
-                           "stalled branch", "stalled branches")
-                + " (" + count_noun(
-                    estimate["stalled_remaining_candidate_count"],
-                    "candidate") + ")")
+        for kind, label, plural in (
+                ("learning", "branch still sampling",
+                 "branches still sampling"),
+                ("unworked", "branch with no worker",
+                 "branches with no worker")):
+            if estimate[f"{kind}_branch_count"]:
+                excluded.append(
+                    count_noun(estimate[f"{kind}_branch_count"], label, plural)
+                    + " (" + count_noun(
+                        estimate[f"{kind}_remaining_candidate_count"],
+                        "candidate") + ")")
         if excluded:
             summary.append(_fit("    excludes " + " and ".join(excluded),
                                 width))
