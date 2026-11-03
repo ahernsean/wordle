@@ -345,6 +345,12 @@ CREATE TABLE IF NOT EXISTS worker_heartbeat (
                                     -- last claim boundary; NULL if none was selected
     scheduling_role    TEXT,        -- one of SCHEDULING_ROLES; NULL if opener_work_id
                                     -- is NULL
+    -- The branch this worker was on before its current one, when it began
+    -- there and when it left; NULL until the worker has left a branch.  A
+    -- report holds a branch's estimate briefly after its worker leaves.
+    previous_branch_id         INTEGER,
+    previous_branch_started_at INTEGER,
+    previous_branch_left_at    INTEGER,
     -- Hint-artifact accounting for the run (hint_cache.py).  All NULL when the
     -- swarm was started without --hint-cache, which is not the same fact as a
     -- measured zero.  The first four count LOOKUPS, from both hint sites: a
@@ -1950,6 +1956,11 @@ class ERDQueue:
             "first_best_at": "INTEGER",
             "nodes_at_first_best": "INTEGER",
         }, schema="telemetry")
+        self._add_columns("worker_heartbeat", {
+            "previous_branch_id": "INTEGER",
+            "previous_branch_started_at": "INTEGER",
+            "previous_branch_left_at": "INTEGER",
+        })
 
         # Baseline epoch 0 and the run_meta pointer, both idempotent.  git_sha is
         # stamped later (set_epoch) when a deploy knows it.
@@ -2977,13 +2988,17 @@ class ERDQueue:
                   scheduling_role=None,
                   hint_lookups=None, hint_hits=None, hint_accepted=None,
                   hint_rejected=None, hint_inline_placements=None,
-                  hint_inline_wins=None):
+                  hint_inline_wins=None, previous_branch_key=None,
+                  previous_branch_started_at=None,
+                  previous_branch_left_at=None):
         if scheduling_role is not None and scheduling_role not in SCHEDULING_ROLES:
             raise ValueError(f"unknown scheduling_role {scheduling_role!r}: "
                              f"expected one of {SCHEDULING_ROLES}")
         now = int(time.time())
         current_branch_id = (self._intern_branch(current_branch_key, create=True)
                              if current_branch_key is not None else None)
+        previous_branch_id = (self._intern_branch(previous_branch_key, create=True)
+                              if previous_branch_key is not None else None)
         self._conn.execute("""
             INSERT OR REPLACE INTO worker_heartbeat
                 (worker_id, pid, current_branch_id, n_words, started_at,
@@ -2993,9 +3008,11 @@ class ERDQueue:
                  cur_max_depth, cur_nodes, node_rate, cur_path, cur_help_depth,
                  opener_work_id, scheduling_role,
                  hint_lookups, hint_hits, hint_accepted, hint_rejected,
-                 hint_inline_placements, hint_inline_wins)
+                 hint_inline_placements, hint_inline_wins,
+                 previous_branch_id, previous_branch_started_at,
+                 previous_branch_left_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?)
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (worker_id, pid, current_branch_id, n_words, started_at,
               now, claims_done, claim_idx, claim_started_at,
               cand_rate, cache_hits, cache_misses, n_cutoff, n_pruned, n_ok,
@@ -3003,7 +3020,9 @@ class ERDQueue:
               cur_max_depth, cur_nodes, node_rate, cur_path, cur_help_depth,
               opener_work_id, scheduling_role,
               hint_lookups, hint_hits, hint_accepted, hint_rejected,
-              hint_inline_placements, hint_inline_wins))
+              hint_inline_placements, hint_inline_wins,
+              previous_branch_id, previous_branch_started_at,
+              previous_branch_left_at))
         # Attributed so a heartbeat write storm is visible in the WAL report: an
         # unthrottled per-candidate heartbeat is a full-page WAL frame each and
         # otherwise hides here, uncategorised.
@@ -3103,6 +3122,7 @@ class ERDQueue:
         return self._conn.execute("""
             SELECT h.*,
                    bk.branch_key AS current_branch_key,
+                   previous.branch_key AS previous_branch_key,
                    COALESCE(owner.owner_priority, b.priority) AS priority,
                    b.spine,
                    COALESCE(owner.owner_opener, b.opener) AS opener,
@@ -3113,6 +3133,8 @@ class ERDQueue:
                    ON h.current_branch_id = b.branch_id
             LEFT JOIN branches bk
                    ON h.current_branch_id = bk.branch_id
+            LEFT JOIN branches previous
+                   ON h.previous_branch_id = previous.branch_id
             LEFT JOIN live_branch_opener_rows owner
                    ON owner.branch_id = h.current_branch_id
                   AND owner.opener_work_id = h.opener_work_id

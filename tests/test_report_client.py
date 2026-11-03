@@ -1130,12 +1130,15 @@ class ReportClientContract:
             data["totals"]["display_state_counts"] = {"waiting": 1}
             data["estimate"].update({
                 "estimated_branch_count": 1,
+                "open_branch_count": 4,
                 "learning_branch_count": 1,
                 "learning_remaining_candidate_count": 1,
                 "unworked_branch_count": 2,
-                "unworked_remaining_candidate_count": 43249})
+                "unworked_remaining_candidate_count": 43249,
+                "candidates_done_branch_count": 0})
             data["estimate"]["longest_branch"].update({
-                "remaining_candidate_count": 1, "live_worker_count": 1})
+                "remaining_candidate_count": 1, "live_worker_count": 1,
+                "worker_count": 1, "unworked_seconds": None})
             route.fulfill(response=response, json=progress)
 
         self.page.route("**/api/view/word-progress**", one_of_each)
@@ -1146,13 +1149,15 @@ class ReportClientContract:
         finally:
             self.page.unroute("**/api/view/word-progress**")
 
+        # One priced branch is named without being compared with anything.
+        self.assertIn(" (1\u00a0candidate left, 1\u00a0worker)", text)
+        self.assertNotIn("the last of", text)
+        self.assertNotIn("longest", text)
         self.assertIn(
-            "longest of 1\u00a0open branch: SCOPE\u00a0----y (1\u00a0candidate"
-            " left, 1\u00a0worker)", text)
-        self.assertIn(
-            "excludes 1\u00a0waiting group and 1\u00a0branch still sampling"
-            " (1\u00a0candidate) and 2\u00a0branches with no worker"
+            "4\u00a0open branches: 1\u00a0priced, 1\u00a0still sampling"
+            " (1\u00a0candidate), 2\u00a0with no worker"
             " (43,249\u00a0candidates)", text)
+        self.assertIn("excludes 1\u00a0waiting group", text)
 
     def test_word_progress_estimate_never_breaks_after_a_number(self):
         # The estimate's facts wrap between words on a phone, but a number is
@@ -1164,10 +1169,12 @@ class ReportClientContract:
             progress["data"]["totals"]["display_state_counts"] = {"waiting": 79}
             progress["data"]["estimate"].update({
                 "provisional": True, "estimated_branch_count": 10,
+                "open_branch_count": 16,
                 "learning_branch_count": 2,
                 "learning_remaining_candidate_count": 8671,
                 "unworked_branch_count": 3,
-                "unworked_remaining_candidate_count": 845})
+                "unworked_remaining_candidate_count": 845,
+                "candidates_done_branch_count": 1})
             progress["data"]["estimate"]["longest_branch"].update({
                 "spine": "BAYOU -y--- CAROB ----- MINTY -----",
                 "remaining_candidate_count": 8561, "live_worker_count": 2})
@@ -1192,8 +1199,12 @@ class ReportClientContract:
             progress = response.json()
             progress["data"]["estimate"].update({
                 "estimated_seconds": None, "estimated_branch_count": 0,
-                "longest_branch": None, "learning_branch_count": 1,
-                "learning_remaining_candidate_count": 5})
+                "longest_branch": None, "open_branch_count": 1,
+                "learning_branch_count": 1,
+                "learning_remaining_candidate_count": 5,
+                "learning_sample_seconds": 95,
+                "unworked_branch_count": 0,
+                "candidates_done_branch_count": 0})
             route.fulfill(response=response, json=progress)
 
         self.page.route("**/api/view/word-progress**", unsampled)
@@ -1204,8 +1215,90 @@ class ReportClientContract:
         finally:
             self.page.unroute("**/api/view/word-progress**")
 
-        self.assertIn("No estimate yet: no open branch has a sample", text)
-        self.assertIn("1\u00a0branch still sampling (5\u00a0candidates)", text)
+        # The reader cannot know what sample a price needs, so it is named.
+        self.assertIn(
+            "No estimate yet after 1m 35s: 1\u00a0open branch is still"
+            " sampling to gather 3\u00a0minutes of data", text)
+        self.assertNotIn("open branch:", text)
+
+    def _word_progress_panel_with(self, adjust):
+        def adjusted(route):
+            response = route.fetch()
+            progress = response.json()
+            adjust(progress["data"])
+            route.fulfill(response=response, json=progress)
+
+        self.page.route("**/api/view/word-progress**", adjusted)
+        try:
+            self.apply_branch_target("SALET")
+            self.page.wait_for_selector("table.word-progress")
+        finally:
+            self.page.unroute("**/api/view/word-progress**")
+
+    def test_word_progress_time_remaining_is_bold(self):
+        # It stands out the way the panel's other figures do.
+        self._word_progress_panel_with(lambda data: None)
+        for host in (".word-progress-headline",
+                     ".word-progress-panel .stat-line.prose-facts"):
+            strong = self.page.locator(host + " strong").first.inner_text()
+            self.assertRegex(strong, r"^~\d", host)
+
+    def test_word_progress_estimate_draws_its_branch_as_tiles(self):
+        steps = [{"word": "bayou", "pattern": "-y---", "word_is_answer": True},
+                 {"word": "carob", "pattern": "-----", "word_is_answer": False}]
+
+        def two_step_spine(data):
+            data["estimate"]["longest_branch"].update({
+                "spine": "BAYOU -y--- CAROB -----", "spine_steps": steps})
+
+        self._word_progress_panel_with(two_step_spine)
+        facts = self.page.locator(".word-progress-panel .stat-line.prose-facts")
+        tiles = facts.locator(".inline-spine .word.word-sm")
+        self.assertEqual(tiles.count(), 2)
+        self.assertEqual(
+            [tiles.nth(index).get_attribute("data-spine") for index in range(2)],
+            ["BAYOU -y---", "CAROB -----"])
+        self.assertIn("is-answer", tiles.nth(0).get_attribute("class"))
+        # Drawn, not written: the spine's text appears nowhere bare.
+        self.assertNotIn("-y---", facts.text_content())
+
+    def test_word_progress_estimate_says_how_long_a_branch_has_had_no_worker(self):
+        def departed(data):
+            data["estimate"]["longest_branch"].update({
+                "live_worker_count": 0, "worker_count": 1,
+                "unworked_seconds": 40})
+
+        self._word_progress_panel_with(departed)
+        text = self.page.locator(".word-progress-panel").inner_text()
+        self.assertIn("no worker for 40s)", text)
+
+    def test_word_progress_headline_counts_branches_beside_groups(self):
+        # A group holds every branch open beneath it, so six branches can be
+        # open in five groups, and the headline must not leave that unsaid.
+        headline = self.page.evaluate("""() => renderWordProgressHeadline({
+          totals:{state_counts:{working:5}}, work_started_at:1785575213,
+          active_branches:[{},{},{},{},{},{}], estimate:null,
+        }, null).innerText""")
+        self.assertIn("5 groups working (6\u00a0branches)", headline)
+        same = self.page.evaluate("""() => renderWordProgressHeadline({
+          totals:{state_counts:{working:2}}, work_started_at:1785575213,
+          active_branches:[{},{}], estimate:null,
+        }, null).innerText""")
+        self.assertNotIn("branches", same)
+
+    def test_word_progress_panel_is_named_for_cost_once_the_word_is_complete(self):
+        summary = "details.word-progress-panel > summary"
+        self._word_progress_panel_with(lambda data: None)
+        self.assertEqual(self.page.locator(summary).inner_text(),
+                         "Word progress")
+
+        def completed(data):
+            data["estimate"] = None
+            data["completed_at"] = 1785575213
+
+        self._word_progress_panel_with(completed)
+        self.page.wait_for_function(
+            f"() => document.querySelector({summary!r}).innerText === 'Word cost'")
 
     def test_completed_word_progress_replaces_an_inapplicable_estimate(self):
         def completed_progress(route):

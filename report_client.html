@@ -212,6 +212,7 @@
        snaps up to a pixel off center. */
     :root { --tile-base:15px; --tile-gap-ratio:.07; --tile-font-ratio:.62; --tile-outline-ratio:.023; --tile-notch-ratio:.38; }
     .word-sm { --tile:var(--tile-base); }
+    .inline-spine { display:inline-flex; gap:.25rem; vertical-align:middle; }
     .word-md { --tile:20px; --tile:round(calc(var(--tile-base) * 1.3),1px); }
     .word-lg { --tile:27px; --tile:round(calc(var(--tile-base) * 1.8),1px); }
     /* Nothing inside a word is a flex or grid item: those are blockified, and a
@@ -1612,14 +1613,60 @@
       cell.append(button);
       return cell;
     }
-    // Only groups still waiting hold work the estimate cannot see.  A group the
-    // swarm never opened because it needed no search is not missing work.
-    function excludedText(totals,estimate){
-      const waiting=(totals.display_state_counts||totals.state_counts||{}).waiting||0,parts=[];
-      if(waiting)parts.push(countNoun(waiting,"waiting group"));
-      if(estimate.learning_branch_count)parts.push(countNoun(estimate.learning_branch_count,"branch still sampling","branches still sampling")+" ("+countNoun(estimate.learning_remaining_candidate_count,"candidate")+")");
-      if(estimate.unworked_branch_count)parts.push(countNoun(estimate.unworked_branch_count,"branch with no worker","branches with no worker")+" ("+countNoun(estimate.unworked_remaining_candidate_count,"candidate")+")");
-      return parts.length?"excludes "+parts.join(" and "):"";
+    // Minutes and seconds, for spans short enough that both matter.
+    const formatElapsed=seconds=>{
+      seconds=Math.floor(seconds);
+      if(seconds<60)return seconds+"s";
+      const rest=seconds%60;
+      return Math.floor(seconds/60)+"m"+(rest?" "+rest+"s":"");
+    };
+    // The estimate, then how the open branches divide when they are not all
+    // priced.  The total comes before its parts, so the parts can be checked
+    // against it.  Only groups still waiting hold work the estimate cannot
+    // see: a group the swarm never opened because it needed no search is not
+    // missing work.
+    // The time remaining is bold, like the other figures in the panel.
+    function remainingTimeNode(estimate,...rest){
+      const node=element("span","");
+      node.append(element("strong","","~"+formatDuration(estimate.estimated_seconds)),
+        " remaining"+(estimate.provisional?" (provisional)":""),...rest);
+      return node;
+    }
+    // A spine inside a sentence: its words as the smallest tiles, in a line.
+    function inlineSpine(steps){
+      const node=element("span","inline-spine");
+      for(const step of steps)node.append(wordTiles(step.word,step.pattern,step.word_is_answer,"word-sm"));
+      return node;
+    }
+    function wordEstimateFacts(totals,estimate){
+      const facts=[],longest=estimate.longest_branch;
+      if(longest){
+        const away=!longest.live_worker_count&&longest.unworked_seconds!==null&&longest.unworked_seconds!==undefined;
+        const priced=estimate.estimated_branch_count;
+        facts.push(remainingTimeNode(estimate,", from ",inlineSpine(longest.spine_steps||[]),
+          (priced===1?"":", the last of "+countNoun(priced,"priced branch","priced branches")+" to finish")
+          +" ("+countNoun(longest.remaining_candidate_count,"candidate")+" left, "
+          +(away?"no worker for "+formatElapsed(longest.unworked_seconds):countNoun(longest.worker_count,"worker"))+")"));
+      }else if(estimate.learning_branch_count){
+        const sampled=estimate.learning_sample_seconds,count=estimate.learning_branch_count,required=estimate.required_sample_seconds;
+        facts.push("No estimate yet"+(sampled===null||sampled===undefined?"":" after "+formatElapsed(sampled))+": "
+          +countNoun(count,"open branch","open branches")+(count===1?" is":" are")+" still sampling to gather "
+          +(required%60===0?countNoun(required/60,"minute"):countNoun(required,"second"))+" of data");
+      }else{
+        facts.push("No estimate yet: no open branch with candidates left has a worker");
+      }
+      const parts=[
+        [estimate.estimated_branch_count,"priced",null],
+        [estimate.learning_branch_count,"still sampling",estimate.learning_remaining_candidate_count],
+        [estimate.unworked_branch_count,"with no worker",estimate.unworked_remaining_candidate_count],
+        [estimate.candidates_done_branch_count,"with every candidate done",null],
+      ].filter(([count])=>count);
+      if(parts.length>1)facts.push(countNoun(estimate.open_branch_count,"open branch","open branches")+": "
+        +parts.map(([count,label,candidates])=>numText(count)+"\u00a0"+label
+          +(candidates===null?"":" ("+countNoun(candidates,"candidate")+")")).join(", "));
+      const waiting=(totals.display_state_counts||totals.state_counts||{}).waiting||0;
+      if(waiting)facts.push("excludes "+countNoun(waiting,"waiting group"));
+      return facts;
     }
     // The headline sits outside the collapsible panel so the numbers worth a
     // glance are readable with the table closed.  It carries no coverage
@@ -1632,8 +1679,12 @@
     function renderWordProgressHeadline(data,solvedGroupCount){
       const totals=data.totals||{},estimate=data.estimate,parts=[];
       const counts=totals.display_state_counts||totals.state_counts||{};
-      if(estimate&&estimate.longest_branch)parts.push("~"+formatDuration(estimate.estimated_seconds)+" remaining"+(estimate.provisional?" (provisional)":""));
-      if(counts.working)parts.push(numText(counts.working)+" groups working");
+      if(estimate&&estimate.longest_branch)parts.push(remainingTimeNode(estimate,""));
+      // A group holds every branch open beneath it, so the two counts differ
+      // whenever a group has published sub-branches.
+      const openBranches=(data.active_branches||[]).length;
+      if(counts.working)parts.push(numText(counts.working)+" groups working"
+        +(openBranches&&openBranches!==counts.working?" ("+countNoun(openBranches,"branch","branches")+")":""));
       if(counts.waiting)parts.push(numText(counts.waiting)+" waiting");
       parts.push("began "+absoluteTime(data.work_started_at));
       return statLine(parts);
@@ -1682,14 +1733,7 @@
       fragment.append(statLine(times));
       const estimate=data.estimate;
       if(estimate){
-        const longest=estimate.longest_branch;
-        const estimateLine=statLine(longest?[
-          "~"+formatDuration(estimate.estimated_seconds)+" remaining"+(estimate.provisional?" (provisional)":""),
-          "longest of "+countNoun(estimate.estimated_branch_count,"open branch","open branches")+": "+longest.spine.replace(/ /g,"\u00a0")
-            +" ("+countNoun(longest.remaining_candidate_count,"candidate")+" left, "+countNoun(longest.live_worker_count,"worker")+")",
-          excludedText(totals,estimate)]:[
-          "No estimate yet: no open branch has a sample",
-          excludedText(totals,estimate)]);
+        const estimateLine=statLine(wordEstimateFacts(totals,estimate));
         estimateLine.classList.add("prose-facts");
         fragment.append(estimateLine);
       }else if(data.completed_at!==null&&data.completed_at!==undefined){
@@ -1779,7 +1823,12 @@
       fragment.append(element("p","dim","Counts cover "+telemetryEpochText+"."));
       return fragment;
     }
+    // Once a word's work is complete the panel records what it cost; there is
+    // no progress left to report.
+    function wordProgressHeading(complete){return complete?"Word cost":"Word progress";}
     function renderWordProgressInto(headlineHost,host,url,data,solvedGroupCount,state){
+      const summary=host.closest("details")?.querySelector(":scope > summary");
+      if(summary)summary.textContent=wordProgressHeading(data.completed_at!==null&&data.completed_at!==undefined);
       headlineHost.replaceChildren(renderWordProgressHeadline(data,solvedGroupCount));
       host.replaceChildren(renderWordProgressPanel(data,url,state,headlineHost,host,solvedGroupCount));
       // The panel is built before the report is mounted, and scroll offsets do
@@ -1938,7 +1987,10 @@
       const progressURL=wordProgressURL(state),progressDetails=element("details","word-progress-panel");
       progressDetails.open=wordProgressOpen;
       const progressHeadline=element("div","word-progress-headline"),progressHost=element("div","word-progress-host");
-      progressDetails.append(element("summary","clickable","Word progress"),progressHost);
+      // Named from the word's ERD until the panel's own data says whether
+      // the word's work is complete (wordProgressHeading).
+      const wordSolved=erd&&(erd.state==="complete"||erd.state==="infeasible");
+      progressDetails.append(element("summary","clickable",wordProgressHeading(wordSolved)),progressHost);
       progressDetails.addEventListener("toggle",()=>{wordProgressOpen=progressDetails.open;});
       // Fetched whether or not the panel is open: the headline outside it
       // carries the same result.  The solved-group count is only passed on
