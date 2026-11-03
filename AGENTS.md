@@ -1019,6 +1019,19 @@ separators and the agreeing noun; it is importable from everywhere, since
 `wordle_ui` imports nothing.  Where no count is involved, rephrase rather than
 hedge: "every pattern of each word", not "all patterns for the word(s)".
 
+### A number never wraps away from what it counts
+
+Wherever text can wrap, a line may break between words but never between a
+number and the word or unit after it: `8,671 branches evaluating` may break
+after `branches`, never before it, and `845 seconds` never breaks at all.  The
+space there is a no-break space (` `), not an ordinary one.
+
+The web client's `countNoun` already joins its count to its noun that way, so
+a count it renders is safe.  Text that glues a number to a word by hand must
+write the ` ` itself; an ordinary space renders identically and fails only
+on a narrow screen.  A duration rendered as a single token (`14m`, `1.0h`) has
+no space to break.
+
 ### Dates run day, month, year
 
 `1 Aug 2026`, never `Aug 1, 2026`. The American form orders the fields
