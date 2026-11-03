@@ -1154,6 +1154,38 @@ class ReportClientContract:
             " (1\u00a0candidate) and 2\u00a0branches with no worker"
             " (43,249\u00a0candidates)", text)
 
+    def test_word_progress_estimate_never_breaks_after_a_number(self):
+        # The estimate's facts wrap between words on a phone, but a number is
+        # never separated from what it counts: every space after a digit is a
+        # no-break space.
+        def every_fact(route):
+            response = route.fetch()
+            progress = response.json()
+            progress["data"]["totals"]["display_state_counts"] = {"waiting": 79}
+            progress["data"]["estimate"].update({
+                "provisional": True, "estimated_branch_count": 10,
+                "learning_branch_count": 2,
+                "learning_remaining_candidate_count": 8671,
+                "unworked_branch_count": 3,
+                "unworked_remaining_candidate_count": 845})
+            progress["data"]["estimate"]["longest_branch"].update({
+                "spine": "BAYOU -y--- CAROB ----- MINTY -----",
+                "remaining_candidate_count": 8561, "live_worker_count": 2})
+            route.fulfill(response=response, json=progress)
+
+        self.page.route("**/api/view/word-progress**", every_fact)
+        try:
+            self.apply_branch_target("SALET")
+            self.page.wait_for_selector("table.word-progress")
+            text = self.page.locator(
+                ".word-progress-panel .stat-line.prose-facts").text_content()
+        finally:
+            self.page.unroute("**/api/view/word-progress**")
+
+        self.assertIn("8,561\u00a0candidates", text)
+        self.assertIn("845\u00a0candidates", text)
+        self.assertIsNone(re.search(r"\d ", text), text)
+
     def test_word_progress_without_a_sampled_branch_says_so(self):
         def unsampled(route):
             response = route.fetch()
