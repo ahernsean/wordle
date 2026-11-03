@@ -5636,6 +5636,24 @@ class WordProgressReportTest(unittest.TestCase):
         self.assertEqual(live, {})
         self.assertEqual(departed, {})
 
+    def test_a_provisional_estimate_says_what_will_firm_it_up(self):
+        estimate = _word_progress_estimate([
+            {**self._estimated_branch("SALET -y---", 900, "rough", 100),
+             "eta": {"state": "rough", "estimated_seconds": 100,
+                     "sample_duration_seconds": 250,
+                     "worker_count_changed": False,
+                     "worker_count_sample_complete": True}},
+            {**self._estimated_branch("SALET --y--", 900, "rough", 50),
+             "eta": {"state": "rough", "estimated_seconds": 50,
+                     "sample_duration_seconds": 600,
+                     "worker_count_changed": True,
+                     "worker_count_sample_complete": True}},
+        ])
+        # The shortest sample is the last to firm up.
+        self.assertEqual(estimate["provisional_sample_seconds"], 250)
+        self.assertTrue(estimate["provisional_worker_count_changed"])
+        self.assertFalse(estimate["provisional_worker_count_unknown"])
+
     def test_estimate_is_provisional_only_when_a_branch_sample_is_rough(self):
         estimate = _word_progress_estimate([
             self._estimated_branch("SALET -y---", 900, "ready", 100),

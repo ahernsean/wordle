@@ -340,6 +340,21 @@ def _format_required_sample(seconds):
     return count_noun(seconds, "second")
 
 
+def _provisional_text(estimate):
+    """Why an estimate is provisional, briefly: what will firm it up."""
+    reasons = []
+    if estimate["provisional_sample_seconds"] is not None:
+        reasons.append(
+            f"{_format_elapsed(estimate['provisional_sample_seconds'])} of"
+            f" {_format_elapsed(estimate['stable_sample_seconds'])}")
+    if estimate["provisional_worker_count_changed"]:
+        reasons.append("worker count changed over"
+                       f" {_format_elapsed(estimate['sample_window_seconds'])}")
+    if estimate["provisional_worker_count_unknown"]:
+        reasons.append("worker counts not recorded")
+    return "provisional" + (": " + "; ".join(reasons) if reasons else "")
+
+
 def word_progress_estimate_lines(estimate, waiting_group_count):
     """The word estimate as the lines a reader sees: the estimate, then how the
     open branches divide when they are not all timed.
@@ -349,7 +364,6 @@ def word_progress_estimate_lines(estimate, waiting_group_count):
     lines = []
     longest = estimate["longest_branch"]
     if longest is not None:
-        provisional_text = " (provisional)" if estimate["provisional"] else ""
         if longest["live_worker_count"] or longest["unworked_seconds"] is None:
             worker_text = count_noun(longest["worker_count"], "worker")
         else:
@@ -362,9 +376,11 @@ def word_progress_estimate_lines(estimate, waiting_group_count):
             " branches to finish")
         lines.append(
             f"~{_abbreviate_duration(estimate['estimated_seconds'])} remaining"
-            f"{provisional_text}, {source_text} ("
+            f", {source_text} ("
             + count_noun(longest["remaining_candidate_count"], "candidate")
             + f" left, {worker_text})")
+        if estimate["provisional"]:
+            lines.append(_provisional_text(estimate))
     elif estimate["learning_branch_count"]:
         sampled = estimate["learning_sample_seconds"]
         after_text = (f" after {_format_elapsed(sampled)}"

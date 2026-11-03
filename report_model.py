@@ -1965,11 +1965,26 @@ def _word_progress_estimate(active_branches):
         return None
     longest = max(estimated, key=lambda branch: branch["eta"]["estimated_seconds"],
                   default=None)
+    # Why the estimate is provisional, so a reader can see what will firm it
+    # up: a rough branch's sample is short of the stable length, its worker
+    # count changed within the sample window, or the sample's worker counts
+    # were not recorded.  The shortest sample is the last to firm up.
+    rough = [branch["eta"] for branch in estimated
+             if branch["eta"]["state"] == "rough"]
+    short_samples = [eta["sample_duration_seconds"] for eta in rough
+                     if eta.get("sample_duration_seconds", 0)
+                     < BRANCH_ETA_STABLE_SAMPLE_SECONDS]
     return {
         "estimated_seconds": (
             longest["eta"]["estimated_seconds"] if longest else None),
-        "provisional": any(
-            branch["eta"]["state"] == "rough" for branch in estimated),
+        "provisional": bool(rough),
+        "provisional_sample_seconds": min(short_samples, default=None),
+        "stable_sample_seconds": BRANCH_ETA_STABLE_SAMPLE_SECONDS,
+        "provisional_worker_count_changed": any(
+            eta.get("worker_count_changed") for eta in rough),
+        "provisional_worker_count_unknown": any(
+            not eta.get("worker_count_sample_complete", True) for eta in rough),
+        "sample_window_seconds": BRANCH_ETA_WINDOW_SECONDS,
         "estimated_branch_count": len(estimated),
         "estimated_remaining_candidate_count": sum(
             branch["candidate_count"] - branch["done_candidate_count"]

@@ -2821,6 +2821,11 @@ class WordProgressRendererTest(unittest.TestCase):
             "unworked_branch_count": 0,
             "unworked_remaining_candidate_count": 0,
             "candidates_done_branch_count": 0,
+            "provisional_sample_seconds": None,
+            "stable_sample_seconds": 600,
+            "provisional_worker_count_changed": False,
+            "provisional_worker_count_unknown": False,
+            "sample_window_seconds": 600,
             **overrides,
         }
         return estimate
@@ -2881,8 +2886,13 @@ class WordProgressRendererTest(unittest.TestCase):
 
     def test_provisional_estimate_is_marked(self):
         output = render_report(word_progress_report(
-            estimate=self._branch_estimate(provisional=True)), width=160)
-        self.assertIn("~12.4d remaining (provisional), from", output)
+            estimate=self._branch_estimate(
+                provisional=True, provisional_sample_seconds=250,
+                provisional_worker_count_changed=True)), width=160)
+        self.assertIn("~12.4d remaining, from", output)
+        # What will firm it up, briefly.
+        self.assertIn("provisional: 4m 10s of 10m; worker count changed"
+                      " over 10m", output)
 
     def test_estimate_without_a_sampled_branch_says_how_long_it_has_sampled(self):
         output = render_report(word_progress_report(
@@ -3285,7 +3295,12 @@ class TerminalUtilityTest(unittest.TestCase):
                          "required_sample_seconds": 180,
                          "unworked_branch_count": 1,
                          "unworked_remaining_candidate_count": 2,
-                         "candidates_done_branch_count": 0},
+                         "candidates_done_branch_count": 0,
+                         "provisional_sample_seconds": 120,
+                         "stable_sample_seconds": 600,
+                         "provisional_worker_count_changed": False,
+                         "provisional_worker_count_unknown": False,
+                         "sample_window_seconds": 600},
             "response_groups": [{"pattern": "-----", "state": "waiting",
                                  "answer_count": 2, "started": False,
                                  "provenance": "none", "paid_by": None,
@@ -3307,7 +3322,8 @@ class TerminalUtilityTest(unittest.TestCase):
                                  "inherited_wall_time_millis": 0}],
         }
         output = report_terminal.render_report(report, width=120)
-        self.assertIn("~2m remaining (provisional), from RAISE -y---", output)
+        self.assertIn("~2m remaining, from RAISE -y---", output)
+        self.assertIn("provisional: 2m of 10m", output)
         self.assertIn("RAISE -y--- (3 candidates left, 1 worker)", output)
         self.assertIn("2 open branches: 1 timed, 1 with no worker"
                       " (2 candidates)", output)

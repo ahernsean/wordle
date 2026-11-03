@@ -1635,8 +1635,16 @@
       return node;
     }
     function remainingTimeNode(estimate,...rest){
-      return estimateNode("~"+formatDuration(estimate.estimated_seconds),
-        " remaining"+(estimate.provisional?" (provisional)":""),...rest);
+      return estimateNode("~"+formatDuration(estimate.estimated_seconds)," remaining",...rest);
+    }
+    // Why an estimate is provisional, briefly: what will firm it up.
+    function provisionalText(estimate){
+      const reasons=[];
+      if(estimate.provisional_sample_seconds!==null&&estimate.provisional_sample_seconds!==undefined)
+        reasons.push(formatElapsed(estimate.provisional_sample_seconds)+" of "+formatElapsed(estimate.stable_sample_seconds));
+      if(estimate.provisional_worker_count_changed)reasons.push("worker count changed over "+formatElapsed(estimate.sample_window_seconds));
+      if(estimate.provisional_worker_count_unknown)reasons.push("worker counts not recorded");
+      return "provisional"+(reasons.length?": "+reasons.join("; "):"");
     }
     // A spine inside a sentence: its words as the smallest tiles, in a line.
     function inlineSpine(steps){
@@ -1660,6 +1668,7 @@
           (timed===1?"":", the last of "+countNoun(timed,"timed branch","timed branches")+" to finish")
           +" ("+countNoun(longest.remaining_candidate_count,"candidate")+" left, "
           +(away?"no worker for "+formatElapsed(longest.unworked_seconds):countNoun(longest.worker_count,"worker"))+")"));
+        if(estimate.provisional)facts.push(provisionalText(estimate));
       }else if(estimate.learning_branch_count){
         const sampled=estimate.learning_sample_seconds,count=estimate.learning_branch_count,required=estimate.required_sample_seconds;
         facts.push(estimateNode("No estimate yet",(sampled===null||sampled===undefined?"":" after "+formatElapsed(sampled))+": "

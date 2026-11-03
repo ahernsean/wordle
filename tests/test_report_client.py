@@ -1116,7 +1116,9 @@ class ReportClientContract:
                       worker_count:1, unworked_seconds:null}},
         }).innerText""")
 
-        self.assertIn("~1.0h remaining (provisional)", text)
+        self.assertIn("~1.0h remaining", text)
+        self.assertNotIn("(provisional)", text)
+        self.assertIn("provisional", text)
 
     def test_word_progress_estimate_names_no_time_without_a_sampled_branch(self):
         text = self.page.evaluate("""() => renderWordEstimate({
