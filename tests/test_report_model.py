@@ -5507,12 +5507,17 @@ class WordProgressReportTest(unittest.TestCase):
 
     @staticmethod
     def _estimated_branch(spine, remaining, state, estimated_seconds,
-                          live_worker_count=1):
+                          live_worker_count=1, departed_worker_count=0,
+                          unworked_seconds=None, sample_duration_seconds=60):
         return {
             "spine": spine, "answer_count": 50,
             "candidate_count": 1_000, "done_candidate_count": 1_000 - remaining,
             "live_worker_count": live_worker_count,
-            "eta": {"state": state, "estimated_seconds": estimated_seconds},
+            "departed_worker_count": departed_worker_count,
+            "worker_count": live_worker_count + departed_worker_count,
+            "unworked_seconds": unworked_seconds,
+            "eta": {"state": state, "estimated_seconds": estimated_seconds,
+                    "sample_duration_seconds": sample_duration_seconds},
         }
 
     def test_estimate_is_the_longest_open_branch(self):
@@ -5538,12 +5543,116 @@ class WordProgressReportTest(unittest.TestCase):
         self.assertEqual(estimate["estimated_branch_count"], 2)
         self.assertEqual(estimate["estimated_remaining_candidate_count"], 950)
         self.assertEqual(estimate["longest_branch"], {
-            "spine": "SALET ----- CRONY -----", "answer_count": 50,
-            "remaining_candidate_count": 50, "live_worker_count": 2})
+            "spine": "SALET ----- CRONY -----", "spine_steps": [],
+            "answer_count": 50,
+            "remaining_candidate_count": 50, "live_worker_count": 2,
+            "worker_count": 2, "unworked_seconds": None})
         self.assertEqual(estimate["learning_branch_count"], 1)
         self.assertEqual(estimate["learning_remaining_candidate_count"], 30)
         self.assertEqual(estimate["unworked_branch_count"], 1)
         self.assertEqual(estimate["unworked_remaining_candidate_count"], 20)
+        # The four kinds partition the open branches, so a reader can check
+        # the parts against the total.
+        self.assertEqual(estimate["candidates_done_branch_count"], 1)
+        self.assertEqual(estimate["open_branch_count"], 5)
+        self.assertEqual(
+            estimate["estimated_branch_count"]
+            + estimate["learning_branch_count"]
+            + estimate["unworked_branch_count"]
+            + estimate["candidates_done_branch_count"],
+            estimate["open_branch_count"])
+
+    def test_estimate_says_how_long_the_furthest_sampling_branch_has_sampled(self):
+        # The branch closest to a price is the one the reader is waiting on.
+        estimate = _word_progress_estimate([
+            self._estimated_branch("SALET -y---", 900, "learning", None,
+                                   sample_duration_seconds=95),
+            self._estimated_branch("SALET --y--", 900, "learning", None,
+                                   sample_duration_seconds=40),
+        ])
+
+        self.assertEqual(estimate["learning_sample_seconds"], 95)
+        self.assertEqual(estimate["required_sample_seconds"],
+                         report_model.BRANCH_ETA_ROUGH_SAMPLE_SECONDS)
+
+    def test_a_departed_worker_keeps_its_branch_priced_during_its_grace(self):
+        # Priced from the departed worker, so it is not a branch with no
+        # worker, and the estimate says how long it has gone unworked.
+        estimate = _word_progress_estimate([
+            self._estimated_branch("SALET -y---", 900, "rough", 300,
+                                   live_worker_count=0,
+                                   departed_worker_count=1,
+                                   unworked_seconds=12),
+        ])
+
+        self.assertEqual(estimate["estimated_branch_count"], 1)
+        self.assertEqual(estimate["unworked_branch_count"], 0)
+        self.assertEqual(estimate["longest_branch"]["worker_count"], 1)
+        self.assertEqual(estimate["longest_branch"]["unworked_seconds"], 12)
+
+    @staticmethod
+    def _heartbeat_row(current, previous=None, started_at=None, left_at=None,
+                       updated_at=1_000):
+        return {"current_branch_key": current, "previous_branch_key": previous,
+                "previous_branch_started_at": started_at,
+                "previous_branch_left_at": left_at,
+                "updated_at": updated_at, "pid": None}
+
+    def test_a_worker_counts_toward_the_branch_it_left_for_a_tenth_of_its_stint(self):
+        # Held for 300 s, so it still counts 30 s after leaving and not after.
+        rows = [self._heartbeat_row(b"child", b"parent", 600, 900)]
+
+        live, departed = report_model._branch_worker_presence(rows, 930)
+        self.assertEqual(live[b"child"], 1)
+        self.assertEqual(departed[b"parent"], [900])
+
+        live, departed = report_model._branch_worker_presence(rows, 931)
+        self.assertNotIn(b"parent", departed)
+
+    def test_a_departure_grace_never_exceeds_a_minute(self):
+        # Held for an hour: a tenth would be six minutes, the cap is one.
+        rows = [self._heartbeat_row(b"child", b"parent", 0, 3_600,
+                                    updated_at=3_661)]
+
+        _live, departed = report_model._branch_worker_presence(rows, 3_660)
+        self.assertEqual(departed[b"parent"], [3_600])
+        _live, departed = report_model._branch_worker_presence(rows, 3_661)
+        self.assertNotIn(b"parent", departed)
+
+    def test_a_worker_back_on_the_branch_it_left_is_only_live_there(self):
+        # Counted once, as live: a departure that has been undone is no
+        # departure, and counting both would price the branch at two workers.
+        rows = [self._heartbeat_row(b"parent", b"parent", 600, 900)]
+
+        live, departed = report_model._branch_worker_presence(rows, 910)
+        self.assertEqual(live[b"parent"], 1)
+        self.assertNotIn(b"parent", departed)
+
+    def test_a_dead_worker_gives_the_branch_it_left_no_grace(self):
+        rows = [self._heartbeat_row(b"child", b"parent", 600, 900,
+                                    updated_at=0)]
+
+        live, departed = report_model._branch_worker_presence(rows, 910)
+        self.assertEqual(live, {})
+        self.assertEqual(departed, {})
+
+    def test_a_provisional_estimate_says_what_will_firm_it_up(self):
+        estimate = _word_progress_estimate([
+            {**self._estimated_branch("SALET -y---", 900, "rough", 100),
+             "eta": {"state": "rough", "estimated_seconds": 100,
+                     "sample_duration_seconds": 250,
+                     "worker_count_changed": False,
+                     "worker_count_sample_complete": True}},
+            {**self._estimated_branch("SALET --y--", 900, "rough", 50),
+             "eta": {"state": "rough", "estimated_seconds": 50,
+                     "sample_duration_seconds": 600,
+                     "worker_count_changed": True,
+                     "worker_count_sample_complete": True}},
+        ])
+        # The shortest sample is the last to firm up.
+        self.assertEqual(estimate["provisional_sample_seconds"], 250)
+        self.assertTrue(estimate["provisional_worker_count_changed"])
+        self.assertFalse(estimate["provisional_worker_count_unknown"])
 
     def test_estimate_is_provisional_only_when_a_branch_sample_is_rough(self):
         estimate = _word_progress_estimate([
@@ -5600,6 +5709,44 @@ class WordProgressReportTest(unittest.TestCase):
         self.assertEqual(branches["SALET -y---"]["eta"]["state"], "rough")
         self.assertIsNone(branches["SALET ----y"]["eta"])
         json.dumps(data["active_branches"])
+
+    def test_a_worker_that_just_left_a_branch_still_prices_it(self):
+        # The worker went to help another branch five seconds ago, after five
+        # minutes on this one, so its heartbeat names only the other branch.
+        now = int(time.time())
+        worked_key = ScoreCache.encode_subset(ANSWERS[0:2])
+        helped_key = ScoreCache.encode_subset(ANSWERS[4:6])
+        queue = self._open_queue()
+        self._open_branch(queue, "SALET -y---", 2, now - 300, slice(0, 2))
+        queue.heartbeat("worker-0", os.getpid(), worked_key, 2, now, 0)
+        for _ in range(2):
+            bundle_id, [idx], _forced = queue.claim_next_bundle(
+                worked_key, "worker-0", 5, list(range(5)), [0.0] * 5,
+                small_count=1, count_cap=1)
+            self.assertTrue(queue.apply_candidate_result(
+                worked_key, idx, claimed_by="worker-0", bundle_id=bundle_id,
+                evaluation_time_millis=3_000))
+        queue.heartbeat("worker-0", os.getpid(), helped_key, 2, now, 0,
+                        previous_branch_key=worked_key,
+                        previous_branch_started_at=now - 305,
+                        previous_branch_left_at=now - 5)
+        queue.close()
+
+        data = collect_report(self.sources, self._request())["data"]
+
+        [branch] = data["active_branches"]
+        self.assertEqual(branch["live_worker_count"], 0)
+        self.assertEqual(branch["departed_worker_count"], 1)
+        self.assertEqual(branch["worker_count"], 1)
+        self.assertGreaterEqual(branch["unworked_seconds"], 5)
+        self.assertEqual(branch["spine_steps"], [
+            {"word": "salet", "pattern": "-y---",
+             "word_is_answer": "salet" in ANSWERS}])
+        estimate = data["estimate"]
+        self.assertAlmostEqual(estimate["estimated_seconds"], 9)
+        self.assertEqual(estimate["unworked_branch_count"], 0)
+        self.assertEqual(estimate["longest_branch"]["unworked_seconds"],
+                         branch["unworked_seconds"])
 
     def test_word_progress_requires_a_word_target(self):
         with self.assertRaises(ValueError):

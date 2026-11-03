@@ -57,6 +57,10 @@ BRANCH_ETA_WINDOW_SECONDS = 10 * 60
 BRANCH_ETA_ROUGH_SAMPLE_SECONDS = 3 * 60
 BRANCH_ETA_STABLE_SAMPLE_SECONDS = 10 * 60
 BRANCH_ETA_SPEEDUP = {1: 1.0, 2: 1.64, 3: 1.97, 4: 1.97}
+# A worker that leaves a branch still counts toward the word estimate for a
+# tenth of the time it held the branch, and never for more than a minute.
+WORKER_DEPARTURE_GRACE_FRACTION = 0.1
+WORKER_DEPARTURE_GRACE_MAX_SECONDS = 60
 OVERVIEW_COMPLETION_DISPLAY_SECONDS = 5
 
 RichSpineStep = Tuple[Optional[int], Optional[str], Optional[str], str]
@@ -1868,6 +1872,45 @@ def collect_word_report(sources: ReportOpeners, request: ReportRequest) -> dict:
     return report
 
 
+def _branch_worker_presence(heartbeat_rows, generated_at):
+    """Live workers on each branch, and the workers that recently left one.
+
+    A heartbeat names only the branch its worker is on now, so a worker that
+    goes to help another branch stops counting toward the one it left at its
+    next heartbeat.  It is not making progress there, but it usually comes
+    back, and dropping the branch at once makes the estimate flicker with
+    every departure.  So a live worker still counts toward the branch it left
+    for `WORKER_DEPARTURE_GRACE_FRACTION` of the time it held it, up to
+    `WORKER_DEPARTURE_GRACE_MAX_SECONDS`.
+
+    Returns a Counter of live workers by branch key, and for each branch the
+    departure times of the workers still within their grace.
+    """
+    live_worker_counts = collections.Counter()
+    departed_workers = collections.defaultdict(list)
+    for row in heartbeat_rows:
+        if not _worker_is_live(row, generated_at):
+            continue
+        current = _row_value(row, "current_branch_key")
+        current = bytes(current) if current is not None else None
+        if current is not None:
+            live_worker_counts[current] += 1
+        previous = _row_value(row, "previous_branch_key")
+        started_at = _row_value(row, "previous_branch_started_at")
+        left_at = _row_value(row, "previous_branch_left_at")
+        if previous is None or started_at is None or left_at is None:
+            continue
+        previous = bytes(previous)
+        if previous == current:
+            continue
+        grace_seconds = min(
+            WORKER_DEPARTURE_GRACE_FRACTION * max(0, left_at - started_at),
+            WORKER_DEPARTURE_GRACE_MAX_SECONDS)
+        if generated_at - left_at <= grace_seconds:
+            departed_workers[previous].append(left_at)
+    return live_worker_counts, departed_workers
+
+
 def _word_progress_estimate(active_branches):
     """When the branches open under a word will finish, at current staffing.
 
@@ -1886,27 +1929,35 @@ def _word_progress_estimate(active_branches):
     word: response groups still waiting, and branches not yet published beneath
     the open ones, have no sample to price them by.
 
-    A branch with candidates left but no estimate either has no live worker on
-    it or has not yet sampled both kinds of work; each kind is counted so the
-    report can say what the estimate leaves out.  A branch with every candidate
-    done is waiting on its sub-branches or its finalize and adds no remaining
-    candidate work of its own.  Returns None when no open branch has
-    candidates left.
+    A branch with candidates left but no estimate either has no worker on it
+    or has not yet sampled both kinds of work; each kind is counted so the
+    report can say what the estimate leaves out, and how long the furthest
+    along of the sampling branches has sampled so far.  A branch with every
+    candidate done is waiting on its sub-branches or its finalize and adds no
+    remaining candidate work of its own.  The four counts partition the open
+    branches.  Returns None when no open branch has candidates left.
     """
     estimated = []
     learning_branch_count = learning_remaining = 0
     unworked_branch_count = unworked_remaining = 0
+    candidates_done_branch_count = 0
+    learning_sample_seconds = None
     for branch in active_branches:
         branch_remaining = max(0, branch["candidate_count"]
                                   - branch["done_candidate_count"])
         if not branch_remaining:
+            candidates_done_branch_count += 1
             continue
         eta = branch["eta"]
         if eta is not None and eta["state"] in ("ready", "rough"):
             estimated.append(branch)
-        elif branch["live_worker_count"]:
+        elif branch["worker_count"]:
             learning_branch_count += 1
             learning_remaining += branch_remaining
+            if eta is not None:
+                learning_sample_seconds = max(
+                    learning_sample_seconds or 0,
+                    eta["sample_duration_seconds"])
         else:
             unworked_branch_count += 1
             unworked_remaining += branch_remaining
@@ -1914,26 +1965,48 @@ def _word_progress_estimate(active_branches):
         return None
     longest = max(estimated, key=lambda branch: branch["eta"]["estimated_seconds"],
                   default=None)
+    # Why the estimate is provisional, so a reader can see what will firm it
+    # up: a rough branch's sample is short of the stable length, its worker
+    # count changed within the sample window, or the sample's worker counts
+    # were not recorded.  The shortest sample is the last to firm up.
+    rough = [branch["eta"] for branch in estimated
+             if branch["eta"]["state"] == "rough"]
+    short_samples = [eta["sample_duration_seconds"] for eta in rough
+                     if eta.get("sample_duration_seconds", 0)
+                     < BRANCH_ETA_STABLE_SAMPLE_SECONDS]
     return {
         "estimated_seconds": (
             longest["eta"]["estimated_seconds"] if longest else None),
-        "provisional": any(
-            branch["eta"]["state"] == "rough" for branch in estimated),
+        "provisional": bool(rough),
+        "provisional_sample_seconds": min(short_samples, default=None),
+        "stable_sample_seconds": BRANCH_ETA_STABLE_SAMPLE_SECONDS,
+        "provisional_worker_count_changed": any(
+            eta.get("worker_count_changed") for eta in rough),
+        "provisional_worker_count_unknown": any(
+            not eta.get("worker_count_sample_complete", True) for eta in rough),
+        "sample_window_seconds": BRANCH_ETA_WINDOW_SECONDS,
         "estimated_branch_count": len(estimated),
         "estimated_remaining_candidate_count": sum(
             branch["candidate_count"] - branch["done_candidate_count"]
             for branch in estimated),
         "longest_branch": None if longest is None else {
             "spine": longest["spine"],
+            "spine_steps": longest.get("spine_steps", []),
             "answer_count": longest["answer_count"],
             "remaining_candidate_count": (
                 longest["candidate_count"] - longest["done_candidate_count"]),
             "live_worker_count": longest["live_worker_count"],
+            "worker_count": longest["worker_count"],
+            "unworked_seconds": longest["unworked_seconds"],
         },
+        "open_branch_count": len(active_branches),
         "learning_branch_count": learning_branch_count,
         "learning_remaining_candidate_count": learning_remaining,
+        "learning_sample_seconds": learning_sample_seconds,
+        "required_sample_seconds": BRANCH_ETA_ROUGH_SAMPLE_SECONDS,
         "unworked_branch_count": unworked_branch_count,
         "unworked_remaining_candidate_count": unworked_remaining,
+        "candidates_done_branch_count": candidates_done_branch_count,
     }
 
 
@@ -2320,24 +2393,32 @@ def collect_word_progress_report(sources: ReportOpeners,
              if entry["completed_at"] is not None),
             default=data["completed_at"],
         )
-    live_worker_counts = collections.Counter(
-        bytes(row["current_branch_key"]) for row in heartbeat_rows
-        if row["current_branch_key"] is not None
-        and _worker_is_live(row, generated_at))
+    live_worker_counts, departed_workers = _branch_worker_presence(
+        heartbeat_rows, generated_at)
     active_branches = []
     for branch, eta_sample in zip(progress["active_branches"], eta_samples):
         live_worker_count = live_worker_counts[branch["branch_key"]]
+        departures = departed_workers.get(branch["branch_key"], [])
+        worker_count = live_worker_count + len(departures)
         active_branches.append({
             "spine": branch["spine"],
+            "spine_steps": _normalized_branch_spine(branch, answer_set),
             "answer_count": branch["answer_count"],
             "candidate_count": branch["candidate_count"],
             "done_candidate_count": branch["done_candidate_count"],
             "created_at": branch["created_at"],
             "live_worker_count": live_worker_count,
+            "departed_worker_count": len(departures),
+            "worker_count": worker_count,
+            # How long the branch has had no worker, while a departed worker
+            # still counts toward it: the time since the last one left.
+            "unworked_seconds": (
+                generated_at - max(departures)
+                if departures and not live_worker_count else None),
             "eta": _candidate_eta(
                 {"candidate_count": branch["candidate_count"],
                  "completed_candidate_count": branch["done_candidate_count"]},
-                eta_sample, live_worker_count, generated_at),
+                eta_sample, worker_count, generated_at),
         })
     data["estimate"] = _word_progress_estimate(active_branches)
     data["active_branches"] = active_branches

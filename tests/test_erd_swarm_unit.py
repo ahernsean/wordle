@@ -100,6 +100,7 @@ def _bare_worker():
     w._cur_depth = 0
     w._spine = {}
     w._hb_max_spine = {}
+    w._branch_history = erd_swarm._HeartbeatBranchHistory()
     w._log_max_spine = {}
     w.started = 0
     w._work_context = WorkContext.empty()
@@ -150,6 +151,68 @@ def _context(branch_key=b"branch", spine=None, opener_work_id=None,
     return WorkContext(
         opener_work_id, opener_priority, opener, opener_pattern,
         branch_key, spine, scheduling_role)
+
+
+class TestHeartbeatBranchHistory(unittest.TestCase):
+    """The branch a worker last left, for a report's departure grace."""
+
+    def test_leaving_a_branch_records_when_it_began_and_when_it_left(self):
+        history = erd_swarm._HeartbeatBranchHistory()
+        history.observe(b"parent", 100.4)
+        history.observe(b"child", 400.9)
+        self.assertEqual(history.branch_key, b"child")
+        self.assertEqual(history.started_at, 400)
+        self.assertEqual((history.previous_branch_key,
+                          history.previous_started_at,
+                          history.previous_left_at), (b"parent", 100, 400))
+
+    def test_moving_to_no_branch_is_leaving_it(self):
+        history = erd_swarm._HeartbeatBranchHistory()
+        history.observe(b"parent", 100)
+        history.observe(None, 300)
+        self.assertIsNone(history.branch_key)
+        self.assertEqual((history.previous_branch_key,
+                          history.previous_left_at), (b"parent", 300))
+
+    def test_coming_back_from_no_branch_resumes_the_stint(self):
+        # Scheduling between two bundles on one branch is not a new stint, or
+        # every bundle would reset the time the grace is measured from.
+        history = erd_swarm._HeartbeatBranchHistory()
+        history.observe(b"parent", 100)
+        history.observe(None, 300)
+        history.observe(b"parent", 301)
+        self.assertEqual(history.started_at, 100)
+
+    def test_coming_back_from_another_branch_starts_a_new_stint(self):
+        history = erd_swarm._HeartbeatBranchHistory()
+        history.observe(b"parent", 100)
+        history.observe(b"child", 300)
+        history.observe(b"parent", 350)
+        self.assertEqual(history.started_at, 350)
+        self.assertEqual((history.previous_branch_key,
+                          history.previous_started_at,
+                          history.previous_left_at), (b"child", 300, 350))
+
+    def test_an_equal_key_is_the_same_branch(self):
+        # Keys are re-encoded along the way, so identity is not sameness.
+        history = erd_swarm._HeartbeatBranchHistory()
+        history.observe(bytes(b"parent"), 100)
+        history.observe(b"par" + b"ent", 200)
+        self.assertEqual(history.started_at, 100)
+        self.assertIsNone(history.previous_branch_key)
+
+    def test_a_throttled_tick_still_notices_the_departure(self):
+        # Ticks between heartbeat writes are where most departures happen; the
+        # write that follows reports the branch left, at the time it was left.
+        w = _bare_worker()
+        w._liveness_tick(b"parent", 2, None, None, None, None, force=True)
+        w._liveness_tick(b"child", 2, None, None, None, None)
+        self.assertEqual(w.queue.heartbeat.call_count, 1)
+        w._liveness_tick(b"child", 2, None, None, None, None, force=True)
+        kwargs = w.queue.heartbeat.call_args.kwargs
+        self.assertEqual(kwargs["previous_branch_key"], b"parent")
+        self.assertIsNotNone(kwargs["previous_branch_started_at"])
+        self.assertIsNotNone(kwargs["previous_branch_left_at"])
 
 
 class TestHeartbeatThrottling(unittest.TestCase):

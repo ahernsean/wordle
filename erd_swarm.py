@@ -926,6 +926,47 @@ class _StallWatchdog:
                                  self._worker_name)
 
 
+class _HeartbeatBranchHistory:
+    """The branch a worker's heartbeat names, and the branch it last left.
+
+    A heartbeat names only the branch the worker is on now, so a worker that
+    goes to help another branch, waits on a dependency, or returns to
+    scheduling stops counting toward the branch it left from that heartbeat
+    on.  The branch it left, when it began on it and when it left let a
+    report hold that branch's estimate briefly instead of dropping it at every
+    departure.
+
+    Time on no branch is not a stint of its own: a worker that moves from a
+    branch to no branch has left it, and one that comes back from no branch to
+    the branch it left resumes its stint there.  Coming back from another
+    branch starts a new stint.
+    """
+
+    def __init__(self):
+        self.branch_key = None
+        self.started_at = None
+        self.previous_branch_key = None
+        self.previous_started_at = None
+        self.previous_left_at = None
+
+    def observe(self, branch_key, now):
+        if branch_key == self.branch_key:
+            return
+        resumed = (self.branch_key is None and branch_key is not None
+                   and branch_key == self.previous_branch_key)
+        if self.branch_key is not None:
+            self.previous_branch_key = self.branch_key
+            self.previous_started_at = self.started_at
+            self.previous_left_at = int(now)
+        self.branch_key = branch_key
+        if branch_key is None:
+            self.started_at = None
+        elif resumed:
+            self.started_at = self.previous_started_at
+        else:
+            self.started_at = int(now)
+
+
 class _BranchWorker:
     """One worker process's state and operations on branches and candidates."""
 
@@ -1024,6 +1065,7 @@ class _BranchWorker:
         self._cur_depth = 0
         self._spine = {}             # guess_depth -> subset size on the active descent
         self._hb_max_spine = {}      # deepest spine since last heartbeat (→ DB)
+        self._branch_history = _HeartbeatBranchHistory()
         self._log_max_spine = {}     # deepest spine since last progress log (→ log file)
         self._last_progress_log = 0.0
         # Utilisation accounting: cumulative wall time spent inside candidate
@@ -1515,6 +1557,8 @@ class _BranchWorker:
         handed to another worker.
         """
         now = time.time()
+        if branch_key is not self._branch_history.branch_key:
+            self._branch_history.observe(branch_key, now)
         if not force and now - self._last_hb < HB_SECONDS:
             return
         self._time_account.note_tick()
@@ -1571,7 +1615,10 @@ class _BranchWorker:
             cur_path=self._hb_spine_str(),
             cur_help_depth=self._help_recursion_depth,
             opener_work_id=self._work_context.opener_work_id,
-            scheduling_role=self._work_context.scheduling_role)
+            scheduling_role=self._work_context.scheduling_role,
+            previous_branch_key=self._branch_history.previous_branch_key,
+            previous_branch_started_at=self._branch_history.previous_started_at,
+            previous_branch_left_at=self._branch_history.previous_left_at)
         self._time_account.note_heartbeat_written()
         self._maybe_write_worker_time()
         self._hb_max_spine = {}

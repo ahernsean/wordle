@@ -1089,38 +1089,48 @@ class ReportClientContract:
         self.assertAlmostEqual(overlap["headerTop"], overlap["frameTop"],
                                delta=2)
 
-    def test_word_progress_headline_shows_with_the_panel_collapsed(self):
+    def test_word_progress_estimate_shows_with_the_panel_collapsed(self):
         # The remaining-time estimate is the number worth a glance; burying it
-        # behind a disclosure puts it out of reach on a phone.
+        # behind a disclosure puts it out of reach on a phone.  So are the
+        # group counts it sits under.
         self.apply_branch_target("SALET")
         self.page.wait_for_selector("table.word-progress")
         self.page.evaluate(
             "() => document.querySelector('details.word-progress-panel')"
             ".open = false")
-        headline = self.page.locator(".word-progress-headline").inner_text()
-        self.assertIn("remaining", headline)
-        self.assertIn("groups working", headline)
-        self.assertIn("began", headline)
-        self.assertEqual(
-            self.page.locator("table.word-progress").count(), 1)
+        estimate = self.page.locator(".word-estimate-host").inner_text()
+        self.assertIn("remaining", estimate)
+        self.assertTrue(self.page.locator(".word-estimate-host").is_visible())
+        self.assertIn("working", self.page.locator(".word-summary").inner_text())
+        self.assertEqual(self.page.locator(
+            "details.word-progress-panel .word-estimate").count(), 0)
 
-    def test_word_progress_headline_marks_a_warm_up_estimate_provisional(self):
-        headline = self.page.evaluate("""() => renderWordProgressHeadline({
-          totals:{state_counts:{}}, work_started_at:1785575213,
-          estimate:{estimated_seconds:3600, provisional:true,
-                    longest_branch:{spine:"SALET -y---"}},
-        }, null).innerText""")
+    def test_word_progress_estimate_marks_a_warm_up_estimate_provisional(self):
+        text = self.page.evaluate("""() => renderWordEstimate({
+          estimate:{estimated_seconds:3600, provisional:true, estimated_branch_count:1,
+                    open_branch_count:1, learning_branch_count:0,
+                    unworked_branch_count:0, candidates_done_branch_count:0,
+                    required_sample_seconds:180,
+                    longest_branch:{spine:"SALET -y---", spine_steps:[],
+                      remaining_candidate_count:3, live_worker_count:1,
+                      worker_count:1, unworked_seconds:null}},
+        }).innerText""")
 
-        self.assertIn("~1.0h remaining (provisional)", headline)
+        self.assertIn("~1.0h remaining", text)
+        self.assertNotIn("(provisional)", text)
+        self.assertIn("provisional", text)
 
-    def test_word_progress_headline_names_no_time_without_a_sampled_branch(self):
-        headline = self.page.evaluate("""() => renderWordProgressHeadline({
-          totals:{state_counts:{}}, work_started_at:1785575213,
+    def test_word_progress_estimate_names_no_time_without_a_sampled_branch(self):
+        text = self.page.evaluate("""() => renderWordEstimate({
           estimate:{estimated_seconds:null, provisional:false,
-                    longest_branch:null, learning_branch_count:1},
-        }, null).innerText""")
+                    longest_branch:null, open_branch_count:1,
+                    learning_branch_count:1, learning_remaining_candidate_count:4,
+                    learning_sample_seconds:20, required_sample_seconds:180,
+                    unworked_branch_count:0, candidates_done_branch_count:0},
+        }).innerText""")
 
-        self.assertNotIn("remaining", headline)
+        self.assertNotIn("remaining", text)
+        self.assertIn("No estimate yet after 20s", text)
 
     def test_word_progress_estimate_counts_agree_with_their_nouns(self):
         def one_of_each(route):
@@ -1130,29 +1140,36 @@ class ReportClientContract:
             data["totals"]["display_state_counts"] = {"waiting": 1}
             data["estimate"].update({
                 "estimated_branch_count": 1,
+                "open_branch_count": 4,
                 "learning_branch_count": 1,
                 "learning_remaining_candidate_count": 1,
                 "unworked_branch_count": 2,
-                "unworked_remaining_candidate_count": 43249})
+                "unworked_remaining_candidate_count": 43249,
+                "candidates_done_branch_count": 0})
             data["estimate"]["longest_branch"].update({
-                "remaining_candidate_count": 1, "live_worker_count": 1})
+                "remaining_candidate_count": 1, "live_worker_count": 1,
+                "worker_count": 1, "unworked_seconds": None})
             route.fulfill(response=response, json=progress)
 
         self.page.route("**/api/view/word-progress**", one_of_each)
         try:
             self.apply_branch_target("SALET")
             self.page.wait_for_selector("table.word-progress")
-            text = self.page.locator(".word-progress-panel").inner_text()
+            text = self.page.locator(".word-estimate-host").inner_text()
         finally:
             self.page.unroute("**/api/view/word-progress**")
 
+        # One timed branch is named without being compared with anything.
+        self.assertIn(" (1\u00a0candidate left, 1\u00a0worker)", text)
+        self.assertNotIn("the last of", text)
+        self.assertNotIn("longest", text)
         self.assertIn(
-            "longest of 1\u00a0open branch: SCOPE\u00a0----y (1\u00a0candidate"
-            " left, 1\u00a0worker)", text)
-        self.assertIn(
-            "excludes 1\u00a0waiting group and 1\u00a0branch still sampling"
-            " (1\u00a0candidate) and 2\u00a0branches with no worker"
+            "4\u00a0open branches: 1\u00a0timed, 1\u00a0still sampling"
+            " (1\u00a0candidate), 2\u00a0with no worker"
             " (43,249\u00a0candidates)", text)
+        # The waiting group is counted in the summary row, not repeated here.
+        self.assertNotIn("waiting", text)
+        self.assertIn("waiting", self.page.locator(".word-summary").inner_text())
 
     def test_word_progress_estimate_never_breaks_after_a_number(self):
         # The estimate's facts wrap between words on a phone, but a number is
@@ -1164,10 +1181,12 @@ class ReportClientContract:
             progress["data"]["totals"]["display_state_counts"] = {"waiting": 79}
             progress["data"]["estimate"].update({
                 "provisional": True, "estimated_branch_count": 10,
+                "open_branch_count": 16,
                 "learning_branch_count": 2,
                 "learning_remaining_candidate_count": 8671,
                 "unworked_branch_count": 3,
-                "unworked_remaining_candidate_count": 845})
+                "unworked_remaining_candidate_count": 845,
+                "candidates_done_branch_count": 1})
             progress["data"]["estimate"]["longest_branch"].update({
                 "spine": "BAYOU -y--- CAROB ----- MINTY -----",
                 "remaining_candidate_count": 8561, "live_worker_count": 2})
@@ -1178,7 +1197,7 @@ class ReportClientContract:
             self.apply_branch_target("SALET")
             self.page.wait_for_selector("table.word-progress")
             text = self.page.locator(
-                ".word-progress-panel .stat-line.prose-facts").text_content()
+                ".word-estimate-host .word-estimate").text_content()
         finally:
             self.page.unroute("**/api/view/word-progress**")
 
@@ -1192,20 +1211,183 @@ class ReportClientContract:
             progress = response.json()
             progress["data"]["estimate"].update({
                 "estimated_seconds": None, "estimated_branch_count": 0,
-                "longest_branch": None, "learning_branch_count": 1,
-                "learning_remaining_candidate_count": 5})
+                "longest_branch": None, "open_branch_count": 1,
+                "learning_branch_count": 1,
+                "learning_remaining_candidate_count": 5,
+                "learning_sample_seconds": 95,
+                "unworked_branch_count": 0,
+                "candidates_done_branch_count": 0})
             route.fulfill(response=response, json=progress)
 
         self.page.route("**/api/view/word-progress**", unsampled)
         try:
             self.apply_branch_target("SALET")
             self.page.wait_for_selector("table.word-progress")
-            text = self.page.locator(".word-progress-panel").inner_text()
+            text = self.page.locator(".word-estimate-host").inner_text()
         finally:
             self.page.unroute("**/api/view/word-progress**")
 
-        self.assertIn("No estimate yet: no open branch has a sample", text)
-        self.assertIn("1\u00a0branch still sampling (5\u00a0candidates)", text)
+        # The reader cannot know what sample a price needs, so it is named.
+        self.assertIn(
+            "No estimate yet after 1m 35s: 1\u00a0open branch is still"
+            " sampling to gather 3\u00a0minutes of data", text)
+        self.assertNotIn("open branch:", text)
+
+    def _word_progress_panel_with(self, adjust):
+        def adjusted(route):
+            response = route.fetch()
+            progress = response.json()
+            adjust(progress["data"])
+            route.fulfill(response=response, json=progress)
+
+        self.page.route("**/api/view/word-progress**", adjusted)
+        try:
+            self.apply_branch_target("SALET")
+            self.page.wait_for_selector("table.word-progress")
+        finally:
+            self.page.unroute("**/api/view/word-progress**")
+
+    def _strong_styles(self, host):
+        # The estimate's figure beside a metric's: colour, size and weight.
+        return self.page.evaluate("""host => {
+          const style=node=>{const computed=getComputedStyle(node);
+            return [computed.color,computed.fontSize,computed.fontWeight];};
+          return [style(document.querySelector(host+' strong')),
+                  style(document.querySelector('.word-progress-panel .metric strong'))];
+        }""", host)
+
+    def test_word_progress_time_remaining_is_bold(self):
+        # It stands out the way the page's other figures do: bold, at a
+        # metric's size and full strength.
+        self._word_progress_panel_with(lambda data: None)
+        host = ".word-estimate-host .word-estimate-primary"
+        strong = self.page.locator(host + " strong").first.inner_text()
+        self.assertRegex(strong, r"^~\d")
+        estimate_style, metric_style = self._strong_styles(host)
+        self.assertEqual(estimate_style, metric_style)
+
+    def test_word_progress_secondary_facts_stay_dim(self):
+        def mixed(data):
+            data["estimate"].update({"open_branch_count": 3,
+                                     "unworked_branch_count": 2,
+                                     "unworked_remaining_candidate_count": 9})
+
+        self._word_progress_panel_with(mixed)
+        secondary = self.page.locator(
+            ".word-estimate-host .word-estimate .stat-line")
+        self.assertIn("3\u00a0open branches:", secondary.inner_text())
+        self.assertIn("dim", secondary.get_attribute("class"))
+        self.assertEqual(self.page.locator(
+            ".word-estimate-host .word-estimate-primary").count(), 1)
+
+    def test_word_progress_absent_estimate_is_bold(self):
+        def unsampled(data):
+            data["estimate"].update({
+                "estimated_seconds": None, "estimated_branch_count": 0,
+                "longest_branch": None, "learning_branch_count": 2,
+                "learning_remaining_candidate_count": 30,
+                "learning_sample_seconds": 42})
+
+        self._word_progress_panel_with(unsampled)
+        host = ".word-estimate-host .word-estimate-primary"
+        self.assertEqual(self.page.locator(host + " strong").first.inner_text(),
+                         "No estimate yet")
+        estimate_style, metric_style = self._strong_styles(host)
+        self.assertEqual(estimate_style, metric_style)
+        # The time sampled so far is the data's, not a fixed phrase.
+        self.assertIn("No estimate yet after 42s:",
+                      self.page.locator(host).inner_text())
+
+    def test_word_progress_estimate_draws_its_branch_as_tiles(self):
+        steps = [{"word": "bayou", "pattern": "-y---", "word_is_answer": True},
+                 {"word": "carob", "pattern": "-----", "word_is_answer": False}]
+
+        def two_step_spine(data):
+            data["estimate"]["longest_branch"].update({
+                "spine": "BAYOU -y--- CAROB -----", "spine_steps": steps})
+
+        self._word_progress_panel_with(two_step_spine)
+        facts = self.page.locator(".word-estimate-host .word-estimate")
+        tiles = facts.locator(".inline-spine .word.word-sm")
+        self.assertEqual(tiles.count(), 2)
+        self.assertEqual(
+            [tiles.nth(index).get_attribute("data-spine") for index in range(2)],
+            ["BAYOU -y---", "CAROB -----"])
+        self.assertIn("is-answer", tiles.nth(0).get_attribute("class"))
+        # Drawn, not written: the spine's text appears nowhere bare.
+        self.assertNotIn("-y---", facts.text_content())
+
+    def test_word_progress_estimate_says_how_long_a_branch_has_had_no_worker(self):
+        def departed(data):
+            data["estimate"]["longest_branch"].update({
+                "live_worker_count": 0, "worker_count": 1,
+                "unworked_seconds": 40})
+
+        self._word_progress_panel_with(departed)
+        text = self.page.locator(".word-estimate-host").inner_text()
+        self.assertIn("no worker for 40s)", text)
+
+    def test_word_summary_divides_the_groups_by_work_once_progress_arrives(self):
+        # Until the panel's data lands the groups are divided by what the
+        # cache holds; the work states then divide the same groups more
+        # finely, and replace them rather than repeat them.
+        def summary_report(route):
+            response = route.fetch()
+            report = response.json()
+            if report.get("report_kind") == "word":
+                report["data"]["response_group_summary"] = {
+                    "branch_count": 81, "answer_count": 3209,
+                    "trivial_count": 24, "exact_count": 52, "loss_count": 0,
+                    "missing_count": 5}
+            route.fulfill(response=response, json=report)
+
+        self.page.route("**/api/view?**", summary_report)
+        # The panel's request is held in the page until released, so the
+        # summary can be read as it stands before the data arrives.
+        self.page.evaluate("""() => { window.__holdProgress=true;
+          const original=window.fetch;
+          window.fetch=(url,...rest)=>String(url).includes('/api/view/word-progress')
+            ?new Promise(resolve=>{const wait=()=>window.__holdProgress
+                ?setTimeout(wait,50):resolve(original(url,...rest));wait();})
+            :original(url,...rest); }""")
+        try:
+            self.apply_branch_target("SALET")
+            self.page.wait_for_selector(".word-summary")
+            before = self.page.locator(".word-summary").inner_text()
+            self.assertIn("not cached", before)
+            self.assertIn("81", before)
+            self.page.evaluate("() => { window.__holdProgress=false; }")
+            self.page.wait_for_selector("table.word-progress")
+            after = self.page.locator(".word-summary").inner_text()
+        finally:
+            self.page.unroute("**/api/view?**")
+        self.assertNotIn("not cached", after)
+        self.assertNotIn("exact", after)
+        self.assertIn("working", after)
+        self.assertIn("81", after)
+
+    def test_word_progress_panel_is_a_work_breakdown_once_the_word_is_complete(self):
+        summary = "details.word-progress-panel > summary"
+        self._word_progress_panel_with(lambda data: None)
+        self.assertEqual(self.page.locator(summary).inner_text(),
+                         "Word progress")
+
+        def completed(route):
+            response = route.fetch()
+            progress = response.json()
+            progress["data"]["estimate"] = None
+            progress["data"]["completed_at"] = 1785575213
+            route.fulfill(response=response, json=progress)
+
+        # The panel is already drawn, so the route stays until a poll has
+        # carried the completed data to it.
+        self.page.route("**/api/view/word-progress**", completed)
+        try:
+            self.page.wait_for_function(
+                f"() => document.querySelector({summary!r}).innerText"
+                " === 'Work breakdown'")
+        finally:
+            self.page.unroute("**/api/view/word-progress**")
 
     def test_completed_word_progress_replaces_an_inapplicable_estimate(self):
         def completed_progress(route):
@@ -1219,41 +1401,45 @@ class ReportClientContract:
         try:
             self.apply_branch_target("SALET")
             self.page.wait_for_selector("table.word-progress")
-            text = self.page.locator(".word-progress-panel").inner_text()
+            text = self.page.locator(".word-estimate-host").inner_text()
         finally:
             self.page.unroute("**/api/view/word-progress**")
 
         self.assertIn("Completed", text)
         self.assertNotIn("No completion estimate", text)
 
-    def test_word_progress_headline_states_no_coverage_percentage(self):
+    def test_word_progress_estimate_states_no_coverage_percentage(self):
         # Cost concentrates so hard that breadth of coverage reads as
         # percent-complete: 98.8% of answers reached beside ~12d remaining
         # after 11 days of work invites exactly the wrong conclusion.
         self.apply_branch_target("SALET")
         self.page.wait_for_selector("table.word-progress")
-        headline = self.page.locator(".word-progress-headline").inner_text()
-        self.assertNotIn("%", headline)
+        estimate = self.page.locator(".word-estimate-host").inner_text()
+        self.assertNotIn("%", estimate)
 
-    def test_word_progress_headline_counts_groups_by_state(self):
-        # The State column says where each pattern sits; the headline says how
-        # many are in each live state, and nothing the ERD line already shows.
-        text = self.page.evaluate("""() => renderWordProgressHeadline({
-          totals:{state_counts:{waiting:34, working:45, solved:38}},
-          work_started_at:1785575213, estimate:null,
-        }, null).innerText""")
-        self.assertIn("45 groups working", text)
-        self.assertIn("34 waiting", text)
-        self.assertNotIn("38", text)
+    def test_word_summary_counts_groups_by_work_state(self):
+        def states(data):
+            data["totals"]["display_state_counts"] = {
+                "waiting": 34, "working": 45, "solved": 38}
 
-    def test_word_progress_headline_omits_states_with_no_groups(self):
+        self._word_progress_panel_with(states)
+        metrics = self.page.eval_on_selector_all(
+            ".word-summary .word-group-states .metric",
+            "nodes => nodes.map(n => [n.querySelector('strong').textContent,"
+            " n.querySelector('span').textContent])")
+        self.assertEqual(metrics, [["34", "waiting"], ["45", "working"],
+                                   ["38", "solved"]])
+
+    def test_word_summary_omits_states_with_no_groups(self):
         # A zero is noise on a phone, and its absence already says the state is
-        # empty.  SCOPE currently has nothing waiting.
-        text = self.page.evaluate("""() => renderWordProgressHeadline({
-          totals:{state_counts:{working:79, solved:38}},
-          work_started_at:1785575213, estimate:null,
-        }, null).innerText""")
-        self.assertIn("79 groups working", text)
+        # empty.
+        def states(data):
+            data["totals"]["display_state_counts"] = {"working": 79,
+                                                      "solved": 38}
+
+        self._word_progress_panel_with(states)
+        text = self.page.locator(".word-summary").inner_text()
+        self.assertIn("79", text)
         self.assertNotIn("waiting", text)
 
     def test_word_progress_table_states_which_patterns_are_finished(self):
@@ -1398,9 +1584,9 @@ class ReportClientContract:
     def test_word_progress_dates_are_day_month_year(self):
         self.apply_branch_target("SALET")
         self.page.wait_for_selector("table.word-progress")
-        headline = self.page.locator(".word-progress-headline").inner_text()
-        self.assertRegex(headline, r"began \d{1,2} [A-Z][a-z]{2} \d{4}")
-        self.assertNotRegex(headline, r"[A-Z][a-z]{2} \d{1,2}, \d{4}")
+        times = self.page.locator("details.word-progress-panel").inner_text()
+        self.assertRegex(times, r"work began \d{1,2} [A-Z][a-z]{2} \d{4}")
+        self.assertNotRegex(times, r"[A-Z][a-z]{2} \d{1,2}, \d{4}")
 
     def test_word_progress_omits_the_cumulative_branch_total(self):
         # Carving work into a sub-branch raises the count without any answer
@@ -1423,7 +1609,6 @@ class ReportClientContract:
         text = self.page.locator("details.word-progress-panel").inner_text()
         self.assertIn("538,391", text)
         self.assertNotIn("538391", text)
-        self.assertIn("8,671", text)
 
     def test_word_progress_response_column_stays_put_while_the_rest_scrolls(self):
         """The tiles name the row, so they must not scroll away from it.
@@ -1542,7 +1727,7 @@ class ReportClientContract:
         self.page.wait_for_selector("table.word-progress")
         self.page.wait_for_function(
             "() => document.querySelector('details.word-progress-panel')"
-            "        .innerText.includes('tree total nodes')")
+            "        .innerText.includes(' inherited)')")
         with open(os.path.join(FIXTURE_DIRECTORY,
                                "word_progress-inherited.json")) as fixture_file:
             rows = {row["pattern"]: row for row
@@ -1692,7 +1877,9 @@ class ReportClientContract:
             self.apply_branch_target("SALET")
             self.page.wait_for_selector("table.word-progress")
             text = self.page.locator("details.word-progress-panel").inner_text()
-            self.assertIn("tree total nodes", text)
+            # Each total says how much of it other openers paid for.
+            self.assertIn("nodes (", text)
+            self.assertIn(" inherited)", text)
             self.assertNotIn("Measuring what other openers spent", text)
             self.assertTrue(requested)
             self.assertTrue(all("inherited_cost=1" in url for url in requested))
@@ -1753,7 +1940,7 @@ class ReportClientContract:
         self.page.wait_for_selector("table.word-progress")
         self.page.wait_for_function(
             "() => document.querySelector('details.word-progress-panel')"
-            "        .innerText.includes('tree total nodes')")
+            "        .innerText.includes(' inherited)')")
         self.assertEqual(
             self.page.eval_on_selector_all(
                 "#word-progress-sort option", "options => options.map(o => o.value)"),
@@ -1803,7 +1990,7 @@ class ReportClientContract:
         self.page.wait_for_selector("table.word-progress")
         self.page.wait_for_function(
             "() => document.querySelector('details.word-progress-panel')"
-            "        .innerText.includes('tree total nodes')")
+            "        .innerText.includes(' inherited)')")
         requests = []
         self.page.on("request", lambda request: (
             requests.append(request.url)

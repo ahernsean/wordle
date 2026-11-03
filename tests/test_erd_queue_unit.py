@@ -1151,6 +1151,52 @@ class TestCancelAndInspection(_TmpQueue):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["worker_id"], "worker-0")
 
+    def test_heartbeats_with_branch_names_the_branch_the_worker_left(self):
+        now = int(time.time())
+        left_key = ScoreCache.encode_subset(WORDS[:4])
+        self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, 5)
+        self.q.heartbeat("worker-0", pid=1, current_branch_key=self.key,
+                         n_words=len(WORDS), started_at=now, claims_done=0,
+                         previous_branch_key=left_key,
+                         previous_branch_started_at=now - 300,
+                         previous_branch_left_at=now - 5)
+        [row] = self.q.heartbeats_with_branch()
+        self.assertEqual(bytes(row["previous_branch_key"]), left_key)
+        self.assertEqual(row["previous_branch_started_at"], now - 300)
+        self.assertEqual(row["previous_branch_left_at"], now - 5)
+
+    def test_a_heartbeat_before_any_departure_names_no_previous_branch(self):
+        now = int(time.time())
+        self.q.heartbeat("worker-0", pid=1, current_branch_key=self.key,
+                         n_words=len(WORDS), started_at=now, claims_done=0)
+        [row] = self.q.heartbeats_with_branch()
+        self.assertIsNone(row["previous_branch_key"])
+        self.assertIsNone(row["previous_branch_left_at"])
+
+    def test_migration_adds_the_previous_branch_columns_to_an_older_queue(self):
+        self.q.close()
+        conn = sqlite3.connect(self.queue_path)
+        try:
+            # The table as it stood before the columns, rebuilt by copying,
+            # since this SQLite cannot drop a column.
+            kept = [row[1] for row in conn.execute(
+                "PRAGMA table_info(worker_heartbeat)")
+                if not row[1].startswith("previous_branch_")]
+            conn.executescript(f"""
+                ALTER TABLE worker_heartbeat RENAME TO worker_heartbeat_current;
+                CREATE TABLE worker_heartbeat AS
+                    SELECT {", ".join(kept)} FROM worker_heartbeat_current;
+                DROP TABLE worker_heartbeat_current;
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+        self.q = ERDQueue(self.queue_path)
+        columns = {row["name"] for row in self.q._conn.execute(
+            "PRAGMA table_info(worker_heartbeat)")}
+        self.assertLessEqual({"previous_branch_id", "previous_branch_started_at",
+                              "previous_branch_left_at"}, columns)
+
     def test_worker_counts_by_branch_counts_live_workers(self):
         now = int(time.time())
         self.q.create_branch(self.key, len(WORDS), N_CANDIDATES, 5)

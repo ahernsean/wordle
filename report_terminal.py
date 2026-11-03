@@ -325,6 +325,105 @@ def _abbreviate_duration(seconds):
     return f"{seconds / 86400:.1f}d"
 
 
+def _format_elapsed(seconds):
+    """Minutes and seconds, for spans short enough that both matter."""
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, seconds = divmod(seconds, 60)
+    return f"{minutes}m {seconds}s" if seconds else f"{minutes}m"
+
+
+def _format_required_sample(seconds):
+    if seconds % 60 == 0:
+        return count_noun(seconds // 60, "minute")
+    return count_noun(seconds, "second")
+
+
+def _provisional_text(estimate):
+    """Why an estimate is provisional, briefly: what will firm it up."""
+    reasons = []
+    if estimate["provisional_sample_seconds"] is not None:
+        reasons.append(
+            f"{_format_elapsed(estimate['provisional_sample_seconds'])} of"
+            f" {_format_elapsed(estimate['stable_sample_seconds'])}")
+    if estimate["provisional_worker_count_changed"]:
+        reasons.append("worker count changed over"
+                       f" {_format_elapsed(estimate['sample_window_seconds'])}")
+    if estimate["provisional_worker_count_unknown"]:
+        reasons.append("worker counts not recorded")
+    return "provisional" + (": " + "; ".join(reasons) if reasons else "")
+
+
+def word_progress_estimate_lines(estimate, waiting_group_count):
+    """The word estimate as the lines a reader sees: the estimate, then how the
+    open branches divide when they are not all timed.
+
+    The total comes before its parts, so the parts can be checked against it.
+    """
+    lines = []
+    longest = estimate["longest_branch"]
+    if longest is not None:
+        if longest["live_worker_count"] or longest["unworked_seconds"] is None:
+            worker_text = count_noun(longest["worker_count"], "worker")
+        else:
+            worker_text = (
+                f"no worker for {_format_elapsed(longest['unworked_seconds'])}")
+        timed = estimate["estimated_branch_count"]
+        source_text = (
+            f"from {longest['spine']}" if timed == 1 else
+            f"from {longest['spine']}, the last of {timed:,} timed"
+            " branches to finish")
+        lines.append(
+            f"~{_abbreviate_duration(estimate['estimated_seconds'])} remaining"
+            f", {source_text} ("
+            + count_noun(longest["remaining_candidate_count"], "candidate")
+            + f" left, {worker_text})")
+        if estimate["provisional"]:
+            lines.append(_provisional_text(estimate))
+    elif estimate["learning_branch_count"]:
+        sampled = estimate["learning_sample_seconds"]
+        after_text = (f" after {_format_elapsed(sampled)}"
+                      if sampled is not None else "")
+        sampling_count = estimate["learning_branch_count"]
+        lines.append(
+            f"No estimate yet{after_text}: "
+            + count_noun(sampling_count, "open branch", "open branches")
+            + (" is" if sampling_count == 1 else " are")
+            + " still sampling to gather "
+            + _format_required_sample(estimate["required_sample_seconds"])
+            + " of data")
+    else:
+        lines.append("No estimate yet: no open branch with candidates left"
+                     " has a worker")
+    parts = [
+        (estimate["estimated_branch_count"], "timed", None),
+        (estimate["learning_branch_count"], "still sampling",
+         estimate["learning_remaining_candidate_count"]),
+        (estimate["unworked_branch_count"], "with no worker",
+         estimate["unworked_remaining_candidate_count"]),
+        (estimate["candidates_done_branch_count"], "with every candidate done",
+         None),
+    ]
+    present = [part for part in parts if part[0]]
+    if len(present) > 1:
+        lines.append(
+            count_noun(estimate["open_branch_count"], "open branch",
+                       "open branches")
+            + ": " + ", ".join(
+                f"{count:,} {label}"
+                + (f" ({count_noun(candidates, 'candidate')})"
+                   if candidates is not None else "")
+                for count, label, candidates in present))
+    # Only groups still waiting hold work the estimate cannot see.  A group the
+    # swarm never opened because it needed no search is not missing work, and
+    # counting it here would invent a backlog.
+    if waiting_group_count:
+        lines.append("excludes " + count_noun(waiting_group_count,
+                                              "waiting group"))
+    return lines
+
+
 DISK_RATE_FLOOR_BYTES = 10_000
 
 
@@ -2107,46 +2206,9 @@ def _render_word_progress_sections(report, width, display_order):
             width,
         ))
     else:
-        longest = estimate["longest_branch"]
-        if longest is None:
-            summary.append(_fit(
-                "  estimate unavailable: no open branch has a sample yet",
-                width,
-            ))
-        else:
-            provisional_text = " (provisional)" if estimate["provisional"] else ""
-            summary.append(_fit(
-                f"  estimate ~{_abbreviate_duration(estimate['estimated_seconds'])}"
-                f"{provisional_text}, longest of "
-                + count_noun(estimate["estimated_branch_count"],
-                             "open branch", "open branches")
-                + f": {longest['spine']} ("
-                + count_noun(longest["remaining_candidate_count"], "candidate")
-                + " left, "
-                + count_noun(longest["live_worker_count"], "worker") + ")",
-                width,
-            ))
-        # Only groups still waiting hold work the estimate cannot see.  A
-        # group the swarm never opened because it needed no search is not
-        # missing work, and counting it here would invent a backlog.
-        excluded = []
-        waiting = _state_counts(totals).get("waiting", 0)
-        if waiting:
-            excluded.append(count_noun(waiting, "waiting group"))
-        for kind, label, plural in (
-                ("learning", "branch still sampling",
-                 "branches still sampling"),
-                ("unworked", "branch with no worker",
-                 "branches with no worker")):
-            if estimate[f"{kind}_branch_count"]:
-                excluded.append(
-                    count_noun(estimate[f"{kind}_branch_count"], label, plural)
-                    + " (" + count_noun(
-                        estimate[f"{kind}_remaining_candidate_count"],
-                        "candidate") + ")")
-        if excluded:
-            summary.append(_fit("    excludes " + " and ".join(excluded),
-                                width))
+        for line in word_progress_estimate_lines(
+                estimate, _state_counts(totals).get("waiting", 0)):
+            summary.append(_fit("  " + line, width))
     rows = [f"{'Pattern':<7} {'State':>9} {'Answers':>7} {'Done':>8}"
             f" {'Eval.':>6} {'Nodes':>9} {'Share':>5} {'Elapsed':>8}"
             f" {'Workers':>8} {'Paid by':>11}"]
