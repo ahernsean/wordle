@@ -1229,7 +1229,7 @@ class ReportClientContract:
 
         # The reader cannot know what sample a price needs, so it is named.
         self.assertIn(
-            "No estimate yet after 1m 35s: 1\u00a0open branch is still"
+            "No estimate yet after 1m 35s: 1\u00a0branch is still"
             " sampling to gather 3\u00a0minutes of data", text)
         self.assertNotIn("open branch:", text)
 
@@ -1407,6 +1407,25 @@ class ReportClientContract:
 
         self.assertIn("Completed", text)
         self.assertNotIn("No completion estimate", text)
+
+    def _word_progress_without_estimate(self, open_branch_count, waiting):
+        def adjust(data):
+            data["estimate"] = None
+            data["totals"]["open_branch_count"] = open_branch_count
+            data["totals"]["display_state_counts"]["waiting"] = waiting
+
+        self._word_progress_panel_with(adjust)
+        return self.page.locator(".word-estimate-host").inner_text()
+
+    def test_word_progress_with_no_open_branch_names_its_waiting_groups(self):
+        self.assertEqual(
+            self._word_progress_without_estimate(0, 48),
+            "No completion estimate: no branch is open; 48\u00a0groups waiting")
+
+    def test_word_progress_with_every_candidate_done_says_so(self):
+        self.assertEqual(
+            self._word_progress_without_estimate(2, 0),
+            "No completion estimate: no open branch has candidates left")
 
     def test_word_progress_estimate_states_no_coverage_percentage(self):
         # Cost concentrates so hard that breadth of coverage reads as
@@ -4118,8 +4137,10 @@ class ReportClientContract:
         self.page.evaluate(
             "async () => { await window.__reportClient.fetchReport(); }")
         self.page.wait_for_function("() => window.__detailFetches === 1")
-        self.assertIn("Rank 1 of 2",
-                      self.page.locator(".opener-lookup-answer").inner_text())
+        # The count rises when the lookup is sent; its answer lands later.
+        self.page.wait_for_function(
+            "() => document.querySelector('.opener-lookup-answer')"
+            "?.innerText.includes('Rank 1 of 2')")
 
     def test_a_lookup_answers_the_panel_that_is_mounted_when_it_finishes(self):
         """A redraw mid-flight must not strand the answer in a dead node.
