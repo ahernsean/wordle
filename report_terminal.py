@@ -355,6 +355,20 @@ def _provisional_text(estimate):
     return "provisional" + (": " + "; ".join(reasons) if reasons else "")
 
 
+def word_progress_no_estimate_text(totals):
+    """Why an unfinished word has no completion estimate.
+
+    Either no branch is open, so nothing is being timed and the waiting
+    groups have yet to start, or every open branch has all its candidates
+    done and waits on its sub-branches or its finalize.
+    """
+    if totals.get("open_branch_count"):
+        return "No completion estimate: no open branch has candidates left"
+    waiting = _state_counts(totals).get("waiting", 0)
+    return ("No completion estimate: no branch is open"
+            + (f"; {count_noun(waiting, 'group')} waiting" if waiting else ""))
+
+
 def word_progress_estimate_lines(estimate, waiting_group_count):
     """The word estimate as the lines a reader sees: the estimate, then how the
     open branches divide when they are not all timed.
@@ -388,7 +402,7 @@ def word_progress_estimate_lines(estimate, waiting_group_count):
         sampling_count = estimate["learning_branch_count"]
         lines.append(
             f"No estimate yet{after_text}: "
-            + count_noun(sampling_count, "open branch", "open branches")
+            + count_noun(sampling_count, "branch", "branches")
             + (" is" if sampling_count == 1 else " are")
             + " still sampling to gather "
             + _format_required_sample(estimate["required_sample_seconds"])
@@ -2201,10 +2215,7 @@ def _render_word_progress_sections(report, width, display_order):
             ))
     estimate = data["estimate"]
     if estimate is None:
-        summary.append(_fit(
-            "  estimate unavailable: no open branch has candidates left",
-            width,
-        ))
+        summary.append(_fit("  " + word_progress_no_estimate_text(totals), width))
     else:
         for line in word_progress_estimate_lines(
                 estimate, _state_counts(totals).get("waiting", 0)):

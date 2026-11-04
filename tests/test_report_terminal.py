@@ -2904,8 +2904,10 @@ class WordProgressRendererTest(unittest.TestCase):
                 learning_sample_seconds=95)), width=160)
         # The reader cannot know what sample a price needs, so it is named.
         self.assertIn(
-            "No estimate yet after 1m 35s: 2 open branches are still sampling"
+            "No estimate yet after 1m 35s: 2 branches are still sampling"
             " to gather 3 minutes of data", output)
+        # "open" names the total the breakdown divides, never one part of it.
+        self.assertNotIn("open branches are still sampling", output)
 
     def test_estimate_with_no_worked_branch_says_so(self):
         output = render_report(word_progress_report(
@@ -2919,9 +2921,27 @@ class WordProgressRendererTest(unittest.TestCase):
         # Every open branch is the same kind, so there is nothing to divide.
         self.assertNotIn("open branches:", output)
 
-    def test_absent_estimate_is_stated_rather_than_guessed(self):
+    def test_absent_estimate_with_open_branches_says_their_candidates_are_done(self):
         output = render_report(word_progress_report(), width=120)
-        self.assertIn("estimate unavailable", output)
+        self.assertIn("No completion estimate: no open branch has candidates"
+                      " left", output)
+
+    def test_absent_estimate_with_no_open_branch_names_the_waiting_groups(self):
+        report = word_progress_report()
+        report["data"]["totals"]["open_branch_count"] = 0
+        output = render_report(report, width=120)
+        self.assertIn("No completion estimate: no branch is open; 79 groups"
+                      " waiting", output)
+        self.assertNotIn("candidates left", output)
+
+    def test_absent_estimate_with_nothing_open_or_waiting_names_no_groups(self):
+        report = word_progress_report()
+        totals = report["data"]["totals"]
+        totals["open_branch_count"] = 0
+        for counts in ("state_counts", "display_state_counts"):
+            totals.get(counts, {}).pop("waiting", None)
+        output = render_report(report, width=120)
+        self.assertIn("No completion estimate: no branch is open\n", output)
 
     def test_absent_request_time_is_omitted_rather_than_shown_as_unknown(self):
         # The queue has no trustworthy request time for this root, so the line

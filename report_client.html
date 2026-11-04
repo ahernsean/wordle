@@ -1672,7 +1672,7 @@
       }else if(estimate.learning_branch_count){
         const sampled=estimate.learning_sample_seconds,count=estimate.learning_branch_count,required=estimate.required_sample_seconds;
         facts.push(estimateNode("No estimate yet",(sampled===null||sampled===undefined?"":" after "+formatElapsed(sampled))+": "
-          +countNoun(count,"open branch","open branches")+(count===1?" is":" are")+" still sampling to gather "
+          +countNoun(count,"branch","branches")+(count===1?" is":" are")+" still sampling to gather "
           +(required%60===0?countNoun(required/60,"minute"):countNoun(required,"second"))+" of data"));
       }else{
         facts.push(estimateNode("No estimate yet",": no open branch with candidates left has a worker"));
@@ -1692,6 +1692,14 @@
     // readable with the panel closed.  It carries no coverage percentage:
     // cost concentrates so hard that breadth of coverage reads as
     // percent-complete while saying nothing about the time left.
+    // Why an unfinished word has no completion estimate: no branch is open
+    // yet, or every open branch has all its candidates done and waits on its
+    // sub-branches or its finalize.
+    function noEstimateText(totals){
+      if(totals.open_branch_count)return "No completion estimate: no open branch has candidates left";
+      const waiting=(totals.display_state_counts||{}).waiting||0;
+      return "No completion estimate: no branch is open"+(waiting?"; "+countNoun(waiting,"group")+" waiting":"");
+    }
     function renderWordEstimate(data){
       const estimate=data.estimate,block=element("div","word-estimate");
       if(estimate){
@@ -1707,7 +1715,7 @@
       }else if(data.completed_at!==null&&data.completed_at!==undefined){
         block.append(element("p","dim","Completed "+relativeAge(data.completed_at,Math.floor(Date.now()/1000))+"."));
       }else{
-        block.append(element("p","dim","No completion estimate: no open branch has candidates left."));
+        block.append(element("p","dim",noEstimateText(data.totals||{})));
       }
       return block;
     }
