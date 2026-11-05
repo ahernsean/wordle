@@ -2229,8 +2229,9 @@ def collect_word_progress_report(sources: ReportOpeners,
             spine for spine in finalizing_spines.values()
             if spine.split()[0].lower() != word.lower()
         })
-        subtree_rollups = (queue.roll_up_spine_subtrees(foreign_spines)
-                           if request.inherited_cost else {})
+        subtree_rollups = (
+            queue.roll_up_spine_subtrees(foreign_spines, request.epoch)
+            if request.inherited_cost else {})
         _mark_queue_opener_ok(report)
     except (sqlite3.Error, OSError) as error:
         _mark_queue_opener_error(report, error)

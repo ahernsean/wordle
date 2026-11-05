@@ -6171,15 +6171,20 @@ class ERDQueue:
         """
         return spine + " ", spine + " " + chr(0x10FFFF)
 
-    def roll_up_spine_subtrees(self, spines) -> dict:
+    def roll_up_spine_subtrees(self, spines, epoch=None) -> dict:
         """Finalized branches, nodes, worker-time and epochs under each spine.
 
         The cost of an inherited group is its whole subtree, not the one
         branch that names it: everything the first opener finalized beneath
         that spine is work this opener did not repeat.  Each spine is the
         branch itself plus an index range over its descendants, so the cost
-        is in the subtrees asked about rather than in the whole log.
+        is in the subtrees asked about rather than in the whole log.  With an
+        epoch, only that epoch's records are counted, as report_word_progress
+        counts an opener's own work.
         """
+        # +epoch keeps the planner on the spine index, as in
+        # report_word_progress.
+        epoch_condition = "AND +epoch = ?" if epoch is not None else ""
         rollups = {}
         for spine in dict.fromkeys(spines):
             if not spine:
@@ -6194,8 +6199,10 @@ class ERDQueue:
                        MAX(finalized_at) AS last_finalized_at,
                        GROUP_CONCAT(DISTINCT epoch) AS telemetry_epochs
                 FROM telemetry.branch_finalize_log
-                WHERE spine = ? OR (spine >= ? AND spine < ?)
-            """, (spine, low, high)).fetchone()
+                WHERE (spine = ? OR (spine >= ? AND spine < ?))
+                  {epoch_condition}
+            """, (spine, low, high,
+                  *(() if epoch is None else (epoch,)))).fetchone()
             rollup = dict(row)
             rollup["telemetry_epochs"] = sorted(
                 int(value)

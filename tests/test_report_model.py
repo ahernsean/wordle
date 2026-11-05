@@ -5282,6 +5282,26 @@ class WordProgressReportTest(unittest.TestCase):
                          row["inherited_telemetry_epochs"])
         self.assertTrue(data["telemetry_epochs"])
 
+    def test_an_epoch_filter_scopes_the_inherited_cost_too(self):
+        # "Only this epoch's records" must hold for every figure shown: the
+        # payer's work was recorded in another epoch, so none of it counts.
+        pattern = self.INHERITED_PATTERN
+        self._inherit_group(pattern)
+        queue = self._open_queue()
+        recorded_epoch = queue.epoch
+        queue.close()
+
+        data = collect_report(self.sources, replace(
+            self._request(), inherited_cost=True,
+            epoch=recorded_epoch + 1))["data"]
+
+        row = next(row for row in data["response_groups"]
+                   if row["pattern"] == pattern)
+        self.assertEqual(row["inherited_search_node_count"], 0)
+        self.assertEqual(row["inherited_telemetry_epochs"], [])
+        self.assertEqual(data["telemetry_epochs"], [])
+        self.assertEqual(data["selected_telemetry_epoch"], recorded_epoch + 1)
+
     def test_every_word_progress_sort_orders_by_the_nodes_it_names(self):
         """Both orders are declared, and the dispatch table is checked.
 
