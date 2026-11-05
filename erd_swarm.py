@@ -2410,10 +2410,13 @@ class _BranchWorker:
                         ('exact' if best_guess is not None else 'loss')))
             spine_tokens = (spine or "").split()
             if len(spine_tokens) >= 2:
+                # Worker-time as the queue's reports count it: evaluation
+                # and the coordination that handed the branch's bundles out.
                 self.score_cache.add_opener_response_group_summary(
                     spine_tokens[0], spine_tokens[1], ERD_ALL, nodes_spent,
-                    total_bundle_wall_time_millis, created_at, finalized_at,
-                    self.queue.epoch)
+                    (total_bundle_wall_time_millis or 0)
+                    + (coordination_time_millis or 0),
+                    created_at, finalized_at, self.queue.epoch)
         except Exception:
             logger.exception(
                 '%s finalize telemetry failed for branch %s -- result '

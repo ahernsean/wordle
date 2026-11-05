@@ -14,7 +14,7 @@ import erd_swarm
 from cache_sqlite import ScoreCache
 from erd_queue import ERDQueue
 from erd_swarm import _BranchWorker, _WorkerTimeAccount, ROOT_BUDGET
-from wordle_engine import SOLVED
+from wordle_engine import ERD_ALL, SOLVED
 from tests.test_erd_swarm_unit import BRANCH, CANDIDATES, _bare_worker
 
 ACTIVITY_COLUMNS = tuple(f"{activity}_time_millis"
@@ -606,6 +606,41 @@ class TestBranchCoordinationReachesTheFinalizeLog(unittest.TestCase):
         finally:
             queue.close()
         self.assertEqual(logged, sum(recorded))
+
+    def test_the_opener_group_summary_counts_coordination(self):
+        # The summary a word report falls back on prices the group as the
+        # queue's reports do, so a small branch whose cost is coordination
+        # does not read as free.
+        self.queue_path = os.path.join(self._tmp.name, "spined.sqlite3")
+        queue = ERDQueue(self.queue_path)
+        try:
+            queue.create_branch(self.branch_key, len(BRANCH), len(CANDIDATES),
+                                budget=ROOT_BUDGET, spine="CRANE -----")
+        finally:
+            queue.close()
+        worker = _BranchWorker(0, self.cache_path, self.queue_path, None,
+                               small_count=2, count_cap=2)
+        worker._time_account = _account(_SteppingClock(step_time_millis=1))
+        try:
+            worker.solve_branch_focused(self.branch_key)
+        finally:
+            worker.close()
+        queue = ERDQueue(self.queue_path)
+        try:
+            evaluation, coordination = queue._conn.execute(
+                "SELECT total_bundle_wall_time_millis, coordination_time_millis "
+                "FROM telemetry.branch_finalize_log").fetchone()
+        finally:
+            queue.close()
+        cache = ScoreCache(self.cache_path, BRANCH)
+        try:
+            summary = cache.opener_response_group_summary_map(
+                "crane", ERD_ALL)["-----"]
+        finally:
+            cache.close()
+        self.assertGreater(coordination, 0)
+        self.assertEqual(summary["worker_time_millis"],
+                         (evaluation or 0) + coordination)
 
     def test_each_bundle_carries_only_its_own_members(self):
         worker = _bare_worker()
