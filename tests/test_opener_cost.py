@@ -63,7 +63,8 @@ class TestCompletedOpenerTiming(_Log):
         self.assertEqual(timing["search_node_count"], 140)
         self.assertEqual(timing["evaluation_time_millis"], 200)
         self.assertEqual(timing["coordination_time_millis"], 20)
-        self.assertEqual(timing["worker_time_millis"], 300)
+        # Each branch's bundle evaluation (150) and coordination (10).
+        self.assertEqual(timing["worker_time_millis"], 320)
         self.assertEqual(timing["first_created_at"], self.now - 600)
         self.assertEqual(timing["completed_at"], self.now)
 

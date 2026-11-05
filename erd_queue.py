@@ -2867,11 +2867,10 @@ class ERDQueue:
         read as a cheaper opener than it was.
         """
         low, high = self._spine_subtree_bounds(opener.upper())
-        return self._conn.execute("""
+        return self._conn.execute(f"""
             SELECT MIN(created_at) AS first_created_at,
                    MAX(finalized_at) AS completed_at,
-                   SUM(COALESCE(total_bundle_wall_time_millis, 0))
-                       AS worker_time_millis,
+                   SUM({_FINALIZED_WORKER_TIME_SQL}) AS worker_time_millis,
                    COALESCE(SUM(nodes_spent), 0) AS search_node_count,
                    CASE WHEN COUNT(evaluation_time_millis) = COUNT(*)
                         THEN SUM(evaluation_time_millis) END
