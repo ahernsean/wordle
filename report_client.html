@@ -1258,6 +1258,9 @@
       const value=state.sort||options[0]?.[0]||"";
       return options.find(([optionValue])=>optionValue===value)?.[1]||value||"default";
     }
+    // Placed directly above the list the sort control orders, since nothing
+    // else on a page is in that order.
+    function sortNote(state){return element("p","dim sort-note","sorted by "+activeSortLabel(state));}
     function sourceErrorBanner(report){
       const failures=Object.entries(report.sources||{}).filter(([,source])=>source.error);
       if(!failures.length)return null;
@@ -1270,8 +1273,6 @@
       meta.append(element("h1","",report.report_kind+" report"));
       // A report with no target covers everything, so its header names none.
       if((report.report_kind!=="branch"||report.tree)&&state.branch_target)meta.append(branchTargetLabel(report,state));
-      // A branch report lists nothing in the order the sort control sets.
-      if(report.report_kind!=="branch")meta.append(element("span","dim","sorted by "+activeSortLabel(state)));
       // A report served from revalidation is not refreshed by the poll: its
       // data is as old as the last time its signal moved.  Saying so is the
       // difference between a reader trusting a two-second cadence the screen
@@ -1509,6 +1510,9 @@
       fragment.append(element("h2","","Branches · status "+(state.branch_status.length?state.branch_status.join(", "):"all")));
       const sentBranchCount=report.data.sent_branch_count??(report.data.branches||[]).length,matchedBranchCount=report.data.matched_branch_count??sentBranchCount;
       if(matchedBranchCount>sentBranchCount)fragment.append(element("p","dim","Shown "+numText(sentBranchCount)+" of "+numText(matchedBranchCount)+" matched branches"));
+      // Unsorted branches are packed to hold their places, an order no
+      // label describes.
+      if(state.sort)fragment.append(sortNote(state));
       const liveWorkersByBranch=new Map();for(const worker of report.data.workers||[]){if(!worker.is_live||worker.branch_key_hex===null||worker.branch_key_hex===undefined)continue;const key=String(worker.branch_key_hex);if(!liveWorkersByBranch.has(key))liveWorkersByBranch.set(key,[]);liveWorkersByBranch.get(key).push(worker);}
       const previousWorkersById=previousBy(previous,"workers","worker_id");
       const branches=gridElement("branches"),previousRows=previousBy(previous,"branches","branch_key_hex");
@@ -1525,6 +1529,9 @@
     }
     const formatDuration=seconds=>{
       if(seconds===null||seconds===undefined||seconds<0)return "—";
+      // A nonzero span shorter than a second keeps its own magnitude rather
+      // than rounding to a zero that reads as "took no time".
+      if(seconds>0&&seconds<1){const millis=Math.round(seconds*1000);return millis<1?"<1ms":millis<1000?millis+"ms":"1s";}
       if(seconds<60)return Math.round(seconds)+"s";
       if(seconds<3600)return Math.round(seconds/60)+"m";
       if(seconds<86400)return (seconds/3600).toFixed(1)+"h";
@@ -1754,14 +1761,18 @@
       // as though the work had started before it was asked for.
       const times=[];
       if(totals.requested_at!==null&&totals.requested_at!==undefined)times.push("requested "+absoluteTime(totals.requested_at));
-      const telemetryEpochs=data.telemetry_epochs||[];
-      const telemetryEpochText=data.selected_telemetry_epoch!==null&&data.selected_telemetry_epoch!==undefined
-        ?"telemetry epoch "+data.selected_telemetry_epoch
-        :telemetryEpochs.length?"telemetry epoch"+(telemetryEpochs.length>1?"s ":" ")+telemetryEpochs.join(", "):"no recorded telemetry";
+      // The epochs these figures were recorded in, and the swarm's epoch now
+      // only when it is not among them, where it would repeat one shown.
+      const selectedEpoch=data.selected_telemetry_epoch??null;
+      const recordedEpochs=selectedEpoch!==null?[selectedEpoch]:data.telemetry_epochs||[];
+      const recordedEpochText=selectedEpoch!==null
+        ?"showing only epoch "+selectedEpoch+"\u2019s records"
+        :recordedEpochs.length?"recorded in epoch"+(recordedEpochs.length>1?"s ":" ")+recordedEpochs.join(", "):"nothing recorded yet";
+      const currentEpochText=data.epoch===null||data.epoch===undefined||recordedEpochs.includes(data.epoch)?null:"swarm now in epoch "+data.epoch;
       times.push("work began "+absoluteTime(data.work_started_at),
                  "latest "+absoluteTime(data.work_latest_at),
                  data.completed_at===null||data.completed_at===undefined?null:"completed "+absoluteTime(data.completed_at),
-                 "active epoch "+data.epoch,telemetryEpochText);
+                 recordedEpochText,currentEpochText);
       fragment.append(statLine(times));
       const sortField=element("label","field word-progress-sort");
       sortField.append(element("span","fieldlabel","Order by"));
@@ -1834,7 +1845,7 @@
         ["Nodes","Search nodes spent on the group."],
         ["Share","The group's nodes as a fraction of every row shown here."],
         ["Elapsed","Wall-clock from first work to last, shared with whatever else the swarm was running."],
-        ["Workers","Summed worker time: six workers for an hour reads as six hours."],
+        ["Workers","Summed worker time, evaluating and coordinating: six workers for an hour reads as six hours."],
         ["Paid by","The opener that first finalized this branch, and so paid for it; its costs fill the row. \u201cself\u201d where this opener did the work. A payer shows the response it opened onto, or how many guesses it needed."],
       ]){
         legend.append(element("dt","",term),element("dd","",definition));
@@ -1842,7 +1853,7 @@
       const legendDetails=element("details","word-progress-legend-panel");
       legendDetails.append(element("summary","clickable","Table legend"),legend);
       fragment.append(legendDetails);
-      fragment.append(element("p","dim","Counts cover "+telemetryEpochText+"."));
+      fragment.append(element("p","dim","Counts: "+recordedEpochText+"."));
       return fragment;
     }
     // Once a word's work is complete the panel breaks down where it went; there is
@@ -2024,7 +2035,7 @@
       // counts above it come from the same result.
       attachWordProgress(estimateHost,groupStatesHost,progressHost,progressURL,state);
       fragment.append(estimateHost,progressDetails);
-      const shownRows=data.response_groups||[],matchedRows=data.matched_rows??shownRows.length,totalRows=data.total_rows??responseSummary?.branch_count??matchedRows;fragment.append(element("p","dim","Shown "+numText(shownRows.length)+" of "+numText(matchedRows)+" matched · "+numText(totalRows)+" total response groups"));
+      const shownRows=data.response_groups||[],matchedRows=data.matched_rows??shownRows.length,totalRows=data.total_rows??responseSummary?.branch_count??matchedRows;fragment.append(element("p","dim","Shown "+numText(shownRows.length)+" of "+numText(matchedRows)+" matched · "+numText(totalRows)+" total response groups"),sortNote(state));
       const previousRows=previousBy(previous,"response_groups","branch_key_hex"),wordSpine=state.branch_target.trim();
       const responseGroupCard=row=>{
         const card=element("article","card clickable "+branchClass(row)+" "+changeClass(row,previousRows.get(String(row.branch_key_hex))));card.dataset.identity=row.branch_key_hex;
@@ -2272,7 +2283,7 @@
       const buildPage=(siblings,paging,parentSpine)=>{const holder=element("div","tree-page"),tree=buildGroupedList(siblings,parentSpine||"","tree");holder.append(tree);const key=pageKey(parentSpine),history=treePageHistory.get(key)||[],returnedGroupCount=paging.returned_group_count??wordGroups(siblings).length,totalGroupCount=paging.total_group_count??returnedGroupCount;if(history.length||paging.next_cursor)holder.append(buildPager({summary:"Showing "+numText(returnedGroupCount)+" of "+numText(totalGroupCount)+" child groups",previous:history.length?()=>{const prior=history.pop();treePageHistory.set(key,history);if(!parentSpine)setState({...currentState,tree_cursor:prior||null},false);else loadPage(parentSpine,prior,holder);}:null,next:paging.next_cursor?()=>{history.push(paging.cursor||null);treePageHistory.set(key,history);if(!parentSpine)setState({...currentState,tree_cursor:paging.next_cursor},false);else loadPage(parentSpine,paging.next_cursor,holder);}:null}));return holder;};
       fragment.append(buildPage(data.nodes||[],data.paging||{},data.paging?.parent_spine||""));return fragment;
     }
-    function renderQueue(report,previous,state){const fragment=document.createDocumentFragment(),summary=element("div","metrics");for(const [key,value] of Object.entries(report.data.summary?.branch_count_by_status||{}))summary.append(metric("status "+key,value));for(const [key,value] of Object.entries(report.data.summary?.branch_count_by_worker_status||{}))summary.append(metric("worker "+key,value));fragment.append(summary);const grid=gridElement("queue"),previousRows=previousBy(previous,"rows","branch_key_hex");for(const row of ordered(report.data.rows||[],"branch_key_hex","queue",state))grid.append(cardForBranch(row,previousRows.get(String(row.branch_key_hex))));fragment.append(grid);return fragment;}
+    function renderQueue(report,previous,state){const fragment=document.createDocumentFragment(),summary=element("div","metrics");for(const [key,value] of Object.entries(report.data.summary?.branch_count_by_status||{}))summary.append(metric("status "+key,value));for(const [key,value] of Object.entries(report.data.summary?.branch_count_by_worker_status||{}))summary.append(metric("worker "+key,value));fragment.append(summary,sortNote(state));const grid=gridElement("queue"),previousRows=previousBy(previous,"rows","branch_key_hex");for(const row of ordered(report.data.rows||[],"branch_key_hex","queue",state))grid.append(cardForBranch(row,previousRows.get(String(row.branch_key_hex))));fragment.append(grid);return fragment;}
     function workerFactSections(worker,generatedAt){
       const fragment=document.createDocumentFragment();
       const identity=[["worker",workerName(worker)],["PID",worker.pid],["state",worker.state],["last heartbeat",relativeAge(worker.updated_at,generatedAt)]];
@@ -2434,6 +2445,7 @@
       // and released its ownership.
       else if(!rows.length&&namedWord)fragment.append(element("p","dim",
         namedWord.toUpperCase()+" owns no live branches: its work has finished and released them."));
+      if(sourceWords.length)fragment.append(sortNote(state));
       const previousWords=previousBy(previous,"summary","opener");
       const wordCard=row=>sourceWordCard(row,previousWords.get(String(row.opener)),state,report.generated_at);
       if(data.summary_groups){

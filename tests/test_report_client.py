@@ -2029,8 +2029,54 @@ class ReportClientContract:
         text = self.page.locator("details.word-progress-panel").inner_text()
         self.assertNotIn("requested", text)
         self.assertIn("work began", text)
-        self.assertIn("active epoch", text)
-        self.assertIn("no recorded telemetry", text)
+        self.assertIn("nothing recorded yet", text)
+        self.assertIn("swarm now in epoch", text)
+
+    def test_word_progress_says_when_figures_were_recorded_and_the_epoch_now(self):
+        def earlier_epochs(data):
+            data.update(epoch=27, telemetry_epochs=[17, 25],
+                        selected_telemetry_epoch=None)
+        self._word_progress_panel_with(earlier_epochs)
+        text = self.page.locator("details.word-progress-panel").inner_text()
+        self.assertIn("recorded in epochs 17, 25", text)
+        self.assertIn("swarm now in epoch 27", text)
+
+    def test_word_progress_names_the_epoch_now_only_when_not_recorded_in(self):
+        def current_epoch(data):
+            data.update(epoch=26, telemetry_epochs=[25, 26],
+                        selected_telemetry_epoch=None)
+        self._word_progress_panel_with(current_epoch)
+        text = self.page.locator("details.word-progress-panel").inner_text()
+        self.assertIn("recorded in epochs 25, 26", text)
+        self.assertNotIn("swarm now", text)
+        self.assertNotIn("active epoch", text)
+
+    def test_word_progress_subsecond_worker_time_keeps_its_unit(self):
+        # Seven small inherited branches cost 55 ms between them.  Rounded to
+        # whole seconds that reads as "cost nothing".
+        def small_inheritance(data):
+            data["totals"].update(
+                provenance_counts={**data["totals"].get("provenance_counts", {}),
+                                   "inherited": 7},
+                inherited_cost_known=True, inherited_search_node_count=111,
+                inherited_wall_time_millis=55)
+        self._word_progress_panel_with(small_inheritance)
+        text = self.page.locator("details.word-progress-panel").inner_text()
+        self.assertIn("55ms inherited", text)
+        self.assertNotIn("0s inherited", text)
+
+    def test_word_report_sort_label_sits_above_the_list_it_orders(self):
+        self.apply_branch_target("SALET")
+        self.page.wait_for_selector("table.word-progress")
+        self.assertNotIn("sorted by", self.page.locator(".report-meta").inner_text())
+        placement = self.page.evaluate("""() => {
+          const notes=[...document.querySelectorAll('#report .sort-note')];
+          return notes.map(note=>[note.textContent,
+            note.nextElementSibling?.dataset.gridKey
+            ?? note.nextElementSibling?.className]);
+        }""")
+        self.assertEqual(placement,
+                         [["sorted by # of answers (default)", "response-groups"]])
 
     def test_word_progress_url_carries_only_parameters_the_report_accepts(self):
         # The word view's own display state — group_by, sort, limit, branch
@@ -2724,8 +2770,11 @@ class ReportClientContract:
         # The list of every opener names no target, so its caption names none.
         caption = " ".join(self.page.locator(".report-meta").first.inner_text().split())
         self.assertNotIn("root", caption)
-        self.assertIn(
-            "sorted by state (default)", caption)
+        # The order is named beside the list it orders, not in the caption.
+        self.assertNotIn("sorted by", caption)
+        self.assertEqual(
+            self.page.locator("#report .sort-note").inner_text(),
+            "sorted by state (default)")
         self.page.evaluate(
             "__reportClient.setState({...__reportClient.getState(), sort: 'default'})")
         self.assertIn("sort=default", self.page.url)

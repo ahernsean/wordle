@@ -316,6 +316,11 @@ def _sample_worker_count_text(sample_worker_count):
 def _abbreviate_duration(seconds):
     if seconds is None or seconds < 0:
         return "—"
+    # A nonzero span shorter than the next unit keeps its own magnitude
+    # rather than truncating to a zero that reads as "took no time".
+    if 0 < seconds < 1:
+        millis = int(seconds * 1000)
+        return f"{millis}ms" if millis else "<1ms"
     if seconds < 60:
         return f"{int(seconds)}s"
     if seconds < 3600:
@@ -2136,6 +2141,29 @@ def _state_counts(totals):
             if counts.get(state)}
 
 
+def word_progress_epoch_text(data):
+    """Which epochs the figures were recorded in, and the swarm's own now.
+
+    The swarm's current epoch is named only when it is not among them,
+    since otherwise it repeats an epoch already shown.
+    """
+    selected_epoch = data.get("selected_telemetry_epoch")
+    recorded_epochs = ([selected_epoch] if selected_epoch is not None
+                       else data.get("telemetry_epochs", []))
+    if selected_epoch is not None:
+        text = f"showing only epoch {selected_epoch}'s records"
+    elif recorded_epochs:
+        text = ("recorded in epoch " if len(recorded_epochs) == 1
+                else "recorded in epochs ") + ", ".join(
+                    str(epoch) for epoch in recorded_epochs)
+    else:
+        text = "nothing recorded yet"
+    current_epoch = data.get("epoch")
+    if current_epoch is not None and current_epoch not in recorded_epochs:
+        text += f"; swarm now in epoch {current_epoch}"
+    return text
+
+
 def _render_word_progress_sections(report, width, display_order):
     data = report["data"]
     totals = data["totals"]
@@ -2143,19 +2171,9 @@ def _render_word_progress_sections(report, width, display_order):
     spine_prefix = data.get("spine_prefix")
     subject = (spine_prefix + ("*" if data["word_is_answer"] else "")
                if spine_prefix else word)
-    selected_epoch = data.get("selected_telemetry_epoch")
-    telemetry_epochs = data.get("telemetry_epochs", [])
-    telemetry_scope = (
-        f"telemetry-epoch={selected_epoch}"
-        if selected_epoch is not None
-        else (("telemetry-epochs=" if len(telemetry_epochs) > 1
-               else "telemetry-epoch=")
-              + ",".join(str(epoch) for epoch in telemetry_epochs)
-              if telemetry_epochs else "telemetry-epochs=none")
-    )
     header = _semantic_header(
         report,
-        f"Word progress {subject}  active-epoch={data['epoch']}  {telemetry_scope}",
+        f"Word progress {subject}  {word_progress_epoch_text(data)}",
         width,
     )
     requested_at = totals["requested_at"]

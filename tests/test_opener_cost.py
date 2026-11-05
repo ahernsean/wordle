@@ -95,7 +95,8 @@ class TestSpineSubtreeRollup(_Log):
 
         self.assertEqual(rollup["branch_count"], 3)
         self.assertEqual(rollup["search_node_count"], 147)
-        self.assertEqual(rollup["wall_time_millis"], 450)
+        # Each branch's bundle evaluation (150) and coordination (10).
+        self.assertEqual(rollup["wall_time_millis"], 480)
 
     def test_an_empty_subtree_reports_nothing_spent(self):
         rollup = self.q.roll_up_spine_subtrees(["SALET -----"])["SALET -----"]

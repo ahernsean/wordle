@@ -5275,6 +5275,12 @@ class WordProgressReportTest(unittest.TestCase):
         # Inherited work is never folded into this opener's measured total:
         # the two answer different questions and their sum is a third.
         self.assertEqual(totals["search_node_count"], 0)
+        # The inherited figures were recorded too, and their epoch says when,
+        # although this opener recorded nothing of its own.
+        self.assertEqual(row["telemetry_epochs"], [])
+        self.assertEqual(data["telemetry_epochs"],
+                         row["inherited_telemetry_epochs"])
+        self.assertTrue(data["telemetry_epochs"])
 
     def test_every_word_progress_sort_orders_by_the_nodes_it_names(self):
         """Both orders are declared, and the dispatch table is checked.

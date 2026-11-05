@@ -43,6 +43,15 @@ WORKER_LIVENESS_SECONDS = 30
 QUEUE_REPORT_BRANCH_STATUSES = ("queued", "evaluating", "finalizing", "done")
 QUEUE_REPORT_BRANCH_WORKER_STATUSES = ("active", "waiting")
 
+# Worker-time a finalized branch cost: its bundles' evaluation spans plus the
+# coordination spent handing those bundles out.  On a small branch the
+# one-level prune leaves a few candidates of milliseconds each, so nearly all
+# of its cost is coordination, and evaluation alone would report it as free.
+# Rows from before coordination was recorded contribute evaluation only.
+_FINALIZED_WORKER_TIME_SQL = (
+    "COALESCE(total_bundle_wall_time_millis, 0)"
+    " + COALESCE(coordination_time_millis, 0)")
+
 # Why a claim transaction handed out no bundle.  These are decided inside the
 # transaction, which is the only place that can decide them: the cap counts
 # occupancy against the very claims the transaction is about to create, so a
@@ -5998,8 +6007,9 @@ class ERDQueue:
         different questions:
           elapsed_time_millis  wall-clock span from first work to last, which the
                           swarm's other branches share
-          wall_time_millis     summed worker-time across bundles, which counts a
-                          six-worker hour as six hours
+          wall_time_millis     summed worker-time across bundles, evaluation
+                          and the coordination handing them out, which
+                          counts a six-worker hour as six hours
         Their ratio is a coarse read on how much parallelism the group drew.
 
         Progress on still-running branches comes from candidate_claims: a
@@ -6025,7 +6035,7 @@ class ERDQueue:
             SELECT SUBSTR(spine, ?, 5) AS pattern,
                    COUNT(*) AS branch_count,
                    SUM(nodes_spent) AS search_node_count,
-                   SUM(total_bundle_wall_time_millis) AS wall_time_millis,
+                   SUM({_FINALIZED_WORKER_TIME_SQL}) AS wall_time_millis,
                    MIN(created_at) AS first_created_at,
                    MAX(finalized_at) AS last_finalized_at,
                    GROUP_CONCAT(DISTINCT epoch) AS telemetry_epochs
@@ -6163,7 +6173,7 @@ class ERDQueue:
         return spine + " ", spine + " " + chr(0x10FFFF)
 
     def roll_up_spine_subtrees(self, spines) -> dict:
-        """Finalized branches, nodes and worker-time under each spine.
+        """Finalized branches, nodes, worker-time and epochs under each spine.
 
         The cost of an inherited group is its whole subtree, not the one
         branch that names it: everything the first opener finalized beneath
@@ -6176,17 +6186,23 @@ class ERDQueue:
             if not spine:
                 continue
             low, high = self._spine_subtree_bounds(spine)
-            row = self._conn.execute("""
+            row = self._conn.execute(f"""
                 SELECT COUNT(*) AS branch_count,
                        COALESCE(SUM(nodes_spent), 0) AS search_node_count,
-                       COALESCE(SUM(total_bundle_wall_time_millis), 0)
+                       COALESCE(SUM({_FINALIZED_WORKER_TIME_SQL}), 0)
                            AS wall_time_millis,
                        MIN(created_at) AS first_created_at,
-                       MAX(finalized_at) AS last_finalized_at
+                       MAX(finalized_at) AS last_finalized_at,
+                       GROUP_CONCAT(DISTINCT epoch) AS telemetry_epochs
                 FROM telemetry.branch_finalize_log
                 WHERE spine = ? OR (spine >= ? AND spine < ?)
             """, (spine, low, high)).fetchone()
-            rollups[spine] = dict(row)
+            rollup = dict(row)
+            rollup["telemetry_epochs"] = sorted(
+                int(value)
+                for value in (rollup["telemetry_epochs"] or "").split(",")
+                if value)
+            rollups[spine] = rollup
         return rollups
 
     def opener_work_requests_for_word(self, word) -> list:
