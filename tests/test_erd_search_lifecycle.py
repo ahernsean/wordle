@@ -11,6 +11,7 @@ from contextlib import ExitStack, redirect_stdout
 import io
 import json
 import os
+import re
 import sqlite3
 import tempfile
 import time
@@ -439,39 +440,95 @@ class QueueOperatorCommandTest(unittest.TestCase):
         self.assertEqual(arguments.limit, 10)
         self.assertEqual(arguments.since_seconds, 3600)
 
+    # Every report a view can select, with what it needs to be a valid
+    # request on its own.  The empty selector is the overview.
+    VIEW_REPORT_SELECTORS = (
+        (), ("--queue",), ("--workers",), ("--worker", "1"), ("--cache",),
+        ("--hotspots",), ("--work-distribution",), ("--leaderboard",),
+        ("--openers",), ("--word-progress", "raise"),
+    )
+
+    # Options valid only with some reports, each with a value it accepts.
+    REPORT_SCOPED_OPTIONS = (
+        ("--by", "nodes"), ("--epoch", "3"), ("--since-seconds", "30"),
+        ("--sample-size", "30"),
+    )
+
+    @staticmethod
+    def _options_named(message):
+        return set(re.findall(r"(?<![\w-])--[a-z][a-z-]*", message))
+
+    def _parse(self, arguments):
+        """The parser's error line for these arguments, or None if it
+        accepted them and dispatched."""
+        with (
+            patch("sys.argv", ["erd_search.py", *arguments]),
+            patch.object(erd_search, "ensure_runtime_dir"),
+            patch.object(erd_search, "cmd_view"),
+            patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            try:
+                erd_search.main()
+            except SystemExit as raised:
+                self.assertEqual(raised.code, 2, stderr.getvalue())
+                return stderr.getvalue().rpartition(" error: ")[2].strip()
+        return None
+
+    def test_every_view_report_selector_is_a_valid_request_alone(self):
+        for selector in self.VIEW_REPORT_SELECTORS:
+            with self.subTest(selector=selector):
+                self.assertIsNone(self._parse(["view", *selector]))
+
+    def test_a_report_scoped_option_names_exactly_the_reports_that_accept_it(self):
+        """The refusal names the option and every report that accepts it, and
+        no report that refuses it, so the message cannot fall behind the
+        validation it describes."""
+        for option, value in self.REPORT_SCOPED_OPTIONS:
+            accepting, messages = set(), set()
+            for selector in self.VIEW_REPORT_SELECTORS:
+                error = self._parse(["view", *selector, option, value])
+                if error is None:
+                    if selector:
+                        accepting.add(selector[0])
+                else:
+                    messages.add(error)
+            with self.subTest(option=option):
+                self.assertEqual(len(messages), 1, messages)
+                self.assertTrue(accepting)
+                self.assertEqual(self._options_named(messages.pop()),
+                                 {option} | accepting)
+
     def test_main_rejects_invalid_view_and_priority_argument_combinations(self):
+        """Each refusal is the parser's, and names the options it is about
+        and no others, which is what tells one refusal from another."""
         cases = (
-            (["view", "--format", "json", "--watch", "1"], "json cannot"),
-            (["queue", "priority", "--word", "raise", "--priority", "1"], "pattern is required"),
-            (["view", "--limit", "0"], "limit must"),
-            (["view", "--minimum-answer-count", "2", "--maximum-answer-count", "1"], "cannot exceed"),
-            (["view", "--by", "nodes"], "requires --hotspots"),
+            (["view", "--format", "json", "--watch", "1"],
+             {"--format", "--watch"}),
+            (["queue", "priority", "--word", "raise", "--priority", "1"],
+             {"--pattern", "--word"}),
             (["queue", "priority", "--opener-word", "raise",
               "--pattern=-----", "--priority", "1"],
-             "pattern can only be used with --word"),
-            (["view", "NOTAWORD"], "five-letter word"),
-            (["view", "--since-seconds", "30"],
-             "--since-seconds requires --hotspots or --work-distribution"),
-            (["view", "--sample-size", "30"],
-             "--sample-size requires --hotspots"),
-            (["view", "--epoch", "3"],
-             "--epoch requires --hotspots, --word-progress, or "
-             "--work-distribution"),
-            (["view", "--accuracy"], "unrecognized arguments: --accuracy"),
+             {"--pattern", "--word"}),
+            (["view", "--limit", "0"], {"--limit"}),
+            (["view", "--minimum-answer-count", "2",
+              "--maximum-answer-count", "1"],
+             {"--minimum-answer-count", "--maximum-answer-count"}),
+            (["view", "--accuracy"], {"--accuracy"}),
             (["view", "--hotspots", "--since-seconds", "0"],
-             "since-seconds must be at least 1"),
-            (["view", "--hotspots", "--sample-size", "0"],
-             "sample-size must be at least 1"),
+             {"--since-seconds"}),
+            (["view", "--hotspots", "--sample-size", "0"], {"--sample-size"}),
         )
-        for arguments, message in cases:
-            with self.subTest(arguments=arguments), \
-                 patch("sys.argv", ["erd_search.py", *arguments]), \
-                 patch.object(erd_search, "ensure_runtime_dir"), \
-                 patch("sys.stderr", new_callable=io.StringIO) as stderr:
-                with self.assertRaises(SystemExit) as raised:
-                    erd_search.main()
-            self.assertEqual(raised.exception.code, 2)
-            self.assertIn(message, stderr.getvalue())
+        for arguments, options in cases:
+            with self.subTest(arguments=arguments):
+                error = self._parse(arguments)
+                self.assertIsNotNone(error)
+                self.assertEqual(self._options_named(error), options)
+
+    def test_a_spine_token_that_is_not_a_word_is_named_in_its_refusal(self):
+        error = self._parse(["view", "NOTAWORD"])
+        self.assertIsNotNone(error)
+        self.assertIn("NOTAWORD", error)
+        self.assertEqual(self._options_named(error), set())
 
     def test_supervisor_disk_and_wal_helpers_cover_failure_paths(self):
         queue = Mock()
@@ -1107,7 +1164,7 @@ class QueueMutationReportingTest(unittest.TestCase):
 
 
 class QueueAddReportingTest(unittest.TestCase):
-    """What queue add tells the operator it skipped and why."""
+    """What queue add does with what it skips, and that it names the cause."""
 
     def setUp(self):
         self.queue = Mock()
@@ -1120,6 +1177,8 @@ class QueueAddReportingTest(unittest.TestCase):
             lambda rows: {rows[0][3]: (1, rows[0][2], True, len(rows))})
         self.response_cache = Mock()
         self.response_cache.group_words.return_value = {0: ["cigar", "rebut"]}
+        self.score_cache = Mock()
+        self.score_cache.report_branch_states.return_value = {}
         self.arguments = SimpleNamespace(
             queue="queue.sqlite3", cache="cache.sqlite3",
             word=["raise"], words_file=None, pattern=None,
@@ -1128,12 +1187,11 @@ class QueueAddReportingTest(unittest.TestCase):
         )
 
     def _run(self):
-        score_cache = Mock()
-        score_cache.report_branch_states.return_value = {}
         with (
             patch.object(erd_search, "load_word_list",
                          return_value=["cigar", "rebut", "raise"]),
-            patch.object(erd_search, "ScoreCache", return_value=score_cache),
+            patch.object(erd_search, "ScoreCache",
+                         return_value=self.score_cache),
             patch.object(erd_search, "ResponseCache",
                          return_value=self.response_cache),
             patch.object(erd_search, "ERDQueue", return_value=self.queue),
@@ -1142,28 +1200,52 @@ class QueueAddReportingTest(unittest.TestCase):
             erd_search.cmd_queue_add(self.arguments)
         return output.getvalue()
 
-    def test_priority_words_without_a_words_file_are_ignored(self):
-        self.arguments.priority_words = ["raise"]
-        self.assertIn("only applies with --words-file", self._run())
+    def _queued_priorities(self):
+        """Each queued opener's priority, by opener."""
+        return {rows[0][3]: rows[0][2] for (rows,), _keywords
+                in self.queue.add_pending_many.call_args_list}
 
-    def test_priority_words_outside_the_word_list_are_named(self):
+    def test_priority_words_without_a_words_file_are_ignored(self):
+        """Every word takes a rung, as if no priority words were given."""
+        self.arguments.word = ["raise", "cigar"]
+        self.arguments.priority_words = ["raise"]
+        output = self._run()
+        priorities = self._queued_priorities()
+        self.assertEqual(set(priorities), {"raise", "cigar"})
+        self.assertEqual(priorities["raise"] - priorities["cigar"],
+                         self.arguments.priority_step)
+        self.assertIn("--priority-words", output)
+
+    def test_priority_words_outside_the_word_list_are_named_and_not_queued(self):
         self.arguments.word = None
         self.arguments.words_file = "words.txt"
         self.arguments.priority_words = ["crane"]
-        self.assertIn("priority words not in the word list", self._run())
+        output = self._run()
+        self.assertEqual(set(self._queued_priorities()),
+                         {"cigar", "rebut", "raise"})
+        self.assertIn("crane", output)
 
     def test_a_response_group_too_small_to_search_is_not_queued(self):
         self.arguments.pattern = "-----"
         self.response_cache.group_words.return_value = {0: ["cigar"]}
-        self.assertIn("nothing to queue", self._run())
+        output = self._run()
+        self.queue.add_pending_many.assert_not_called()
+        self.assertIn("RAISE", output)
+        self.assertNotIn("--max-branch-size", output)
 
-    def test_a_response_group_over_the_size_limit_is_skipped(self):
+    def test_a_response_group_over_the_size_limit_is_not_queued(self):
         self.arguments.pattern = "-----"
         self.arguments.max_branch_size = 1
-        self.assertIn("exceeds --max-branch-size", self._run())
+        output = self._run()
+        self.queue.add_pending_many.assert_not_called()
+        self.assertIn("RAISE", output)
+        self.assertIn("--max-branch-size", output)
 
-    def test_an_interrupted_add_says_so_and_still_closes_its_stores(self):
+    def test_an_interrupted_add_queues_nothing_and_still_closes_its_stores(self):
         self.arguments.pattern = "-----"
         self.response_cache.group_words.side_effect = KeyboardInterrupt
-        self.assertIn("Interrupted", self._run())
+        output = self._run()
+        self.queue.add_pending_many.assert_not_called()
+        self.assertIn("Interrupted", output)
+        self.score_cache.close.assert_called_once_with()
         self.queue.close.assert_called_once_with()
