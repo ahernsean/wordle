@@ -1350,12 +1350,19 @@ no CI at all; opening the pull request is what starts it, and pushing again to
 an open one restarts it. Open the pull request as soon as the change is worth
 CI's time. Let CI do its job; read its result rather than pre-empting it.
 
-**The one trap of narrow scope is user-facing strings.**
-`tests/test_erd_search_lifecycle.py` pins `erd_search.py`'s `parser.error`
-messages by substring, so widening one report's option set fails a test in a
-module the diff never touches. When a change alters an error message, grep
-`tests/` for a distinctive fragment of the old wording — that is cheaper and
-more certain than running everything.
+**A test of a message asserts what the message is evidence of, not its
+wording.** A refusal's exit code is the same for every refusal, so a test
+needs the message to tell which check fired; it does not need the sentence.
+`tests/test_erd_search_lifecycle.py` asserts which options an `erd_search.py`
+`parser.error` names, and derives the reports a report-scoped option such as
+`--epoch` names from the reports that actually accept it, so rewording a
+refusal changes no test and a message that falls behind its validation fails
+one.  Where a message reports that something was skipped, assert that it was
+skipped (nothing written to the queue), and keep the message check to the
+token that names the cause.  Tests that still pin wording exist elsewhere, so
+when a change alters a user-facing string, grep `tests/` for a distinctive
+fragment of the old wording -- that is cheaper and more certain than running
+everything.
 
 **Prove a new test can fail.** Disable the fix — stub the function to a no-op,
 or patch the constant back — and confirm the tests that are supposed to catch
