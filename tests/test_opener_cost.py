@@ -63,7 +63,8 @@ class TestCompletedOpenerTiming(_Log):
         self.assertEqual(timing["search_node_count"], 140)
         self.assertEqual(timing["evaluation_time_millis"], 200)
         self.assertEqual(timing["coordination_time_millis"], 20)
-        self.assertEqual(timing["worker_time_millis"], 300)
+        # Each branch's bundle evaluation (150) and coordination (10).
+        self.assertEqual(timing["worker_time_millis"], 320)
         self.assertEqual(timing["first_created_at"], self.now - 600)
         self.assertEqual(timing["completed_at"], self.now)
 
@@ -95,7 +96,8 @@ class TestSpineSubtreeRollup(_Log):
 
         self.assertEqual(rollup["branch_count"], 3)
         self.assertEqual(rollup["search_node_count"], 147)
-        self.assertEqual(rollup["wall_time_millis"], 450)
+        # Each branch's bundle evaluation (150) and coordination (10).
+        self.assertEqual(rollup["wall_time_millis"], 480)
 
     def test_an_empty_subtree_reports_nothing_spent(self):
         rollup = self.q.roll_up_spine_subtrees(["SALET -----"])["SALET -----"]
@@ -105,6 +107,24 @@ class TestSpineSubtreeRollup(_Log):
     def test_a_rollup_is_an_index_range(self):
         self.assertEveryLookupUsesTheSpineIndex(
             lambda: self.q.roll_up_spine_subtrees(["CRANE -----"]))
+
+    def test_an_epoch_narrows_a_rollup_to_its_own_records(self):
+        # An epoch filter scopes every figure a word report shows, so the
+        # cost of an inherited subtree counts only that epoch's records too.
+        self._finalized("CRANE -----", 100)
+        self.q.set_epoch(self.q.epoch + 1)
+        self._finalized("CRANE ----- LUBES -y---", 40)
+        epoch = self.q.epoch
+        rollup = self.q.roll_up_spine_subtrees(
+            ["CRANE -----"], epoch - 1)["CRANE -----"]
+        self.assertEqual(rollup["search_node_count"], 100)
+        self.assertEqual(rollup["telemetry_epochs"], [epoch - 1])
+        whole = self.q.roll_up_spine_subtrees(["CRANE -----"])["CRANE -----"]
+        self.assertEqual(whole["search_node_count"], 140)
+
+    def test_a_rollup_for_one_epoch_still_uses_the_spine_index(self):
+        self.assertEveryLookupUsesTheSpineIndex(
+            lambda: self.q.roll_up_spine_subtrees(["CRANE -----"], self.q.epoch))
 
     def test_word_progress_groups_through_the_index(self):
         self._finalized("CRANE -----", 100)

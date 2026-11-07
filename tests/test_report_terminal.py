@@ -2748,12 +2748,31 @@ class WordProgressInheritanceRendererTest(unittest.TestCase):
 class WordProgressRendererTest(unittest.TestCase):
     def test_reports_request_time_and_work_start_as_separate_facts(self):
         output = render_report(word_progress_report(), width=120)
-        self.assertIn("active-epoch=11  telemetry-epochs=9,11", output)
+        # The swarm's epoch is among those recorded, so it is not repeated.
+        self.assertIn("recorded in epochs 9, 11", output)
+        self.assertNotIn("swarm now", output)
         self.assertIn("Requested", output)
         self.assertIn("work began", output)
         # The two differ by ~11 days here; collapsing them would report the
         # queue wait as though it were search time.
         self.assertIn("2026-", output)
+
+    def test_epoch_text_separates_what_was_recorded_from_the_swarm_now(self):
+        text = report_terminal.word_progress_epoch_text
+        self.assertEqual(text({"epoch": 26, "telemetry_epochs": [26]}),
+                         "recorded in epoch 26")
+        self.assertEqual(text({"epoch": 27, "telemetry_epochs": [17, 25]}),
+                         "recorded in epochs 17, 25; swarm now in epoch 27")
+        self.assertEqual(text({"epoch": 27, "telemetry_epochs": []}),
+                         "nothing recorded yet; swarm now in epoch 27")
+        self.assertEqual(
+            text({"epoch": 27, "telemetry_epochs": [17, 25],
+                  "selected_telemetry_epoch": 25}),
+            "showing only epoch 25's records; swarm now in epoch 27")
+        self.assertEqual(
+            text({"epoch": 25, "telemetry_epochs": [17, 25],
+                  "selected_telemetry_epoch": 25}),
+            "showing only epoch 25's records")
 
     def test_shows_worst_group_share_and_both_time_bases(self):
         output = render_report(word_progress_report(), width=120)
@@ -3077,6 +3096,11 @@ class TerminalUtilityTest(unittest.TestCase):
         self.assertEqual(report_terminal._abbreviate_number(1_200), "1.2k")
         self.assertEqual(report_terminal._abbreviate_duration(-1), "—")
         self.assertEqual(report_terminal._abbreviate_duration(90), "1m")
+        # A nonzero span under a second is not a zero.
+        self.assertEqual(report_terminal._abbreviate_duration(0), "0s")
+        self.assertEqual(report_terminal._abbreviate_duration(0.055), "55ms")
+        self.assertEqual(report_terminal._abbreviate_duration(0.0004), "<1ms")
+        self.assertEqual(report_terminal._abbreviate_duration(1.5), "1s")
         self.assertEqual(report_terminal._format_fill_eta(30), "0 min")
         self.assertEqual(report_terminal._format_fill_eta(200000), "2.3 d")
         row = {"count": 2, "best_erd": 2.0, "current_candidate": "raise"}

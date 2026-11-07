@@ -2790,6 +2790,35 @@ class TestSpineAttribution(_TmpQueue):
         self.assertEqual(rollups["TARSE -y-g-"]["wall_time_millis"], 10_250)
         self.assertEqual(rollups["TARSE -y-g-"]["branch_count"], 3)
 
+    def test_worker_time_counts_coordination_beside_evaluation(self):
+        # A small branch is pruned to a few candidates of milliseconds each,
+        # so its cost is the coordination that handed them out.  A row from
+        # before coordination was recorded still contributes its evaluation.
+        self.q.add_branch_finalize_log(
+            self.key, "XEROX -g-y-", 9, 5, 10, 13, 26, 8,
+            total_bundle_wall_time_millis=3, coordination_time_millis=926)
+        self.q.add_branch_finalize_log(
+            self.key, "XEROX -g-y- CRANE -----", 2, 4, 10, 14, 1, 1,
+            total_bundle_wall_time_millis=40)
+
+        rollup = self.q.roll_up_spine_subtrees(["XEROX -g-y-"])["XEROX -g-y-"]
+        progress = self.q.report_word_progress("XEROX", None)
+
+        self.assertEqual(rollup["wall_time_millis"], 969)
+        self.assertEqual(progress["groups"]["-g-y-"]["wall_time_millis"], 969)
+
+    def test_subtree_rollup_names_the_epochs_it_was_recorded_in(self):
+        self._log(self.key, "TARSE -y-g-", 400, 4_000, finalized_at=500)
+        self.q.set_epoch(self.q.epoch + 3)
+        self._log(self.key, "TARSE -y-g- CRANE -----", 600, 6_000, finalized_at=600)
+        self._log(self.key, "TARSE -y-g- CRANE ----- NURDY -y---", 25, 250,
+                  finalized_at=700)
+        rollups = self.q.roll_up_spine_subtrees(["TARSE -y-g-", "SALET -----"])
+        epoch = self.q.epoch
+        self.assertEqual(rollups["TARSE -y-g-"]["telemetry_epochs"],
+                         [epoch - 3, epoch])
+        self.assertEqual(rollups["SALET -----"]["telemetry_epochs"], [])
+
     def test_subtree_rollup_reads_every_spine_from_one_scan(self):
         for index, spine in enumerate(("AAAAA -----", "MMMMM -----", "ZZZZZ -----")):
             self._log(self.key, spine, 10 * (index + 1), 100, finalized_at=index)

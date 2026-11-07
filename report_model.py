@@ -2229,8 +2229,9 @@ def collect_word_progress_report(sources: ReportOpeners,
             spine for spine in finalizing_spines.values()
             if spine.split()[0].lower() != word.lower()
         })
-        subtree_rollups = (queue.roll_up_spine_subtrees(foreign_spines)
-                           if request.inherited_cost else {})
+        subtree_rollups = (
+            queue.roll_up_spine_subtrees(foreign_spines, request.epoch)
+            if request.inherited_cost else {})
         _mark_queue_opener_ok(report)
     except (sqlite3.Error, OSError) as error:
         _mark_queue_opener_error(report, error)
@@ -2326,6 +2327,8 @@ def collect_word_progress_report(sources: ReportOpeners,
         row["inherited_search_node_count"] = (
             rollup["search_node_count"] if rollup else 0)
         row["inherited_wall_time_millis"] = rollup["wall_time_millis"] if rollup else 0
+        row["inherited_telemetry_epochs"] = (
+            rollup["telemetry_epochs"] if rollup else [])
         row["inherited_elapsed_time_millis"] = (
             (rollup["last_finalized_at"] - rollup["first_created_at"]) * 1000
             if rollup and rollup["first_created_at"] is not None
@@ -2372,8 +2375,12 @@ def collect_word_progress_report(sources: ReportOpeners,
             if shown_node_total else 0.0)
     data["response_groups"] = rows
     data["epoch"] = active_epoch
+    # Every epoch whose records a total is built from, so an inherited
+    # group's figures name the epoch they were recorded in as well.
     data["telemetry_epochs"] = sorted({
-        epoch for row in rows for epoch in row["telemetry_epochs"]
+        epoch for row in rows
+        for epoch in (*row["telemetry_epochs"],
+                      *row["inherited_telemetry_epochs"])
     })
     data["selected_telemetry_epoch"] = progress["epoch"]
     data["work_started_at"] = min(
